@@ -1,7 +1,7 @@
 # sasscode
 
 [![Install with bioconda](https://img.shields.io/badge/Install%20with-bioconda-brightgreen.svg)](http://bioconda.github.io/recipes/sasscode/README.html)
-[![Anaconda Version](https://anaconda.org/bioconda/sasscode/badges/version.svg)](http://bioconda.github.io/recipes/sasscode/README.html)
+<!--TODO: [![Anaconda Version](https://anaconda.org/bioconda/sasscode/badges/version.svg)](http://bioconda.github.io/recipes/sasscode/README.html)-->
 [![Build Status](https://github.com/clintval/sasscode/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/clintval/sasscode/actions/workflows/ci.yml?query=branch%3Amain)
 [![Coverage Status](https://coveralls.io/repos/github/clintval/sasscode/badge.svg?branch=main)](https://coveralls.io/github/clintval/sasscode?branch=main)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
