@@ -7,7 +7,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Language](https://img.shields.io/badge/language-rust-dea588.svg)](https://www.rust-lang.org/)
 
-Flexible read parsing and demultiplexing to unmapped SAM/BAM/CRAM, splitcode-style.
+Flexible read parsing and demultiplexing to FASTX/SAM/BAM/CRAM, splitcode-style.
 
 ![sasscode](.github/img/cover.jpg)
 
@@ -21,9 +21,9 @@ pixi exec \
 
 ## Introduction
 
-`sasscode` reads multiple FASTX/SAM/BAM/CRAM inputs, identifies and extracts technical sequences (barcodes, UMIs, adapters) with error tolerance using the [`sassy`](https://github.com/RagnarGrootKoerkamp/sassy) approximate matcher, and writes a correct unmapped SAM/BAM/CRAM with preserved per-segment qualities, fanning a pool out into per-sample (and optionally per-sample and per-library) files in a single pass.
+The tool `sasscode` reads multiple FASTX/SAM/BAM/CRAM inputs, identifies and extracts technical sequences (barcodes, UMIs, adapters) with error tolerance using the [`sassy`](https://github.com/RagnarGrootKoerkamp/sassy) approximate matcher, and writes FASTX/SAM/BAM/CRAM files with preserved per-read segment qualities, fanning a read pool out into per-sample (and optionally per-sample and per-library) files in a single pass.
 
-It aims to do in one shot what otherwise would take a chain of separate tools, including:
+It aims to do in one shot what otherwise would take a combination of separate tools, including:
 
 - [`fgbio FastqToBam`](https://github.com/fulcrumgenomics/fgbio): stitch multiple FASTQs into one unmapped BAM via read structures and SAM tags
 - [`fqtk`](https://github.com/fulcrumgenomics/fqtk): fast sample demultiplexing driven by per-read barcode structures
@@ -35,7 +35,7 @@ It aims to do in one shot what otherwise would take a chain of separate tools, i
 
 ## Quick Start
 
-Process a SPLiT-seq run (splitcode's [SPLiT-seq example](https://splitcode.readthedocs.io/en/latest/tutorials_splitseq.html)) in one call: three rounds of 8 bp cell barcodes plus a 10 bp UMI on R2, with the cDNA on R1, emitted as an unmapped BAM with `CB` and `RX` tags:
+Process a SPLiT-seq run (splitcode's [SPLiT-seq example](https://splitcode.readthedocs.io/en/latest/tutorials_splitseq.html)) in one call: three rounds of 8 bp cell barcodes plus a 10 bp UMI on R2, with the cDNA on R1, emitted as an unmapped BAM with `CB` and `RX` tags and their associated quality scores in tags `CY` and `QX`:
 
 ```bash
 sasscode R1.fastq.gz R2.fastq.gz \
@@ -68,10 +68,10 @@ sasscode R1.fastq.gz R2.fastq.gz \
 
 ## Features
 
-- **FASTX/SAM/BAM/CRAM in and out** (BAM/CRAM written unmapped), with per-segment qualities carried through extraction.
+- **FASTX/SAM/BAM/CRAM in and out** (SAM/BAM/CRAM written unmapped), with per-segment qualities carried through extraction.
 - **splitcode-style matching**: tag groups, variable-length tags, location windows, mismatch/indel tolerance, sequential `next`/`previous` anchoring, `@extract` spans, and error-correction to canonical barcodes.
-- **Single-pass demultiplexing, optionally nested**: split a pool into per-sample outputs and, if you like, each sample into sub-samples (a library of samples, sub-libraries of lysates, and so on), each written as its own unmapped BAM/CRAM with `SM`/`LB` read groups.
-- **Configured on the CLI or in sheets** with the same grammar: flags repeat and accumulate, so a spec can be built up piece by piece (`--group g::loc=... --group g::dist=...`), or written compactly with comma lists (`--tag CB=bc1,bc2,bc3`).
+- **Single-pass demultiplexing, optionally nested**: split a pool into per-sample outputs and, if you like, each sample into sub-samples (a library of samples, sub-libraries of lysates, and so on), each written as its own FASTX/SAM/BAM/CRAM with `SM`/`LB` read group identifiers.
+- **Configured on the CLI or in sheets** with the same grammar: flags repeat and accumulate, so a spec can be built up piece by piece (`--group g1::loc=... --group g1::dist=...`), or written compactly with comma lists (`--group g1::loc=...,dist=...`).
 
 ## Development and Testing
 

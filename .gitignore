@@ -1,0 +1,12 @@
+# pixi environments
+.pixi/*
+!.pixi/config.toml
+
+# rust / cargo
+/target/
+
+# reference repo clones (read-only, never committed)
+/reference/
+
+# macOS
+.DS_Store

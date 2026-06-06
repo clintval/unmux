@@ -1,0 +1,58 @@
+[package]
+name = "sasscode"
+version = "0.1.0"
+authors = ["Clint Valentine <valentine.clint@gmail.com>"]
+edition = "2021"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/clintval/sasscode"
+description = "Flexible read parsing and demultiplexing to FASTX/SAM/BAM/CRAM, splitcode-style."
+categories = ["command-line-utilities", "science"]
+keywords = ["bioinformatics", "demultiplex", "barcode", "fastq", "splitcode"]
+
+[profile.release]
+codegen-units = 1
+lto = true
+
+[lib]
+name = "sasscodelib"
+path = "src/lib/mod.rs"
+
+[[bin]]
+name = "sasscode"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive", "wrap_help"] }
+env_logger = "0.11"
+flate2 = "1"
+log = "0.4"
+memchr = "2"
+noodles = { version = "0.109", features = ["bam", "bgzf", "core", "cram", "fasta", "fastq", "sam"] }
+pa-types = "1.5"
+sassy = { version = "0.2", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+# Engine deps still to wire as each is verified:
+#   pooled-writer = "0.4"   # many-file BGZF fan-out (same crate fqtk uses)
+#   rayon        = "1"
+
+[dev-dependencies]
+assert_cmd = "2"
+criterion = { version = "0.5", features = ["html_reports"] }
+cucumber = "0.21"
+futures = "0.3"
+predicates = "3"
+pretty_assertions = "1"
+rstest = "0.26"
+tempfile = "3"
+which = "6"
+
+[[test]]
+name = "cucumber"
+harness = false
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tarpaulin_include)'] }
