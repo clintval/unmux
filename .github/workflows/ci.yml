@@ -6,26 +6,31 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: "-C target-cpu=native"
+  # No global RUSTFLAGS: `-C target-cpu=native` bakes the build host's instruction set into the
+  # output, which then faults (SIGILL, exit 132) when rust-cache restores it onto a different-
+  # generation runner. It is also unexpressible across this matrix's two architectures (x86-64 +
+  # arm64). Each job that wants SIMD codegen pins a fixed, portable target-cpu for its own arch.
 
 jobs:
   fmt:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           components: rustfmt
       - run: cargo fmt -- --check
 
   lint:
     runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: "-C target-cpu=x86-64-v3"
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - run: cargo clippy --all-targets --all-features -- -D warnings
 
   test:
@@ -34,17 +39,74 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    env:
+      # x86-64-v3 (AVX2/FMA/BMI2) is guaranteed on every GitHub ubuntu runner and stops short of the
+      # AVX-512 that `native` opportunistically enables; arm64 macOS has NEON as a baseline, no flag.
+      RUSTFLAGS: ${{ matrix.os == 'ubuntu-latest' && '-C target-cpu=x86-64-v3' || '' }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - run: cargo test --all --no-fail-fast --verbose
 
+  # The scalar fallback must build and run on a host without AVX2/NEON: drop the
+  # target-cpu requirement and force sassy's scalar backend. This MUST be a release build: sassy's
+  # `ensure_simd` compile gate is suppressed by `debug_assertions`, so only a release build with
+  # empty RUSTFLAGS actually requires (and thus tests) the `scalar` feature on an x86-64 runner.
+  scalar:
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: ""
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - run: cargo build --release --features scalar
+      - run: cargo test --release --all --features scalar --no-fail-fast
+
+  # Coverage builds cargo-tarpaulin via `cargo install` and rust-cache caches that binary, so it is
+  # the job most exposed to the cross-runner SIGILL described on the top-level env: pin RUSTFLAGS
+  # empty (no target-cpu) so the cached binary runs on any runner. sassy still picks its SIMD path at
+  # runtime via `is_x86_feature_detected!`, so a portable build loses no coverage fidelity.
   coverage:
     runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: ""
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - run: cargo install cargo-tarpaulin --locked
-      - run: cargo tarpaulin --all --all-features --timeout 600 --out Xml -- --test-threads 1
+      # tarpaulin forwards everything after `--` to every test binary, but the cucumber test
+      # (`harness = false`) uses its own CLI parser and aborts on libtest's `--test-threads`. Pass it
+      # via RUST_TEST_THREADS instead: libtest honors the env var, cucumber ignores it.
+      - run: RUST_TEST_THREADS=1 cargo tarpaulin --all --all-features --timeout 600 --out Xml
+
+  # Build the shipped multi-versioned x86 artifact. cargo-multivers packs one slice per CPU
+  # tier (x86-64-v3 + v4, per `[package.metadata.multivers.x86_64]`) behind a CPUID dispatcher.
+  # ubuntu-latest is x86_64, so both slices are compiled and packed here; runtime AVX-512 validation
+  # still needs an AVX-512 host, which GitHub-hosted runners do not guarantee.
+  #
+  # This gates the pipeline: the x86 build is verified green here. It still cannot be smoke-tested on
+  # the arm64 dev box (the generated multivers-runner 0.3.2 fails to compile under recent rustc on
+  # aarch64, referencing `is_aarch64_feature_detected!` without the now-required `use std::arch::...`
+  # import). The x86 path emits `is_x86_feature_detected!` instead and builds here, so CI is the source
+  # of truth for this job.
+  dist-multivers:
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: ""
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - run: cargo install cargo-multivers --locked
+      - run: cargo multivers --profile dist
+      # cargo-multivers writes the merged runner under its own target subtree (always a `release`
+      # dir, regardless of --profile), not target/dist/. ubuntu-latest is x86_64, so the triple is
+      # fixed.
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: unmux-x86_64-multivers
+          path: target/cargo-multivers/x86_64-unknown-linux-gnu/release/unmux
+          if-no-files-found: error

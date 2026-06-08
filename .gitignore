@@ -10,3 +10,16 @@
 
 # macOS
 .DS_Store
+
+# claude code
+.claude/*
+
+# local planning docs (kept out of the remote)
+/docs/
+
+# editor settings
+/.vscode/
+
+# python bytecode
+__pycache__/
+*.pyc
