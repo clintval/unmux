@@ -85,3 +85,9 @@ unmux "R1.fastq.gz" "R2.fastq.gz" \
 ## Development and Testing
 
 See the [contributing guide](./CONTRIBUTING.md) for more information.
+
+> [!NOTE]
+> Claude Code was used substantially in the development of `unmux`.
+> Claude was used most notably for ideation support, prototyping, and code generation.
+> Although most of the code in this repository was AI-generated, the author committed to defining nearly all of the API through spec-driven development, reading and reviewing every code comment, line of actual Rust, and all tests (unit, integration, and narrative).
+> So, until which time where we are ready to release a v1, treat this project as AI-enabled, well-reviewed, and well-tested by a single discriminating human with modest Rust experience and expert experience in bioinformatics and other programming languages like Scala.
