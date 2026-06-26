@@ -940,4 +940,138 @@ mod tests {
             );
         }
     }
+
+    fn render_one(tag: [u8; 2], value: Value) -> String {
+        let mut data = Data::default();
+        data.insert(Tag::from(tag), value);
+        String::from_utf8(render_tags(&data)).unwrap()
+    }
+
+    #[test]
+    fn test_render_tags_every_scalar_value_type() {
+        // Each `Value` variant renders to its samtools `fastq -T` field. The
+        // signed/unsigned integer widths all share the `i` type code; character,
+        // float, string, and hex have their own.
+        assert_eq!(render_one(*b"XA", Value::Character(b'Q')), "XA:A:Q");
+        assert_eq!(render_one(*b"XB", Value::Int8(-5)), "XB:i:-5");
+        assert_eq!(render_one(*b"XC", Value::UInt8(5)), "XC:i:5");
+        assert_eq!(render_one(*b"XD", Value::Int16(-300)), "XD:i:-300");
+        assert_eq!(render_one(*b"XE", Value::UInt16(300)), "XE:i:300");
+        assert_eq!(render_one(*b"XF", Value::Int32(-70000)), "XF:i:-70000");
+        assert_eq!(render_one(*b"XG", Value::UInt32(70000)), "XG:i:70000");
+        assert_eq!(render_one(*b"XH", Value::Float(1.5)), "XH:f:1.5");
+        assert_eq!(
+            render_one(*b"XI", Value::String("ACGT".into())),
+            "XI:Z:ACGT"
+        );
+        assert_eq!(render_one(*b"XJ", Value::Hex("CAFE".into())), "XJ:H:CAFE");
+    }
+
+    #[test]
+    fn test_render_array_every_subtype() {
+        // A `B` array renders as `subtype,v1,v2,...` with the SAM subtype code per
+        // element width (c/C/s/S/i/I for the integers, f for float).
+        assert_eq!(render_array(&Array::Int8(vec![-1, 2])), "c,-1,2");
+        assert_eq!(render_array(&Array::UInt8(vec![1, 2])), "C,1,2");
+        assert_eq!(render_array(&Array::Int16(vec![-3, 4])), "s,-3,4");
+        assert_eq!(render_array(&Array::UInt16(vec![5, 6])), "S,5,6");
+        assert_eq!(render_array(&Array::Int32(vec![-7, 8])), "i,-7,8");
+        assert_eq!(render_array(&Array::UInt32(vec![9, 10])), "I,9,10");
+        assert_eq!(render_array(&Array::Float(vec![1.5])), "f,1.5");
+        // And an array value renders through `render_tags` with the `B` code.
+        assert_eq!(
+            render_one(*b"XK", Value::Array(Array::Int32(vec![1, 2, 3]))),
+            "XK:B:i,1,2,3"
+        );
+    }
+
+    #[test]
+    fn test_gzip_fastq_roundtrip_is_valid_gzip() {
+        // create() (which supplies the default header) + a gzipped FASTQ sink:
+        // exercise the gzip encoder write/finish path and confirm the file is real
+        // gzip that decodes back to the record.
+        use std::io::Read;
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out.fq.gz");
+        let mut w =
+            OutputWriter::create(Some(&out), OutputFormat::Fastq { gzip: true }, 6).unwrap();
+        w.write_fragment(&[OutputRead {
+            name: b"r1",
+            bases: b"ACGT",
+            quals: Some(&[30, 30, 30, 30]),
+            tags: None,
+            read_group: None,
+        }])
+        .unwrap();
+        w.finish().unwrap();
+
+        let bytes = std::fs::read(&out).unwrap();
+        assert_eq!(&bytes[..2], &[0x1f, 0x8b], "gzip magic bytes");
+        let mut text = String::new();
+        flate2::read::GzDecoder::new(&bytes[..])
+            .read_to_string(&mut text)
+            .unwrap();
+        // qual 30 re-encodes to Phred+33 '?' (30 + 33 = 63).
+        assert_eq!(text, "@r1\nACGT\n+\n????\n", "decoded FASTQ: {text:?}");
+    }
+
+    #[test]
+    fn test_write_encoded_rejects_cram() {
+        // CRAM records are not independent per-fragment byte slices, so the
+        // encode-on-workers append path refuses them.
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out.cram");
+        let mut w = OutputWriter::create(Some(&out), OutputFormat::Cram, 0).unwrap();
+        let err = w.write_encoded(b"bytes").unwrap_err().to_string();
+        assert!(err.contains("CRAM"), "{err}");
+    }
+
+    #[test]
+    fn test_encode_fragment_rejects_cram() {
+        let header = default_header();
+        let err = encode_fragment(OutputFormat::Cram, &header, &[])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("CRAM"), "{err}");
+    }
+
+    #[test]
+    fn test_more_than_two_reads_per_fragment_is_rejected() {
+        // SAM/BAM/CRAM holds at most two segments (a pair) per template.
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out.sam");
+        let mut w = OutputWriter::create(Some(&out), OutputFormat::Sam, 0).unwrap();
+        let q = [30u8; 4];
+        let reads: Vec<OutputRead> = (0..3)
+            .map(|_| OutputRead {
+                name: b"r",
+                bases: b"ACGT",
+                quals: Some(&q),
+                tags: None,
+                read_group: None,
+            })
+            .collect();
+        let err = w.write_fragment(&reads).unwrap_err().to_string();
+        assert!(err.contains("at most two"), "{err}");
+    }
+
+    #[test]
+    fn test_sink_writer_write_and_flush_delegate() {
+        // The `Write` impl delegates to the inner stream for the plain and gzip
+        // variants (the pooled variant needs a compressor pool and is covered by
+        // the fan-out integration tests).
+        let mut plain = SinkWriter::Plain(BufWriter::new(Box::new(Vec::new()) as Box<dyn Write>));
+        assert_eq!(plain.write(b"abc").unwrap(), 3);
+        plain.flush().unwrap();
+        plain.finish().unwrap();
+
+        let mut gzip = sink_writer(
+            BufWriter::new(Box::new(Vec::new()) as Box<dyn Write>),
+            true,
+            6,
+        );
+        assert_eq!(gzip.write(b"abc").unwrap(), 3);
+        gzip.flush().unwrap();
+        gzip.finish().unwrap();
+    }
 }

@@ -307,4 +307,143 @@ mod tests {
         // fire on it.
         assert!(validate_group("bc", &seqs(&["NNNANNN"]), &dist(0), MatchMode::All).is_ok());
     }
+
+    #[test]
+    fn test_mask_covers_every_iupac_code() {
+        // Concrete bases occupy one bit, U aliases T, each ambiguity code is the
+        // union of its member bits, and N is all four. The mask upper-cases first,
+        // so case is irrelevant; any byte that is not a code is the empty set.
+        let expected: &[(u8, u8)] = &[
+            (b'A', 0b0001),
+            (b'C', 0b0010),
+            (b'G', 0b0100),
+            (b'T', 0b1000),
+            (b'U', 0b1000),
+            (b'R', 0b0101), // A G
+            (b'Y', 0b1010), // C T
+            (b'S', 0b0110), // C G
+            (b'W', 0b1001), // A T
+            (b'K', 0b1100), // G T
+            (b'M', 0b0011), // A C
+            (b'B', 0b1110), // C G T
+            (b'D', 0b1101), // A G T
+            (b'H', 0b1011), // A C T
+            (b'V', 0b0111), // A C G
+            (b'N', 0b1111),
+        ];
+        for &(code, bits) in expected {
+            assert_eq!(mask(code), bits, "mask({})", code as char);
+            assert_eq!(
+                mask(code.to_ascii_lowercase()),
+                bits,
+                "mask is case-insensitive for {}",
+                code as char
+            );
+        }
+        for &junk in b"X-. 0" {
+            assert_eq!(
+                mask(junk),
+                0,
+                "non-code {:?} maps to the empty set",
+                junk as char
+            );
+        }
+    }
+
+    #[test]
+    fn test_complement_covers_every_iupac_code() {
+        // Watson-Crick on ACGT, U complements like T, and each ambiguity code maps
+        // to the code of its complemented member set (e.g. R={A,G} -> {T,C}=Y).
+        // Case is preserved; unrecognized bytes pass through unchanged.
+        let pairs: &[(u8, u8)] = &[
+            (b'A', b'T'),
+            (b'C', b'G'),
+            (b'G', b'C'),
+            (b'T', b'A'),
+            (b'U', b'A'),
+            (b'R', b'Y'),
+            (b'Y', b'R'),
+            (b'S', b'S'),
+            (b'W', b'W'),
+            (b'K', b'M'),
+            (b'M', b'K'),
+            (b'B', b'V'),
+            (b'V', b'B'),
+            (b'D', b'H'),
+            (b'H', b'D'),
+            (b'N', b'N'),
+        ];
+        for &(base, comp) in pairs {
+            assert_eq!(complement(base), comp, "complement({})", base as char);
+            assert_eq!(
+                complement(base.to_ascii_lowercase()),
+                comp.to_ascii_lowercase(),
+                "complement preserves case for {}",
+                base as char
+            );
+        }
+        for &junk in b"X-* " {
+            assert_eq!(
+                complement(junk),
+                junk,
+                "unknown byte {:?} passes through",
+                junk as char
+            );
+        }
+    }
+
+    #[test]
+    fn test_reverse_complement_mixed_case_and_ambiguity() {
+        // Reverse the bytes, then complement each, preserving case. AACG ->
+        // (reverse) GCAA -> (complement) CGTT.
+        let mut seq = b"AACG".to_vec();
+        reverse_complement(&mut seq);
+        assert_eq!(&seq, b"CGTT");
+        // Lowercase plus ambiguity codes: rySw -> (reverse) wSyr -> (complement)
+        // wSry (w<->w, S<->S self-complement; y->r, r->y).
+        let mut mixed = b"rySw".to_vec();
+        reverse_complement(&mut mixed);
+        assert_eq!(&mixed, b"wSry");
+    }
+
+    #[test]
+    fn test_single_tag_degeneracy_warns_under_cap() {
+        // 4^7 = 16384 expansions: past the per-tag warn threshold (4096) but well
+        // under the hard cap, and not all-N (the trailing A), so it is accepted
+        // with a soft warning rather than rejected.
+        let w = validate_group("g", &seqs(&["NNNNNNNA"]), &dist(0), MatchMode::All).unwrap();
+        assert_eq!(w.len(), 1, "one per-tag degeneracy warning: {w:?}");
+        assert!(w[0].contains("highly degenerate"), "{}", w[0]);
+    }
+
+    #[test]
+    fn test_group_total_degeneracy_warns_under_cap() {
+        // Two tags of 4^8 = 65536 sum to 131072: each is under the per-tag cap, but
+        // the group total clears the group warn threshold (100_000) while staying
+        // under the group cap. They differ only at the last position, so at dist=0
+        // they do not collide.
+        let w = validate_group(
+            "g",
+            &seqs(&["NNNNNNNNA", "NNNNNNNNC"]),
+            &dist(0),
+            MatchMode::All,
+        )
+        .unwrap();
+        assert!(
+            w.iter().any(|m| m.contains("sequences total")),
+            "a group-total warning is present: {w:?}"
+        );
+    }
+
+    #[test]
+    fn test_group_total_hard_cap_errors() {
+        // Ten tags of 4^10 = 1_048_576 each (exactly the per-tag cap, so none trips
+        // it individually) sum to 10_485_760, over the 10_000_000 group cap.
+        let big = vec![b"NNNNNNNNNNA".to_vec(); 10];
+        let err = validate_group("g", &big, &dist(0), MatchMode::All)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("sequences total"), "{err}");
+        assert!(err.contains("cap"), "{err}");
+    }
 }
