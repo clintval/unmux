@@ -1,7 +1,7 @@
 [workspace]
 authors = ["clintval <valentine.clint@gmail.com>"]
 channels = ["conda-forge", "bioconda"]
-name = "sasscode"
+name = "unmux"
 platforms = ["linux-64", "osx-64", "osx-arm64"]
 version = "0.1.0"
 
@@ -11,16 +11,7 @@ test = "cargo test --all --no-fail-fast --verbose"
 fmt = "cargo fmt"
 fmt-check = "cargo fmt -- --check"
 lint = "cargo clippy --all-targets --all-features -- -D warnings"
+dist-multivers = "cargo multivers --profile dist"
 
 [dependencies]
 rust = ">=1.91"
-
-[feature.benchmarking.dependencies]
-splitcode = "*"
-fqtk = "*"
-fgbio = "*"
-samtools = "*"
-seqspec = "*"
-
-[environments]
-benchmarking = ["benchmarking"]

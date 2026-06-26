@@ -1,54 +1,86 @@
 [package]
-name = "sasscode"
+name = "unmux"
 version = "0.1.0"
 authors = ["Clint Valentine <valentine.clint@gmail.com>"]
 edition = "2021"
 license = "MIT"
 readme = "README.md"
-repository = "https://github.com/clintval/sasscode"
+repository = "https://github.com/clintval/unmux"
 description = "Flexible read parsing and demultiplexing to FASTX/SAM/BAM/CRAM, splitcode-style."
 categories = ["command-line-utilities", "science"]
 keywords = ["bioinformatics", "demultiplex", "barcode", "fastq", "splitcode"]
 
 [profile.release]
 codegen-units = 1
-lto = true
+lto = "fat"
+
+# Shipped artifacts (bioconda etc.): the release settings plus no debug info and a stripped binary.
+[profile.dist]
+inherits = "release"
+codegen-units = 1
+lto = "fat"
+debug = 0
+incremental = false
+strip = true
+
+# AVX-512 distribution. `cargo multivers --profile dist` builds one slice per CPU tier and
+# packs them behind a CPUID dispatcher chosen at startup, so a single shipped binary runs natively on
+# both AVX2-only and AVX-512 hosts. Mirrors sassy's own config verbatim: v3 is the AVX2 floor, v4 is
+# AVX-512. Both slices run sassy's 4-lane matcher; the v4 slice just gets AVX-512-aware codegen for
+# it. The wider 8-lane path (sassy's `avx512` feature) is NOT enabled: it fails to compile in sassy
+# 0.2.3 (search.rs hardcodes `wide::u64x4` while the feature widens the lane type to `u64x8`), and is
+# blocked on an upstream fix. See CONTRIBUTING. TODO: raise issue with upstream.
+[package.metadata.multivers.x86_64]
+cpus = ["x86-64-v3", "x86-64-v4"]
+
+# Default build requires SIMD (AVX2/NEON, via sassy + `RUSTFLAGS=-C target-cpu=native`; see
+# CONTRIBUTING). `scalar` forwards to sassy's scalar backend so the tool builds and runs on hosts
+# without AVX2/NEON, at reduced throughput. The AVX-512 distribution path ships
+# per-CPU codegen slices via `cargo multivers` (see `[package.metadata.multivers.x86_64]`), not a
+# force-on feature, so a non-AVX-512 host never runs AVX-512 codegen. sassy's wider 8-lane `avx512`
+# feature is intentionally not forwarded: it does not compile in sassy 0.2.3. TODO: see above.
+[features]
+scalar = ["sassy/scalar"]
 
 [lib]
-name = "sasscodelib"
+name = "unmux"
 path = "src/lib/mod.rs"
 
 [[bin]]
-name = "sasscode"
+name = "unmux"
 path = "src/main.rs"
 
 [dependencies]
+ahash = "0.8"
 anyhow = "1"
 clap = { version = "4", features = ["derive", "wrap_help"] }
+csv = "1"
 env_logger = "0.11"
-flate2 = "1"
+flate2 = { version = "1", features = ["zlib-ng"] }
 log = "0.4"
 memchr = "2"
+mimalloc = "0.1"
 noodles = { version = "0.109", features = ["bam", "bgzf", "core", "cram", "fasta", "fastq", "sam"] }
 pa-types = "1.5"
+pooled-writer = "0.4"
+rayon = "1"
 sassy = { version = "0.2", default-features = false }
+smallvec = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
-# Engine deps still to wire as each is verified:
-#   pooled-writer = "0.4"   # many-file BGZF fan-out (same crate fqtk uses)
-#   rayon        = "1"
+thousands = "0.2"
 
 [dev-dependencies]
 assert_cmd = "2"
-criterion = { version = "0.5", features = ["html_reports"] }
+bolero = "0.13"
 cucumber = "0.21"
+noodles = { version = "0.109", features = ["bam", "bgzf", "sam"] }
 futures = "0.3"
 predicates = "3"
 pretty_assertions = "1"
 rstest = "0.26"
 tempfile = "3"
-which = "6"
 
 [[test]]
 name = "cucumber"
