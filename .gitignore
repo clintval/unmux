@@ -5,6 +5,9 @@
 # rust / cargo
 /target/
 
+# coverage reports (tarpaulin writes these to the repo root)
+/lcov.info
+
 # reference repo clones (read-only, never committed)
 /reference/
 
