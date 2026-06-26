@@ -70,6 +70,9 @@ jobs:
   # runtime via `is_x86_feature_detected!`, so a portable build loses no coverage fidelity.
   coverage:
     runs-on: ubuntu-latest
+    permissions:
+      checks: write
+      contents: read
     env:
       RUSTFLAGS: ""
     steps:
@@ -80,7 +83,12 @@ jobs:
       # tarpaulin forwards everything after `--` to every test binary, but the cucumber test
       # (`harness = false`) uses its own CLI parser and aborts on libtest's `--test-threads`. Pass it
       # via RUST_TEST_THREADS instead: libtest honors the env var, cucumber ignores it.
-      - run: RUST_TEST_THREADS=1 cargo tarpaulin --all --all-features --timeout 600 --out Xml
+      - run: RUST_TEST_THREADS=1 cargo tarpaulin --all --all-features --timeout 600 --out Lcov
+      - name: Upload coverage to Coveralls
+        uses: coverallsapp/github-action@5cbfd81b66ca5d10c19b062c04de0199c215fb6e # v2
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path-to-lcov: ./lcov.info
 
   # Build the shipped multi-versioned x86 artifact. cargo-multivers packs one slice per CPU
   # tier (x86-64-v3 + v4, per `[package.metadata.multivers.x86_64]`) behind a CPUID dispatcher.
