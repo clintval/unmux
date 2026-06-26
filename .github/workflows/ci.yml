@@ -83,7 +83,10 @@ jobs:
       # tarpaulin forwards everything after `--` to every test binary, but the cucumber test
       # (`harness = false`) uses its own CLI parser and aborts on libtest's `--test-threads`. Pass it
       # via RUST_TEST_THREADS instead: libtest honors the env var, cucumber ignores it.
-      - run: RUST_TEST_THREADS=1 cargo tarpaulin --all --all-features --timeout 600 --out Lcov
+      # --follow-exec: the integration and cucumber tests drive `unmux` as a subprocess via
+      # `Command::cargo_bin`, so without this tarpaulin traces only the test process and never credits
+      # the binary's own lines (main, CLI dispatch) that those tests exercise.
+      - run: RUST_TEST_THREADS=1 cargo tarpaulin --all --all-features --timeout 600 --follow-exec --out Lcov
       - name: Upload coverage to Coveralls
         uses: coverallsapp/github-action@5cbfd81b66ca5d10c19b062c04de0199c215fb6e # v2
         with:
