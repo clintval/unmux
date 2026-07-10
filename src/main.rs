@@ -129,8 +129,8 @@ struct DemuxCmd {
     /// Input files set with `N=PATH` for explicit 0-based file indices.
     ///
     /// Repeatable; indices must be unique and contiguous from 0 (flag order
-    /// is free; a gap or non-zero start is an error). `PATH` may be '`-`' for stdin
-    /// (at most once). Mutually exclusive with positional inputs.
+    /// is free; a gap or non-zero start is an error). `PATH` may be '`-`' for
+    /// stdin (at most once). Mutually exclusive with positional inputs.
     ///
     ///   --in 0=r1.fq.gz --in 1=r2.fq.gz   file 0 = r1, file 1 = r2
     ///   --in 0=- --in 1=r2.fq.gz          file 0 from stdin, file 1 = r2
@@ -144,11 +144,12 @@ struct DemuxCmd {
 
     /// Output path for demuxed records.
     ///
-    /// Format set by extension (FASTX/SAM/BAM/CRAM). '`-`' or `/dev/stdout` writes
-    /// standard output in the input format. Read groups and SAM tags are
-    /// SAM/BAM/CRAM-only; FASTX puts `--tag` values in the record-name comment.
-    /// Missing parent dirs are created. Placeholders fan-out the pool into
-    /// multiple files including `%pool`, `%sample`, `%sub_sample`, and `%ordinal`.
+    /// Format set by extension (FASTX/SAM/BAM/CRAM). '`-`' or `/dev/stdout`
+    /// writes standard output in the input format. Read groups and SAM tags
+    /// are SAM/BAM/CRAM-only; FASTX puts `--tag` values in the record-name
+    /// comment. Missing parent dirs are created. Placeholders fan-out the
+    /// pool into multiple files including `%pool`, `%sample`, `%sub_sample`,
+    /// and `%ordinal`.
     ///
     ///   --out out.bam                   one file, all assigned records
     ///   --out %sample.bam               one file per sample
@@ -216,8 +217,8 @@ struct DemuxCmd {
     /// Set which streams become the primary record sequences (repeatable).
     ///
     /// Each name is an `--extract` stream (an input record is not a stream
-    /// until extracted). Concatenate with '`+`'; one value per output record (R1,
-    /// R2, ...). Optional; with none the full input is the raw output.
+    /// until extracted). Concatenate with '`+`'; one value per output record
+    /// (R1, R2, ...). Optional; with none the full input is the raw output.
     ///
     /// SAM/BAM/CRAM allows at most two ordinals; multi-FASTX may have more.
     /// `::raw=true` emits observed bases for a stream from a corrected `@grp`
@@ -234,10 +235,10 @@ struct DemuxCmd {
 
     /// SAM tag binding or attributes (repeatable; accumulates).
     ///
-    /// `TAG=STREAM[+STREAM]` binds record bases (join with '`+`'); `TAG::ATTRS` sets
-    /// qual/sep/raw. A multi-stream tag joins sequences with `sep` (default: '`-`')
-    /// and qualities with `qual-sep` (default: a space). Default qual tags
-    /// pre-exist for: CB/CY CR/CY RX/QX BC/QT OX/BZ.
+    /// `TAG=STREAM[+STREAM]` binds record bases (join with '`+`'); `TAG::ATTRS`
+    /// sets qual/sep/raw. A multi-stream tag joins sequences with `sep`
+    /// (default: '`-`') and qualities with `qual-sep` (default: a space).
+    /// Default qual tags pre-exist for: CB/CY CR/CY RX/QX BC/QT OX/BZ.
     ///
     ///   --tag RX=umi             UMI tag (auto quality tag `QX`)
     ///   --tag CB=bc1+bc2+bc3     join three barcode streams
