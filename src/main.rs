@@ -26,6 +26,15 @@ pub(crate) const ERROR: Style = AnsiColor::Red.on_default().effects(Effects::BOL
 pub(crate) const VALID: Style = AnsiColor::Cyan.on_default().effects(Effects::BOLD);
 pub(crate) const INVALID: Style = AnsiColor::Yellow.on_default().effects(Effects::BOLD);
 
+/// The tool name in the help header: primary color (green), bold.
+pub(crate) const NAME: Style = AnsiColor::Green.on_default().effects(Effects::BOLD);
+/// The version in the help header: secondary color (cyan).
+pub(crate) const VERSION: Style = AnsiColor::Cyan.on_default();
+/// Indented code examples in help text: tertiary color (yellow). Like the
+/// primary/secondary header colors, this is a named ANSI slot rather than a
+/// hard-coded RGB value, so it follows the user's terminal palette.
+pub(crate) const CODE: Style = AnsiColor::Yellow.on_default();
+
 /// Cargo's color style.
 /// [source](https://github.com/crate-ci/clap-cargo/blob/master/src/style.rs)
 pub(crate) const CARGO_STYLING: Styles = Styles::styled()
@@ -58,7 +67,7 @@ pub(crate) const CARGO_STYLING: Styles = Styles::styled()
 ///   unmux in.fq --extract r=0:0:9 --template r > out.fq
 ///   unmux r1.fq r2.fq --group bc=bc.tsv --sample s=bc::t01 --out %sample.bam
 ///
-/// Notation (also see param docs below with expressive examples`):
+/// Notation (also see param docs below with expressive examples):
 ///
 ///   file:start:end  0-based, half-open; `end`=record length; neg counts from
 ///                   the record end. The FIRST number is the input file index
@@ -77,7 +86,7 @@ pub(crate) const CARGO_STYLING: Styles = Styles::styled()
 ///   %ordinal        1-based read ordinal (R%ordinal → R1, R2) (--out only).
 ///   %source         0-based input file idx (--unassigned or --remove only).
 #[derive(Debug, Parser)]
-#[command(author, version, color = clap::ColorChoice::Always, term_width = 80, verbatim_doc_comment, override_usage = "unmux [READS]... [OPTIONS]")]
+#[command(author, version, color = clap::ColorChoice::Always, verbatim_doc_comment, override_usage = "unmux [READS]... [OPTIONS]")]
 #[clap(styles = CARGO_STYLING)]
 struct Cli {
     #[command(flatten)]
@@ -377,13 +386,117 @@ struct DemuxCmd {
     threads: u16,
 }
 
+/// Build the help header line: the tool `name` in the primary color (green,
+/// bold) and `version` in the secondary color (cyan).
+fn header_line(name: &str, version: &str) -> String {
+    format!(
+        "{}{name}{} {}{version}{}",
+        NAME.render(),
+        NAME.render_reset(),
+        VERSION.render(),
+        VERSION.render_reset(),
+    )
+}
+
+/// Paint terms wrapped in backticks (`` `like this` ``) in the tertiary
+/// [`CODE`] color and drop the backticks. `after` is the escape that restores
+/// the surrounding text's color once a term ends: a reset for default-colored
+/// prose, or the code color again on an already-code-colored line.
+fn paint_backtick_terms(text: &str, after: &str) -> String {
+    let code = CODE.render().to_string();
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(open) = rest.find('`') {
+        out.push_str(&rest[..open]);
+        let tail = &rest[open + 1..];
+        match tail.find('`') {
+            Some(close) => {
+                out.push_str(&code);
+                out.push_str(&tail[..close]);
+                out.push_str(after);
+                rest = &tail[close + 1..];
+            }
+            // An unmatched backtick has no closing partner; keep it verbatim.
+            None => {
+                out.push('`');
+                rest = tail;
+                break;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Style one help string: paint the indented example/notation lines in the
+/// tertiary [`CODE`] color, paint backtick-wrapped terms in the same color on
+/// the remaining prose lines, and drop the backticks throughout. Section labels
+/// and ordinary prose keep the default color.
+fn style_help_text(text: &str) -> String {
+    let code = CODE.render().to_string();
+    let reset = CODE.render_reset().to_string();
+    text.split_inclusive('\n')
+        .map(|line| {
+            let (content, newline) = match line.strip_suffix('\n') {
+                Some(content) => (content, "\n"),
+                None => (line, ""),
+            };
+            if content.starts_with("  ") && !content.trim().is_empty() {
+                // The whole line is code-colored, so a backtick term keeps that
+                // color; it only loses its backticks (restore code after it).
+                let painted = paint_backtick_terms(content, &code);
+                format!("{code}{painted}{reset}{newline}")
+            } else {
+                // Default-colored prose: only the backtick terms are painted.
+                format!("{}{newline}", paint_backtick_terms(content, &reset))
+            }
+        })
+        .collect()
+}
+
+/// Prepend the colored name/version header to the command's help and apply
+/// [`style_help_text`] (code-color the examples, paint backtick terms, drop the
+/// backticks). Applied to the short about (drives `-h`), the long about (drives
+/// `--help`), and each option's short and long help.
+fn decorate_help(cmd: clap::Command) -> clap::Command {
+    let header = header_line(cmd.get_name(), cmd.get_version().unwrap_or_default());
+    let about = cmd.get_about().map(ToString::to_string);
+    let long_about = cmd
+        .get_long_about()
+        .map(ToString::to_string)
+        .or_else(|| about.clone());
+
+    let mut cmd = cmd;
+    if let Some(about) = about {
+        cmd = cmd.about(format!("{header}\n\n{}", style_help_text(&about)));
+    }
+    if let Some(long_about) = long_about {
+        cmd = cmd.long_about(format!("{header}\n\n{}", style_help_text(&long_about)));
+    }
+    cmd.mut_args(|mut arg| {
+        if let Some(help) = arg.get_help().map(ToString::to_string) {
+            arg = arg.help(style_help_text(&help));
+        }
+        if let Some(long_help) = arg.get_long_help().map(ToString::to_string) {
+            arg = arg.long_help(style_help_text(&long_help));
+        }
+        arg
+    })
+}
+
 /// Main binary entrypoint.
 #[cfg(not(tarpaulin_include))]
 fn main() -> Result<(), Error> {
     let env = Env::default().default_filter_or("info");
     env_logger::Builder::from_env(env).init();
 
-    let matches = Cli::command().term_width(80).get_matches();
+    // Our doc comments are hand-wrapped to fit 80 columns (that is what
+    // `verbatim_doc_comment` is for), and `decorate_help` injects ANSI color
+    // into them. clap's own help wrapping would count those escape bytes as
+    // visible width and mis-wrap the styled lines, so we disable it and let the
+    // authored line breaks stand as the wrapping.
+    let cmd = decorate_help(Cli::command().term_width(usize::MAX));
+    let matches = cmd.get_matches();
     let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
 
     // `unmux` is the demux command: the flattened top-level args are the demux
