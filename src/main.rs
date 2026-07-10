@@ -392,23 +392,43 @@ struct DemuxCmd {
     threads: u16,
 }
 
+/// The ANSI escape that starts `style`, or an empty string when `color` is off
+/// (honoring `NO_COLOR`). Its matching reset comes from [`reset`].
+fn esc(style: Style, color: bool) -> String {
+    if color {
+        style.render().to_string()
+    } else {
+        String::new()
+    }
+}
+
+/// The reset escape for `style` (a full SGR reset), or empty when `color` is off.
+fn esc_reset(style: Style, color: bool) -> String {
+    if color {
+        style.render_reset().to_string()
+    } else {
+        String::new()
+    }
+}
+
 /// Paint the first line of `text` in the primary [`TITLE`] color (the tool's
-/// one-line description), leaving the rest of the text untouched.
-fn green_first_line(text: &str) -> String {
-    let title = TITLE.render().to_string();
-    let reset = TITLE.render_reset().to_string();
+/// one-line description), leaving the rest of the text untouched. With `color`
+/// off, the text is returned unchanged.
+fn green_first_line(text: &str, color: bool) -> String {
+    let title = esc(TITLE, color);
+    let reset = esc_reset(TITLE, color);
     match text.split_once('\n') {
         Some((first, rest)) => format!("{title}{first}{reset}\n{rest}"),
         None => format!("{title}{text}{reset}"),
     }
 }
 
-/// Paint terms wrapped in backticks (`` `like this` ``) in the tertiary
-/// [`CODE`] color and drop the backticks. `after` is the escape that restores
-/// the surrounding text's color once a term ends: a reset for default-colored
-/// prose, or the code color again on an already-code-colored line.
-fn paint_backtick_terms(text: &str, after: &str) -> String {
-    let code = CODE.render().to_string();
+/// Drop the backticks around terms (`` `like this` ``), painting each term with
+/// the `code` escape. `after` is the escape that restores the surrounding text's
+/// color once a term ends: a reset for default prose, or the code/faded color
+/// again inside a code or description column. With color off, `code` and `after`
+/// are empty, so this just strips the backticks.
+fn paint_backtick_terms(text: &str, code: &str, after: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(open) = rest.find('`') {
@@ -416,7 +436,7 @@ fn paint_backtick_terms(text: &str, after: &str) -> String {
         let tail = &rest[open + 1..];
         match tail.find('`') {
             Some(close) => {
-                out.push_str(&code);
+                out.push_str(code);
                 out.push_str(&tail[..close]);
                 out.push_str(after);
                 rest = &tail[close + 1..];
@@ -467,10 +487,10 @@ fn split_two_column(content: &str) -> Option<(&str, &str, &str)> {
 ///
 /// Backtick terms stay [`CODE`] everywhere, so code stands out even inside a
 /// faded description.
-fn style_help_text(text: &str) -> String {
-    let code = CODE.render().to_string();
-    let faded = FADED.render().to_string();
-    let reset = CODE.render_reset().to_string();
+fn style_help_text(text: &str, color: bool) -> String {
+    let code = esc(CODE, color);
+    let faded = esc(FADED, color);
+    let reset = esc_reset(CODE, color);
     text.split_inclusive('\n')
         .map(|line| {
             let (content, newline) = match line.strip_suffix('\n') {
@@ -479,19 +499,19 @@ fn style_help_text(text: &str) -> String {
             };
             if !content.starts_with("  ") || content.trim().is_empty() {
                 // Prose (or a blank line): only the backtick terms are painted.
-                return format!("{}{newline}", paint_backtick_terms(content, &reset));
+                return format!("{}{newline}", paint_backtick_terms(content, &code, &reset));
             }
             if let Some((left, gap, right)) = split_two_column(content) {
-                let left = paint_backtick_terms(left, &code);
-                let right = paint_backtick_terms(right, &faded);
+                let left = paint_backtick_terms(left, &code, &code);
+                let right = paint_backtick_terms(right, &code, &faded);
                 format!("{code}{left}{reset}{gap}{faded}{right}{reset}{newline}")
             } else if content.len() - content.trim_start().len() > 2 {
                 // A wrapped description continuation aligned past the left column.
-                let painted = paint_backtick_terms(content, &faded);
+                let painted = paint_backtick_terms(content, &code, &faded);
                 format!("{faded}{painted}{reset}{newline}")
             } else {
                 // A single-column code example (a bare command, no description).
-                let painted = paint_backtick_terms(content, &code);
+                let painted = paint_backtick_terms(content, &code, &code);
                 format!("{code}{painted}{reset}{newline}")
             }
         })
@@ -503,7 +523,7 @@ fn style_help_text(text: &str) -> String {
 /// examples, paint backtick terms, drop the backticks). Applied to the short
 /// about (drives `-h`), the long about (drives `--help`), and each option's
 /// short and long help.
-fn decorate_help(cmd: clap::Command) -> clap::Command {
+fn decorate_help(cmd: clap::Command, color: bool) -> clap::Command {
     let about = cmd.get_about().map(ToString::to_string);
     let long_about = cmd
         .get_long_about()
@@ -512,16 +532,24 @@ fn decorate_help(cmd: clap::Command) -> clap::Command {
 
     let footer = format!(
         "{}MIT License 2026 · Clint Valentine{}",
-        FOOTER.render(),
-        FOOTER.render_reset(),
+        esc(FOOTER, color),
+        esc_reset(FOOTER, color),
     );
 
-    let mut cmd = cmd;
+    let choice = if color {
+        clap::ColorChoice::Always
+    } else {
+        clap::ColorChoice::Never
+    };
+    let mut cmd = cmd.color(choice);
     if let Some(about) = about {
-        cmd = cmd.about(green_first_line(&style_help_text(&about)));
+        cmd = cmd.about(green_first_line(&style_help_text(&about, color), color));
     }
     if let Some(long_about) = long_about {
-        cmd = cmd.long_about(green_first_line(&style_help_text(&long_about)));
+        cmd = cmd.long_about(green_first_line(
+            &style_help_text(&long_about, color),
+            color,
+        ));
     }
     cmd = cmd
         .next_line_help(true)
@@ -529,10 +557,10 @@ fn decorate_help(cmd: clap::Command) -> clap::Command {
         .after_long_help(footer);
     cmd.mut_args(|mut arg| {
         if let Some(help) = arg.get_help().map(ToString::to_string) {
-            arg = arg.help(style_help_text(&help));
+            arg = arg.help(style_help_text(&help, color));
         }
         if let Some(long_help) = arg.get_long_help().map(ToString::to_string) {
-            arg = arg.long_help(style_help_text(&long_help));
+            arg = arg.long_help(style_help_text(&long_help, color));
         }
         arg
     })
@@ -541,15 +569,26 @@ fn decorate_help(cmd: clap::Command) -> clap::Command {
 /// Main binary entrypoint.
 #[cfg(not(tarpaulin_include))]
 fn main() -> Result<(), Error> {
+    // NO_COLOR (https://no-color.org): if the variable is present at all, even
+    // empty, suppress every ANSI color, both ours and clap's and the logger's.
+    let color = std::env::var_os("NO_COLOR").is_none();
+
     let env = Env::default().default_filter_or("info");
-    env_logger::Builder::from_env(env).init();
+    let write_style = if color {
+        env_logger::WriteStyle::Auto
+    } else {
+        env_logger::WriteStyle::Never
+    };
+    env_logger::Builder::from_env(env)
+        .write_style(write_style)
+        .init();
 
     // Our doc comments are hand-wrapped to fit 80 columns (that is what
     // `verbatim_doc_comment` is for), and `decorate_help` injects ANSI color
     // into them. clap's own help wrapping would count those escape bytes as
     // visible width and mis-wrap the styled lines, so we disable it and let the
     // authored line breaks stand as the wrapping.
-    let cmd = decorate_help(Cli::command().term_width(usize::MAX));
+    let cmd = decorate_help(Cli::command().term_width(usize::MAX), color);
     let matches = cmd.get_matches();
     let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
 

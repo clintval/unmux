@@ -20,9 +20,12 @@ const FOOTER: Style = AnsiColor::Magenta.on_default();
 const DESCRIPTION: &str = "Flexible record parsing and demultiplexing to FASTX/SAM/BAM/CRAM.";
 
 /// Run the binary with `flag` and return its captured stdout (with ANSI).
+/// `NO_COLOR` is cleared so these color assertions are deterministic even when
+/// the test host sets it.
 fn help_stdout(flag: &str) -> String {
     let output = Command::cargo_bin("unmux")
         .unwrap()
+        .env_remove("NO_COLOR")
         .arg(flag)
         .assert()
         .success()
@@ -147,8 +150,8 @@ fn visible_width(line: &str) -> usize {
 
 #[test]
 fn both_help_flags_wrap_within_eighty_columns() {
-    // `--help` is hand-wrapped; `-h` is re-wrapped from clap's two-column layout
-    // by `wrap_short_help`. Neither may exceed 80 rendered columns.
+    // `--help` is hand-wrapped; `-h` uses clap's next-line layout. Neither the
+    // colored nor the NO_COLOR rendering may exceed 80 rendered columns.
     for flag in ["--help", "-h"] {
         let widest = help_stdout(flag)
             .lines()
@@ -159,5 +162,46 @@ fn both_help_flags_wrap_within_eighty_columns() {
             widest <= 80,
             "{flag} has a line of {widest} columns; must be <= 80"
         );
+    }
+}
+
+/// Run the binary with `NO_COLOR` set to `value` and return its stdout.
+fn no_color_stdout(flag: &str, value: &str) -> String {
+    let output = Command::cargo_bin("unmux")
+        .unwrap()
+        .env("NO_COLOR", value)
+        .arg(flag)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    String::from_utf8(output).unwrap()
+}
+
+#[test]
+fn no_color_env_suppresses_all_ansi() {
+    // Per https://no-color.org, any value (including empty) disables color.
+    for value in ["1", "", "anything"] {
+        for flag in ["--help", "-h"] {
+            let out = no_color_stdout(flag, value);
+            assert!(
+                !out.contains('\u{1b}'),
+                "NO_COLOR={value:?} {flag} must emit no ANSI escapes"
+            );
+            // Backticks are still stripped and the content is intact.
+            assert!(
+                !out.contains('`'),
+                "NO_COLOR={value:?} {flag} strips backticks"
+            );
+            assert!(
+                out.contains("Flexible record parsing and demultiplexing"),
+                "NO_COLOR={value:?} {flag} keeps the description"
+            );
+            assert!(
+                out.contains("MIT License 2026 · Clint Valentine"),
+                "NO_COLOR={value:?} {flag} keeps the footer"
+            );
+        }
     }
 }
