@@ -58,11 +58,12 @@ pub(crate) const CARGO_STYLING: Styles = Styles::styled()
 ///
 /// Mental model:
 ///
-/// - scan the inputs and match each input record against tag `--group`(s)
-/// - pull those bases into named `--extract` streams
-/// - route the record: assign to a `--sample`, else unassigned, or `--remove` it
-/// - set streams as the primary record sequences with `--template`
-/// - write those streams to SAM tags with `--tag`(s)
+///   ⋙ scan the inputs and match each tag `--group`(s) against each record
+///   ⋙ pull those matched bases into named `--extract` streams
+///   ⋙ route the record: assign to a `--sample`, else unassigned, or `--remove` it
+///   ⋙ set streams as the primary record sequences with `--template`
+///   ⋙ also set streams into SAM tags with `--tag`(s)
+///   ⋙ write records by fanning them to files by sample, sub-sample, ordinal
 ///
 /// A "pool" is all input records for one run of unmux.
 ///
