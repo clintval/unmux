@@ -3635,7 +3635,7 @@ mod tests {
         // level 0 (stored) must produce a clearly larger file than at level 9
         // (max), and both must round-trip every record.
         let dir = tempfile::tempdir().unwrap();
-        let bases = [b'A', b'C', b'G', b'T'];
+        let bases = *b"ACGT";
         let n = 1000u32;
         let mut fq = Vec::new();
         for i in 0..n {
