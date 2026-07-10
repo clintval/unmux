@@ -36,6 +36,9 @@ pub(crate) const CODE: Style = AnsiColor::Yellow.on_default();
 /// The license/attribution footer at the bottom of the help: magenta, a named
 /// ANSI slot distinct from the other help colors, so it follows the terminal.
 pub(crate) const FOOTER: Style = AnsiColor::Magenta.on_default();
+/// The right-hand description column of an indented two-column table: a faded
+/// gray (bright-black), so the left-hand code term (in [`CODE`]) stands out.
+pub(crate) const FADED: Style = AnsiColor::BrightBlack.on_default();
 
 /// Cargo's color style.
 /// [source](https://github.com/crate-ci/clap-cargo/blob/master/src/style.rs)
@@ -58,12 +61,12 @@ pub(crate) const CARGO_STYLING: Styles = Styles::styled()
 ///
 /// Mental model:
 ///
-///   ⋙ scan the inputs and match each tag `--group`(s) against each record
-///   ⋙ pull those matched bases into named `--extract` streams
-///   ⋙ route the record: assign to a `--sample`, else unassigned, or `--remove` it
-///   ⋙ set streams as the primary record sequences with `--template`
-///   ⋙ also set streams into SAM tags with `--tag`(s)
-///   ⋙ write records by fanning them to files by sample, sub-sample, ordinal
+///  1. scan the inputs and match each tag `--group`(s) against each record
+///  2. pull those matched bases into named `--extract` streams
+///  3. route the record: assign to a `--sample`, else unassigned, or `--remove` it
+///  4. set streams as the primary record sequences with `--template`
+///  5. also set streams into SAM tags with `--tag`(s)
+///  6. write records by fanning them to files by sample, sub-sample, ordinal
 ///
 /// A "pool" is all input records for one run of unmux.
 ///
@@ -81,14 +84,14 @@ pub(crate) const CARGO_STYLING: Styles = Styles::styled()
 ///   @grp             a group's matched span. `@grp+off:len` & `@grp-off:len`
 ///                    step past/before it (trailing number is a LENGTH!).
 ///   @grpA..@grpB     the region between two matched spans.
-///   +                concat streams (cb+umi) or 'AND' samples (`gA::a+gB::b`).
+///   +                concat streams (`cb+umi`) or 'AND' samples (`gA::a+gB::b`).
 ///   ~                reverse-complement the stream (`~cb`, `BC=~bc`).
 ///   ,                list separator ('OR' a tag pool & attribute lists).
 ///   %XX              percent-escape a byte in a tag sep/qual-sep value or an
-///                    output path (`%20` space, `%09` tab, `%2C` comma).
+///                    output path (`%20`=space, `%09`=tab, `%2C`=comma).
 ///   %pool            the pool ID (see `--pool`).
 ///   %sample          the sample ID (`--out` only)
-///   %sub_sample      the sub_sample ID (`@RG LB`) (--out only).
+///   %sub_sample      the sub_sample ID (`@RG LB`) (`--out` only).
 ///   %ordinal         1-based read ordinal (R%ordinal → R1, R2) (`--out` only).
 ///   %source          0-based input file idx (`--unassigned` or `--remove` only).
 #[derive(Debug, Parser)]
@@ -115,18 +118,18 @@ struct DemuxCmd {
     #[arg(value_name = "READS", num_args = 0.., verbatim_doc_comment)]
     inputs_positional: Vec<PathBuf>,
 
-    /// Identifier for the input pool; fills the symbol %pool.
+    /// Identifier for the input pool; fills the placeholder %pool.
     ///
     /// Optional, and defaults to the common stem of the input filenames.
     ///
-    ///   --pool lib01   %pool → lib01
+    ///   --pool lib01   %pool placeholder is now set to 'lib01'
     #[arg(long = "pool", value_name = "ID", verbatim_doc_comment)]
     pool: Option<String>,
 
     /// Input files set with `N=PATH` for explicit 0-based file indices.
     ///
     /// Repeatable; indices must be unique and contiguous from 0 (flag order
-    /// is free; a gap or non-zero start is an error). `PATH` may be `-` for stdin
+    /// is free; a gap or non-zero start is an error). `PATH` may be '`-`' for stdin
     /// (at most once). Mutually exclusive with positional inputs.
     ///
     ///   --in 0=r1.fq.gz --in 1=r2.fq.gz   file 0 = r1, file 1 = r2
@@ -141,7 +144,7 @@ struct DemuxCmd {
 
     /// Output path for demuxed records.
     ///
-    /// Format set by extension (FASTX/SAM/BAM/CRAM). `-` or `/dev/stdout` writes
+    /// Format set by extension (FASTX/SAM/BAM/CRAM). '`-`' or `/dev/stdout` writes
     /// standard output in the input format. Read groups and SAM tags are
     /// SAM/BAM/CRAM-only; FASTX puts `--tag` values in the record-name comment.
     /// Missing parent dirs are created. Placeholders fan-out the pool into
@@ -164,9 +167,9 @@ struct DemuxCmd {
     ///
     /// Sources:
     ///
-    ///   bc=tags.tsv       from a TSV file with `id` and `seq` columns
-    ///   bc={AAC,ACG,TTG}  inline set, auto tag IDs
-    ///   bc={a=AAC,b=ACG}  inline set, explicit tag IDs
+    ///   bc=tags.tsv        from a TSV file with `id` and `seq` columns
+    ///   bc={AAC,ACG,TTG}   inline set, auto tag IDs
+    ///   bc={a=AAC,b=ACG}   inline set, explicit tag IDs
     ///
     /// Attributes (`NAME::key=val`):
     ///
@@ -184,9 +187,9 @@ struct DemuxCmd {
     ///   bc::both_strands=true    match forward and reverse-complement
     ///   bc::partial5=3:0.1       5' truncation ok: >=3 bp, <=10% mismatches
     ///   bc::partial3=3:0.1       same, at the 3' end
-    ///   bc::anchor=5p            anchor tags' 5-prime base at loc.start
-    ///   bc::anchor=3p            anchor tags' 3-prime base at loc.end
-    ///   bc::match=i7+i5          match tags on joined --extract streams
+    ///   bc::anchor=5p            anchor tags' 5-prime base at `loc.start`
+    ///   bc::anchor=3p            anchor tags' 3-prime base at `loc.end`
+    ///   bc::match=i7+i5          match tags on joined `--extract` streams
     #[arg(long = "group", value_name = "SPEC", verbatim_doc_comment)]
     groups: Vec<String>,
 
@@ -213,7 +216,7 @@ struct DemuxCmd {
     /// Set which streams become the primary record sequences (repeatable).
     ///
     /// Each name is an `--extract` stream (an input record is not a stream
-    /// until extracted). Concatenate with `+`; one value per output record (R1,
+    /// until extracted). Concatenate with '`+`'; one value per output record (R1,
     /// R2, ...). Optional; with none the full input is the raw output.
     ///
     /// SAM/BAM/CRAM allows at most two ordinals; multi-FASTX may have more.
@@ -231,14 +234,14 @@ struct DemuxCmd {
 
     /// SAM tag binding or attributes (repeatable; accumulates).
     ///
-    /// `TAG=STREAM[+STREAM]` binds record bases (join with `+`); `TAG::ATTRS` sets
-    /// qual/sep/raw. A multi-stream tag joins sequences with `sep` (default: `-`)
+    /// `TAG=STREAM[+STREAM]` binds record bases (join with '`+`'); `TAG::ATTRS` sets
+    /// qual/sep/raw. A multi-stream tag joins sequences with `sep` (default: '`-`')
     /// and qualities with `qual-sep` (default: a space). Default qual tags
     /// pre-exist for: CB/CY CR/CY RX/QX BC/QT OX/BZ.
     ///
-    ///   --tag RX=umi             UMI tag (auto quality tag QX)
+    ///   --tag RX=umi             UMI tag (auto quality tag `QX`)
     ///   --tag CB=bc1+bc2+bc3     join three barcode streams
-    ///   --tag CB::sep=_          join sequences with _ not -
+    ///   --tag CB::sep=_          join sequences with '`_`' not '`-`'
     ///   --tag CB::qual=CY        name the paired quality tag
     ///   --tag CB::qual=none      emit no quality tag
     ///   --tag CB::qual-sep=%20   join qualities with a space
@@ -260,16 +263,16 @@ struct DemuxCmd {
     /// must start with X/Y/Z or contain a lowercase char. QC is available for
     /// assigned, unassigned, and removed records.
     ///
-    ///   ...           no --qc-tag means no QC is written
-    ///   --qc-tag      JSON in tag ZS (the default)
-    ///   --qc-tag=ZQ   JSON in tag ZQ
+    ///   ...           no `--qc-tag` means no QC is written
+    ///   --qc-tag      JSON in tag `ZS` (the default)
+    ///   --qc-tag=ZQ   JSON in tag `ZQ`
     #[arg(long = "qc-tag", value_name = "TAG", num_args = 0..=1, default_missing_value = "ZS", verbatim_doc_comment)]
     qc_tag: Option<String>,
 
     /// Sample fan-out target `SAMPLE[::SUB_SAMPLE]=SELECTOR` (repeatable).
     ///
     /// SELECTOR is `group::id-or-seq[,...]` (comma is OR pool), a bare `group`
-    /// (any of its tags), or several joined with `+` (AND across groups).
+    /// (any of its tags), or several joined with '`+`' (AND across groups).
     /// SUB_SAMPLE → `@RG LB`.
     ///
     /// Exclusive with `--sample-sheet` and `--sample-from-group`.
@@ -277,7 +280,7 @@ struct DemuxCmd {
     ///   --sample s1=bc::t01          route tag t01 to sample s1
     ///   --sample s1=bc::t01,t02      OR pool: any listed tag
     ///   --sample s1=i7::a+i5::b      AND: needs both indices
-    ///   --sample s1::lib9=bc::t01    sub_sample lib9 (→ LB)
+    ///   --sample s1::lib9=bc::t01    sub_sample lib9 (→ `@RG LB`)
     ///   --sample s1::%pool=bc::t01   sub_sample from pool ID
     #[arg(long = "sample", value_name = "SPEC", verbatim_doc_comment)]
     samples: Vec<String>,
@@ -328,7 +331,7 @@ struct DemuxCmd {
     /// Records to remove via `SEL[=PATH_PATTERN]` (repeatable).
     ///
     /// A record matching `SEL` (a `group` or `group::id`) is removed and tallied as
-    /// `removed` (distinct from `--unassigned`). With `=PATH_PATTERN` the removed
+    /// removed (distinct from `--unassigned`). With `=PATH_PATTERN` the removed
     /// records are written to the output path otherwise they are simply
     /// ignored. `SEL` is required. The only placeholders allowed in
     /// `PATH_PATTERN` are `%pool` and `%source` (input file index).
@@ -429,12 +432,43 @@ fn paint_backtick_terms(text: &str, after: &str) -> String {
     out
 }
 
-/// Style one help string: paint the indented example/notation lines in the
-/// tertiary [`CODE`] color, paint backtick-wrapped terms in the same color on
-/// the remaining prose lines, and drop the backticks throughout. Section labels
-/// and ordinary prose keep the default color.
+/// Split an indented two-column row into (left, gap, right) at the first run of
+/// three or more spaces that follows the left-hand term. The 3-space minimum is
+/// the table delimiter; single-column example lines (no such gap) return `None`.
+fn split_two_column(content: &str) -> Option<(&str, &str, &str)> {
+    let bytes = content.as_bytes();
+    let mut seen_term = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b' ' {
+            let start = i;
+            while i < bytes.len() && bytes[i] == b' ' {
+                i += 1;
+            }
+            if seen_term && i - start >= 3 {
+                return Some((&content[..start], &content[start..i], &content[i..]));
+            }
+        } else {
+            seen_term = true;
+            i += 1;
+        }
+    }
+    None
+}
+
+/// Style one help string, dropping backticks throughout:
+///
+/// - indented two-column rows: the left code term in [`CODE`] (yellow), the
+///   right description column in [`FADED`] (gray);
+/// - indented description continuations (deeper indent, no term): all [`FADED`];
+/// - indented single-column examples (a bare command): all [`CODE`];
+/// - prose: default color, with backtick terms painted in [`CODE`].
+///
+/// Backtick terms stay [`CODE`] everywhere, so code stands out even inside a
+/// faded description.
 fn style_help_text(text: &str) -> String {
     let code = CODE.render().to_string();
+    let faded = FADED.render().to_string();
     let reset = CODE.render_reset().to_string();
     text.split_inclusive('\n')
         .map(|line| {
@@ -442,14 +476,22 @@ fn style_help_text(text: &str) -> String {
                 Some(content) => (content, "\n"),
                 None => (line, ""),
             };
-            if content.starts_with("  ") && !content.trim().is_empty() {
-                // The whole line is code-colored, so a backtick term keeps that
-                // color; it only loses its backticks (restore code after it).
+            if !content.starts_with("  ") || content.trim().is_empty() {
+                // Prose (or a blank line): only the backtick terms are painted.
+                return format!("{}{newline}", paint_backtick_terms(content, &reset));
+            }
+            if let Some((left, gap, right)) = split_two_column(content) {
+                let left = paint_backtick_terms(left, &code);
+                let right = paint_backtick_terms(right, &faded);
+                format!("{code}{left}{reset}{gap}{faded}{right}{reset}{newline}")
+            } else if content.len() - content.trim_start().len() > 2 {
+                // A wrapped description continuation aligned past the left column.
+                let painted = paint_backtick_terms(content, &faded);
+                format!("{faded}{painted}{reset}{newline}")
+            } else {
+                // A single-column code example (a bare command, no description).
                 let painted = paint_backtick_terms(content, &code);
                 format!("{code}{painted}{reset}{newline}")
-            } else {
-                // Default-colored prose: only the backtick terms are painted.
-                format!("{}{newline}", paint_backtick_terms(content, &reset))
             }
         })
         .collect()
