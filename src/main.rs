@@ -26,14 +26,16 @@ pub(crate) const ERROR: Style = AnsiColor::Red.on_default().effects(Effects::BOL
 pub(crate) const VALID: Style = AnsiColor::Cyan.on_default().effects(Effects::BOLD);
 pub(crate) const INVALID: Style = AnsiColor::Yellow.on_default().effects(Effects::BOLD);
 
-/// The tool name in the help header: primary color (green), bold.
-pub(crate) const NAME: Style = AnsiColor::Green.on_default().effects(Effects::BOLD);
-/// The version in the help header: secondary color (cyan).
-pub(crate) const VERSION: Style = AnsiColor::Cyan.on_default();
-/// Indented code examples in help text: tertiary color (yellow). Like the
-/// primary/secondary header colors, this is a named ANSI slot rather than a
-/// hard-coded RGB value, so it follows the user's terminal palette.
+/// The tool's one-line description at the top of the help: primary color
+/// (green), bold.
+pub(crate) const TITLE: Style = AnsiColor::Green.on_default().effects(Effects::BOLD);
+/// Indented code examples and backtick-wrapped terms in help text: tertiary
+/// color (yellow). Like the title color, this is a named ANSI slot rather than
+/// a hard-coded RGB value, so it follows the user's terminal palette.
 pub(crate) const CODE: Style = AnsiColor::Yellow.on_default();
+/// The license/attribution footer at the bottom of the help: magenta, a named
+/// ANSI slot distinct from the other help colors, so it follows the terminal.
+pub(crate) const FOOTER: Style = AnsiColor::Magenta.on_default();
 
 /// Cargo's color style.
 /// [source](https://github.com/crate-ci/clap-cargo/blob/master/src/style.rs)
@@ -48,43 +50,46 @@ pub(crate) const CARGO_STYLING: Styles = Styles::styled()
 
 /// Flexible record parsing and demultiplexing to FASTX/SAM/BAM/CRAM.
 ///
-/// unmux reads multiple FASTX/SAM/BAM/CRAM inputs, identifies and extracts
-/// technical sequences (barcodes, UMIs, adapters) with error tolerance using
-/// an approximate matcher, and writes FASTX/SAM/BAM/CRAM files with preserved
+/// This tool reads multiple FASTX/SAM/BAM/CRAM inputs, identifies and extracts
+/// technical sequences (barcodes, UMIs, adapters) with error tolerance using an
+/// approximate matcher, and writes FASTX/SAM/BAM/CRAM data with preserved
 /// per-record segment qualities, fanning a record pool out into per-sample, and
 /// optionally per-sample and per-library, files in a single pass.
 ///
-/// Mental model: scan the input and match each input record against tag
-/// --group(s), then pull those bases into named --extract streams, then route
-/// the record somewhere such as assigning it to a --sample, else unassigned,
-/// or removed by --remove. Set streams as the primary record sequences with
-/// --template and set --tag(s) to write streams to SAM tags. A "pool" is all
-/// input records for one run of unmux.
+/// Mental model:
+///
+/// - scan the inputs and match each input record against tag `--group`(s)
+/// - pull those bases into named `--extract` streams
+/// - route the record: assign to a `--sample`, else unassigned, or `--remove` it
+/// - set streams as the primary record sequences with `--template`
+/// - write those streams to SAM tags with `--tag`(s)
+///
+/// A "pool" is all input records for one run of unmux.
 ///
 /// Quick start:
 ///
-///   unmux in.fq --out out.bam
-///   unmux in.fq --extract r=0:0:9 --template r > out.fq
+///   unmux in.fq --out out.bam   # simply converts FASTQ to uBAM
+///   unmux in.fq --extract myslice=0:0:9 --template myslice > out.fq
 ///   unmux r1.fq r2.fq --group bc=bc.tsv --sample s=bc::t01 --out %sample.bam
 ///
 /// Notation (also see param docs below with expressive examples):
 ///
-///   file:start:end  0-based, half-open; `end`=record length; neg counts from
-///                   the record end. The FIRST number is the input file index
-///                   (0:0:8 = file 0, bases [0,8); 1:0:8 = file 1).
-///   @grp            a group's matched span. @grp+off:len / @grp-off:len step
-///                   past / before it (trailing number is a LENGTH, not end).
-///   @grpA..@grpB    the region between two matched spans.
-///   +               concat streams (cb+umi) or 'AND' samples (gA::a+gB::b).
-///   ~               reverse-complement the stream (~cb, BC=~bc).
-///   ,               list separator ('OR' a tag pool & attribute lists).
-///   %XX             percent-escape a byte in a tag sep/qual-sep value or an
-///                   output path (%20 space, %09 tab, %2C comma).
-///   %pool           the pool ID (see --pool).
-///   %sample         the sample ID (--out only)
-///   %sub_sample     the sub_sample ID (@RG LB) (--out only).
-///   %ordinal        1-based read ordinal (R%ordinal → R1, R2) (--out only).
-///   %source         0-based input file idx (--unassigned or --remove only).
+///   file:start:end   0-based, half-open; `end` is record LENGTH; neg counts
+///                    from the record END. The FIRST number is the input file
+///                    index (0:0:8 = file 0, bases [0,8); 1:0:8 = file 1).
+///   @grp             a group's matched span. `@grp+off:len` & `@grp-off:len`
+///                    step past/before it (trailing number is a LENGTH!).
+///   @grpA..@grpB     the region between two matched spans.
+///   +                concat streams (cb+umi) or 'AND' samples (`gA::a+gB::b`).
+///   ~                reverse-complement the stream (`~cb`, `BC=~bc`).
+///   ,                list separator ('OR' a tag pool & attribute lists).
+///   %XX              percent-escape a byte in a tag sep/qual-sep value or an
+///                    output path (`%20` space, `%09` tab, `%2C` comma).
+///   %pool            the pool ID (see `--pool`).
+///   %sample          the sample ID (`--out` only)
+///   %sub_sample      the sub_sample ID (`@RG LB`) (--out only).
+///   %ordinal         1-based read ordinal (R%ordinal → R1, R2) (`--out` only).
+///   %source          0-based input file idx (`--unassigned` or `--remove` only).
 #[derive(Debug, Parser)]
 #[command(author, version, color = clap::ColorChoice::Always, verbatim_doc_comment, override_usage = "unmux [READS]... [OPTIONS]")]
 #[clap(styles = CARGO_STYLING)]
@@ -101,11 +106,11 @@ struct DemuxCmd {
     ///
     /// 0-based by order, the first file is index 0 (splitcode-style). With no
     /// inputs at all, file 0 defaults to stdin, so bare unmux reads stdin.
-    /// Mutually exclusive with --in. Inputs must agree on yes/no qualities
+    /// Mutually exclusive with `--in`. Inputs must agree on yes/no qualities
     /// (FASTA cannot blend with a quality-containing FASTQ/SAM/BAM/CRAM).
     ///
-    ///   unmux r1.fq r2.fq i1.fq    files 0, 1, 2
-    ///   unmux < reads.fq           file 0 from stdin (no args = stdin)
+    ///   unmux r1.fq r2.fq i1.fq   files 0, 1, 2
+    ///   unmux < reads.fq          file 0 from stdin (no args = stdin)
     #[arg(value_name = "READS", num_args = 0.., verbatim_doc_comment)]
     inputs_positional: Vec<PathBuf>,
 
@@ -119,10 +124,9 @@ struct DemuxCmd {
 
     /// Input files set with `N=PATH` for explicit 0-based file indices.
     ///
-    /// Repeatable; indices must be unique and contiguous from 0 (flag
-    /// order is free; a gap or non-zero start is an error). `PATH` may be
-    /// `-` for stdin (at most once). Mutually exclusive with positional
-    /// inputs.
+    /// Repeatable; indices must be unique and contiguous from 0 (flag order
+    /// is free; a gap or non-zero start is an error). `PATH` may be `-` for stdin
+    /// (at most once). Mutually exclusive with positional inputs.
     ///
     ///   --in 0=r1.fq.gz --in 1=r2.fq.gz   file 0 = r1, file 1 = r2
     ///   --in 0=- --in 1=r2.fq.gz          file 0 from stdin, file 1 = r2
@@ -134,6 +138,23 @@ struct DemuxCmd {
     )]
     inputs: Vec<String>,
 
+    /// Output path for demuxed records.
+    ///
+    /// Format set by extension (FASTX/SAM/BAM/CRAM). `-` or `/dev/stdout` writes
+    /// standard output in the input format. Read groups and SAM tags are
+    /// SAM/BAM/CRAM-only; FASTX puts `--tag` values in the record-name comment.
+    /// Missing parent dirs are created. Placeholders fan-out the pool into
+    /// multiple files including `%pool`, `%sample`, `%sub_sample`, and `%ordinal`.
+    ///
+    ///   --out out.bam                   one file, all assigned records
+    ///   --out %sample.bam               one file per sample
+    ///   --out %sample.%sub_sample.bam   per sample and sub-sample
+    ///   --out %pool.R%ordinal.fq.gz     per pool, per template record
+    ///
+    /// [default: /dev/stdout]
+    #[arg(long = "out", value_name = "PATTERN", verbatim_doc_comment)]
+    out: Option<String>,
+
     /// Tag-group definition or attributes (repeatable; accumulates).
     ///
     /// `NAME=SOURCE` is the UMI/barcode/adapter set; `NAME::ATTRS` constrains
@@ -142,11 +163,11 @@ struct DemuxCmd {
     ///
     /// Sources:
     ///
-    ///   bc=tags.tsv        from a TSV file with `id` and `seq` columns
-    ///   bc={AAC,ACG,TTG}   inline set, auto tag IDs
-    ///   bc={a=AAC,b=ACG}   inline set, explicit tag IDs
+    ///   bc=tags.tsv       from a TSV file with `id` and `seq` columns
+    ///   bc={AAC,ACG,TTG}  inline set, auto tag IDs
+    ///   bc={a=AAC,b=ACG}  inline set, explicit tag IDs
     ///
-    /// Attributes (NAME::key=val):
+    /// Attributes (`NAME::key=val`):
     ///
     ///   bc::loc=1:0:8            file 1 bases [0,8) (default: whole record)
     ///   bc::dist=1               allow 1 substitution
@@ -170,12 +191,12 @@ struct DemuxCmd {
 
     /// Make a named record segment into a stream `NAME=[SPEC]` (repeatable).
     ///
-    /// NAME becomes a stream for --template, --tag, and group `match=`.
-    /// An extracted stream carries both bases AND qualities.
+    /// `NAME` becomes a stream for `--template`, `--tag`, and group `match=`. An
+    /// extracted stream carries both bases AND qualities.
     ///
-    /// `file:start:end` is 0-based half-open; the trailing number is an
-    /// END (= record length); negatives count from the record end. The
-    /// anchored `@grp` forms take a LENGTH as the trailing number instead.
+    /// `file:start:end` is 0-based half-open; the trailing number is an `END`
+    /// (full record length); negatives count from the record end. The
+    /// anchored `@grp` forms take a `LENGTH` as the trailing number instead.
     ///
     ///   r=0:9:end          file 0, base 9 to the end
     ///   bc=1:0:8           file 1, bases [0,8)
@@ -190,9 +211,9 @@ struct DemuxCmd {
 
     /// Set which streams become the primary record sequences (repeatable).
     ///
-    /// Each name is an --extract stream (an input record is not a stream
-    /// until extracted). Concatenate with `+`; one value per output record
-    /// (R1, R2, ...). Optional; with none the full input is the raw output.
+    /// Each name is an `--extract` stream (an input record is not a stream
+    /// until extracted). Concatenate with `+`; one value per output record (R1,
+    /// R2, ...). Optional; with none the full input is the raw output.
     ///
     /// SAM/BAM/CRAM allows at most two ordinals; multi-FASTX may have more.
     /// `::raw=true` emits observed bases for a stream from a corrected `@grp`
@@ -209,10 +230,10 @@ struct DemuxCmd {
 
     /// SAM tag binding or attributes (repeatable; accumulates).
     ///
-    /// `TAG=STREAM[+STREAM]` binds record bases (join with `+`); `TAG::ATTRS`
-    /// sets qual/sep/raw. A multi-stream tag joins sequences with `sep`
-    /// (default: `-`) and qualities with `qual-sep` (default: a space).
-    /// Defaults pre-exist for common tags: CB/CY CR/CY RX/QX BC/QT OX/BZ.
+    /// `TAG=STREAM[+STREAM]` binds record bases (join with `+`); `TAG::ATTRS` sets
+    /// qual/sep/raw. A multi-stream tag joins sequences with `sep` (default: `-`)
+    /// and qualities with `qual-sep` (default: a space). Default qual tags
+    /// pre-exist for: CB/CY CR/CY RX/QX BC/QT OX/BZ.
     ///
     ///   --tag RX=umi             UMI tag (auto quality tag QX)
     ///   --tag CB=bc1+bc2+bc3     join three barcode streams
@@ -232,29 +253,41 @@ struct DemuxCmd {
     #[arg(long = "rg-tag", value_name = "K=V", num_args = 1.., verbatim_doc_comment)]
     rg_tags: Vec<String>,
 
+    /// Per-record QC in a UTF-8 JSON tag value for how the record was routed.
+    ///
+    /// Bare `--qc-tag` uses tag `ZS`; `--qc-tag=TAG` names another 2-char tag which
+    /// must start with X/Y/Z or contain a lowercase char. QC is available for
+    /// assigned, unassigned, and removed records.
+    ///
+    ///   ...           no --qc-tag means no QC is written
+    ///   --qc-tag      JSON in tag ZS (the default)
+    ///   --qc-tag=ZQ   JSON in tag ZQ
+    #[arg(long = "qc-tag", value_name = "TAG", num_args = 0..=1, default_missing_value = "ZS", verbatim_doc_comment)]
+    qc_tag: Option<String>,
+
     /// Sample fan-out target `SAMPLE[::SUB_SAMPLE]=SELECTOR` (repeatable).
     ///
-    /// SELECTOR is `group::id-or-seq[,...]` (comma = OR pool), a bare
-    /// `group` (any of its tags), or several joined with `+` (AND across
-    /// groups). SUB_SAMPLE → `LB`.
+    /// SELECTOR is `group::id-or-seq[,...]` (comma is OR pool), a bare `group`
+    /// (any of its tags), or several joined with `+` (AND across groups).
+    /// SUB_SAMPLE → `@RG LB`.
     ///
-    /// Exclusive with --sample-sheet and --sample-from-group.
+    /// Exclusive with `--sample-sheet` and `--sample-from-group`.
     ///
-    ///   --sample s1=bc::t01           route tag t01 to sample s1
-    ///   --sample s1=bc::t01,t02       OR pool: any listed tag
-    ///   --sample s1=i7::a+i5::b       AND: needs both indices
-    ///   --sample s1::lib9=bc::t01     sub_sample lib9 (→ LB)
-    ///   --sample s1::%pool=bc::t01    sub_sample from pool ID
+    ///   --sample s1=bc::t01          route tag t01 to sample s1
+    ///   --sample s1=bc::t01,t02      OR pool: any listed tag
+    ///   --sample s1=i7::a+i5::b      AND: needs both indices
+    ///   --sample s1::lib9=bc::t01    sub_sample lib9 (→ LB)
+    ///   --sample s1::%pool=bc::t01   sub_sample from pool ID
     #[arg(long = "sample", value_name = "SPEC", verbatim_doc_comment)]
     samples: Vec<String>,
 
-    /// Input sample sheet in TSV format (the table form of --sample).
+    /// Input sample sheet in TSV format (the table form of `--sample`).
     ///
-    /// Columns for `sample` (→ `SM`, required), optional `sub_sample`
-    /// (→ `LB`), and one column per group (cell = a tag ID or sequence).
-    /// Rows sharing a key OR; multiple group columns AND.
+    /// Columns for `sample` (→ `@RG SM`, required), optional `sub_sample` (→
+    /// `@RG LB`), and one column per group (cell = a tag ID or sequence). Rows
+    /// sharing a key OR; multiple group columns AND.
     ///
-    /// Exclusive with --sample / --sample-from-group.
+    /// Exclusive with `--sample` and `--sample-from-group`.
     ///
     ///   --sample-sheet samples.tsv
     #[arg(
@@ -267,55 +300,17 @@ struct DemuxCmd {
 
     /// Make every tag in GROUP its own sample, 1-to-1 (a shortcut).
     ///
-    /// The "just split by barcode" mode: each tag in GROUP becomes a
-    /// sample with no --sample lines and no sheet to maintain. `SM`
-    /// is the tag ID; an optional `sub_sample` column in the group's
-    /// tag file sets `LB`. Records whose GROUP tag matches nothing are
-    /// unassigned, as with --sample. Pair with --out %sample.bam
-    /// to write one file per tag.
+    /// The "just split by barcode" mode: each tag in `GROUP` becomes a sample
+    /// with no `--sample` lines and no sheet to maintain. `@RG SM` is the tag ID;
+    /// an optional `sub_sample` column in the group's tag file sets `@RG LB`.
+    /// Records whose `GROUP` tag matches nothing are unassigned, as with
+    /// `--sample`. Pair with `--out %sample.bam` to write one file per tag.
     ///
-    /// Exclusive with --sample / --sample-sheet.
+    /// Exclusive with `--sample` and `--sample-sheet`.
     ///
     ///   --sample-from-group bc   one sample per tag in group bc
     #[arg(long = "sample-from-group", value_name = "GROUP", conflicts_with_all = ["samples", "sample_sheet"], verbatim_doc_comment)]
     sample_from_group: Option<String>,
-
-    /// Records to remove via `SEL[=PATH_PATTERN]` (repeatable).
-    ///
-    /// A record matching SEL (a `group` or `group::id`) is removed and
-    /// tallied as `removed` (distinct from --unassigned). With
-    /// `=PATH_PATTERN` the removed records are written to the output path
-    /// otherwise they are simply ignored. SEL is required. The only
-    /// placeholders allowed in PATH_PATTERN are `%pool` and `%source`
-    /// (input file index).
-    ///
-    ///   --remove phiX                      drop records matching phiX group
-    ///   --remove bc::t99                   drop one specific tag's records
-    ///   --remove phiX=phiX.%source.fq.gz   ...and write them out
-    #[arg(
-        long = "remove",
-        value_name = "SEL[=PATH_PATTERN]",
-        verbatim_doc_comment
-    )]
-    remove: Vec<String>,
-
-    /// Output path for demuxed records.
-    ///
-    /// Format set by extension (FASTX/SAM/BAM/CRAM). `-` or `/dev/stdout`
-    /// writes standard output in the input format. Read groups and SAM tags
-    /// are SAM/BAM/CRAM-only; FASTX puts --tag values in the record-name
-    /// comment. Missing parent dirs are created. Placeholders fan-out the
-    /// pool into multiple files including %pool, %sample, %sub_sample, and
-    /// %ordinal.
-    ///
-    ///   --out out.bam                   one file, all assigned records
-    ///   --out %sample.bam               one file per sample
-    ///   --out %sample.%sub_sample.bam   per sample and sub-sample
-    ///   --out %pool.R%ordinal.fq.gz     per pool, per template record
-    ///
-    /// [default: /dev/stdout]
-    #[arg(long = "out", value_name = "PATTERN", verbatim_doc_comment)]
-    out: Option<String>,
 
     /// Output path pattern for records matching no sample.
     ///
@@ -328,6 +323,24 @@ struct DemuxCmd {
     ///   --unassigned unmatched.fa              all segments in one FASTA
     #[arg(long = "unassigned", value_name = "PATTERN", verbatim_doc_comment)]
     unassigned: Option<String>,
+
+    /// Records to remove via `SEL[=PATH_PATTERN]` (repeatable).
+    ///
+    /// A record matching `SEL` (a `group` or `group::id`) is removed and tallied as
+    /// `removed` (distinct from `--unassigned`). With `=PATH_PATTERN` the removed
+    /// records are written to the output path otherwise they are simply
+    /// ignored. `SEL` is required. The only placeholders allowed in
+    /// `PATH_PATTERN` are `%pool` and `%source` (input file index).
+    ///
+    ///   --remove phiX                      drop records matching phiX group
+    ///   --remove bc::t99                   drop one specific tag's records
+    ///   --remove phiX=phiX.%source.fq.gz   ...and write them out
+    #[arg(
+        long = "remove",
+        value_name = "SEL[=PATH_PATTERN]",
+        verbatim_doc_comment
+    )]
+    remove: Vec<String>,
 
     /// Per-sample metrics TSV with one data row per fan-out target.
     ///
@@ -349,33 +362,21 @@ struct DemuxCmd {
     #[arg(long = "metrics-summary", value_name = "PATTERN", verbatim_doc_comment)]
     metrics_summary: Option<PathBuf>,
 
-    /// Per-record QC in a UTF-8 JSON tag value for how the record was routed.
-    ///
-    /// Bare --qc-tag uses tag `ZS`; --qc-tag=TAG names another 2-char tag
-    /// which must start with X/Y/Z or contain a lowercase char. QC is
-    /// available for assigned, unassigned, and removed records.
-    ///
-    ///   ...           no --qc-tag means no QC is written
-    ///   --qc-tag      JSON in tag ZS (the default)
-    ///   --qc-tag=ZQ   JSON in tag ZQ
-    #[arg(long = "qc-tag", value_name = "TAG", num_args = 0..=1, default_missing_value = "ZS", verbatim_doc_comment)]
-    qc_tag: Option<String>,
-
-    /// Fail fast unless every tag of every group named by a
-    /// --sample/--sample-sheet selector is claimed by some sample (no
-    /// tag in a sampled group left unclaimed). Off by default; applies only
-    /// when samples are declared.
+    /// Fail fast unless every tag of every group named by a `--sample` and
+    /// `--sample-sheet` selector is claimed by some sample (no tag in
+    /// a sampled group left unclaimed). Off by default; applies only when
+    /// samples are declared.
     #[arg(long = "require-samples-explain-all-tags", verbatim_doc_comment)]
     require_samples_explain_all_tags: bool,
 
     /// Disable auto pair-detection. Treat each record as single-end, even
-    /// when one input looks interleaved (mate-name pairing). Interleaving
-    /// is otherwise auto-detected.
+    /// when one input looks interleaved (mate-name pairing). Interleaving is
+    /// otherwise auto-detected.
     #[arg(long, verbatim_doc_comment)]
     per_record: bool,
 
-    /// Compression level 0-9 for BGZF (BAM) and gzip (FASTX.gz).
-    /// CRAM uses its own codecs and ignores this.
+    /// Compression level 0-9 for BGZF (BAM) and gzip (FASTX.gz). CRAM uses
+    /// its own codecs and ignores this.
     #[arg(long, value_name = "LEVEL", default_value_t = 5, value_parser = clap::value_parser!(u8).range(0..=9), verbatim_doc_comment)]
     compression: u8,
 
@@ -386,16 +387,15 @@ struct DemuxCmd {
     threads: u16,
 }
 
-/// Build the help header line: the tool `name` in the primary color (green,
-/// bold) and `version` in the secondary color (cyan).
-fn header_line(name: &str, version: &str) -> String {
-    format!(
-        "{}{name}{} {}{version}{}",
-        NAME.render(),
-        NAME.render_reset(),
-        VERSION.render(),
-        VERSION.render_reset(),
-    )
+/// Paint the first line of `text` in the primary [`TITLE`] color (the tool's
+/// one-line description), leaving the rest of the text untouched.
+fn green_first_line(text: &str) -> String {
+    let title = TITLE.render().to_string();
+    let reset = TITLE.render_reset().to_string();
+    match text.split_once('\n') {
+        Some((first, rest)) => format!("{title}{first}{reset}\n{rest}"),
+        None => format!("{title}{text}{reset}"),
+    }
 }
 
 /// Paint terms wrapped in backticks (`` `like this` ``) in the tertiary
@@ -454,25 +454,35 @@ fn style_help_text(text: &str) -> String {
         .collect()
 }
 
-/// Prepend the colored name/version header to the command's help and apply
-/// [`style_help_text`] (code-color the examples, paint backtick terms, drop the
-/// backticks). Applied to the short about (drives `-h`), the long about (drives
-/// `--help`), and each option's short and long help.
+/// Style the command's help: paint the first line of the about text in the
+/// primary [`TITLE`] color and apply [`style_help_text`] (code-color the
+/// examples, paint backtick terms, drop the backticks). Applied to the short
+/// about (drives `-h`), the long about (drives `--help`), and each option's
+/// short and long help.
 fn decorate_help(cmd: clap::Command) -> clap::Command {
-    let header = header_line(cmd.get_name(), cmd.get_version().unwrap_or_default());
     let about = cmd.get_about().map(ToString::to_string);
     let long_about = cmd
         .get_long_about()
         .map(ToString::to_string)
         .or_else(|| about.clone());
 
+    let footer = format!(
+        "{}MIT License 2026 · Clint Valentine{}",
+        FOOTER.render(),
+        FOOTER.render_reset(),
+    );
+
     let mut cmd = cmd;
     if let Some(about) = about {
-        cmd = cmd.about(format!("{header}\n\n{}", style_help_text(&about)));
+        cmd = cmd.about(green_first_line(&style_help_text(&about)));
     }
     if let Some(long_about) = long_about {
-        cmd = cmd.long_about(format!("{header}\n\n{}", style_help_text(&long_about)));
+        cmd = cmd.long_about(green_first_line(&style_help_text(&long_about)));
     }
+    cmd = cmd
+        .next_line_help(true)
+        .after_help(footer.clone())
+        .after_long_help(footer);
     cmd.mut_args(|mut arg| {
         if let Some(help) = arg.get_help().map(ToString::to_string) {
             arg = arg.help(style_help_text(&help));
