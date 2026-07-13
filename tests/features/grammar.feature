@@ -29,7 +29,7 @@ Feature: grammar parsing and structural validation
     And stderr contains "both"
 
   Scenario: a boolean attribute rejects numeric values
-    When I run `unmux a.fq --group g=f.tsv --group g::both_strands=1`
+    When I run `unmux a.fq --group g=f.tsv --group g::bothStrands=1`
     Then the exit code is 1
     And stderr contains "true"
 

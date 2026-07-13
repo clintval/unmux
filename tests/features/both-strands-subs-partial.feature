@@ -12,14 +12,14 @@ Feature: Reverse-complement, substitution, and partial end matching
       +
       IIIIIIIIIIIIIIIIIIIIII
       """
-    # both_strands=true lets AACGTG match its rc (CACGTT) at [10,16). The corrected tag is the declared
-    # canonical AACGTG (both_strands is matching-only); use `~` on the tag/template for the read strand.
-    When I run `unmux read.fq --group grp={AACGTG} --group grp::loc=0:10:16,both_strands=true --extract bc=@grp --tag BC=bc --template bc`
+    # bothStrands=true lets AACGTG match its rc (CACGTT) at [10,16). The corrected tag is the declared
+    # canonical AACGTG (bothStrands is matching-only); use `~` on the tag/template for the read strand.
+    When I run `unmux read.fq --group grp={AACGTG} --group grp::loc=0:10:16,bothStrands=true --extract bc=@grp --tag BC=bc --template bc`
     Then the exit code is 0
     And stdout contains "BC:Z:AACGTG"
     And stdout contains "AACGTG"
 
-  Scenario: Without both_strands the antisense instance does not match
+  Scenario: Without bothStrands the antisense instance does not match
     Given a file "read.fq" containing:
       """
       @r1
@@ -108,14 +108,14 @@ Feature: Reverse-complement, substitution, and partial end matching
       IIIIIIIIIIIIIIIIIIIIII
       """
     # The tag AACGTG matches antisense (its rc CACGTT) at [10:16]=CACGAT (1 mismatch). The corrected tag
-    # is the declared canonical AACGTG (both_strands is matching-only), NOT its read-strand rc CACGTT; `~` on
+    # is the declared canonical AACGTG (bothStrands is matching-only), NOT its read-strand rc CACGTT; `~` on
     # the tag/template is how you would ask for the read strand.
-    When I run `unmux read.fq --group grp={AACGTG,CCGGAA} --group grp::loc=0:10:16,both_strands=true,dist=1 --extract bc=@grp --tag BC=bc --template bc`
+    When I run `unmux read.fq --group grp={AACGTG,CCGGAA} --group grp::loc=0:10:16,bothStrands=true,dist=1 --extract bc=@grp --tag BC=bc --template bc`
     Then the exit code is 0
     And stdout contains "BC:Z:AACGTG"
     And stdout contains "AACGTG"
 
-  Scenario: A group loaded from a tag file matches on the antisense strand under both_strands=true
+  Scenario: A group loaded from a tag file matches on the antisense strand under bothStrands=true
     Given a file "tags.tsv" containing:
       """
       id	seq
@@ -128,15 +128,15 @@ Feature: Reverse-complement, substitution, and partial end matching
       +
       IIIIIIIIIIIIIIIIIIIIII
       """
-    # The tag set comes from a headered TSV (id/seq columns) rather than an inline {...}; both_strands=true is
+    # The tag set comes from a headered TSV (id/seq columns) rather than an inline {...}; bothStrands=true is
     # what lets the file-sourced AACGTG match its reverse complement CACGTT at [10,16). The corrected tag
-    # is the declared canonical AACGTG. The companion "Without both_strands" scenario above (inline tag) drops
-    # the same antisense instance, so both_strands=true remains load-bearing when the tags arrive from a file.
-    When I run `unmux read.fq --group grp=tags.tsv --group grp::loc=0:10:16,both_strands=true --extract bc=@grp --tag BC=bc --template bc`
+    # is the declared canonical AACGTG. The companion "Without bothStrands" scenario above (inline tag) drops
+    # the same antisense instance, so bothStrands=true remains load-bearing when the tags arrive from a file.
+    When I run `unmux read.fq --group grp=tags.tsv --group grp::loc=0:10:16,bothStrands=true --extract bc=@grp --tag BC=bc --template bc`
     Then the exit code is 0
     And stdout contains "BC:Z:AACGTG"
 
-  Scenario: A multi-row tag file matches forward and antisense tags in one both_strands=true run
+  Scenario: A multi-row tag file matches forward and antisense tags in one bothStrands=true run
     Given a file "tags.tsv" containing:
       """
       id	seq
@@ -155,9 +155,9 @@ Feature: Reverse-complement, substitution, and partial end matching
       IIIIIIIIIIIIIIIIIIIIII
       """
     # Two tags from the file: @fwd carries t2 (GGATCC) on the forward strand at [10,16), @rev carries the
-    # reverse complement of t1 (AACGTG -> CACGTT) at [10,16). With both_strands=true both resolve in a single
+    # reverse complement of t1 (AACGTG -> CACGTT) at [10,16). With bothStrands=true both resolve in a single
     # run with no file-sourcing error, so the observed bases are GGATCC and CACGTT respectively.
-    When I run `unmux read.fq --group grp=tags.tsv --group grp::loc=0:10:16,both_strands=true --extract bc=@grp --tag BC=bc --tag BC::raw=true --template bc`
+    When I run `unmux read.fq --group grp=tags.tsv --group grp::loc=0:10:16,bothStrands=true --extract bc=@grp --tag BC=bc --tag BC::raw=true --template bc`
     Then the exit code is 0
     And stdout contains "BC:Z:GGATCC"
     And stdout contains "BC:Z:CACGTT"
@@ -173,7 +173,7 @@ Feature: Reverse-complement, substitution, and partial end matching
     # grp's AACGTG matches antisense (its rc CACGTT) at [10:16]=CACGAT (1 mismatch). The corrected tag
     # is the declared canonical AACGTG by default; a `~` on the tag stream (BC=~bc) reverse-complements
     # it onto the read strand, so BC is CACGTT here, the same orientation as the read.
-    When I run `unmux read.fq --group grp={AACGTG,CCGGAA} --group grp::loc=0:10:16,both_strands=true,dist=1 --extract bc=@grp --tag BC=~bc --template bc`
+    When I run `unmux read.fq --group grp={AACGTG,CCGGAA} --group grp::loc=0:10:16,bothStrands=true,dist=1 --extract bc=@grp --tag BC=~bc --template bc`
     Then the exit code is 0
     And stdout contains "BC:Z:CACGTT"
 
@@ -189,11 +189,11 @@ Feature: Reverse-complement, substitution, and partial end matching
       +
       IIIIIIIIII
       """
-    # @fwd carries AACGTG forward; @rev carries its reverse complement CACGTT, found via both_strands=true.
+    # @fwd carries AACGTG forward; @rev carries its reverse complement CACGTT, found via bothStrands=true.
     # Both are the SAME barcode, so the corrected BC is the declared canonical AACGTG for both reads,
     # not strand-dependent. The old behavior emitted CACGTT for the antisense read, splitting one
     # barcode into two values; this guards against that footgun.
-    When I run `unmux read.fq --group grp={AACGTG} --group grp::loc=0:0:6,both_strands=true --extract bc=@grp --tag BC=bc --template bc`
+    When I run `unmux read.fq --group grp={AACGTG} --group grp::loc=0:0:6,bothStrands=true --extract bc=@grp --tag BC=bc --template bc`
     Then the exit code is 0
     And stdout contains "BC:Z:AACGTG"
     And stdout does not contain "BC:Z:CACGTT"

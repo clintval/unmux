@@ -1,4 +1,4 @@
-//! The green one-line description at the top of `--help`/`-h` and the tertiary
+//! The magenta one-line description at the top of `--help`/`-h` and the tertiary
 //! color applied to code examples and backtick-wrapped terms. These are styled
 //! on the `clap::Command` at startup (`src/main.rs`), so the test drives the
 //! real binary and inspects the raw ANSI in its output. Escape sequences are
@@ -7,10 +7,11 @@
 //! exact SGR byte layout.
 
 use assert_cmd::Command;
-use clap::builder::styling::{AnsiColor, Effects, Style};
+use clap::builder::styling::{AnsiColor, Style};
 
-/// Primary color: the one-line description (green, bold). Mirrors `TITLE` in `src/main.rs`.
-const TITLE: Style = AnsiColor::Green.on_default().effects(Effects::BOLD);
+/// Title color: the one-line description (magenta, matching the footer).
+/// Mirrors `TITLE` in `src/main.rs`.
+const TITLE: Style = AnsiColor::Magenta.on_default();
 /// Tertiary color: code examples and backtick terms (yellow). Mirrors `CODE` in `src/main.rs`.
 const CODE: Style = AnsiColor::Yellow.on_default();
 /// Footer color: the license/attribution line (magenta). Mirrors `FOOTER` in `src/main.rs`.
@@ -36,22 +37,22 @@ fn help_stdout(flag: &str) -> String {
 }
 
 #[test]
-fn long_help_opens_with_the_green_description_line() {
+fn long_help_opens_with_the_magenta_description_line() {
     let stdout = help_stdout("--help");
     let title = format!("{}{DESCRIPTION}{}\n", TITLE.render(), TITLE.render_reset());
     assert!(
         stdout.starts_with(&title),
-        "--help should open with the green one-line description; got:\n{stdout}"
+        "--help should open with the magenta one-line description; got:\n{stdout}"
     );
 }
 
 #[test]
-fn short_help_opens_with_the_green_description_line() {
+fn short_help_opens_with_the_magenta_description_line() {
     let stdout = help_stdout("-h");
     let title = format!("{}{DESCRIPTION}{}\n", TITLE.render(), TITLE.render_reset());
     assert!(
         stdout.starts_with(&title),
-        "-h should open with the green one-line description; got:\n{stdout}"
+        "-h should open with the magenta one-line description; got:\n{stdout}"
     );
 }
 

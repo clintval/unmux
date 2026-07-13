@@ -1725,7 +1725,7 @@ fn union_len(intervals: &[(usize, usize)]) -> usize {
 /// streams (no delimiter). A referenced stream that is absent (its anchoring
 /// group did not match, or it resolved to nothing) makes the group a non-match.
 /// The tags are searched within the joined text as a single synthetic segment,
-/// so `dist`/`mode`/`delta`/`both_strands` apply over the concatenation.
+/// so `dist`/`mode`/`delta`/`bothStrands` apply over the concatenation.
 fn match_joined(
     group: &CompiledGroup,
     scratch: &mut Scratch,
@@ -1947,7 +1947,7 @@ fn prepared_raw_read(record: &InputRecord, pool: &str, slug: Option<(&str, &str)
 /// (its matched tag index and strand) against the engine's group slice (the
 /// tag's canonical bases), so no per-record correction buffer is carried across
 /// the matcher boundary. The strand is the per-match outcome, not the group's
-/// `both_strands` attribute: a `both_strands=true` group also searches the
+/// `bothStrands` attribute: a `bothStrands=true` group also searches the
 /// forward strand, and a forward match must not have its observed quals
 /// reversed.
 fn canonical_correction<'a>(
@@ -1989,7 +1989,7 @@ fn prepare_body(
             // corrected form) emits the observed bases. Only the `@grp`
             // self-span is corrected (anchored-offset and between-anchor spans
             // are unaffected). The corrected form is always the declared
-            // canonical (matching=only `both_strands=true`); orientation is a
+            // canonical (matching=only `bothStrands=true`); orientation is a
             // use-site choice (`--tag T=~stream` / `--template ~stream`).
             if let SpanBody::AnchorMatch { group } = &spec.span.body {
                 if let Some((canonical, antisense)) = canonical_correction(engine, hits, group) {
@@ -3058,8 +3058,8 @@ mod tests {
 
     #[test]
     fn test_both_strands_group_emits_declared_canonical() {
-        // A `both_strands=true` group matches antisense, but the corrected tag
-        // is always the declared canonical (both_strands is matching-only); the
+        // A `bothStrands=true` group matches antisense, but the corrected tag
+        // is always the declared canonical (bothStrands is matching-only); the
         // raw CR still shows the observed read-strand bases.
         let dir = tempfile::tempdir().unwrap();
         // [10:16] = CACGAT; tag AACGTG matches its rc (CACGTT) at dist=1.
@@ -3073,7 +3073,7 @@ mod tests {
         args.inputs = vec![format!("0={}", input.display())];
         args.groups = vec![
             "g={AACGTG}".to_string(),
-            "g::loc=0:10:16,both_strands=true,dist=1".to_string(),
+            "g::loc=0:10:16,bothStrands=true,dist=1".to_string(),
         ];
         args.extracts = vec!["bc=@g".to_string()];
         args.tags = vec![
@@ -3114,7 +3114,7 @@ mod tests {
         args.inputs = vec![format!("0={}", input.display())];
         args.groups = vec![
             "g={AACGTG}".to_string(),
-            "g::loc=0:10:16,both_strands=true,dist=1".to_string(),
+            "g::loc=0:10:16,bothStrands=true,dist=1".to_string(),
         ];
         args.extracts = vec!["bc=@g".to_string()];
         // CB defaults to the CY quality tag, carrying the corrected qualities.
@@ -3131,10 +3131,10 @@ mod tests {
 
     #[test]
     fn test_both_strands_group_forward_match_quals_not_reversed() {
-        // A `both_strands=true` group also searches the forward strand. On a
+        // A `bothStrands=true` group also searches the forward strand. On a
         // forward match the observed quals already co-orient with the declared
         // canonical, so they must NOT be reversed: the per-match strand governs
-        // the correction, not the group's `both_strands` attribute.
+        // the correction, not the group's `bothStrands` attribute.
         let dir = tempfile::tempdir().unwrap();
         // [10:16] = AACGTG (the declared tag, forward) with quals raw 20..=25
         // (Phred+33 = "56789:").
@@ -3148,7 +3148,7 @@ mod tests {
         args.inputs = vec![format!("0={}", input.display())];
         args.groups = vec![
             "g={AACGTG}".to_string(),
-            "g::loc=0:10:16,both_strands=true,dist=1".to_string(),
+            "g::loc=0:10:16,bothStrands=true,dist=1".to_string(),
         ];
         args.extracts = vec!["bc=@g".to_string()];
         // CB defaults to the CY quality tag, carrying the corrected qualities.
@@ -3159,7 +3159,7 @@ mod tests {
         let record = first_bam_record(&out);
         assert_eq!(string_tag(&record, *b"CB").as_deref(), Some("AACGTG"));
         // CY stays "56789:" (read order); reversing it to ":98765" would be the
-        // bug of using the group's `both_strands` config instead of the match
+        // bug of using the group's `bothStrands` config instead of the match
         // strand.
         assert_eq!(string_tag(&record, *b"CY").as_deref(), Some("56789:"));
     }

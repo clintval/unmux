@@ -7,7 +7,7 @@
 //! to unmatched, not mis-assigned).
 //!
 //! This is the record-window search primitive: given a [`CompiledGroup`] (its
-//! tag sequences plus the `loc`/`dist`/`both_strands`/`mode`/`delta`
+//! tag sequences plus the `loc`/`dist`/`bothStrands`/`mode`/`delta`
 //! attributes) and a record's per-file base segments, it returns every
 //! accepted match within
 //! the error budget and the single best match under a deterministic total order
@@ -132,7 +132,7 @@ pub struct CompiledGroup {
     pub dist: Dist,
     /// The optional search window; `None` searches every file's whole record.
     pub loc: Option<Location>,
-    /// Search the reverse-complement strand too (`both_strands=`).
+    /// Search the reverse-complement strand too (`bothStrands=`).
     pub revcomp: bool,
     /// Match acceptance policy.
     pub mode: MatchMode,
@@ -539,7 +539,7 @@ fn write_window_key(key: &mut Vec<u8>, loc: Option<&Location>, segments: &[&[u8]
 /// Match a compiled group with an explicit search window `loc`, overriding the
 /// group's own. The engine passes the window a relative `next=GROUP:lo-hi` link
 /// computes from the upstream match; all other attributes
-/// (`dist`/`both_strands`/`mode`/`delta`/find counts) come from `group`. The
+/// (`dist`/`bothStrands`/`mode`/`delta`/find counts) come from `group`. The
 /// reusable [`Scratch`] supplies the thread-local searcher.
 pub fn match_group_at(
     group: &CompiledGroup,
@@ -891,8 +891,9 @@ fn search_budget(group: &CompiledGroup, tag_len: usize) -> usize {
 /// (non-overhang) match is gated by the per-type `dist` budget. A match
 /// truncated at the record's 5'/3' end (sassy overhang) is allowed only when
 /// each overhanging end has a `partial5`/`partial3` policy it satisfies: at
-/// least `min_match` matched bases and a substitution frequency within
-/// `max_mismatch_freq` (and no indels).
+/// least `min_match` matched bases and (no indels) a substitution count within
+/// the policy's `max_mismatch_freq` per matched base, or, when that frequency
+/// is unset, within the group's `dist` substitution budget.
 fn accept_match(
     group: &CompiledGroup,
     tag_len: usize,
@@ -920,9 +921,11 @@ fn accept_match(
     ] {
         if overhang > 0 {
             let partial = partial.expect("an overhanging end has a partial policy");
-            if matched < partial.min_match
-                || subs as f64 > partial.max_mismatch_freq * matched as f64
-            {
+            let subs_ok = match partial.max_mismatch_freq {
+                Some(freq) => subs as f64 <= freq * matched as f64,
+                None => subs <= group.dist.mismatch,
+            };
+            if matched < partial.min_match || !subs_ok {
                 return false;
             }
         }
@@ -1495,7 +1498,7 @@ mod tests {
         let mut g = group(&["ATCGATCG"]);
         g.partial5 = Some(Partial {
             min_match: 4,
-            max_mismatch_freq: 0.1,
+            max_mismatch_freq: Some(0.1),
         });
         // The read begins with CGATCG = the tag's last 6 bases (its first 2,
         // AT, are truncated).
@@ -1512,7 +1515,7 @@ mod tests {
         let mut g = group(&["ACGTACGT"]);
         g.partial3 = Some(Partial {
             min_match: 4,
-            max_mismatch_freq: 0.1,
+            max_mismatch_freq: Some(0.1),
         });
         // The read ends with ACGTA = the tag's first 5 bases (its last 3, CGT,
         // are truncated).
@@ -1530,7 +1533,7 @@ mod tests {
         let mut g = group(&["ATCGATCG"]);
         g.partial3 = Some(Partial {
             min_match: 4,
-            max_mismatch_freq: 0.1,
+            max_mismatch_freq: Some(0.1),
         });
         let result = outcome(&g, "CGATCGTTTT");
         assert!(
@@ -1546,7 +1549,7 @@ mod tests {
         let mut g = group(&["ACGTACGT"]);
         g.partial5 = Some(Partial {
             min_match: 4,
-            max_mismatch_freq: 0.1,
+            max_mismatch_freq: Some(0.1),
         });
         let result = outcome(&g, "TTTTTACGTA");
         assert!(
@@ -1563,7 +1566,7 @@ mod tests {
         let mut g = group(&["ATCGATCG"]);
         g.partial5 = Some(Partial {
             min_match: 4,
-            max_mismatch_freq: 0.1,
+            max_mismatch_freq: Some(0.1),
         });
         // The read starts with CTATCG: the tag's 5' two bases truncated, then
         // one mismatch (G->T) in the 6 matched bases.
@@ -1571,6 +1574,50 @@ mod tests {
         assert!(
             result.best.is_none(),
             "a truncation exceeding the mismatch frequency is rejected: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_partial5_min_only_reuses_dist_mismatch_budget() {
+        // partial5=4 with no `:freq` reuses the group's `dist` substitution
+        // count. The read is 6 bp, shorter than the 8 bp tag, so only a
+        // 5'-truncated placement fits: CTATCG aligns to the tag's last 6 bases
+        // CGATCG with one mismatch. With dist=1 that mismatch is within budget.
+        let mut g = group(&["ATCGATCG"]);
+        g.dist = Dist {
+            mismatch: 1,
+            indel: 0,
+            total: 1,
+        };
+        g.partial5 = Some(Partial {
+            min_match: 4,
+            max_mismatch_freq: None,
+        });
+        let result = outcome(&g, "CTATCG");
+        let best = result
+            .best
+            .expect("a 5'-truncated match within the dist budget");
+        assert_eq!(best.start, 0);
+        assert_eq!(
+            best.end, 6,
+            "matched all 6 nt, one sub within the dist budget"
+        );
+    }
+
+    #[test]
+    fn test_partial5_min_only_requires_exact_overlap_without_dist() {
+        // The same 6 bp read, but with no `:freq` and no `dist` (mismatch
+        // budget 0): a bare partial5 then demands an exact overlap, so the
+        // one-mismatch truncation is rejected.
+        let mut g = group(&["ATCGATCG"]);
+        g.partial5 = Some(Partial {
+            min_match: 4,
+            max_mismatch_freq: None,
+        });
+        let result = outcome(&g, "CTATCG");
+        assert!(
+            result.best.is_none(),
+            "a mismatched truncation is rejected when no dist budget is set: {result:?}"
         );
     }
 

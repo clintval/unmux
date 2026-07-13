@@ -81,15 +81,20 @@ pub struct Dist {
     pub total: usize,
 }
 
-/// A truncated-end matching policy, `min:freq` (`partial5`/`partial3`): allow a
-/// tag to be cut off at the record's 5'/3' end if at least `min_match` bases
-/// align with at most `max_mismatch_freq` mismatches per matched base.
+/// A truncated-end matching policy, `min[:freq]` (`partial5`/`partial3`): allow
+/// a tag to be cut off at the record's 5'/3' end if at least `min_match` bases
+/// align. With `freq`, at most `max_mismatch_freq` mismatches per matched base
+/// are tolerated; omitting it leaves `max_mismatch_freq` `None`, so the
+/// truncated region instead reuses the group's `dist` substitution budget (a
+/// bare `partial5=3` with no `dist` therefore requires an exact overlap).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Partial {
     /// Minimum matched bases required.
     pub min_match: usize,
-    /// Maximum mismatch frequency over the matched region.
-    pub max_mismatch_freq: f64,
+    /// Maximum mismatch frequency over the matched region. `None` when the
+    /// `:freq` is omitted, meaning the truncated region reuses the group's
+    /// `dist` substitution count instead.
+    pub max_mismatch_freq: Option<f64>,
 }
 
 /// How matches within `dist` are accepted.
@@ -175,11 +180,11 @@ pub struct GroupAttrs {
     pub min_finds_per_group: Option<usize>,
     /// `maxFindsPerGroup=`.
     pub max_finds_per_group: Option<usize>,
-    /// `both_strands=` (default `false`).
+    /// `bothStrands=` (default `false`).
     pub revcomp: Option<bool>,
-    /// `partial5=min:freq`.
+    /// `partial5=min[:freq]`.
     pub partial5: Option<Partial>,
-    /// `partial3=min:freq`.
+    /// `partial3=min[:freq]`.
     pub partial3: Option<Partial>,
     /// `match=stream[+stream]`: match the joined `--extract` streams instead of
     /// a record window.
@@ -816,7 +821,7 @@ fn apply_group_attrs(attrs: &mut GroupAttrs, body: &str, group: &str) -> Result<
                     set_once!(attrs.max_finds_per_group, 1);
                 }
             }
-            "both_strands" => set_once!(attrs.revcomp, parse_bool(value, "both_strands")?),
+            "bothStrands" => set_once!(attrs.revcomp, parse_bool(value, "bothStrands")?),
             "partial5" => set_once!(attrs.partial5, parse_partial(value, "partial5")?),
             "partial3" => set_once!(attrs.partial3, parse_partial(value, "partial3")?),
             "match" => set_once!(attrs.match_streams, parse_match_streams(value)?),
@@ -944,22 +949,31 @@ fn parse_next(value: &str) -> Result<NextLink> {
     })
 }
 
-/// Parse `partial5`/`partial3` as `min:freq`.
+/// Parse `partial5`/`partial3` as `min[:freq]`. Omitting `:freq` leaves the
+/// frequency unset, so the truncated region reuses the group's `dist`
+/// substitution budget rather than a per-base frequency.
 fn parse_partial(value: &str, attr: &str) -> Result<Partial> {
-    let (min, freq) = value
-        .split_once(':')
-        .with_context(|| format!("{attr} must be `min:freq`, got {value:?}"))?;
+    let (min, freq) = match value.split_once(':') {
+        Some((min, freq)) => (min, Some(freq)),
+        None => (value, None),
+    };
     let min_match = min
         .trim()
         .parse()
         .with_context(|| format!("invalid {attr} min `{min}`"))?;
-    let max_mismatch_freq: f64 = freq
-        .trim()
-        .parse()
-        .with_context(|| format!("invalid {attr} freq `{freq}`"))?;
-    if !(0.0..=1.0).contains(&max_mismatch_freq) {
-        bail!("{attr} freq must be in [0, 1], got {max_mismatch_freq}");
-    }
+    let max_mismatch_freq = match freq {
+        Some(freq) => {
+            let parsed: f64 = freq
+                .trim()
+                .parse()
+                .with_context(|| format!("invalid {attr} freq `{freq}`"))?;
+            if !(0.0..=1.0).contains(&parsed) {
+                bail!("{attr} freq must be in [0, 1], got {parsed}");
+            }
+            Some(parsed)
+        }
+        None => None,
+    };
     Ok(Partial {
         min_match,
         max_mismatch_freq,
@@ -1775,7 +1789,7 @@ fn validate_plan(plan: &DemuxPlan) -> Result<()> {
             }
             if attrs.revcomp == Some(true) {
                 bail!(
-                    "group `{}` anchor= supports the forward strand only (both_strands is not supported)",
+                    "group `{}` anchor= supports the forward strand only (bothStrands is not supported)",
                     group.name
                 );
             }
@@ -2654,7 +2668,16 @@ mod tests {
     fn test_parse_partial_min_freq() {
         let partial = parse_partial("3:0.1", "partial5").unwrap();
         assert_eq!(partial.min_match, 3);
-        assert!((partial.max_mismatch_freq - 0.1).abs() < 1e-9);
+        assert!((partial.max_mismatch_freq.unwrap() - 0.1).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_parse_partial_min_only_leaves_freq_unset() {
+        // Bare `partial5=3` (no `:freq`) parses: the min stays, and the freq is
+        // left unset so the truncated region reuses the group's `dist` budget.
+        let partial = parse_partial("3", "partial5").unwrap();
+        assert_eq!(partial.min_match, 3);
+        assert_eq!(partial.max_mismatch_freq, None);
     }
 
     #[test]
@@ -2693,8 +2716,8 @@ mod tests {
 
     #[test]
     fn test_parse_bool_rejects_numeric() {
-        assert!(parse_bool("1", "both_strands").is_err());
-        assert!(parse_bool("true", "both_strands").unwrap());
+        assert!(parse_bool("1", "bothStrands").is_err());
+        assert!(parse_bool("true", "bothStrands").unwrap());
     }
 
     #[test]
@@ -3132,7 +3155,7 @@ mod tests {
         let mut a = args();
         a.groups = vec![
             "g={ACGT}".to_string(),
-            "g::loc=0:0:4,both_strands=true".to_string(),
+            "g::loc=0:0:4,bothStrands=true".to_string(),
         ];
         let plan = parse_demux(&a).unwrap();
         let g = plan.groups.iter().find(|g| g.name == "g").unwrap();
@@ -3149,7 +3172,7 @@ mod tests {
         // Mirrors anchor5p's restrictions: needs a 3' anchor, forward strand
         // only.
         assert!(err_for("anchor=3p").contains("no 3' anchor"));
-        assert!(err_for("loc=0:0:4,anchor=3p,both_strands=true").contains("forward strand"));
+        assert!(err_for("loc=0:0:4,anchor=3p,bothStrands=true").contains("forward strand"));
         // anchor3p is substitution-only: an indel budget is rejected, a
         // mismatch-only budget is ok.
         assert!(err_for("loc=0:0:6,anchor=3p,dist=1:1").contains("substitution-only"));
@@ -3170,7 +3193,7 @@ mod tests {
         };
         assert!(err_for("anchor=5p").contains("no 5' anchor"));
         assert!(err_for("loc=0:0:4,anchor=5p,partial5=2:0.1").contains("partial"));
-        assert!(err_for("loc=0:0:4,anchor=5p,both_strands=true").contains("forward strand"));
+        assert!(err_for("loc=0:0:4,anchor=5p,bothStrands=true").contains("forward strand"));
         // An indel budget is now supported under anchor=5p (no longer
         // rejected).
         let mut ok = args();
