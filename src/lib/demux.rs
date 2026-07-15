@@ -575,7 +575,7 @@ fn build_routing(
     tag_sets: &HashMap<String, TagSet>,
     group_index: &HashMap<String, usize>,
     pool: &str,
-    _resolved: &HashMap<String, crate::ResolvedReadGroup>,
+    resolved: &HashMap<String, crate::ResolvedReadGroup>,
 ) -> Result<Routing> {
     let (samples, demux) = match &plan.samples {
         SampleSpec::None => (Vec::new(), false),
@@ -584,12 +584,15 @@ fn build_routing(
             let declared: HashSet<&str> = plan.groups.iter().map(|g| g.name.as_str()).collect();
             (load_sample_sheet(path, &declared)?, true)
         }
-        SampleSpec::FromGroup(group) => {
-            let tag_set = tag_sets
-                .get(group)
-                .with_context(|| format!("no loaded tag set for --sample-from-group `{group}`"))?;
-            (expand_from_group(group, tag_set), true)
-        }
+        SampleSpec::FromGroup(group) => match resolved.get(group) {
+            Some(r) => (r.samples.clone(), true),
+            None => {
+                let tag_set = tag_sets.get(group).with_context(|| {
+                    format!("no loaded tag set for --sample-from-group `{group}`")
+                })?;
+                (expand_from_group(group, tag_set), true)
+            }
+        },
     };
     compile_routing(
         &samples,
