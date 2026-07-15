@@ -246,7 +246,7 @@ pub fn compile_routing(
 
 /// Resolve a parsed sample's `(sample, sub_sample)` into a concrete [`Target`],
 /// expanding `%pool`.
-fn resolve_target(sample: &Sample, pool: &str) -> Target {
+pub(crate) fn resolve_target(sample: &Sample, pool: &str) -> Target {
     let sub_sample = match &sample.sub_sample {
         None => None,
         Some(SubSample::Literal(sub)) => Some(sub.clone()),

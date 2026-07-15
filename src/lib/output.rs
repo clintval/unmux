@@ -256,16 +256,46 @@ pub fn provenance_header(command_line: Option<&str>) -> sam::Header {
     provenance_header_builder(command_line).build()
 }
 
-/// Build a SAM header carrying the `@PG` provenance plus one `@RG` line per
-/// fan-out target (`ID` = the target label, `SM` = the sample, `LB` = the
-/// sub_sample) and the shared `--rg-tag` fields on every read group. The
-/// targets are those whose records land in this output file.
+/// A `Target -> constituent original @RG maps` table: for each fan-out target,
+/// the original input `@RG` lines (RG id plus its verbatim `Map<ReadGroup>`)
+/// whose records land in that target's output file. Built once per `@RG`-split
+/// run and consumed by [`read_group_header`].
+pub type ConstituentReadGroups = HashMap<Target, Vec<(Vec<u8>, Map<ReadGroup>)>>;
+
+/// Build a SAM header carrying the `@PG` provenance plus the `@RG` lines for the
+/// targets whose records land in this output file.
+///
+/// With `constituent` `Some` (an `@RG`-split run), each target contributes its
+/// *original* input `@RG` line(s) verbatim, deduped by id across targets that
+/// share the file, so the split is faithful to the source header (correct
+/// `SM`/`LB`/`PL`/`PU`/...); the synthesized per-target `@RG` path is skipped.
+/// The shared `--rg-tag` overlay is not applied here: the originals already
+/// carry their fields, so applying `--rg-tag` onto them is deferred.
+///
+/// With `constituent` `None` (normal barcode demux), one synthesized `@RG` is
+/// emitted per target (`ID` = the target label, `SM` = the sample, `LB` = the
+/// sub_sample) with the shared `--rg-tag` fields on every read group.
 pub fn read_group_header(
     targets: &[&Target],
     rg_tags: &[(String, String)],
     command_line: Option<&str>,
+    constituent: Option<&ConstituentReadGroups>,
 ) -> Result<sam::Header> {
     let mut builder = provenance_header_builder(command_line);
+    if let Some(constituent) = constituent {
+        // An @RG-split run: emit each target's original @RG line(s) verbatim,
+        // deduped by id across targets that share this file, and skip the synth
+        // per-target @RG path entirely.
+        let mut emitted: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+        for target in targets {
+            for (id, map) in constituent.get(target).into_iter().flatten() {
+                if emitted.insert(id.clone()) {
+                    builder = builder.add_read_group(id.clone(), map.clone());
+                }
+            }
+        }
+        return Ok(builder.build());
+    }
     for target in targets {
         let mut read_group =
             Map::<ReadGroup>::builder().insert(rg_tag::SAMPLE, target.sample.as_str());
@@ -723,6 +753,7 @@ mod tests {
             &refs,
             &[("PL".to_string(), "ILLUMINA".to_string())],
             Some("unmux --in 0=r.fq"),
+            None,
         )
         .unwrap();
         // The @PG provenance record is present alongside the @RG lines.
@@ -741,6 +772,53 @@ mod tests {
                 .get(&rg_tag::LIBRARY)
                 .map(|v| v.to_string()),
             Some("lib01".to_string())
+        );
+    }
+
+    #[test]
+    fn read_group_header_emits_only_constituent_lines() {
+        // An @RG-split run: sampleA's file carries the original @RG lines for
+        // rg1 and rg3 (the read groups mapping to it), and never sampleB's rg2.
+        let sample_a = Target {
+            sample: "sampleA".to_string(),
+            sub_sample: None,
+        };
+        let sample_b = Target {
+            sample: "sampleB".to_string(),
+            sub_sample: None,
+        };
+        let rg_map = |sm: &str| {
+            Map::<ReadGroup>::builder()
+                .insert(rg_tag::SAMPLE, sm)
+                .build()
+                .expect("a read group map has no required fields")
+        };
+        let mut constituent: HashMap<Target, Vec<(Vec<u8>, Map<ReadGroup>)>> = HashMap::new();
+        constituent.insert(
+            sample_a.clone(),
+            vec![
+                (b"rg1".to_vec(), rg_map("sampleA")),
+                (b"rg3".to_vec(), rg_map("sampleA")),
+            ],
+        );
+        constituent.insert(sample_b.clone(), vec![(b"rg2".to_vec(), rg_map("sampleB"))]);
+
+        let header = read_group_header(&[&sample_a], &[], None, Some(&constituent)).unwrap();
+        let read_groups = header.read_groups();
+        assert!(read_groups.contains_key(&b"rg1"[..]), "carries rg1");
+        assert!(read_groups.contains_key(&b"rg3"[..]), "carries rg3");
+        assert!(
+            !read_groups.contains_key(&b"rg2"[..]),
+            "never another sample's rg2"
+        );
+        // The original SM is preserved verbatim (not the synthesized target
+        // label).
+        let rg1 = &read_groups[&b"rg1"[..]];
+        assert_eq!(
+            rg1.other_fields()
+                .get(&rg_tag::SAMPLE)
+                .map(|v| v.to_string()),
+            Some("sampleA".to_string())
         );
     }
 

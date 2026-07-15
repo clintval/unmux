@@ -50,7 +50,7 @@ use crate::matcher::{
 use crate::metrics::Metrics;
 use crate::output::{
     build_tag_data, default_read_group_header, insert_string_tag, qual_tag_name, read_group_header,
-    resolve_metrics_path, resolve_pattern, MultiWriter, PathContext,
+    resolve_metrics_path, resolve_pattern, ConstituentReadGroups, MultiWriter, PathContext,
 };
 use crate::qc::{removed_slug, routed_slug, unassigned_slug, Unassigned};
 use crate::tags::{load_tag_file, TagSet};
@@ -605,6 +605,41 @@ fn build_routing(
     )
 }
 
+/// Build the static `Target -> constituent original @RG maps` table for an
+/// `@RG`-split run: for each RG id, the target its records route to paired with
+/// that read group's original `@RG` map (looked up by id). One target
+/// accumulates every original read group whose records land in its file, so the
+/// output header can list them verbatim (correct SM/LB/PL/PU/...) instead of a
+/// synthesized per-target `@RG`. Empty for any non-`@RG` run.
+fn build_constituent_rgs(
+    plan: &DemuxPlan,
+    resolved: &HashMap<String, crate::ResolvedReadGroup>,
+    rg_info: &crate::input::ReadGroupInfo,
+) -> ConstituentReadGroups {
+    let mut out: ConstituentReadGroups = HashMap::new();
+    let SampleSpec::FromGroup(group) = &plan.samples else {
+        return out;
+    };
+    let Some(r) = resolved.get(group) else {
+        return out;
+    };
+    let pool = pool_id(plan);
+    let by_id: HashMap<&[u8], &crate::input::InputReadGroup> = rg_info
+        .read_groups
+        .iter()
+        .map(|rg| (rg.id.as_slice(), rg))
+        .collect();
+    for (rg_id, &tag_idx) in &r.rg_to_idx {
+        let target = crate::fanout::resolve_target(&r.samples[tag_idx], &pool);
+        if let Some(rg) = by_id.get(rg_id.as_slice()) {
+            out.entry(target)
+                .or_default()
+                .push((rg_id.clone(), rg.map.clone()));
+        }
+    }
+    out
+}
+
 /// A SAM/BAM `--out` destination (a path, or `None` for stdout), the fan-out
 /// targets whose records land there, and its format.
 type OutDestination = (Option<PathBuf>, Vec<Target>, OutputFormat);
@@ -810,11 +845,15 @@ fn out_headers(
     pool: &str,
     input_formats: &[SniffedFormat],
     command_line: Option<&str>,
+    constituent: Option<&ConstituentReadGroups>,
 ) -> Result<HashMap<Option<PathBuf>, noodles::sam::Header>> {
     let mut headers = HashMap::new();
     for (dest, targets, _) in out_destinations(plan, routing, pool, input_formats)? {
         let refs: Vec<&Target> = targets.iter().collect();
-        headers.insert(dest, read_group_header(&refs, &plan.rg_tags, command_line)?);
+        headers.insert(
+            dest,
+            read_group_header(&refs, &plan.rg_tags, command_line, constituent)?,
+        );
     }
     Ok(headers)
 }
@@ -915,6 +954,11 @@ struct Engine<'a> {
     /// `@PG`-provenance header, matching `MultiWriter::open`'s fallback so
     /// worker-encoded bytes stay byte-identical.
     default_header: &'a Header,
+    /// Whether this is an `@RG`-split run (`--sample-from-group` over an `@RG`
+    /// source). When set, an assigned record keeps its original `RG:Z` (its
+    /// `@RG` line is carried verbatim by the header, see [`build_constituent_rgs`])
+    /// rather than being rewritten to a synthesized per-target read group.
+    is_read_group_split: bool,
 }
 
 /// Run the demux engine: match tag groups per record, route each record with
@@ -932,7 +976,27 @@ fn run_engine(plan: &DemuxPlan, command_line: Option<&str>) -> Result<()> {
     let pool = pool_id(plan);
     let routing = build_routing(plan, &tag_sets, &group_index, &pool, &resolved)?;
 
-    let headers = out_headers(plan, &routing, &pool, &input_formats, command_line)?;
+    // An `@RG`-split run (`--sample-from-group` over an `@RG` source) is faithful
+    // to the input header: each output file lists its constituent original `@RG`
+    // lines and each assigned record keeps its original `RG:Z`. The
+    // `Target -> constituent @RG maps` table is statically known before reading
+    // any record, so it is built once here.
+    let is_read_group_split =
+        matches!(&plan.samples, SampleSpec::FromGroup(g) if resolved.contains_key(g));
+    let constituent = if is_read_group_split {
+        Some(build_constituent_rgs(plan, &resolved, &rg_info))
+    } else {
+        None
+    };
+
+    let headers = out_headers(
+        plan,
+        &routing,
+        &pool,
+        &input_formats,
+        command_line,
+        constituent.as_ref(),
+    )?;
     // The fallback header for any destination absent from `headers`
     // (pass-through `--out`, the raw `--unassigned`/`--remove` bins): `@PG`
     // provenance plus a default `@RG` whose ID/SM/LB are the pool id, so every
@@ -1057,6 +1121,7 @@ fn run_engine(plan: &DemuxPlan, command_line: Option<&str>) -> Result<()> {
         routed_streams: &routed_streams,
         headers: &headers,
         default_header: &default_header,
+        is_read_group_split,
     };
     let mut metrics = Metrics::new(pool.clone(), routing.targets());
 
@@ -2084,8 +2149,15 @@ fn prepare_body(
     let tag_data = build_tag_data(&plan.tags, &streams);
     // An assigned read carries its sample's read group; a pass-through read (no
     // target) carries the default pool read group, so a SAM/BAM/CRAM `--out`
-    // matches the default `@RG` in its header.
-    let read_group = target.map(Target::label).or_else(|| Some(pool.to_string()));
+    // matches the default `@RG` in its header. On an `@RG`-split run the record
+    // keeps its carried original `RG:Z` instead (already in `read.tags` via
+    // `merge_data`); `None` leaves it untouched, since `writer::build_record`
+    // only inserts `RG:Z` when a read group is set.
+    let read_group = if engine.is_read_group_split {
+        None
+    } else {
+        target.map(Target::label).or_else(|| Some(pool.to_string()))
+    };
     let sample = target.map(|t| t.sample.as_str());
     let sub_sample = target.and_then(|t| t.sub_sample.as_deref());
 
