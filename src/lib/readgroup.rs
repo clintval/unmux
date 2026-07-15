@@ -46,7 +46,7 @@ fn label(tier1: &str, tier2: Option<&str>) -> String {
 /// its entry index.
 pub fn resolve(group: &str, info: &ReadGroupInfo, key: ReadGroupKey) -> Result<ResolvedReadGroup> {
     if info.read_groups.is_empty() {
-        bail!("group `{group}` uses `@RG` but the input header declares no @RG lines (SAM/BAM/CRAM only)");
+        bail!("group `{group}` uses `@RG` but the input header declares no @RG lines (the `@RG` source needs a SAM/BAM/CRAM header)");
     }
     let mut tag_set = TagSet::default();
     let mut samples = Vec::new();
@@ -59,7 +59,10 @@ pub fn resolve(group: &str, info: &ReadGroupInfo, key: ReadGroupKey) -> Result<R
             .entry((tier1.clone(), tier2.clone()))
             .or_insert_with(|| {
                 let idx = tag_set.entries.len();
-                let token = label(&tier1, tier2.as_deref());
+                // Fold `idx` into the token so it stays unique even when two
+                // distinct (SM, LB) pairs format to the same `label()` string
+                // (e.g. `("sA", "l1.2")` and `("sA.l1", "2")` both read `sA.l1.2`).
+                let token = format!("{}#{idx}", label(&tier1, tier2.as_deref()));
                 tag_set.entries.push(TagEntry {
                     id: token.clone(),
                     seq: token.clone(),
@@ -119,7 +122,7 @@ mod tests {
                 .iter()
                 .map(|e| e.id.clone())
                 .collect::<Vec<_>>(),
-            vec!["rg1", "rg2"]
+            vec!["rg1#0", "rg2#1"]
         );
         assert_eq!(
             r.samples
@@ -184,5 +187,27 @@ mod tests {
     #[test]
     fn resolve_empty_header_errors() {
         assert!(resolve("rg", &info(&[]), ReadGroupKey::Id).is_err());
+    }
+
+    #[test]
+    fn resolve_two_tier_tokens_unique_even_with_dotted_values() {
+        let r = resolve(
+            "b",
+            &info(&[
+                ("rg1", Some("sA"), Some("l1.2")),
+                ("rg2", Some("sA.l1"), Some("2")),
+            ]),
+            ReadGroupKey::SmLb,
+        )
+        .unwrap();
+        assert_eq!(r.tag_set.entries.len(), 2);
+        assert_ne!(r.tag_set.entries[0].id, r.tag_set.entries[1].id);
+        assert_ne!(
+            r.rg_to_idx[b"rg1".as_slice()],
+            r.rg_to_idx[b"rg2".as_slice()]
+        );
+        // each Sample still carries the real SM as its sample name
+        assert_eq!(r.samples[0].sample, "sA");
+        assert_eq!(r.samples[1].sample, "sA.l1");
     }
 }
