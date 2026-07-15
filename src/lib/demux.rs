@@ -244,20 +244,41 @@ fn log_run_shape(plan: &DemuxPlan, input_formats: &[SniffedFormat], dests: &[Pat
 /// Load every `--group`'s tag set once, keyed by group name. The matcher (via
 /// [`compile_groups`]) and the router (via [`build_routing`]) share these, so a
 /// file is read and an inline set built only once.
-fn load_tag_sets(plan: &DemuxPlan) -> Result<HashMap<String, TagSet>> {
+fn load_tag_sets(
+    plan: &DemuxPlan,
+    resolved: &HashMap<String, crate::ResolvedReadGroup>,
+) -> Result<HashMap<String, TagSet>> {
     let mut tag_sets = HashMap::with_capacity(plan.groups.len());
     for group in &plan.groups {
         let tag_set = match &group.source {
             GroupSource::File(path) => load_tag_file(path)
                 .with_context(|| format!("failed to load tag set for group `{}`", group.name))?,
             GroupSource::Inline(tags) => TagSet::from_inline(tags),
-            GroupSource::ReadGroup(_) => {
-                bail!("`@RG` group source is not wired up yet")
-            }
+            GroupSource::ReadGroup(_) => resolved[&group.name].tag_set.clone(),
         };
         tag_sets.insert(group.name.clone(), tag_set);
     }
     Ok(tag_sets)
+}
+
+/// Resolve every `@RG` group in the plan against the input header's read
+/// groups, once, keyed by group name. Built right after the reader opens (so
+/// the header is available) and shared by [`load_tag_sets`], `compile_groups`
+/// (Task 5), and `build_routing` (Task 7).
+fn resolve_read_group_groups(
+    plan: &DemuxPlan,
+    rg_info: &crate::input::ReadGroupInfo,
+) -> Result<HashMap<String, crate::ResolvedReadGroup>> {
+    let mut resolved = HashMap::new();
+    for group in &plan.groups {
+        if let GroupSource::ReadGroup(key) = group.source {
+            resolved.insert(
+                group.name.clone(),
+                crate::resolve_read_group(&group.name, rg_info, key)?,
+            );
+        }
+    }
+    Ok(resolved)
 }
 
 /// A group's sequential prerequisite by upstream NAME, the form built before
@@ -306,6 +327,7 @@ fn anchor5p_window_overrun_warning(group: &CompiledGroup) -> Option<String> {
 fn compile_groups(
     plan: &DemuxPlan,
     tag_sets: &HashMap<String, TagSet>,
+    _resolved: &HashMap<String, crate::ResolvedReadGroup>,
 ) -> Result<(Vec<CompiledGroup>, HashMap<String, usize>)> {
     let mut compiled = Vec::with_capacity(plan.groups.len());
     let mut name_prereqs = Vec::with_capacity(plan.groups.len());
@@ -538,6 +560,7 @@ fn build_routing(
     tag_sets: &HashMap<String, TagSet>,
     group_index: &HashMap<String, usize>,
     pool: &str,
+    _resolved: &HashMap<String, crate::ResolvedReadGroup>,
 ) -> Result<Routing> {
     let (samples, demux) = match &plan.samples {
         SampleSpec::None => (Vec::new(), false),
@@ -881,13 +904,16 @@ struct Engine<'a> {
 /// fields and an `@RG` read group) or to the `--remove` / `--unassigned` bins,
 /// tally metrics, and emit the metrics TSVs / stderr log.
 fn run_engine(plan: &DemuxPlan, command_line: Option<&str>) -> Result<()> {
-    let tag_sets = load_tag_sets(plan)?;
-    let (groups, group_index) = compile_groups(plan, &tag_sets)?;
-    let pool = pool_id(plan);
-    let routing = build_routing(plan, &tag_sets, &group_index, &pool)?;
-
     let reader = FragmentReader::open(&plan.inputs, plan.per_record)?;
     let input_formats = reader.formats().to_vec();
+    let rg_info = reader.input_read_groups()?;
+    let resolved = resolve_read_group_groups(plan, &rg_info)?;
+
+    let tag_sets = load_tag_sets(plan, &resolved)?;
+    let (groups, group_index) = compile_groups(plan, &tag_sets, &resolved)?;
+    let pool = pool_id(plan);
+    let routing = build_routing(plan, &tag_sets, &group_index, &pool, &resolved)?;
+
     let headers = out_headers(plan, &routing, &pool, &input_formats, command_line)?;
     // The fallback header for any destination absent from `headers`
     // (pass-through `--out`, the raw `--unassigned`/`--remove` bins): `@PG`
