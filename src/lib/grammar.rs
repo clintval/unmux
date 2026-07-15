@@ -727,7 +727,10 @@ fn parse_groups(specs: &[String]) -> Result<Vec<Group>> {
                 )
             })?;
             if matches!(source, GroupSource::ReadGroup(_)) && b.attrs != GroupAttrs::default() {
-                bail!("group `{}` uses the `@RG` source, which takes no attributes", b.name);
+                bail!(
+                    "group `{}` uses the `@RG` source, which takes no attributes",
+                    b.name
+                );
             }
             Ok(Group {
                 name: b.name,
@@ -3449,16 +3452,31 @@ mod tests {
 
     #[test]
     fn parse_group_source_read_group_forms() {
-        assert_eq!(parse_group_source("@RG", "rg").unwrap(), GroupSource::ReadGroup(ReadGroupKey::Id));
-        assert_eq!(parse_group_source("@RG::SM", "rg").unwrap(), GroupSource::ReadGroup(ReadGroupKey::Sm));
-        assert_eq!(parse_group_source("@RG::LB", "rg").unwrap(), GroupSource::ReadGroup(ReadGroupKey::Lb));
-        assert_eq!(parse_group_source("@RG::SM::LB", "rg").unwrap(), GroupSource::ReadGroup(ReadGroupKey::SmLb));
+        assert_eq!(
+            parse_group_source("@RG", "rg").unwrap(),
+            GroupSource::ReadGroup(ReadGroupKey::Id)
+        );
+        assert_eq!(
+            parse_group_source("@RG::SM", "rg").unwrap(),
+            GroupSource::ReadGroup(ReadGroupKey::Sm)
+        );
+        assert_eq!(
+            parse_group_source("@RG::LB", "rg").unwrap(),
+            GroupSource::ReadGroup(ReadGroupKey::Lb)
+        );
+        assert_eq!(
+            parse_group_source("@RG::SM::LB", "rg").unwrap(),
+            GroupSource::ReadGroup(ReadGroupKey::SmLb)
+        );
     }
 
     #[test]
     fn parse_group_source_read_group_rejects_bad_suffix() {
         for bad in ["@RG::LB::SM", "@RG::PU", "@RGX", "@RG::"] {
-            assert!(parse_group_source(bad, "rg").is_err(), "{bad} should be rejected");
+            assert!(
+                parse_group_source(bad, "rg").is_err(),
+                "{bad} should be rejected"
+            );
         }
     }
 
@@ -3466,5 +3484,13 @@ mod tests {
     fn read_group_source_rejects_attributes() {
         let err = parse_groups(&["rg=@RG".into(), "rg::dist=1".into()]).unwrap_err();
         assert!(err.to_string().contains("takes no attributes"), "{err}");
+    }
+
+    #[test]
+    fn parse_group_source_lowercase_at_rg_is_a_file() {
+        assert_eq!(
+            parse_group_source("@rg", "rg").unwrap(),
+            GroupSource::File(PathBuf::from("@rg"))
+        );
     }
 }
