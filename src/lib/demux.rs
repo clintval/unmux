@@ -989,6 +989,38 @@ fn run_engine(plan: &DemuxPlan, command_line: Option<&str>) -> Result<()> {
         None
     };
 
+    if is_read_group_split && rg_info.has_sq {
+        log::warn!(
+            "input is aligned (@SQ present); this @RG split writes UNMAPPED records: alignments, \
+             CIGAR/MAPQ, and mate/alignment tags are dropped and reverse-strand reads are restored \
+             to sequenced orientation. Carrying mapped data through a split is planned for a future \
+             release; for an alignment-preserving split now, use `samtools split`."
+        );
+    }
+
+    if is_read_group_split {
+        if let Some(pattern) = &plan.out {
+            if pattern.uses(Placeholder::Sample) || pattern.uses(Placeholder::SubSample) {
+                let mut by_path: HashMap<PathBuf, Vec<String>> = HashMap::new();
+                for target in routing.targets() {
+                    for path in out_paths(pattern, &pool, Some(target), 1, &input_formats)? {
+                        by_path.entry(path).or_default().push(target.label());
+                    }
+                }
+                for (path, labels) in &by_path {
+                    if labels.len() > 1 {
+                        log::warn!(
+                            "targets {} merge into one file `{}`; add a placeholder such as \
+                             %sub_sample to separate them",
+                            labels.join(", "),
+                            path.display()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     let headers = out_headers(
         plan,
         &routing,
