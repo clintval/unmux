@@ -285,14 +285,22 @@ pub fn read_group_header(
     if let Some(constituent) = constituent {
         // An @RG-split run: emit each target's original @RG line(s) verbatim,
         // deduped by id across targets that share this file, and skip the synth
-        // per-target @RG path entirely.
-        let mut emitted: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+        // per-target @RG path entirely. The bucket built by
+        // `build_constituent_rgs` iterates a HashMap, so its order is not
+        // deterministic; sort by id here so the emitted line order is stable
+        // run-to-run regardless of upstream iteration order.
+        let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+        let mut deduped: Vec<(Vec<u8>, Map<ReadGroup>)> = Vec::new();
         for target in targets {
             for (id, map) in constituent.get(target).into_iter().flatten() {
-                if emitted.insert(id.clone()) {
-                    builder = builder.add_read_group(id.clone(), map.clone());
+                if seen.insert(id.clone()) {
+                    deduped.push((id.clone(), map.clone()));
                 }
             }
+        }
+        deduped.sort_by(|(a, _), (b, _)| a.cmp(b));
+        for (id, map) in deduped {
+            builder = builder.add_read_group(id, map);
         }
         return Ok(builder.build());
     }
@@ -819,6 +827,45 @@ mod tests {
                 .get(&rg_tag::SAMPLE)
                 .map(|v| v.to_string()),
             Some("sampleA".to_string())
+        );
+    }
+
+    #[test]
+    fn read_group_header_emits_constituent_lines_in_deterministic_id_order() {
+        // The constituent bucket for sampleA is built in reverse id order
+        // (rg3 before rg1). Regardless of that bucket order, the emitted
+        // @RG lines must come out sorted by id, so the header is
+        // deterministic run-to-run even though `build_constituent_rgs`
+        // iterates a HashMap upstream.
+        let sample_a = Target {
+            sample: "sampleA".to_string(),
+            sub_sample: None,
+        };
+        let rg_map = |sm: &str| {
+            Map::<ReadGroup>::builder()
+                .insert(rg_tag::SAMPLE, sm)
+                .build()
+                .expect("a read group map has no required fields")
+        };
+        let mut constituent: HashMap<Target, Vec<(Vec<u8>, Map<ReadGroup>)>> = HashMap::new();
+        constituent.insert(
+            sample_a.clone(),
+            vec![
+                (b"rg3".to_vec(), rg_map("sampleA")),
+                (b"rg1".to_vec(), rg_map("sampleA")),
+            ],
+        );
+
+        let header = read_group_header(&[&sample_a], &[], None, Some(&constituent)).unwrap();
+        let mut writer = sam::io::Writer::new(Vec::new());
+        writer.write_header(&header).unwrap();
+        let text = String::from_utf8(writer.into_inner()).unwrap();
+
+        let rg1_pos = text.find("ID:rg1").expect("rg1 present in header text");
+        let rg3_pos = text.find("ID:rg3").expect("rg3 present in header text");
+        assert!(
+            rg1_pos < rg3_pos,
+            "expected ID:rg1 before ID:rg3 in header text, got:\n{text}"
         );
     }
 
