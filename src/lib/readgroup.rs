@@ -46,7 +46,7 @@ fn label(tier1: &str, tier2: Option<&str>) -> String {
 /// its entry index.
 pub fn resolve(group: &str, info: &ReadGroupInfo, key: ReadGroupKey) -> Result<ResolvedReadGroup> {
     if info.read_groups.is_empty() {
-        bail!("group `{group}` uses `@RG` but the input header declares no @RG lines (the `@RG` source needs a SAM/BAM/CRAM header)");
+        bail!("group `{group}` uses `@RG` but no `@RG` read groups were found in the input header; the `@RG` source needs a SAM/BAM/CRAM input that declares read groups (FASTX inputs have none)");
     }
     let mut tag_set = TagSet::default();
     let mut samples = Vec::new();
@@ -186,7 +186,8 @@ mod tests {
 
     #[test]
     fn resolve_empty_header_errors() {
-        assert!(resolve("rg", &info(&[]), ReadGroupKey::Id).is_err());
+        let err = resolve("rg", &info(&[]), ReadGroupKey::Id).err().unwrap();
+        assert!(err.to_string().contains("@RG"));
     }
 
     #[test]
