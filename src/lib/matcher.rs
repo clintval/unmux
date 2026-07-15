@@ -173,6 +173,9 @@ pub struct CompiledGroup {
     /// [`CompiledGroup::encode`] alongside `encoded` so the matcher reads it
     /// per search instead of rebuilding the set for every record.
     pub batched_tags: AHashSet<usize>,
+    /// For an `@RG` group: RG id -> tag index, used to route a record by its
+    /// `RG:Z` instead of a sequence search. `None` for a normal group.
+    pub read_group: Option<std::collections::HashMap<Vec<u8>, usize>>,
 }
 
 /// Which find-count constraint a group outcome violated, with the observed
@@ -239,6 +242,7 @@ impl CompiledGroup {
             anchor: None,
             encoded: Vec::new(),
             batched_tags: AHashSet::new(),
+            read_group: None,
         }
     }
 

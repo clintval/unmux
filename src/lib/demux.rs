@@ -327,21 +327,29 @@ fn anchor5p_window_overrun_warning(group: &CompiledGroup) -> Option<String> {
 fn compile_groups(
     plan: &DemuxPlan,
     tag_sets: &HashMap<String, TagSet>,
-    _resolved: &HashMap<String, crate::ResolvedReadGroup>,
+    resolved: &HashMap<String, crate::ResolvedReadGroup>,
 ) -> Result<(Vec<CompiledGroup>, HashMap<String, usize>)> {
     let mut compiled = Vec::with_capacity(plan.groups.len());
     let mut name_prereqs = Vec::with_capacity(plan.groups.len());
     for group in &plan.groups {
+        let is_read_group = matches!(group.source, GroupSource::ReadGroup(_));
         let attrs = &group.attrs;
         let dist = attrs.dist.unwrap_or_default();
         let mode = attrs.mode.unwrap_or(MatchMode::All);
         // Guard the IUPAC tag set up front: reject a combinatorial explosion or
         // an indistinguishable tag pair, and warn on a within-`dist` overlap
-        // that `mode=nearest` would only disambiguate.
-        for warning in
-            crate::iupac::validate_group(&group.name, &tag_sets[&group.name].seqs(), &dist, mode)?
-        {
-            log::warn!("{warning}");
+        // that `mode=nearest` would only disambiguate. An `@RG` group's "tags"
+        // are synthetic routing tokens (not DNA), so this sequence machinery
+        // does not apply to it.
+        if !is_read_group {
+            for warning in crate::iupac::validate_group(
+                &group.name,
+                &tag_sets[&group.name].seqs(),
+                &dist,
+                mode,
+            )? {
+                log::warn!("{warning}");
+            }
         }
         let mut compiled_group = CompiledGroup {
             name: group.name.clone(),
@@ -363,12 +371,17 @@ fn compile_groups(
             anchor: attrs.anchor,
             encoded: Vec::new(),
             batched_tags: Default::default(),
+            read_group: resolved.get(&group.name).map(|r| r.rg_to_idx.clone()),
         };
         // Precompute the sassy v2 batched search batches (and their covered tag
-        // set) for large equal-length tag buckets.
-        compiled_group.encode();
-        if let Some(warning) = anchor5p_window_overrun_warning(&compiled_group) {
-            log::warn!("{warning}");
+        // set) for large equal-length tag buckets. Skipped for an `@RG` group:
+        // its tags are routing tokens, not DNA, so a sassy search over them is
+        // meaningless.
+        if !is_read_group {
+            compiled_group.encode();
+            if let Some(warning) = anchor5p_window_overrun_warning(&compiled_group) {
+                log::warn!("{warning}");
+            }
         }
         compiled.push(compiled_group);
         name_prereqs.push(prereq_for(group, &plan.groups, &plan.extracts));
@@ -3314,6 +3327,61 @@ mod tests {
             anchor5p_window_overrun_warning(&g).is_none(),
             "window is unaffected"
         );
+    }
+
+    #[test]
+    fn compile_groups_marks_read_group() {
+        // An @RG group's compiled tags are synthetic routing tokens (e.g.
+        // `rg1#0`), not DNA, so compile_groups must skip the IUPAC
+        // validation/sassy encode() sequence machinery for it and instead
+        // carry the RG-id -> tag-idx map on `read_group`. A normal group's
+        // `read_group` stays `None`.
+        let mut args = base_args();
+        args.inputs = vec!["0=/dev/null".to_string()];
+        args.groups = vec!["norm={s1=AAAA}".to_string(), "rg=@RG".to_string()];
+        let plan = crate::grammar::parse_demux(&args).unwrap();
+
+        let mut rg_to_idx = HashMap::new();
+        rg_to_idx.insert(b"rg1".to_vec(), 0usize);
+        let resolved: HashMap<String, crate::ResolvedReadGroup> = HashMap::from([(
+            "rg".to_string(),
+            crate::ResolvedReadGroup {
+                tag_set: crate::tags::TagSet {
+                    entries: vec![crate::tags::TagEntry {
+                        id: "rg1#0".to_string(),
+                        seq: "rg1#0".to_string(),
+                        sub_sample: None,
+                    }],
+                },
+                samples: Vec::new(),
+                rg_to_idx,
+            },
+        )]);
+
+        let tag_sets = load_tag_sets(&plan, &resolved).unwrap();
+        let (compiled, _index) = compile_groups(&plan, &tag_sets, &resolved).unwrap();
+
+        let norm = compiled.iter().find(|g| g.name == "norm").unwrap();
+        assert!(
+            norm.read_group.is_none(),
+            "a normal group's read_group is None"
+        );
+
+        let rg = compiled.iter().find(|g| g.name == "rg").unwrap();
+        let read_group = rg
+            .read_group
+            .as_ref()
+            .expect("an @RG group's read_group is Some");
+        assert_eq!(read_group[b"rg1".as_slice()], 0);
+        // The sequence machinery is skipped: no batched-search encoding, and
+        // the rest of the record-window attributes stay at their bare
+        // defaults (the grammar rejects any attrs on an `@RG` group).
+        assert!(
+            rg.encoded.is_empty(),
+            "an @RG group skips sassy encode() (its tags are routing tokens, not DNA)"
+        );
+        assert_eq!(rg.dist, crate::grammar::Dist::default());
+        assert!(rg.loc.is_none());
     }
 
     #[test]
