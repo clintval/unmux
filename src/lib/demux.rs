@@ -251,6 +251,9 @@ fn load_tag_sets(plan: &DemuxPlan) -> Result<HashMap<String, TagSet>> {
             GroupSource::File(path) => load_tag_file(path)
                 .with_context(|| format!("failed to load tag set for group `{}`", group.name))?,
             GroupSource::Inline(tags) => TagSet::from_inline(tags),
+            GroupSource::ReadGroup(_) => {
+                bail!("`@RG` group source is not wired up yet")
+            }
         };
         tag_sets.insert(group.name.clone(), tag_set);
     }
