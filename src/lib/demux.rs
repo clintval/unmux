@@ -22,6 +22,8 @@ use std::fs::File;
 use std::io::BufWriter;
 
 use anyhow::{anyhow, bail, Context, Result};
+use noodles::sam::alignment::record::data::field::Tag;
+use noodles::sam::alignment::record_buf::data::field::Value;
 use noodles::sam::alignment::record_buf::Data;
 use noodles::sam::Header;
 use pooled_writer::{bgzf::BgzfCompressor, Pool, PoolBuilder, PooledWriter};
@@ -1244,6 +1246,18 @@ fn match_fragment(
     // relative `next` link windows the downstream search; a bare `next`/`prev`
     // link skips the downstream group when the upstream did not match).
     for (idx, group) in engine.groups.iter().enumerate() {
+        if let Some(rg_to_idx) = &group.read_group {
+            if let Some(tag_idx) = match_read_group(rg_to_idx, fragment) {
+                hits[idx] = Some(GroupHit {
+                    tag_idx,
+                    span: None,
+                    subs: 0,
+                    indels: 0,
+                    revcomp: false,
+                });
+            }
+            continue;
+        }
         let outcome = match &group.match_streams {
             // A `match=` group matches the joined `--extract` streams, not a
             // read window.
@@ -1761,6 +1775,20 @@ fn union_len(intervals: &[(usize, usize)]) -> usize {
         }
     }
     covered
+}
+
+/// Route a fragment by its carried `RG:Z` for an `@RG` group: the tag index of
+/// the read group the record belongs to, or `None` (no RG tag, or an id absent
+/// from the header).
+fn match_read_group(rg_to_idx: &HashMap<Vec<u8>, usize>, fragment: &Fragment) -> Option<usize> {
+    for record in &fragment.records {
+        if let Some(data) = &record.tags {
+            if let Some(Value::String(rg)) = data.get(&Tag::READ_GROUP) {
+                return rg_to_idx.get(AsRef::<[u8]>::as_ref(rg)).copied();
+            }
+        }
+    }
+    None
 }
 
 /// Match a `match=` group against the concatenation of its named `--extract`
@@ -4663,6 +4691,60 @@ mod tests {
         assert!(
             read_back(&unassigned).is_empty(),
             "un.bam holds zero records"
+        );
+    }
+
+    #[test]
+    fn match_read_group_routes_by_rg_tag() {
+        use noodles::sam::alignment::record::data::field::Tag;
+        use noodles::sam::alignment::record_buf::data::field::Value;
+
+        let rg_to_idx: HashMap<Vec<u8>, usize> = [(b"rg1".to_vec(), 0), (b"rg2".to_vec(), 1)]
+            .into_iter()
+            .collect();
+
+        let with_rg = |rg: &[u8]| InputRecord {
+            name: b"r".to_vec(),
+            bases: b"ACGT".to_vec(),
+            quals: None,
+            tags: Some(
+                [(Tag::READ_GROUP, Value::String(rg.to_vec().into()))]
+                    .into_iter()
+                    .collect(),
+            ),
+        };
+
+        let fragment = Fragment {
+            records: vec![with_rg(b"rg2")],
+        };
+        assert_eq!(
+            match_read_group(&rg_to_idx, &fragment),
+            Some(1),
+            "routes to the tag index of the record's RG:Z"
+        );
+
+        let no_rg = InputRecord {
+            name: b"r".to_vec(),
+            bases: b"ACGT".to_vec(),
+            quals: None,
+            tags: None,
+        };
+        let fragment = Fragment {
+            records: vec![no_rg],
+        };
+        assert_eq!(
+            match_read_group(&rg_to_idx, &fragment),
+            None,
+            "no RG tag at all means no route"
+        );
+
+        let fragment = Fragment {
+            records: vec![with_rg(b"rg3")],
+        };
+        assert_eq!(
+            match_read_group(&rg_to_idx, &fragment),
+            None,
+            "an RG id absent from the map means no route"
         );
     }
 }
