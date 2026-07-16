@@ -136,3 +136,18 @@ Feature: Split an existing multi-read-group input by its @RG header
     When I run `unmux --in 0=a.sam --in 1=b.sam --out out.bam`
     Then the exit code is 0
     And a file "out.bam" exists
+
+  Scenario: a split record keeps its original RG:Z
+    Given a file "in.sam" containing:
+      """
+      @HD	VN:1.6
+      @RG	ID:rg1	SM:sampleA
+      @RG	ID:rg2	SM:sampleB
+      r1	4	*	0	0	*	*	0	0	AAAAAAAA	IIIIIIII	RG:Z:rg1
+      r2	4	*	0	0	*	*	0	0	CCCCCCCC	IIIIIIII	RG:Z:rg2
+      """
+    When I run `unmux in.sam --group rg=@RG --sample-from-group rg --out out/%sample.sam`
+    Then the exit code is 0
+    And the file "out/rg1.sam" contains "RG:Z:rg1"
+    And the file "out/rg2.sam" contains "RG:Z:rg2"
+    And the file "out/rg1.sam" does not contain "RG:Z:rg2"
