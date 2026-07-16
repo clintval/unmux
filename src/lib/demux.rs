@@ -743,19 +743,37 @@ fn enumerate_dests(
     }
     // The `--unassigned` and `--remove` bins (raw segments; `%source` fans out
     // over the input files).
+    for path in enumerate_bins(plan, pool) {
+        add(Some(path), &mut seen, &mut paths);
+    }
+    Ok(paths)
+}
+
+/// Every `--unassigned` / `--remove` bin file path (raw segments; `%source` fans
+/// out over the input files), deduped. Split out of [`enumerate_dests`] so a
+/// `@tag::XX` run, whose `--out` targets are discovered per record rather than
+/// enumerated up front, can pre-create just the bins.
+fn enumerate_bins(plan: &DemuxPlan, pool: &str) -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = Vec::new();
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+    let mut add = |path: PathBuf| {
+        if seen.insert(path.clone()) {
+            paths.push(path);
+        }
+    };
     if let Some(pattern) = &plan.unassigned {
         for path in bin_paths(pattern, pool, plan.inputs.len()) {
-            add(Some(path), &mut seen, &mut paths);
+            add(path);
         }
     }
     for rule in &plan.remove {
         if let Some(pattern) = &rule.pattern {
             for path in bin_paths(pattern, pool, plan.inputs.len()) {
-                add(Some(path), &mut seen, &mut paths);
+                add(path);
             }
         }
     }
-    Ok(paths)
+    paths
 }
 
 /// The `--out` file path(s) for one target (or `None` for a pure pass-through),
@@ -990,7 +1008,16 @@ fn run_engine(plan: &DemuxPlan, command_line: Option<&str>) -> Result<()> {
         .groups
         .iter()
         .any(|g| matches!(g.source, GroupSource::ReadGroup(_)));
-    let rg_info = if has_read_group_source {
+    let aux_tag_source = plan.groups.iter().find_map(|g| match g.source {
+        GroupSource::AuxTag(tag) => Some((g.name.as_str(), tag)),
+        _ => None,
+    });
+    let is_aux_tag_split = matches!(
+        (&plan.samples, aux_tag_source),
+        (SampleSpec::FromGroup(g), Some((name, _))) if g == name
+    );
+    let needs_input_header = has_read_group_source || is_aux_tag_split;
+    let rg_info = if needs_input_header {
         reader.input_read_groups()?
     } else {
         crate::input::ReadGroupInfo::default()
@@ -1001,6 +1028,37 @@ fn run_engine(plan: &DemuxPlan, command_line: Option<&str>) -> Result<()> {
     let (groups, group_index) = compile_groups(plan, &tag_sets, &resolved)?;
     let pool = pool_id(plan);
     let routing = build_routing(plan, &tag_sets, &group_index, &pool, &resolved)?;
+
+    // A `@tag::XX` split routes each record by its own aux value (discovered per
+    // record), so the mode is decided from the input's sort order: if the input
+    // is grouped by the tag (`samtools sort -t XX`) a single output file is open
+    // at a time (streaming); otherwise every value's file is open at once, so
+    // the soft open-file limit is raised toward the hard cap first.
+    let aux_tag = if is_aux_tag_split {
+        aux_tag_source.map(|(_, tag)| tag)
+    } else {
+        None
+    };
+    let aux_streaming = match aux_tag {
+        Some(tag) => crate::input::grouped_by_tag(reader.subsort_order().as_deref(), tag),
+        None => false,
+    };
+    if let Some(tag) = aux_tag {
+        if aux_streaming {
+            log::info!(
+                "input is grouped by aux tag {}; splitting one file at a time",
+                String::from_utf8_lossy(&tag)
+            );
+        } else {
+            let soft = crate::auxtag::raise_open_file_limit();
+            log::info!(
+                "input is not grouped by aux tag {}; splitting with all files open (soft open-file limit {}). Sort by the tag (`samtools sort -t {}`) to stream one file at a time.",
+                String::from_utf8_lossy(&tag),
+                soft,
+                String::from_utf8_lossy(&tag)
+            );
+        }
+    }
 
     // An `@RG`-split run (`--sample-from-group` over an `@RG` source) is faithful
     // to the input header: each output file lists its constituent original `@RG`
@@ -1015,7 +1073,7 @@ fn run_engine(plan: &DemuxPlan, command_line: Option<&str>) -> Result<()> {
         None
     };
 
-    if is_read_group_split && rg_info.has_sq {
+    if (is_read_group_split || is_aux_tag_split) && rg_info.has_sq {
         log::warn!(
             "input is aligned (@SQ present); this @RG split writes UNMAPPED records: alignments, \
              CIGAR/MAPQ, and mate/alignment tags are dropped and reverse-strand reads are restored \
@@ -1060,8 +1118,15 @@ fn run_engine(plan: &DemuxPlan, command_line: Option<&str>) -> Result<()> {
     // provenance plus a default `@RG` whose ID/SM/LB are the pool id, so every
     // SAM/BAM/CRAM record carries a read group even with no `--sample`. A
     // worker uses it for encode-on-workers exactly where `MultiWriter::open`
-    // would, so the bytes stay identical.
-    let default_header = default_read_group_header(&pool, &plan.rg_tags, command_line)?;
+    // would, so the bytes stay identical. A `@tag::XX` split leaves `headers`
+    // empty (its output paths are discovered per record), so every per-value
+    // file resolves to this shared header: the input's original `@RG` line(s)
+    // plus a `@CO` naming the split tag.
+    let default_header = if let Some(tag) = aux_tag {
+        crate::output::aux_tag_header(&rg_info, &pool, &plan.rg_tags, command_line, tag)?
+    } else {
+        default_read_group_header(&pool, &plan.rg_tags, command_line)?
+    };
     // Declared before `writer` so that, on any unwind, `writer` (and its
     // PooledWriters) drops before the pool: a PooledWriter dropped after the
     // pool is stopped would panic. The explicit shutdown below also enforces
@@ -1074,14 +1139,22 @@ fn run_engine(plan: &DemuxPlan, command_line: Option<&str>) -> Result<()> {
         plan.compression,
     );
     // Every directed output file, created up front so a directed file always
-    // exists, even empty.
-    let dests = enumerate_dests(
-        plan,
-        &routing,
-        &pool,
-        &input_formats,
-        reader.fragment_width(),
-    )?;
+    // exists, even empty. A `@tag::XX` split has no static targets (each value's
+    // file is discovered from the records and opened on first sight), so only
+    // the `--unassigned`/`--remove` bins are pre-created; enumerating `--out`
+    // here would resolve `%sample` to the empty string and pre-create a bogus
+    // file.
+    let dests = if is_aux_tag_split {
+        enumerate_bins(plan, &pool)
+    } else {
+        enumerate_dests(
+            plan,
+            &routing,
+            &pool,
+            &input_formats,
+            reader.fragment_width(),
+        )?
+    };
     log_run_shape(plan, &input_formats, &dests);
 
     // Route poolable destinations (gzipped FASTX and BAM) through a shared BGZF
@@ -1180,7 +1253,7 @@ fn run_engine(plan: &DemuxPlan, command_line: Option<&str>) -> Result<()> {
         headers: &headers,
         default_header: &default_header,
         is_read_group_split,
-        aux_tag: None,
+        aux_tag,
     };
     let mut metrics = Metrics::new(pool.clone(), routing.targets());
 
