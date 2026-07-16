@@ -337,15 +337,22 @@ fn compile_groups(
     let mut name_prereqs = Vec::with_capacity(plan.groups.len());
     for group in &plan.groups {
         let is_read_group = matches!(group.source, GroupSource::ReadGroup(_));
+        let aux_tag = match group.source {
+            GroupSource::AuxTag(tag) => Some(tag),
+            _ => None,
+        };
+        // Neither an `@RG` nor a `@tag::XX` group does sequence matching: both
+        // route by a value already carried on the record (an `RG:Z` or another
+        // aux tag), so their "tags" are routing tokens, not DNA.
+        let is_special = is_read_group || aux_tag.is_some();
         let attrs = &group.attrs;
         let dist = attrs.dist.unwrap_or_default();
         let mode = attrs.mode.unwrap_or(MatchMode::All);
         // Guard the IUPAC tag set up front: reject a combinatorial explosion or
         // an indistinguishable tag pair, and warn on a within-`dist` overlap
-        // that `mode=nearest` would only disambiguate. An `@RG` group's "tags"
-        // are synthetic routing tokens (not DNA), so this sequence machinery
-        // does not apply to it.
-        if !is_read_group {
+        // that `mode=nearest` would only disambiguate. This sequence machinery
+        // does not apply to a special (`@RG`/`@tag::XX`) group.
+        if !is_special {
             for warning in crate::iupac::validate_group(
                 &group.name,
                 &tag_sets[&group.name].seqs(),
@@ -376,12 +383,13 @@ fn compile_groups(
             encoded: Vec::new(),
             batched_tags: Default::default(),
             read_group: resolved.get(&group.name).map(|r| r.rg_to_idx.clone()),
+            aux_tag,
         };
         // Precompute the sassy v2 batched search batches (and their covered tag
-        // set) for large equal-length tag buckets. Skipped for an `@RG` group:
-        // its tags are routing tokens, not DNA, so a sassy search over them is
-        // meaningless.
-        if !is_read_group {
+        // set) for large equal-length tag buckets. Skipped for a special
+        // (`@RG`/`@tag::XX`) group: its tags are routing tokens, not DNA, so a
+        // sassy search over them is meaningless.
+        if !is_special {
             compiled_group.encode();
             if let Some(warning) = anchor5p_window_overrun_warning(&compiled_group) {
                 log::warn!("{warning}");
@@ -1361,6 +1369,11 @@ fn match_fragment(
     // relative `next` link windows the downstream search; a bare `next`/`prev`
     // link skips the downstream group when the upstream did not match).
     for (idx, group) in engine.groups.iter().enumerate() {
+        if group.aux_tag.is_some() {
+            // A @tag group routes by the record's own value in `prepare`; it
+            // does no sequence matching and leaves its hit slot empty.
+            continue;
+        }
         if let Some(rg_to_idx) = &group.read_group {
             if let Some(tag_idx) = match_read_group(rg_to_idx, fragment) {
                 hits[idx] = Some(GroupHit {
@@ -4869,5 +4882,87 @@ mod tests {
             None,
             "an RG id absent from the map means no route"
         );
+    }
+
+    /// An [`Engine`] with a single `@tag::<tag>` group and nothing else wired
+    /// up: enough to drive `match_fragment` directly in a unit test. The
+    /// backing state is leaked to satisfy `Engine`'s borrowed fields with a
+    /// `'static` fixture; it is a one-shot allocation for the test process.
+    fn engine_with_single_aux_tag_group(tag: [u8; 2]) -> Engine<'static> {
+        let mut group = CompiledGroup::new("cb", Vec::new());
+        group.aux_tag = Some(tag);
+        let groups: &'static [CompiledGroup] = Box::leak(Box::new(vec![group]));
+        let group_index: &'static HashMap<String, usize> =
+            Box::leak(Box::new([("cb".to_string(), 0)].into_iter().collect()));
+        let plan: &'static DemuxPlan = Box::leak(Box::new(DemuxPlan {
+            pool: None,
+            inputs: Vec::new(),
+            groups: Vec::new(),
+            extracts: Vec::new(),
+            templates: Vec::new(),
+            tags: Vec::new(),
+            rg_tags: Vec::new(),
+            samples: SampleSpec::None,
+            require_samples_explain_all_tags: false,
+            qc_tag: None,
+            remove: Vec::new(),
+            out: None,
+            unassigned: None,
+            metrics_per_sample: None,
+            metrics_summary: None,
+            per_record: false,
+            compression: 0,
+            threads: 1,
+        }));
+        let routing: &'static Routing = Box::leak(Box::new(
+            compile_routing(&[], &[], &HashMap::new(), group_index, "pool", false, false).unwrap(),
+        ));
+        let movable_streams: &'static HashSet<&str> = Box::leak(Box::new(HashSet::new()));
+        let routed_streams: &'static HashSet<&str> = Box::leak(Box::new(HashSet::new()));
+        let headers: &'static HashMap<Option<PathBuf>, Header> =
+            Box::leak(Box::new(HashMap::new()));
+        let default_header: &'static Header = Box::leak(Box::new(Header::default()));
+
+        Engine {
+            plan,
+            groups,
+            group_index,
+            routing,
+            pool: "pool",
+            input_formats: &[],
+            movable_streams,
+            routed_streams,
+            headers,
+            default_header,
+            is_read_group_split: false,
+        }
+    }
+
+    /// A one-record fragment carrying `CB:Z:<cb>`.
+    fn fragment_with_cb(cb: &[u8]) -> Fragment {
+        let mut data = Data::default();
+        data.insert(Tag::new(b'C', b'B'), Value::String(cb.to_vec().into()));
+        Fragment {
+            records: vec![InputRecord {
+                name: b"r1".to_vec(),
+                bases: b"ACGT".to_vec(),
+                quals: None,
+                tags: Some(data),
+            }],
+        }
+    }
+
+    #[test]
+    fn aux_tag_group_produces_no_hit() {
+        // A @tag group does no sequence matching and emits no GroupHit; its
+        // slot stays None. Routing by value is handled later in `prepare`.
+        let engine = engine_with_single_aux_tag_group(*b"CB");
+        let fragment = fragment_with_cb(b"AAAA");
+        let mut scratch = Scratch::new();
+        let m = match_fragment(&engine, &mut scratch, &fragment).unwrap();
+        let FragmentMatch::Routed { hits } = m else {
+            panic!("expected Routed")
+        };
+        assert!(hits.iter().all(Option::is_none));
     }
 }
