@@ -968,7 +968,20 @@ struct Engine<'a> {
 fn run_engine(plan: &DemuxPlan, command_line: Option<&str>) -> Result<()> {
     let reader = FragmentReader::open(&plan.inputs, plan.per_record)?;
     let input_formats = reader.formats().to_vec();
-    let rg_info = reader.input_read_groups()?;
+    // Only read (and conflict-check) the input `@RG` header when an `@RG`
+    // group is actually present: `input_read_groups` bails on a repeated RG id
+    // with conflicting SM/LB across inputs, which is a legitimate outcome for
+    // a non-`@RG` run that never consults SM/LB. Gating keeps that path
+    // behavior-identical to before this feature existed.
+    let has_read_group_source = plan
+        .groups
+        .iter()
+        .any(|g| matches!(g.source, GroupSource::ReadGroup(_)));
+    let rg_info = if has_read_group_source {
+        reader.input_read_groups()?
+    } else {
+        crate::input::ReadGroupInfo::default()
+    };
     let resolved = resolve_read_group_groups(plan, &rg_info)?;
 
     let tag_sets = load_tag_sets(plan, &resolved)?;

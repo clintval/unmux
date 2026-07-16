@@ -119,3 +119,20 @@ Feature: Split an existing multi-read-group input by its @RG header
     When I run `unmux in.sam --group rg=@RG --sample-from-group rg --out out/%sample.bam`
     Then the exit code is 1
     And stderr contains "@RG"
+
+  Scenario: a non-@RG run over inputs with a shared RG id is unaffected
+    Given a file "a.sam" containing:
+      """
+      @HD	VN:1.6
+      @RG	ID:rg1	SM:sampleA
+      q1	4	*	0	0	*	*	0	0	AAAAAAAA	IIIIIIII	RG:Z:rg1
+      """
+    And a file "b.sam" containing:
+      """
+      @HD	VN:1.6
+      @RG	ID:rg1	SM:sampleB
+      q1	4	*	0	0	*	*	0	0	CCCCCCCC	IIIIIIII	RG:Z:rg1
+      """
+    When I run `unmux --in 0=a.sam --in 1=b.sam --out out.bam`
+    Then the exit code is 0
+    And a file "out.bam" exists
