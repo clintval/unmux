@@ -21,7 +21,7 @@ pixi exec \
 
 The whole CLI is documented in `unmux --help`, with worked examples for every flag:
 
-![unmux --help](.github/img/help.gif)
+<video src="https://github.com/clintval/unmux/raw/docs/readme-help-gif/.github/img/help.mp4" poster="https://github.com/clintval/unmux/raw/docs/readme-help-gif/.github/img/help_poster.png" autoplay loop muted playsinline controls width="100%"></video>
 
 ## Introduction
 
