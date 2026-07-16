@@ -127,6 +127,22 @@ pub enum GroupSource {
     File(PathBuf),
     /// `NAME={...}`: tags given inline.
     Inline(Vec<InlineTag>),
+    /// `NAME=@RG[::SM|::LB|::SM::LB]`: the input header's read groups, keyed by
+    /// RG id or a subfield, decided per record by its `RG:Z`.
+    ReadGroup(ReadGroupKey),
+}
+
+/// Which read-group field(s) an `@RG` group keys on (`--group NAME=@RG...`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadGroupKey {
+    /// Bare `@RG`: key on the read-group ID (one file per read group).
+    Id,
+    /// `@RG::SM`: key on the sample (`SM`).
+    Sm,
+    /// `@RG::LB`: key on the library (`LB`).
+    Lb,
+    /// `@RG::SM::LB`: two tiers, `SM` then `LB`.
+    SmLb,
 }
 
 /// One tag of an inline `{...}` set. When no `id=` is given, splitcode-style,
@@ -710,6 +726,12 @@ fn parse_groups(specs: &[String]) -> Result<Vec<Group>> {
                     b.name, b.name
                 )
             })?;
+            if matches!(source, GroupSource::ReadGroup(_)) && b.attrs != GroupAttrs::default() {
+                bail!(
+                    "group `{}` uses the `@RG` source, which takes no attributes",
+                    b.name
+                );
+            }
             Ok(Group {
                 name: b.name,
                 source,
@@ -750,6 +772,17 @@ fn parse_group_source(value: &str, group: &str) -> Result<GroupSource> {
             bail!("inline tag set for group `{group}` is empty");
         }
         Ok(GroupSource::Inline(tags))
+    } else if let Some(rest) = value.strip_prefix("@RG") {
+        let key = match rest {
+            "" => ReadGroupKey::Id,
+            "::SM" => ReadGroupKey::Sm,
+            "::LB" => ReadGroupKey::Lb,
+            "::SM::LB" => ReadGroupKey::SmLb,
+            other => bail!(
+                "group `{group}` `@RG` source accepts only `@RG`, `@RG::SM`, `@RG::LB`, or `@RG::SM::LB`, got `@RG{other}`"
+            ),
+        };
+        Ok(GroupSource::ReadGroup(key))
     } else {
         if value.is_empty() {
             bail!("group `{group}` has an empty source");
@@ -3415,5 +3448,49 @@ mod tests {
         assert_eq!(plan.samples, SampleSpec::FromGroup("sample_bc".to_string()));
         assert!(plan.unassigned.as_ref().unwrap().uses(Placeholder::Source));
         assert!(plan.out.as_ref().unwrap().uses(Placeholder::Ordinal));
+    }
+
+    #[test]
+    fn parse_group_source_read_group_forms() {
+        assert_eq!(
+            parse_group_source("@RG", "rg").unwrap(),
+            GroupSource::ReadGroup(ReadGroupKey::Id)
+        );
+        assert_eq!(
+            parse_group_source("@RG::SM", "rg").unwrap(),
+            GroupSource::ReadGroup(ReadGroupKey::Sm)
+        );
+        assert_eq!(
+            parse_group_source("@RG::LB", "rg").unwrap(),
+            GroupSource::ReadGroup(ReadGroupKey::Lb)
+        );
+        assert_eq!(
+            parse_group_source("@RG::SM::LB", "rg").unwrap(),
+            GroupSource::ReadGroup(ReadGroupKey::SmLb)
+        );
+    }
+
+    #[test]
+    fn parse_group_source_read_group_rejects_bad_suffix() {
+        for bad in ["@RG::LB::SM", "@RG::PU", "@RGX", "@RG::"] {
+            assert!(
+                parse_group_source(bad, "rg").is_err(),
+                "{bad} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn read_group_source_rejects_attributes() {
+        let err = parse_groups(&["rg=@RG".into(), "rg::dist=1".into()]).unwrap_err();
+        assert!(err.to_string().contains("takes no attributes"), "{err}");
+    }
+
+    #[test]
+    fn parse_group_source_lowercase_at_rg_is_a_file() {
+        assert_eq!(
+            parse_group_source("@rg", "rg").unwrap(),
+            GroupSource::File(PathBuf::from("@rg"))
+        );
     }
 }

@@ -22,6 +22,8 @@ use std::fs::File;
 use std::io::BufWriter;
 
 use anyhow::{anyhow, bail, Context, Result};
+use noodles::sam::alignment::record::data::field::Tag;
+use noodles::sam::alignment::record_buf::data::field::Value;
 use noodles::sam::alignment::record_buf::Data;
 use noodles::sam::Header;
 use pooled_writer::{bgzf::BgzfCompressor, Pool, PoolBuilder, PooledWriter};
@@ -48,7 +50,7 @@ use crate::matcher::{
 use crate::metrics::Metrics;
 use crate::output::{
     build_tag_data, default_read_group_header, insert_string_tag, qual_tag_name, read_group_header,
-    resolve_metrics_path, resolve_pattern, MultiWriter, PathContext,
+    resolve_metrics_path, resolve_pattern, ConstituentReadGroups, MultiWriter, PathContext,
 };
 use crate::qc::{removed_slug, routed_slug, unassigned_slug, Unassigned};
 use crate::tags::{load_tag_file, TagSet};
@@ -244,17 +246,42 @@ fn log_run_shape(plan: &DemuxPlan, input_formats: &[SniffedFormat], dests: &[Pat
 /// Load every `--group`'s tag set once, keyed by group name. The matcher (via
 /// [`compile_groups`]) and the router (via [`build_routing`]) share these, so a
 /// file is read and an inline set built only once.
-fn load_tag_sets(plan: &DemuxPlan) -> Result<HashMap<String, TagSet>> {
+fn load_tag_sets(
+    plan: &DemuxPlan,
+    resolved: &HashMap<String, crate::ResolvedReadGroup>,
+) -> Result<HashMap<String, TagSet>> {
     let mut tag_sets = HashMap::with_capacity(plan.groups.len());
     for group in &plan.groups {
         let tag_set = match &group.source {
             GroupSource::File(path) => load_tag_file(path)
                 .with_context(|| format!("failed to load tag set for group `{}`", group.name))?,
             GroupSource::Inline(tags) => TagSet::from_inline(tags),
+            GroupSource::ReadGroup(_) => resolved[&group.name].tag_set.clone(),
         };
         tag_sets.insert(group.name.clone(), tag_set);
     }
     Ok(tag_sets)
+}
+
+/// Resolve every `@RG` group in the plan against the input header's read
+/// groups, once, keyed by group name. Built right after the reader opens (so
+/// the header is available) and shared by the tag-set loader, the group
+/// compiler, and the routing builder ([`load_tag_sets`], `compile_groups`,
+/// `build_routing`).
+fn resolve_read_group_groups(
+    plan: &DemuxPlan,
+    rg_info: &crate::input::ReadGroupInfo,
+) -> Result<HashMap<String, crate::ResolvedReadGroup>> {
+    let mut resolved = HashMap::new();
+    for group in &plan.groups {
+        if let GroupSource::ReadGroup(key) = group.source {
+            resolved.insert(
+                group.name.clone(),
+                crate::resolve_read_group(&group.name, rg_info, key)?,
+            );
+        }
+    }
+    Ok(resolved)
 }
 
 /// A group's sequential prerequisite by upstream NAME, the form built before
@@ -303,20 +330,29 @@ fn anchor5p_window_overrun_warning(group: &CompiledGroup) -> Option<String> {
 fn compile_groups(
     plan: &DemuxPlan,
     tag_sets: &HashMap<String, TagSet>,
+    resolved: &HashMap<String, crate::ResolvedReadGroup>,
 ) -> Result<(Vec<CompiledGroup>, HashMap<String, usize>)> {
     let mut compiled = Vec::with_capacity(plan.groups.len());
     let mut name_prereqs = Vec::with_capacity(plan.groups.len());
     for group in &plan.groups {
+        let is_read_group = matches!(group.source, GroupSource::ReadGroup(_));
         let attrs = &group.attrs;
         let dist = attrs.dist.unwrap_or_default();
         let mode = attrs.mode.unwrap_or(MatchMode::All);
         // Guard the IUPAC tag set up front: reject a combinatorial explosion or
         // an indistinguishable tag pair, and warn on a within-`dist` overlap
-        // that `mode=nearest` would only disambiguate.
-        for warning in
-            crate::iupac::validate_group(&group.name, &tag_sets[&group.name].seqs(), &dist, mode)?
-        {
-            log::warn!("{warning}");
+        // that `mode=nearest` would only disambiguate. An `@RG` group's "tags"
+        // are synthetic routing tokens (not DNA), so this sequence machinery
+        // does not apply to it.
+        if !is_read_group {
+            for warning in crate::iupac::validate_group(
+                &group.name,
+                &tag_sets[&group.name].seqs(),
+                &dist,
+                mode,
+            )? {
+                log::warn!("{warning}");
+            }
         }
         let mut compiled_group = CompiledGroup {
             name: group.name.clone(),
@@ -338,12 +374,17 @@ fn compile_groups(
             anchor: attrs.anchor,
             encoded: Vec::new(),
             batched_tags: Default::default(),
+            read_group: resolved.get(&group.name).map(|r| r.rg_to_idx.clone()),
         };
         // Precompute the sassy v2 batched search batches (and their covered tag
-        // set) for large equal-length tag buckets.
-        compiled_group.encode();
-        if let Some(warning) = anchor5p_window_overrun_warning(&compiled_group) {
-            log::warn!("{warning}");
+        // set) for large equal-length tag buckets. Skipped for an `@RG` group:
+        // its tags are routing tokens, not DNA, so a sassy search over them is
+        // meaningless.
+        if !is_read_group {
+            compiled_group.encode();
+            if let Some(warning) = anchor5p_window_overrun_warning(&compiled_group) {
+                log::warn!("{warning}");
+            }
         }
         compiled.push(compiled_group);
         name_prereqs.push(prereq_for(group, &plan.groups, &plan.extracts));
@@ -535,6 +576,7 @@ fn build_routing(
     tag_sets: &HashMap<String, TagSet>,
     group_index: &HashMap<String, usize>,
     pool: &str,
+    resolved: &HashMap<String, crate::ResolvedReadGroup>,
 ) -> Result<Routing> {
     let (samples, demux) = match &plan.samples {
         SampleSpec::None => (Vec::new(), false),
@@ -543,12 +585,15 @@ fn build_routing(
             let declared: HashSet<&str> = plan.groups.iter().map(|g| g.name.as_str()).collect();
             (load_sample_sheet(path, &declared)?, true)
         }
-        SampleSpec::FromGroup(group) => {
-            let tag_set = tag_sets
-                .get(group)
-                .with_context(|| format!("no loaded tag set for --sample-from-group `{group}`"))?;
-            (expand_from_group(group, tag_set), true)
-        }
+        SampleSpec::FromGroup(group) => match resolved.get(group) {
+            Some(r) => (r.samples.clone(), true),
+            None => {
+                let tag_set = tag_sets.get(group).with_context(|| {
+                    format!("no loaded tag set for --sample-from-group `{group}`")
+                })?;
+                (expand_from_group(group, tag_set), true)
+            }
+        },
     };
     compile_routing(
         &samples,
@@ -559,6 +604,41 @@ fn build_routing(
         demux,
         plan.require_samples_explain_all_tags,
     )
+}
+
+/// Build the static `Target -> constituent original @RG maps` table for an
+/// `@RG`-split run: for each RG id, the target its records route to paired with
+/// that read group's original `@RG` map (looked up by id). One target
+/// accumulates every original read group whose records land in its file, so the
+/// output header can list them verbatim (correct SM/LB/PL/PU/...) instead of a
+/// synthesized per-target `@RG`. Empty for any non-`@RG` run.
+fn build_constituent_rgs(
+    plan: &DemuxPlan,
+    resolved: &HashMap<String, crate::ResolvedReadGroup>,
+    rg_info: &crate::input::ReadGroupInfo,
+) -> ConstituentReadGroups {
+    let mut out: ConstituentReadGroups = HashMap::new();
+    let SampleSpec::FromGroup(group) = &plan.samples else {
+        return out;
+    };
+    let Some(r) = resolved.get(group) else {
+        return out;
+    };
+    let pool = pool_id(plan);
+    let by_id: HashMap<&[u8], &crate::input::InputReadGroup> = rg_info
+        .read_groups
+        .iter()
+        .map(|rg| (rg.id.as_slice(), rg))
+        .collect();
+    for (rg_id, &tag_idx) in &r.rg_to_idx {
+        let target = crate::fanout::resolve_target(&r.samples[tag_idx], &pool);
+        if let Some(rg) = by_id.get(rg_id.as_slice()) {
+            out.entry(target)
+                .or_default()
+                .push((rg_id.clone(), rg.map.clone()));
+        }
+    }
+    out
 }
 
 /// A SAM/BAM `--out` destination (a path, or `None` for stdout), the fan-out
@@ -766,11 +846,15 @@ fn out_headers(
     pool: &str,
     input_formats: &[SniffedFormat],
     command_line: Option<&str>,
+    constituent: Option<&ConstituentReadGroups>,
 ) -> Result<HashMap<Option<PathBuf>, noodles::sam::Header>> {
     let mut headers = HashMap::new();
     for (dest, targets, _) in out_destinations(plan, routing, pool, input_formats)? {
         let refs: Vec<&Target> = targets.iter().collect();
-        headers.insert(dest, read_group_header(&refs, &plan.rg_tags, command_line)?);
+        headers.insert(
+            dest,
+            read_group_header(&refs, &plan.rg_tags, command_line, constituent)?,
+        );
     }
     Ok(headers)
 }
@@ -871,6 +955,11 @@ struct Engine<'a> {
     /// `@PG`-provenance header, matching `MultiWriter::open`'s fallback so
     /// worker-encoded bytes stay byte-identical.
     default_header: &'a Header,
+    /// Whether this is an `@RG`-split run (`--sample-from-group` over an `@RG`
+    /// source). When set, an assigned record keeps its original `RG:Z` (its
+    /// `@RG` line is carried verbatim by the header, see [`build_constituent_rgs`])
+    /// rather than being rewritten to a synthesized per-target read group.
+    is_read_group_split: bool,
 }
 
 /// Run the demux engine: match tag groups per record, route each record with
@@ -878,14 +967,82 @@ struct Engine<'a> {
 /// fields and an `@RG` read group) or to the `--remove` / `--unassigned` bins,
 /// tally metrics, and emit the metrics TSVs / stderr log.
 fn run_engine(plan: &DemuxPlan, command_line: Option<&str>) -> Result<()> {
-    let tag_sets = load_tag_sets(plan)?;
-    let (groups, group_index) = compile_groups(plan, &tag_sets)?;
-    let pool = pool_id(plan);
-    let routing = build_routing(plan, &tag_sets, &group_index, &pool)?;
-
     let reader = FragmentReader::open(&plan.inputs, plan.per_record)?;
     let input_formats = reader.formats().to_vec();
-    let headers = out_headers(plan, &routing, &pool, &input_formats, command_line)?;
+    // Only read (and conflict-check) the input `@RG` header when an `@RG`
+    // group is actually present: `input_read_groups` bails on a repeated RG id
+    // with conflicting SM/LB across inputs, which is a legitimate outcome for
+    // a non-`@RG` run that never consults SM/LB. Gating keeps that path
+    // behavior-identical to before this feature existed.
+    let has_read_group_source = plan
+        .groups
+        .iter()
+        .any(|g| matches!(g.source, GroupSource::ReadGroup(_)));
+    let rg_info = if has_read_group_source {
+        reader.input_read_groups()?
+    } else {
+        crate::input::ReadGroupInfo::default()
+    };
+    let resolved = resolve_read_group_groups(plan, &rg_info)?;
+
+    let tag_sets = load_tag_sets(plan, &resolved)?;
+    let (groups, group_index) = compile_groups(plan, &tag_sets, &resolved)?;
+    let pool = pool_id(plan);
+    let routing = build_routing(plan, &tag_sets, &group_index, &pool, &resolved)?;
+
+    // An `@RG`-split run (`--sample-from-group` over an `@RG` source) is faithful
+    // to the input header: each output file lists its constituent original `@RG`
+    // lines and each assigned record keeps its original `RG:Z`. The
+    // `Target -> constituent @RG maps` table is statically known before reading
+    // any record, so it is built once here.
+    let is_read_group_split =
+        matches!(&plan.samples, SampleSpec::FromGroup(g) if resolved.contains_key(g));
+    let constituent = if is_read_group_split {
+        Some(build_constituent_rgs(plan, &resolved, &rg_info))
+    } else {
+        None
+    };
+
+    if is_read_group_split && rg_info.has_sq {
+        log::warn!(
+            "input is aligned (@SQ present); this @RG split writes UNMAPPED records: alignments, \
+             CIGAR/MAPQ, and mate/alignment tags are dropped and reverse-strand reads are restored \
+             to sequenced orientation. Carrying mapped data through a split is planned for a future \
+             release; for an alignment-preserving split now, use `samtools split`."
+        );
+    }
+
+    if is_read_group_split {
+        if let Some(pattern) = &plan.out {
+            if pattern.uses(Placeholder::Sample) || pattern.uses(Placeholder::SubSample) {
+                let mut by_path: HashMap<PathBuf, Vec<String>> = HashMap::new();
+                for target in routing.targets() {
+                    for path in out_paths(pattern, &pool, Some(target), 1, &input_formats)? {
+                        by_path.entry(path).or_default().push(target.label());
+                    }
+                }
+                for (path, labels) in &by_path {
+                    if labels.len() > 1 {
+                        log::warn!(
+                            "targets {} merge into one file `{}`; add a placeholder such as \
+                             %sub_sample to separate them",
+                            labels.join(", "),
+                            path.display()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    let headers = out_headers(
+        plan,
+        &routing,
+        &pool,
+        &input_formats,
+        command_line,
+        constituent.as_ref(),
+    )?;
     // The fallback header for any destination absent from `headers`
     // (pass-through `--out`, the raw `--unassigned`/`--remove` bins): `@PG`
     // provenance plus a default `@RG` whose ID/SM/LB are the pool id, so every
@@ -1010,6 +1167,7 @@ fn run_engine(plan: &DemuxPlan, command_line: Option<&str>) -> Result<()> {
         routed_streams: &routed_streams,
         headers: &headers,
         default_header: &default_header,
+        is_read_group_split,
     };
     let mut metrics = Metrics::new(pool.clone(), routing.targets());
 
@@ -1202,6 +1360,18 @@ fn match_fragment(
     // relative `next` link windows the downstream search; a bare `next`/`prev`
     // link skips the downstream group when the upstream did not match).
     for (idx, group) in engine.groups.iter().enumerate() {
+        if let Some(rg_to_idx) = &group.read_group {
+            if let Some(tag_idx) = match_read_group(rg_to_idx, fragment) {
+                hits[idx] = Some(GroupHit {
+                    tag_idx,
+                    span: None,
+                    subs: 0,
+                    indels: 0,
+                    revcomp: false,
+                });
+            }
+            continue;
+        }
         let outcome = match &group.match_streams {
             // A `match=` group matches the joined `--extract` streams, not a
             // read window.
@@ -1721,6 +1891,20 @@ fn union_len(intervals: &[(usize, usize)]) -> usize {
     covered
 }
 
+/// Route a fragment by its carried `RG:Z` for an `@RG` group: the tag index of
+/// the read group the record belongs to, or `None` (no RG tag, or an id absent
+/// from the header).
+fn match_read_group(rg_to_idx: &HashMap<Vec<u8>, usize>, fragment: &Fragment) -> Option<usize> {
+    for record in &fragment.records {
+        if let Some(data) = &record.tags {
+            if let Some(Value::String(rg)) = data.get(&Tag::READ_GROUP) {
+                return rg_to_idx.get(AsRef::<[u8]>::as_ref(rg)).copied();
+            }
+        }
+    }
+    None
+}
+
 /// Match a `match=` group against the concatenation of its named `--extract`
 /// streams (no delimiter). A referenced stream that is absent (its anchoring
 /// group did not match, or it resolved to nothing) makes the group a non-match.
@@ -2011,8 +2195,15 @@ fn prepare_body(
     let tag_data = build_tag_data(&plan.tags, &streams);
     // An assigned read carries its sample's read group; a pass-through read (no
     // target) carries the default pool read group, so a SAM/BAM/CRAM `--out`
-    // matches the default `@RG` in its header.
-    let read_group = target.map(Target::label).or_else(|| Some(pool.to_string()));
+    // matches the default `@RG` in its header. On an `@RG`-split run the record
+    // keeps its carried original `RG:Z` instead (already in `read.tags` via
+    // `merge_data`); `None` leaves it untouched, since `writer::build_record`
+    // only inserts `RG:Z` when a read group is set.
+    let read_group = if engine.is_read_group_split {
+        None
+    } else {
+        target.map(Target::label).or_else(|| Some(pool.to_string()))
+    };
     let sample = target.map(|t| t.sample.as_str());
     let sub_sample = target.and_then(|t| t.sub_sample.as_deref());
 
@@ -3288,6 +3479,61 @@ mod tests {
     }
 
     #[test]
+    fn compile_groups_marks_read_group() {
+        // An @RG group's compiled tags are synthetic routing tokens (e.g.
+        // `rg1#0`), not DNA, so compile_groups must skip the IUPAC
+        // validation/sassy encode() sequence machinery for it and instead
+        // carry the RG-id -> tag-idx map on `read_group`. A normal group's
+        // `read_group` stays `None`.
+        let mut args = base_args();
+        args.inputs = vec!["0=/dev/null".to_string()];
+        args.groups = vec!["norm={s1=AAAA}".to_string(), "rg=@RG".to_string()];
+        let plan = crate::grammar::parse_demux(&args).unwrap();
+
+        let mut rg_to_idx = HashMap::new();
+        rg_to_idx.insert(b"rg1".to_vec(), 0usize);
+        let resolved: HashMap<String, crate::ResolvedReadGroup> = HashMap::from([(
+            "rg".to_string(),
+            crate::ResolvedReadGroup {
+                tag_set: crate::tags::TagSet {
+                    entries: vec![crate::tags::TagEntry {
+                        id: "rg1#0".to_string(),
+                        seq: "rg1#0".to_string(),
+                        sub_sample: None,
+                    }],
+                },
+                samples: Vec::new(),
+                rg_to_idx,
+            },
+        )]);
+
+        let tag_sets = load_tag_sets(&plan, &resolved).unwrap();
+        let (compiled, _index) = compile_groups(&plan, &tag_sets, &resolved).unwrap();
+
+        let norm = compiled.iter().find(|g| g.name == "norm").unwrap();
+        assert!(
+            norm.read_group.is_none(),
+            "a normal group's read_group is None"
+        );
+
+        let rg = compiled.iter().find(|g| g.name == "rg").unwrap();
+        let read_group = rg
+            .read_group
+            .as_ref()
+            .expect("an @RG group's read_group is Some");
+        assert_eq!(read_group[b"rg1".as_slice()], 0);
+        // The sequence machinery is skipped: no batched-search encoding, and
+        // the rest of the record-window attributes stay at their bare
+        // defaults (the grammar rejects any attrs on an `@RG` group).
+        assert!(
+            rg.encoded.is_empty(),
+            "an @RG group skips sassy encode() (its tags are routing tokens, not DNA)"
+        );
+        assert_eq!(rg.dist, crate::grammar::Dist::default());
+        assert!(rg.loc.is_none());
+    }
+
+    #[test]
     fn test_anchor5p_relative_next_window() {
         // anchor5p as a relative next= window target (no own loc): grp_a
         // matches AAAA at [0,4], its next=grp_b:0-4 window starts at grp_a's
@@ -3631,7 +3877,7 @@ mod tests {
 
     #[test]
     fn test_bam_output_honors_compression_level() {
-        // Per the spec, --compression sets the BAM BGZF level. The same data at
+        // unmux maps --compression to the BAM BGZF level. The same data at
         // level 0 (stored) must produce a clearly larger file than at level 9
         // (max), and both must round-trip every record.
         let dir = tempfile::tempdir().unwrap();
@@ -3888,8 +4134,9 @@ mod tests {
         };
 
         // 4 is the pooled-BGZF floor: read-ahead + main + >=1 writer + >=1
-        // matcher. Below it (Task 2), compression runs inline; here both runs
-        // use the pool so the bytes are identical.
+        // matcher. With fewer worker threads than that, compression runs inline
+        // instead of through the pool; here both runs clear the floor, so both
+        // use the pool and the bytes are identical.
         let out_min = dir.path().join("min.bam");
         let out_many = dir.path().join("many.bam");
         run(4, &out_min);
@@ -4566,6 +4813,60 @@ mod tests {
         assert!(
             read_back(&unassigned).is_empty(),
             "un.bam holds zero records"
+        );
+    }
+
+    #[test]
+    fn match_read_group_routes_by_rg_tag() {
+        use noodles::sam::alignment::record::data::field::Tag;
+        use noodles::sam::alignment::record_buf::data::field::Value;
+
+        let rg_to_idx: HashMap<Vec<u8>, usize> = [(b"rg1".to_vec(), 0), (b"rg2".to_vec(), 1)]
+            .into_iter()
+            .collect();
+
+        let with_rg = |rg: &[u8]| InputRecord {
+            name: b"r".to_vec(),
+            bases: b"ACGT".to_vec(),
+            quals: None,
+            tags: Some(
+                [(Tag::READ_GROUP, Value::String(rg.to_vec().into()))]
+                    .into_iter()
+                    .collect(),
+            ),
+        };
+
+        let fragment = Fragment {
+            records: vec![with_rg(b"rg2")],
+        };
+        assert_eq!(
+            match_read_group(&rg_to_idx, &fragment),
+            Some(1),
+            "routes to the tag index of the record's RG:Z"
+        );
+
+        let no_rg = InputRecord {
+            name: b"r".to_vec(),
+            bases: b"ACGT".to_vec(),
+            quals: None,
+            tags: None,
+        };
+        let fragment = Fragment {
+            records: vec![no_rg],
+        };
+        assert_eq!(
+            match_read_group(&rg_to_idx, &fragment),
+            None,
+            "no RG tag at all means no route"
+        );
+
+        let fragment = Fragment {
+            records: vec![with_rg(b"rg3")],
+        };
+        assert_eq!(
+            match_read_group(&rg_to_idx, &fragment),
+            None,
+            "an RG id absent from the map means no route"
         );
     }
 }

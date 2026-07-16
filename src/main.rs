@@ -84,6 +84,10 @@ pub(crate) const CARGO_STYLING: Styles = Styles::styled()
 ///
 ///   unmux r1.fq r2.fq --group bc=bc.tsv --sample s=bc::t01 --out %sample.bam
 ///
+///  4. Split a multi-read-group BAM into per-sample BAMs by its @RG header:
+///
+///   unmux in.bam --group rg=@RG::SM --sample-from-group rg --out %sample.bam
+///
 /// Notation (also see param docs below with expressive examples):
 ///
 ///   file:start:end   0-based, half-open; `end` is the record LENGTH;
@@ -92,6 +96,8 @@ pub(crate) const CARGO_STYLING: Styles = Styles::styled()
 ///   @grp             a group's matched span. `@grp+off:len` & `@grp-off:len`
 ///                    step past & before it (trailing number is a LENGTH!).
 ///   @grpA..@grpB     the region between two matched spans.
+///   @RG[::F[::F]]    an input read-group `--group` source (SAM/BAM/CRAM only);
+///                    bare = by RG ID, or by subfield(s), e.g. `@RG::SM::LB`.
 ///   +                concat streams (`cb+umi`) or 'AND' samples (`gA::a+gB::b`).
 ///   ~                reverse-complement the stream (`~cb`, `BC=~bc`).
 ///   ,                list separator ('OR' a tag pool & attribute lists).
@@ -181,6 +187,9 @@ struct DemuxCmd {
     ///   bc=tags.tsv        from a TSV file with `id` and `seq` columns
     ///   bc={AAC,ACG,TTG}   inline set, auto tag IDs
     ///   bc={a=AAC,b=ACG}   inline set, explicit tag IDs
+    ///   rg=@RG             the input @RG read groups, keyed by RG ID
+    ///   rg=@RG::SM         ...keyed by a subfield (`SM` here; also `LB`)
+    ///   rg=@RG::SM::LB     ...two tiers: `SM` then `LB` (sample, sub_sample)
     ///
     /// Attributes (`NAME::key=val`):
     ///
@@ -201,6 +210,13 @@ struct DemuxCmd {
     ///   bc::anchor=5p            anchor tags' 5-prime base at `loc.start`
     ///   bc::anchor=3p            anchor tags' 3-prime base at `loc.end`
     ///   bc::match=i7+i5          match tags on joined `--extract` streams
+    ///
+    /// An `@RG` source reads the input header's read groups instead of
+    /// matching sequences (SAM/BAM/CRAM only; no barcode attributes, no
+    /// `@`-span). Pair with `--sample-from-group` to write one file per
+    /// read group, sample, or library. Output is UNMAPPED, so aligned
+    /// inputs lose alignments (a warning is printed); carrying mapped
+    /// data through a split is planned for later.
     #[arg(long = "group", value_name = "SPEC", verbatim_doc_comment)]
     groups: Vec<String>,
 
@@ -336,6 +352,7 @@ struct DemuxCmd {
     /// Exclusive with `--sample` and `--sample-sheet`.
     ///
     ///   --sample-from-group bc   one sample per tag in group bc
+    ///   --sample-from-group rg   one sample per tag; `rg` may be an `@RG` group
     ///
     /// With `--out %sample.bam` the files are named by that tag ID:
     ///

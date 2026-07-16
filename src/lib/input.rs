@@ -19,11 +19,15 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 
+use std::collections::HashMap;
+
 use anyhow::{anyhow, bail, Context, Result};
 use noodles::sam::alignment::record::data::field::Tag;
 use noodles::sam::alignment::record_buf::data::field::Value;
 use noodles::sam::alignment::record_buf::Data;
 use noodles::sam::alignment::RecordBuf;
+use noodles::sam::header::record::value::map::{read_group::tag as rgt, ReadGroup};
+use noodles::sam::header::record::value::Map;
 use noodles::{bam, bgzf, cram, fasta, fastq, sam};
 use smallvec::SmallVec;
 
@@ -537,6 +541,17 @@ impl FormatReader {
             FormatReader::Empty => Ok(None),
         }
     }
+
+    /// This input's SAM header, or `None` for a FASTX/empty input (which
+    /// carries no header).
+    fn header(&self) -> Option<&sam::Header> {
+        match self {
+            FormatReader::Sam { header, .. }
+            | FormatReader::Bam { header, .. }
+            | FormatReader::Cram { header, .. } => Some(header),
+            _ => None,
+        }
+    }
 }
 
 /// The first whitespace-delimited token of a name. FASTX names may carry a
@@ -750,6 +765,28 @@ fn ensure_compatible_quality(formats: &[SniffedFormat]) -> Result<()> {
     Ok(())
 }
 
+/// One input read group, lifted from an `@RG` header line.
+#[derive(Debug, Clone)]
+pub struct InputReadGroup {
+    /// The RG id (the `RG:Z` value records carry).
+    pub id: Vec<u8>,
+    /// The `SM` subfield, if present.
+    pub sample: Option<String>,
+    /// The `LB` subfield, if present.
+    pub library: Option<String>,
+    /// The original `@RG` map, re-emitted verbatim into output headers.
+    pub map: Map<ReadGroup>,
+}
+
+/// The read groups (and `@SQ` presence) discovered across all inputs.
+#[derive(Debug, Clone, Default)]
+pub struct ReadGroupInfo {
+    /// The read groups in first-seen order across inputs (ids are unique).
+    pub read_groups: Vec<InputReadGroup>,
+    /// Whether any input header carries `@SQ` reference sequences.
+    pub has_sq: bool,
+}
+
 /// Reads logical records across all inputs. With several `--in` files, one
 /// record is pulled from each in lockstep; a single FASTX input is
 /// auto-detected as interleaved (two mates per fragment) unless `--per-record`
@@ -828,6 +865,48 @@ impl FragmentReader {
     /// uncompressed BAM.
     pub fn formats(&self) -> &[SniffedFormat] {
         &self.formats
+    }
+
+    /// The read groups declared by the input headers, in first-seen order, plus
+    /// whether any input is aligned (`@SQ` present). FASTX inputs contribute
+    /// nothing. A repeated RG id whose `SM`/`LB` disagree across inputs errors.
+    pub fn input_read_groups(&self) -> Result<ReadGroupInfo> {
+        let mut info = ReadGroupInfo::default();
+        let mut seen: HashMap<Vec<u8>, usize> = HashMap::new();
+        for reader in &self.readers {
+            let Some(header) = reader.header() else {
+                continue;
+            };
+            if !header.reference_sequences().is_empty() {
+                info.has_sq = true;
+            }
+            for (id, rg) in header.read_groups() {
+                let id: Vec<u8> = AsRef::<[u8]>::as_ref(id).to_vec();
+                let sample = rg.other_fields().get(&rgt::SAMPLE).map(|v| v.to_string());
+                let library = rg.other_fields().get(&rgt::LIBRARY).map(|v| v.to_string());
+                match seen.get(&id) {
+                    Some(&i) => {
+                        let existing = &info.read_groups[i];
+                        if existing.sample != sample || existing.library != library {
+                            bail!(
+                                "read group `{}` has conflicting SM/LB across inputs",
+                                String::from_utf8_lossy(&id)
+                            );
+                        }
+                    }
+                    None => {
+                        seen.insert(id.clone(), info.read_groups.len());
+                        info.read_groups.push(InputReadGroup {
+                            id,
+                            sample,
+                            library,
+                            map: rg.clone(),
+                        });
+                    }
+                }
+            }
+        }
+        Ok(info)
     }
 
     /// The number of records every fragment carries: two for a single
@@ -1724,5 +1803,28 @@ mod tests {
             Some(Value::String(value)) => assert_eq!(value.to_string(), "ACGTACGT"),
             other => panic!("RX (a UMI tag) should be kept: {other:?}"),
         }
+    }
+
+    #[test]
+    fn input_read_groups_reads_sm_lb_and_sq() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("in.sam");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, "@HD\tVN:1.6").unwrap();
+        writeln!(f, "@SQ\tSN:chr1\tLN:1000").unwrap();
+        writeln!(f, "@RG\tID:rg1\tSM:sampleA\tLB:lib1").unwrap();
+        writeln!(f, "@RG\tID:rg2\tSM:sampleB").unwrap();
+        drop(f);
+
+        let reader = FragmentReader::open(&[path], false).unwrap();
+        let info = reader.input_read_groups().unwrap();
+        assert!(info.has_sq);
+        assert_eq!(info.read_groups.len(), 2);
+        assert_eq!(info.read_groups[0].id, b"rg1");
+        assert_eq!(info.read_groups[0].sample.as_deref(), Some("sampleA"));
+        assert_eq!(info.read_groups[0].library.as_deref(), Some("lib1"));
+        assert_eq!(info.read_groups[1].sample.as_deref(), Some("sampleB"));
+        assert_eq!(info.read_groups[1].library, None);
     }
 }

@@ -471,8 +471,8 @@ impl OutputWriter {
 }
 
 /// A BGZF writer over `inner` at the given `--compression` level (0-9). Used by
-/// the inline BAM sink so it honors `--compression` (the spec sets the BAM BGZF
-/// level from it), matching the pooled BAM bins (which pass the level to the
+/// the inline BAM sink so it honors `--compression` (which sets the BAM BGZF
+/// level), matching the pooled BAM bins (which pass the level to the
 /// compressor pool). `--compression` is clap-validated to 0-9, so the
 /// conversion only errors on a programmer mistake.
 fn bgzf_writer<W: Write>(inner: W, compression: u8) -> Result<bgzf::io::Writer<W>> {
