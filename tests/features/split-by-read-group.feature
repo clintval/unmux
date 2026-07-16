@@ -120,7 +120,13 @@ Feature: Split an existing multi-read-group input by its @RG header
     Then the exit code is 1
     And stderr contains "@RG"
 
-  Scenario: a non-@RG run over inputs with a shared RG id is unaffected
+  # `--in 0=`/`--in 1=` are the two segments (mates) of each fragment, paired by
+  # read name, not a concatenation of two files. This is a plain run with no @RG
+  # group, so unmux must not read the input @RG header (nor run its cross-input
+  # conflict check); the two files declaring rg1 with different SM is therefore
+  # harmless and the run succeeds. Before the header read was gated on an @RG
+  # group being present, this errored.
+  Scenario: a plain (non-@RG) run does not consult the input @RG header
     Given a file "a.sam" containing:
       """
       @HD	VN:1.6
@@ -136,6 +142,27 @@ Feature: Split an existing multi-read-group input by its @RG header
     When I run `unmux --in 0=a.sam --in 1=b.sam --out out.bam`
     Then the exit code is 0
     And a file "out.bam" exists
+
+  # The same two inputs, but an @RG split makes unmux read the header, where rg1
+  # is declared with two different SM values across the inputs. That is ambiguous
+  # (which sample does rg1 belong to?), so the run is rejected rather than
+  # silently picking one.
+  Scenario: an @RG split rejects inputs whose @RG lines conflict
+    Given a file "a.sam" containing:
+      """
+      @HD	VN:1.6
+      @RG	ID:rg1	SM:sampleA
+      q1	4	*	0	0	*	*	0	0	AAAAAAAA	IIIIIIII	RG:Z:rg1
+      """
+    And a file "b.sam" containing:
+      """
+      @HD	VN:1.6
+      @RG	ID:rg1	SM:sampleB
+      q1	4	*	0	0	*	*	0	0	CCCCCCCC	IIIIIIII	RG:Z:rg1
+      """
+    When I run `unmux --in 0=a.sam --in 1=b.sam --group rg=@RG --sample-from-group rg --out out/%sample.bam`
+    Then the exit code is 1
+    And stderr contains "conflicting"
 
   Scenario: a split record keeps its original RG:Z
     Given a file "in.sam" containing:
