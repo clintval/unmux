@@ -130,6 +130,11 @@ pub enum GroupSource {
     /// `NAME=@RG[::SM|::LB|::SM::LB]`: the input header's read groups, keyed by
     /// RG id or a subfield, decided per record by its `RG:Z`.
     ReadGroup(ReadGroupKey),
+    /// `NAME=@tag::XX`: route each record by its 2-char SAM aux tag `XX`
+    /// (a cell barcode, UMI, sample barcode, ...), read from the record itself
+    /// (from the read-name comment on FASTX). The value set is discovered from
+    /// the records, not the header.
+    AuxTag([u8; 2]),
 }
 
 /// Which read-group field(s) an `@RG` group keys on (`--group NAME=@RG...`).
@@ -726,9 +731,11 @@ fn parse_groups(specs: &[String]) -> Result<Vec<Group>> {
                     b.name, b.name
                 )
             })?;
-            if matches!(source, GroupSource::ReadGroup(_)) && b.attrs != GroupAttrs::default() {
+            if matches!(source, GroupSource::ReadGroup(_) | GroupSource::AuxTag(_))
+                && b.attrs != GroupAttrs::default()
+            {
                 bail!(
-                    "group `{}` uses the `@RG` source, which takes no attributes",
+                    "group `{}` uses a built-in `@` source, which takes no attributes",
                     b.name
                 );
             }
@@ -783,6 +790,16 @@ fn parse_group_source(value: &str, group: &str) -> Result<GroupSource> {
             ),
         };
         Ok(GroupSource::ReadGroup(key))
+    } else if let Some(tag) = value.strip_prefix("@tag::") {
+        let bytes = tag.as_bytes();
+        let valid =
+            bytes.len() == 2 && bytes[0].is_ascii_alphabetic() && bytes[1].is_ascii_alphanumeric();
+        if !valid {
+            bail!(
+                "group `{group}` `@tag::` source needs a 2-character SAM tag (a letter then a letter or digit), got `@tag::{tag}`"
+            );
+        }
+        Ok(GroupSource::AuxTag([bytes[0], bytes[1]]))
     } else {
         if value.is_empty() {
             bail!("group `{group}` has an empty source");
@@ -3492,5 +3509,43 @@ mod tests {
             parse_group_source("@rg", "rg").unwrap(),
             GroupSource::File(PathBuf::from("@rg"))
         );
+    }
+
+    #[test]
+    fn aux_tag_source_parses_two_char_tag() {
+        let src = parse_group_source("@tag::CB", "g").unwrap();
+        assert_eq!(src, GroupSource::AuxTag(*b"CB"));
+    }
+
+    #[test]
+    fn aux_tag_source_rejects_a_bad_tag() {
+        // one char, three chars, and a non-alphanumeric second char are all invalid.
+        for bad in ["@tag::C", "@tag::CBX", "@tag::C.", "@tag::"] {
+            assert!(
+                parse_group_source(bad, "g").is_err(),
+                "{bad} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn aux_tag_source_is_case_sensitive_and_falls_through_to_file() {
+        // Only exact `@tag::` introduces the source; `@Tag::` and `./@tag::CB` are files.
+        assert_eq!(
+            parse_group_source("@Tag::CB", "g").unwrap(),
+            GroupSource::File(std::path::PathBuf::from("@Tag::CB"))
+        );
+        assert_eq!(
+            parse_group_source("./@tag::CB", "g").unwrap(),
+            GroupSource::File(std::path::PathBuf::from("./@tag::CB"))
+        );
+    }
+
+    #[test]
+    fn aux_tag_source_rejects_attributes() {
+        let err = parse_groups(&["cb=@tag::CB".into(), "cb::dist=1".into()])
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("no attributes"));
     }
 }

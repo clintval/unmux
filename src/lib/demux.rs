@@ -257,6 +257,7 @@ fn load_tag_sets(
                 .with_context(|| format!("failed to load tag set for group `{}`", group.name))?,
             GroupSource::Inline(tags) => TagSet::from_inline(tags),
             GroupSource::ReadGroup(_) => resolved[&group.name].tag_set.clone(),
+            GroupSource::AuxTag(_) => TagSet::default(),
         };
         tag_sets.insert(group.name.clone(), tag_set);
     }
