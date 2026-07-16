@@ -921,9 +921,10 @@ impl FragmentReader {
         Ok(info)
     }
 
-    /// The `@HD` sub-sort order (`SS`) of the first alignment input that has a
-    /// header, as raw bytes; `None` when no input carries a header or none sets
-    /// `SS`. Used to decide whether an `@tag::XX` split may stream.
+    /// The `@HD` sub-sort order (`SS`) of the first alignment input whose header
+    /// sets `SS`, as raw bytes; `None` when no input's header sets `SS` (headers
+    /// lacking `SS` are skipped). Used to decide whether an `@tag::XX` split may
+    /// stream.
     pub fn subsort_order(&self) -> Option<Vec<u8>> {
         for reader in &self.readers {
             let Some(header) = reader.header() else {

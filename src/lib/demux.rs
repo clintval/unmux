@@ -1102,7 +1102,7 @@ fn run_engine(plan: &DemuxPlan, command_line: Option<&str>) -> Result<()> {
 
     if (is_read_group_split || is_aux_tag_split) && rg_info.has_sq {
         log::warn!(
-            "input is aligned (@SQ present); this @RG split writes UNMAPPED records: alignments, \
+            "input is aligned (@SQ present); this split writes UNMAPPED records: alignments, \
              CIGAR/MAPQ, and mate/alignment tags are dropped and reverse-strand reads are restored \
              to sequenced orientation. Carrying mapped data through a split is planned for a future \
              release; for an alignment-preserving split now, use `samtools split`."

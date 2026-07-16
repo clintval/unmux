@@ -7,7 +7,7 @@
 //! sum(denominator)` over the target's records (0 for a pure pass-through run,
 //! where the whole record is the output).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::BufWriter;
 use std::path::Path;
@@ -32,6 +32,10 @@ struct TargetTally {
 pub struct Metrics {
     pool: String,
     targets: Vec<Target>,
+    /// Membership mirror of `targets`, so registering a mid-stream `@tag::XX`
+    /// target is O(1) rather than a linear scan of `targets` per assigned
+    /// record.
+    target_set: HashSet<Target>,
     per_target: HashMap<Target, TargetTally>,
     total: u64,
     pass_through: u64,
@@ -57,6 +61,7 @@ impl Metrics {
         Self {
             pool: pool.into(),
             targets: targets.to_vec(),
+            target_set: targets.iter().cloned().collect(),
             per_target,
             total: 0,
             pass_through: 0,
@@ -72,7 +77,7 @@ impl Metrics {
     /// Register `target` in the per-sample list if new, so a target discovered
     /// mid-stream (a `@tag::XX` split) appears in the per-sample metrics TSV.
     pub fn ensure_target(&mut self, target: &Target) {
-        if !self.targets.contains(target) {
+        if self.target_set.insert(target.clone()) {
             self.targets.push(target.clone());
         }
     }
@@ -375,6 +380,36 @@ mod tests {
         assert_eq!(rows[1], "pool1\tdna01\tlib1\t6\t0.600000\t0.090000");
         // dna02: 2 reads, 0.2, fully extracted 0.0.
         assert_eq!(rows[2], "pool1\tdna02\t\t2\t0.200000\t0.000000");
+    }
+
+    #[test]
+    fn test_ensure_target_registers_once_in_first_seen_order() {
+        // A `@tag::XX` split discovers targets mid-stream. A pre-seeded target is
+        // never re-pushed, and each newly seen target appears exactly once, in
+        // first-seen order.
+        let dir = tempfile::tempdir().unwrap();
+        let seeded = target("pre", None);
+        let mut metrics = Metrics::new("pool1", std::slice::from_ref(&seeded));
+        metrics.record_processed();
+
+        let a = target("a", None);
+        let b = target("b", None);
+        // The pre-seeded target must not be duplicated.
+        metrics.ensure_target(&seeded);
+        metrics.ensure_target(&a);
+        metrics.ensure_target(&b);
+        // A repeat of an already-registered target is a no-op.
+        metrics.ensure_target(&a);
+        metrics.ensure_target(&seeded);
+
+        let path = dir.path().join("per_sample.tsv");
+        metrics.write_per_sample_tsv(&path).unwrap();
+        let rows = lines(&path);
+        let samples: Vec<&str> = rows[1..]
+            .iter()
+            .map(|r| r.split('\t').nth(1).unwrap())
+            .collect();
+        assert_eq!(samples, vec!["pre", "a", "b"]);
     }
 
     #[test]
