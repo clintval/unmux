@@ -16,7 +16,7 @@
 //! parallelized while the writer stays on the consumer thread.
 
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use std::fs::File;
 use std::io::BufWriter;
@@ -1059,8 +1059,8 @@ fn run_engine(plan: &DemuxPlan, command_line: Option<&str>) -> Result<()> {
                 // Unused in streaming mode: only one output file is open at a
                 // time.
                 ceiling: usize::MAX,
-                current: None,
-                current_key: Vec::new(),
+                current_key: None,
+                current_paths: Vec::new(),
                 closed: crate::auxtag::ClosedKeys::default(),
             });
         } else {
@@ -1080,8 +1080,8 @@ fn run_engine(plan: &DemuxPlan, command_line: Option<&str>) -> Result<()> {
             aux = Some(AuxTagSink {
                 streaming: false,
                 ceiling,
-                current: None,
-                current_key: Vec::new(),
+                current_key: None,
+                current_paths: Vec::new(),
                 closed: crate::auxtag::ClosedKeys::default(),
             });
         }
@@ -1737,35 +1737,52 @@ fn prepare_aux_tag(
 struct AuxTagSink {
     streaming: bool,
     ceiling: usize,
-    current: Option<PathBuf>,
-    current_key: Vec<u8>,
+    /// The split value whose files are currently open; `None` before the first
+    /// assigned record. A value change is keyed on this (not on a single path),
+    /// so multi-body output closes every one of the value's body files.
+    current_key: Option<Vec<u8>>,
+    /// Every output path open for `current_key` (one per output body), closed as
+    /// a group when the value changes.
+    current_paths: Vec<PathBuf>,
     closed: crate::auxtag::ClosedKeys,
 }
 
 impl AuxTagSink {
-    /// Prepare the writer for an assigned record whose output goes to `path`
-    /// and whose split value is `key`. Streaming: on a value change, guard
-    /// against recurrence, then close the previous file. All-open: refuse to
-    /// exceed the descriptor ceiling with an actionable error.
+    /// Prepare the writer for an assigned record whose output files are `paths`
+    /// (one per output body) and whose split value is `key`. Streaming: on a
+    /// value change, guard against recurrence, then close every file the
+    /// previous value had open. All-open: refuse to exceed the descriptor
+    /// ceiling with an actionable error.
     fn before_write(
         &mut self,
         writer: &mut MultiWriter,
-        path: Option<&Path>,
         key: &[u8],
+        paths: &[Option<PathBuf>],
     ) -> Result<()> {
         if self.streaming {
-            let changed = self.current.as_deref() != path;
-            if changed {
+            if self.current_key.as_deref() != Some(key) {
                 self.closed.enter(key)?; // fatal if this value already closed
-                if let Some(prev) = self.current.take() {
+                for prev in self.current_paths.drain(..) {
                     writer.close_dest(Some(&prev))?;
-                    self.closed.close(&std::mem::take(&mut self.current_key));
                 }
-                self.current = path.map(Path::to_path_buf);
-                self.current_key = key.to_vec();
+                if let Some(prev_key) = self.current_key.take() {
+                    self.closed.close(&prev_key);
+                }
+                self.current_key = Some(key.to_vec());
+                self.current_paths = paths.iter().flatten().cloned().collect();
             }
-        } else if path.is_some() && !writer.is_open(path) && writer.open_count() >= self.ceiling {
-            return Err(too_many_open_files_error(writer.open_count()));
+        } else {
+            // Every body this record would newly open counts against the
+            // ceiling, so project the open count across all of its paths.
+            let mut open = writer.open_count();
+            for path in paths.iter().map(Option::as_deref) {
+                if path.is_some() && !writer.is_open(path) {
+                    if open >= self.ceiling {
+                        return Err(too_many_open_files_error(open));
+                    }
+                    open += 1;
+                }
+            }
         }
         Ok(())
     }
@@ -1818,14 +1835,18 @@ fn apply_prepared(
     }
     // A `@tag::XX` split discovers its targets from the records, so register the
     // target for the per-sample TSV, then prepare the fan-out writer for this
-    // value before issuing its write: stream one file at a time (closing the
-    // previous value's file, guarding a recurrence) or enforce the open-file
-    // ceiling. A `@tag` assigned record produces exactly one output write.
+    // value before issuing its writes: stream the value's files one value at a
+    // time (closing the previous value's files, guarding a recurrence) or
+    // enforce the open-file ceiling. An assigned record may produce more than one
+    // output body (a `%ordinal` FASTX pair), so all of its paths are passed.
     if let (Some(aux), Tally::Assigned { target, .. }) = (aux.as_mut(), &prepared.tally) {
         metrics.ensure_target(target);
-        if let Some(write) = prepared.writes.first() {
-            aux.before_write(writer, write.path.as_deref(), target.sample.as_bytes())?;
-        }
+        let paths: Vec<Option<PathBuf>> = prepared
+            .writes
+            .iter()
+            .map(|write| write.path.clone())
+            .collect();
+        aux.before_write(writer, target.sample.as_bytes(), &paths)?;
     }
     // In all-open mode the estimated ceiling is a best guess, so map the OS
     // refusing another open file to the same actionable error as a backstop.
@@ -5251,5 +5272,67 @@ mod tests {
             matches!(prepared.tally, Tally::Unassigned),
             "a record carrying no CB is unassigned"
         );
+    }
+
+    #[test]
+    fn aux_tag_streaming_closes_all_body_files_on_value_change() {
+        // A streaming value with multiple output bodies (e.g. an R1/R2 FASTX
+        // pair) must close EVERY one of its files when the value changes, not
+        // just the first, so at most O(1) files stay open regardless of
+        // cardinality. A value that reappears after closing is still fatal.
+        let dir = tempfile::tempdir().unwrap();
+        let a1 = dir.path().join("cellA.1.sam");
+        let a2 = dir.path().join("cellA.2.sam");
+        let b1 = dir.path().join("cellB.1.sam");
+        let mut writer = MultiWriter::new(
+            HashMap::new(),
+            crate::output::provenance_header(None),
+            vec![SniffedFormat::Sam],
+            5,
+        );
+        let read = |name: &'static [u8]| OutputRead {
+            name,
+            bases: b"ACGT",
+            quals: Some(&[30, 30, 30, 30]),
+            tags: None,
+            read_group: None,
+        };
+        let mut aux = AuxTagSink {
+            streaming: true,
+            ceiling: usize::MAX,
+            current_key: None,
+            current_paths: Vec::new(),
+            closed: crate::auxtag::ClosedKeys::default(),
+        };
+
+        // Value A opens two body files.
+        aux.before_write(&mut writer, b"cellA", &[Some(a1.clone()), Some(a2.clone())])
+            .unwrap();
+        writer.write(Some(&a1), &[read(b"ra1")]).unwrap();
+        writer.write(Some(&a2), &[read(b"ra2")]).unwrap();
+        assert_eq!(writer.open_count(), 2);
+
+        // The value changes: BOTH of A's files close, so the open count drops by
+        // two, not one. This is the discriminating check for the multi-body fix.
+        aux.before_write(&mut writer, b"cellB", &[Some(b1.clone())])
+            .unwrap();
+        assert_eq!(
+            writer.open_count(),
+            0,
+            "both of value A's files were closed"
+        );
+        assert!(!writer.is_open(Some(&a1)));
+        assert!(!writer.is_open(Some(&a2)));
+
+        writer.write(Some(&b1), &[read(b"rb1")]).unwrap();
+        assert_eq!(writer.open_count(), 1);
+
+        // Re-seeing a value whose files were already closed is a fatal recurrence.
+        let err = aux
+            .before_write(&mut writer, b"cellA", &[Some(a1.clone())])
+            .unwrap_err();
+        assert!(err.to_string().contains("reappeared"));
+
+        writer.finish().unwrap();
     }
 }
