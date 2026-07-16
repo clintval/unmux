@@ -69,6 +69,14 @@ impl Metrics {
         }
     }
 
+    /// Register `target` in the per-sample list if new, so a target discovered
+    /// mid-stream (a `@tag::XX` split) appears in the per-sample metrics TSV.
+    pub fn ensure_target(&mut self, target: &Target) {
+        if !self.targets.contains(target) {
+            self.targets.push(target.clone());
+        }
+    }
+
     /// Count one processed fragment (every record, before routing).
     pub fn record_processed(&mut self) {
         self.total += 1;

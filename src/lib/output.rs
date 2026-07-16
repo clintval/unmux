@@ -528,6 +528,29 @@ impl MultiWriter {
         OutputWriter::create_with_header(path, format, self.compression, header)
     }
 
+    /// Finalize and drop the writer for one destination (flush, gzip trailer,
+    /// BGZF EOF, CRAM container), producing a complete standalone file. Used by
+    /// the streaming `@tag` split to close a value's file before opening the
+    /// next. A destination with no open writer is a no-op.
+    pub fn close_dest(&mut self, path: Option<&Path>) -> Result<()> {
+        let dest = Dest::from_path(path);
+        match self.writers.remove(&dest) {
+            Some(writer) => writer.finish(),
+            None => Ok(()),
+        }
+    }
+
+    /// The number of output writers currently open.
+    pub fn open_count(&self) -> usize {
+        self.writers.len()
+    }
+
+    /// Whether the destination `path` (stdout when `None`) currently has an open
+    /// writer.
+    pub fn is_open(&self, path: Option<&Path>) -> bool {
+        self.writers.contains_key(&Dest::from_path(path))
+    }
+
     /// Finalize every opened writer (flush, gzip trailers, BGZF EOF), returning
     /// the first error. Every writer is finalized even when one fails, so a
     /// single bad sink does not leave the other fan-out files truncated.
@@ -983,6 +1006,57 @@ mod tests {
             names
         };
         assert_eq!(names(&a), vec![b"ra".to_vec(), b"ra2".to_vec()]);
+        assert_eq!(names(&b), vec![b"rb".to_vec()]);
+    }
+
+    #[test]
+    fn close_dest_finalizes_and_forgets_one_writer() {
+        // Open two SAM files, write one record to each, close the first, then
+        // finish the writer: both files must be complete, valid SAM on disk.
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.sam");
+        let b = dir.path().join("b.sam");
+        let mut writer = MultiWriter::new(
+            HashMap::new(),
+            provenance_header(None),
+            vec![SniffedFormat::Sam],
+            5,
+        );
+        let read = |name: &'static [u8]| OutputRead {
+            name,
+            bases: b"ACGT",
+            quals: Some(&[30, 30, 30, 30]),
+            tags: None,
+            read_group: None,
+        };
+        writer.write(Some(&a), &[read(b"ra")]).unwrap();
+        writer.write(Some(&b), &[read(b"rb")]).unwrap();
+        assert_eq!(writer.open_count(), 2);
+        assert!(writer.is_open(Some(&a)));
+
+        // Close the first file: its writer is finalized and forgotten, the
+        // second stays open.
+        writer.close_dest(Some(&a)).unwrap();
+        assert_eq!(writer.open_count(), 1);
+        assert!(!writer.is_open(Some(&a)));
+        assert!(writer.is_open(Some(&b)));
+        // Closing an already-closed (or never-opened) destination is a no-op.
+        writer.close_dest(Some(&a)).unwrap();
+        assert_eq!(writer.open_count(), 1);
+
+        writer.finish().unwrap();
+
+        // Both files parse as complete SAM carrying their one record.
+        let names = |path: &std::path::Path| {
+            let mut reader =
+                crate::input::FragmentReader::open(&[path.to_path_buf()], false).unwrap();
+            let mut names = Vec::new();
+            while let Some(fragment) = reader.next_fragment().unwrap() {
+                names.extend(fragment.records.into_iter().map(|r| r.name));
+            }
+            names
+        };
+        assert_eq!(names(&a), vec![b"ra".to_vec()]);
         assert_eq!(names(&b), vec![b"rb".to_vec()]);
     }
 }

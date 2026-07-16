@@ -16,7 +16,7 @@
 //! parallelized while the writer stays on the consumer thread.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use std::fs::File;
 use std::io::BufWriter;
@@ -1043,20 +1043,47 @@ fn run_engine(plan: &DemuxPlan, command_line: Option<&str>) -> Result<()> {
         Some(tag) => crate::input::grouped_by_tag(reader.subsort_order().as_deref(), tag),
         None => false,
     };
+    // The consumer-side controller for a `@tag::XX` split: streaming closes each
+    // value's file on a value change (guarding a recurrence), while the all-open
+    // fallback bounds the number of concurrently open outputs. `None` for any
+    // non-`@tag` run.
+    let mut aux: Option<AuxTagSink> = None;
     if let Some(tag) = aux_tag {
         if aux_streaming {
             log::info!(
                 "input is grouped by aux tag {}; splitting one file at a time",
                 String::from_utf8_lossy(&tag)
             );
+            aux = Some(AuxTagSink {
+                streaming: true,
+                // Unused in streaming mode: only one output file is open at a
+                // time.
+                ceiling: usize::MAX,
+                current: None,
+                current_key: Vec::new(),
+                closed: crate::auxtag::ClosedKeys::default(),
+            });
         } else {
+            // Not grouped by the tag, so every value's file is open at once:
+            // raise the soft open-file limit toward the hard cap once, and feed
+            // that same soft limit to both the log and the open-file ceiling
+            // (the number of outputs that may be open, reserving stdio, the
+            // input files, and slack).
             let soft = crate::auxtag::raise_open_file_limit();
+            let ceiling = crate::auxtag::open_file_ceiling(soft, 16 + plan.inputs.len() as u64);
             log::info!(
                 "input is not grouped by aux tag {}; splitting with all files open (soft open-file limit {}). Sort by the tag (`samtools sort -t {}`) to stream one file at a time.",
                 String::from_utf8_lossy(&tag),
                 soft,
                 String::from_utf8_lossy(&tag)
             );
+            aux = Some(AuxTagSink {
+                streaming: false,
+                ceiling,
+                current: None,
+                current_key: Vec::new(),
+                closed: crate::auxtag::ClosedKeys::default(),
+            });
         }
     }
 
@@ -1270,9 +1297,9 @@ fn run_engine(plan: &DemuxPlan, command_line: Option<&str>) -> Result<()> {
     let run_result = (|| -> Result<()> {
         writer.create_all(&dests)?;
         match threads {
-            1 => drive_serial(&engine, reader, &mut writer, &mut metrics),
-            2 => drive_pipelined(&engine, reader, &mut writer, &mut metrics),
-            _ => drive_parallel(&engine, budget, reader, &mut writer, &mut metrics),
+            1 => drive_serial(&engine, reader, &mut writer, &mut metrics, &mut aux),
+            2 => drive_pipelined(&engine, reader, &mut writer, &mut metrics, &mut aux),
+            _ => drive_parallel(&engine, budget, reader, &mut writer, &mut metrics, &mut aux),
         }
     })();
     let finished = writer.finish();
@@ -1704,13 +1731,78 @@ fn prepare_aux_tag(
     }
 }
 
+/// Consumer-side state for a `@tag::XX` split. In streaming mode it closes the
+/// previous value's file when the value changes and errors on a value that
+/// reappears after closing; in all-open mode it enforces the open-file ceiling.
+struct AuxTagSink {
+    streaming: bool,
+    ceiling: usize,
+    current: Option<PathBuf>,
+    current_key: Vec<u8>,
+    closed: crate::auxtag::ClosedKeys,
+}
+
+impl AuxTagSink {
+    /// Prepare the writer for an assigned record whose output goes to `path`
+    /// and whose split value is `key`. Streaming: on a value change, guard
+    /// against recurrence, then close the previous file. All-open: refuse to
+    /// exceed the descriptor ceiling with an actionable error.
+    fn before_write(
+        &mut self,
+        writer: &mut MultiWriter,
+        path: Option<&Path>,
+        key: &[u8],
+    ) -> Result<()> {
+        if self.streaming {
+            let changed = self.current.as_deref() != path;
+            if changed {
+                self.closed.enter(key)?; // fatal if this value already closed
+                if let Some(prev) = self.current.take() {
+                    writer.close_dest(Some(&prev))?;
+                    self.closed.close(&std::mem::take(&mut self.current_key));
+                }
+                self.current = path.map(Path::to_path_buf);
+                self.current_key = key.to_vec();
+            }
+        } else if path.is_some() && !writer.is_open(path) && writer.open_count() >= self.ceiling {
+            return Err(too_many_open_files_error(writer.open_count()));
+        }
+        Ok(())
+    }
+}
+
+/// The actionable error when a `@tag::XX` all-open split cannot open another
+/// output file: `count` files are already open and the process's limit is
+/// reached. Points at sorting by the tag (to stream one file at a time) or
+/// raising the open-file limit.
+fn too_many_open_files_error(count: usize) -> anyhow::Error {
+    anyhow!(
+        "splitting by aux tag reached {} open files (the limit available to this process). Sort by the tag (`samtools sort -t <TAG>`) to stream one file at a time, or raise the open-file limit (`ulimit -n`).",
+        count
+    )
+}
+
+/// Whether an error chain carries the OS refusing another open file
+/// (`EMFILE`/`ENFILE`), so an all-open `@tag` write can be remapped to the
+/// actionable [`too_many_open_files_error`] even if the estimated ceiling was
+/// too generous.
+fn is_open_file_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(crate::auxtag::is_too_many_open_files)
+    })
+}
+
 /// Apply one [`Prepared`] on the serial consumer: tally it and issue its writes
 /// in order. The writer and metrics are single-threaded; everything else now
-/// happens on the worker in [`prepare`].
+/// happens on the worker in [`prepare`]. For a `@tag::XX` split, `aux` drives
+/// the streaming close / open-file guard before an assigned record's write.
 fn apply_prepared(
     prepared: Prepared,
     writer: &mut MultiWriter,
     metrics: &mut Metrics,
+    aux: &mut Option<AuxTagSink>,
 ) -> Result<()> {
     metrics.record_processed();
     metrics.record_read_lengths(prepared.lengths.iter().copied());
@@ -1724,17 +1816,38 @@ fn apply_prepared(
             unext,
         } => metrics.record_assigned(target, *denom, *unext),
     }
+    // A `@tag::XX` split discovers its targets from the records, so register the
+    // target for the per-sample TSV, then prepare the fan-out writer for this
+    // value before issuing its write: stream one file at a time (closing the
+    // previous value's file, guarding a recurrence) or enforce the open-file
+    // ceiling. A `@tag` assigned record produces exactly one output write.
+    if let (Some(aux), Tally::Assigned { target, .. }) = (aux.as_mut(), &prepared.tally) {
+        metrics.ensure_target(target);
+        if let Some(write) = prepared.writes.first() {
+            aux.before_write(writer, write.path.as_deref(), target.sample.as_bytes())?;
+        }
+    }
+    // In all-open mode the estimated ceiling is a best guess, so map the OS
+    // refusing another open file to the same actionable error as a backstop.
+    let all_open = aux.as_ref().is_some_and(|aux| !aux.streaming);
     for write in &prepared.writes {
-        match &write.payload {
+        let path = write.path.as_deref();
+        let result = match &write.payload {
             // Encoded on the worker: the consumer only appends the bytes (the
             // merge-point lever).
-            WritePayload::Encoded(bytes) => writer.write_encoded(write.path.as_deref(), bytes)?,
+            WritePayload::Encoded(bytes) => writer.write_encoded(path, bytes),
             // CRAM fallback: the consumer encodes the structured reads.
             WritePayload::Records(reads) => {
                 let outputs: SmallVec<[OutputRead; 2]> =
                     reads.iter().map(PreparedRead::as_output).collect();
-                writer.write(write.path.as_deref(), &outputs)?;
+                writer.write(path, &outputs)
             }
+        };
+        match result {
+            Err(error) if all_open && is_open_file_error(&error) => {
+                return Err(too_many_open_files_error(writer.open_count()));
+            }
+            other => other?,
         }
     }
     Ok(())
@@ -1834,10 +1947,11 @@ fn apply_chunk(
     prepared: Vec<Result<Prepared>>,
     writer: &mut MultiWriter,
     metrics: &mut Metrics,
+    aux: &mut Option<AuxTagSink>,
     progress: &mut Progress,
 ) -> Result<()> {
     for outcome in prepared {
-        apply_prepared(outcome?, writer, metrics)?;
+        apply_prepared(outcome?, writer, metrics, aux)?;
         progress.record();
     }
     Ok(())
@@ -1872,12 +1986,13 @@ fn drive_serial(
     mut reader: FragmentReader,
     writer: &mut MultiWriter,
     metrics: &mut Metrics,
+    aux: &mut Option<AuxTagSink>,
 ) -> Result<()> {
     let mut progress = Progress::new();
     let mut scratch = Scratch::new();
     while let Some(chunk) = next_chunk(&mut reader, READ_CHUNK)? {
         let prepared = match_chunk_serial(engine, &mut scratch, &chunk);
-        apply_chunk(prepared, writer, metrics, &mut progress)?;
+        apply_chunk(prepared, writer, metrics, aux, &mut progress)?;
     }
     Ok(())
 }
@@ -1893,6 +2008,7 @@ fn drive_pipelined(
     reader: FragmentReader,
     writer: &mut MultiWriter,
     metrics: &mut Metrics,
+    aux: &mut Option<AuxTagSink>,
 ) -> Result<()> {
     let mut progress = Progress::new();
     let mut scratch = Scratch::new();
@@ -1902,7 +2018,7 @@ fn drive_pipelined(
     let mut outcome: Result<()> = Ok(());
     for chunk in &rx {
         let prepared = match_chunk_serial(engine, &mut scratch, &chunk);
-        if let Err(error) = apply_chunk(prepared, writer, metrics, &mut progress) {
+        if let Err(error) = apply_chunk(prepared, writer, metrics, aux, &mut progress) {
             outcome = Err(error);
             break;
         }
@@ -1932,6 +2048,7 @@ fn drive_parallel(
     reader: FragmentReader,
     writer: &mut MultiWriter,
     metrics: &mut Metrics,
+    aux: &mut Option<AuxTagSink>,
 ) -> Result<()> {
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(budget.matchers)
@@ -1960,7 +2077,7 @@ fn drive_parallel(
                 })
                 .collect()
         });
-        if let Err(error) = apply_chunk(prepared, writer, metrics, &mut progress) {
+        if let Err(error) = apply_chunk(prepared, writer, metrics, aux, &mut progress) {
             outcome = Err(error);
             break;
         }
