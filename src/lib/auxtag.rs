@@ -60,6 +60,29 @@ fn fingerprint(key: &[u8]) -> u64 {
     hasher.finish()
 }
 
+/// Raise this process's soft open-file limit toward the hard cap (a process may
+/// do this without privileges) and return the effective soft limit. Best-effort:
+/// on any error the current soft limit is returned unchanged.
+pub fn raise_open_file_limit() -> u64 {
+    let current = rlimit::Resource::NOFILE
+        .get()
+        .map(|(soft, _hard)| soft)
+        .unwrap_or(0);
+    rlimit::increase_nofile_limit(u64::MAX).unwrap_or(current)
+}
+
+/// How many output files may be open at once: the soft limit minus a reserve
+/// for stdio, the input files, and slack. Floors at zero.
+pub fn open_file_ceiling(soft_limit: u64, reserved: u64) -> usize {
+    soft_limit.saturating_sub(reserved) as usize
+}
+
+/// Whether an I/O error is the OS refusing another open file
+/// (`EMFILE`, per-process, or `ENFILE`, system-wide).
+pub fn is_too_many_open_files(err: &std::io::Error) -> bool {
+    matches!(err.raw_os_error(), Some(libc::EMFILE) | Some(libc::ENFILE))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -115,5 +138,26 @@ mod tests {
         closed.close(b"AAAA");
         let err = closed.enter(b"AAAA").err().unwrap();
         assert!(err.to_string().contains("reappeared"));
+    }
+
+    #[test]
+    fn ceiling_subtracts_the_reserve_and_floors_at_zero() {
+        assert_eq!(open_file_ceiling(1024, 16), 1008);
+        assert_eq!(open_file_ceiling(10, 16), 0); // never negative
+    }
+
+    #[test]
+    fn emfile_and_enfile_are_recognized() {
+        let emfile = std::io::Error::from_raw_os_error(libc::EMFILE);
+        let enfile = std::io::Error::from_raw_os_error(libc::ENFILE);
+        let other = std::io::Error::from_raw_os_error(libc::ENOENT);
+        assert!(is_too_many_open_files(&emfile));
+        assert!(is_too_many_open_files(&enfile));
+        assert!(!is_too_many_open_files(&other));
+    }
+
+    #[test]
+    fn raising_the_open_file_limit_returns_a_nonzero_soft_limit() {
+        assert!(raise_open_file_limit() > 0);
     }
 }
