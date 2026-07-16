@@ -19,6 +19,10 @@ pixi exec \
     unmux --help
 ```
 
+The whole CLI is documented in `unmux --help`, with worked examples for every flag:
+
+![unmux --help](.github/img/help.gif)
+
 ## Introduction
 
 The tool `unmux` reads multiple FASTX/SAM/BAM/CRAM inputs, identifies and extracts technical sequences (barcodes, UMIs, adapters) with error tolerance using the [`sassy`](https://github.com/RagnarGrootKoerkamp/sassy) approximate matcher, and writes FASTX/SAM/BAM/CRAM files with preserved per-record segment qualities, fanning a record pool out into per-sample, and optionally per-sample and per-library, files in a single pass.
