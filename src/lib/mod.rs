@@ -7,6 +7,7 @@
 //! point, re-exported here for the binary to dispatch.
 #![warn(missing_docs)]
 
+pub mod auxtag;
 pub mod demux;
 pub mod extract;
 pub mod fanout;
@@ -21,6 +22,7 @@ pub mod readgroup;
 pub mod tags;
 pub mod writer;
 
+pub use auxtag::match_aux_tag;
 pub use demux::{run_demux, DemuxArgs};
 pub use extract::{extract, Extracted, MatchSpan, Segment};
 pub use fanout::{
