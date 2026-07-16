@@ -969,6 +969,9 @@ struct Engine<'a> {
     /// `@RG` line is carried verbatim by the header, see [`build_constituent_rgs`])
     /// rather than being rewritten to a synthesized per-target read group.
     is_read_group_split: bool,
+    /// `Some(tag)` for a `@tag::XX` split: route each record by its aux value
+    /// `tag` (discovered per record) instead of the static `Routing`.
+    aux_tag: Option<[u8; 2]>,
 }
 
 /// Run the demux engine: match tag groups per record, route each record with
@@ -1177,6 +1180,7 @@ fn run_engine(plan: &DemuxPlan, command_line: Option<&str>) -> Result<()> {
         headers: &headers,
         default_header: &default_header,
         is_read_group_split,
+        aux_tag: None,
     };
     let mut metrics = Metrics::new(pool.clone(), routing.targets());
 
@@ -1520,6 +1524,17 @@ fn prepare(engine: &Engine, fragment: &Fragment, fmatch: FragmentMatch) -> Resul
         })
         .collect();
 
+    if let Some(tag) = engine.aux_tag {
+        if let Disposition::Removed(remove) = engine.routing.route(&hits) {
+            return Ok(Prepared {
+                lengths,
+                tally: Tally::Removed,
+                writes: prepare_removed(engine, fragment, remove, &hits),
+            });
+        }
+        return prepare_aux_tag(engine, tag, fragment, &hits, &segments, lengths);
+    }
+
     let (tally, writes) = match engine.routing.route(&hits) {
         Disposition::Removed(remove) => (
             Tally::Removed,
@@ -1572,6 +1587,48 @@ fn prepare(engine: &Engine, fragment: &Fragment, fmatch: FragmentMatch) -> Resul
         tally,
         writes,
     })
+}
+
+/// Route a fragment for a `@tag::XX` split: read its aux value, and either
+/// assign it to a `Target` named by that value (files fan out by `%sample`) or
+/// send it to the `--unassigned` bin. The value names the sample but is never
+/// written as an `@RG`; each record keeps its own tags.
+fn prepare_aux_tag(
+    engine: &Engine,
+    tag: [u8; 2],
+    fragment: &Fragment,
+    hits: &[Option<GroupHit>],
+    segments: &[Segment],
+    lengths: SmallVec<[usize; 4]>,
+) -> Result<Prepared> {
+    let Some(value) = crate::auxtag::match_aux_tag(tag, fragment) else {
+        return Ok(Prepared {
+            lengths,
+            tally: Tally::Unassigned,
+            writes: prepare_unassigned(engine, fragment, &Unassigned::NoSample, hits),
+        });
+    };
+    let target = Target {
+        sample: String::from_utf8_lossy(&value).into_owned(),
+        sub_sample: None,
+    };
+    let (denom, unext) = frac_bases(engine, segments, hits)?;
+    match prepare_body(engine, Some(&target), hits, segments, fragment)? {
+        BodyOutcome::Assembled(writes) => Ok(Prepared {
+            lengths,
+            tally: Tally::Assigned {
+                target,
+                denom,
+                unext,
+            },
+            writes,
+        }),
+        BodyOutcome::MissingStream(missing) => Ok(Prepared {
+            lengths,
+            tally: Tally::Unassigned,
+            writes: prepare_unassigned(engine, fragment, &Unassigned::MissingStream(missing), hits),
+        }),
+    }
 }
 
 /// Apply one [`Prepared`] on the serial consumer: tally it and issue its writes
@@ -2209,11 +2266,11 @@ fn prepare_body(
     let tag_data = build_tag_data(&plan.tags, &streams);
     // An assigned read carries its sample's read group; a pass-through read (no
     // target) carries the default pool read group, so a SAM/BAM/CRAM `--out`
-    // matches the default `@RG` in its header. On an `@RG`-split run the record
-    // keeps its carried original `RG:Z` instead (already in `read.tags` via
-    // `merge_data`); `None` leaves it untouched, since `writer::build_record`
-    // only inserts `RG:Z` when a read group is set.
-    let read_group = if engine.is_read_group_split {
+    // matches the default `@RG` in its header. On an `@RG`-split or `@tag`-split
+    // run the record keeps its own carried `RG:Z` instead (already in
+    // `read.tags` via `merge_data`); `None` leaves it untouched, since
+    // `writer::build_record` only inserts `RG:Z` when a read group is set.
+    let read_group = if engine.is_read_group_split || engine.aux_tag.is_some() {
         None
     } else {
         target.map(Target::label).or_else(|| Some(pool.to_string()))
@@ -4884,11 +4941,16 @@ mod tests {
         );
     }
 
-    /// An [`Engine`] with a single `@tag::<tag>` group and nothing else wired
-    /// up: enough to drive `match_fragment` directly in a unit test. The
-    /// backing state is leaked to satisfy `Engine`'s borrowed fields with a
-    /// `'static` fixture; it is a one-shot allocation for the test process.
-    fn engine_with_single_aux_tag_group(tag: [u8; 2]) -> Engine<'static> {
+    /// An [`Engine`] for a `@tag::<tag>` split: a single aux-tag group, `aux_tag`
+    /// set so `prepare` routes each record by its own value, and an optional
+    /// `--out` pattern. Enough to drive `match_fragment` and `prepare` directly
+    /// in a unit test. The backing state is leaked to satisfy `Engine`'s borrowed
+    /// fields with a `'static` fixture; it is a one-shot allocation for the test
+    /// process.
+    fn engine_with_single_aux_tag_group(
+        tag: [u8; 2],
+        out: Option<OutputPattern>,
+    ) -> Engine<'static> {
         let mut group = CompiledGroup::new("cb", Vec::new());
         group.aux_tag = Some(tag);
         let groups: &'static [CompiledGroup] = Box::leak(Box::new(vec![group]));
@@ -4906,7 +4968,7 @@ mod tests {
             require_samples_explain_all_tags: false,
             qc_tag: None,
             remove: Vec::new(),
-            out: None,
+            out,
             unassigned: None,
             metrics_per_sample: None,
             metrics_summary: None,
@@ -4935,6 +4997,7 @@ mod tests {
             headers,
             default_header,
             is_read_group_split: false,
+            aux_tag: Some(tag),
         }
     }
 
@@ -4956,7 +5019,7 @@ mod tests {
     fn aux_tag_group_produces_no_hit() {
         // A @tag group does no sequence matching and emits no GroupHit; its
         // slot stays None. Routing by value is handled later in `prepare`.
-        let engine = engine_with_single_aux_tag_group(*b"CB");
+        let engine = engine_with_single_aux_tag_group(*b"CB", None);
         let fragment = fragment_with_cb(b"AAAA");
         let mut scratch = Scratch::new();
         let m = match_fragment(&engine, &mut scratch, &fragment).unwrap();
@@ -4964,5 +5027,39 @@ mod tests {
             panic!("expected Routed")
         };
         assert!(hits.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn prepare_routes_by_aux_tag_value() {
+        // A @tag::CB split routes each record to a sample named by its own CB
+        // value, bypassing the index-based routing table; a record carrying no
+        // CB lands in the unassigned bin.
+        let out =
+            crate::grammar::parse_output_pattern("%sample.bam", &[Placeholder::Sample]).unwrap();
+        let engine = engine_with_single_aux_tag_group(*b"CB", Some(out));
+        let mut scratch = Scratch::new();
+
+        let fragment = fragment_with_cb(b"AAAA");
+        let m = match_fragment(&engine, &mut scratch, &fragment).unwrap();
+        let prepared = prepare(&engine, &fragment, m).unwrap();
+        let Tally::Assigned { target, .. } = prepared.tally else {
+            panic!("expected the CB value to assign a sample");
+        };
+        assert_eq!(target.sample, "AAAA", "the sample is named by the CB value");
+
+        let fragment = Fragment {
+            records: vec![InputRecord {
+                name: b"r1".to_vec(),
+                bases: b"ACGT".to_vec(),
+                quals: None,
+                tags: None,
+            }],
+        };
+        let m = match_fragment(&engine, &mut scratch, &fragment).unwrap();
+        let prepared = prepare(&engine, &fragment, m).unwrap();
+        assert!(
+            matches!(prepared.tally, Tally::Unassigned),
+            "a record carrying no CB is unassigned"
+        );
     }
 }
