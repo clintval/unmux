@@ -347,6 +347,31 @@ pub fn default_read_group_header(
     Ok(builder.build())
 }
 
+/// The single header every `@tag::XX` output file carries: `@PG` provenance,
+/// the input's original `@RG` line(s) verbatim (or the default pool `@RG` when
+/// the input declares none), and a `@CO` recording the split tag. An aux-tag
+/// value is not a sample, so it is never written as an `@RG` `SM`; it names the
+/// file (`%sample`) and stays on each record's own tag.
+pub fn aux_tag_header(
+    rg_info: &crate::input::ReadGroupInfo,
+    pool: &str,
+    rg_tags: &[(String, String)],
+    command_line: Option<&str>,
+    tag: [u8; 2],
+) -> Result<sam::Header> {
+    let note = format!("unmux: split by aux tag {}", String::from_utf8_lossy(&tag));
+    if rg_info.read_groups.is_empty() {
+        let mut header = default_read_group_header(pool, rg_tags, command_line)?;
+        header.comments_mut().push(note.into());
+        return Ok(header);
+    }
+    let mut builder = provenance_header_builder(command_line).add_comment(note);
+    for rg in &rg_info.read_groups {
+        builder = builder.add_read_group(rg.id.clone(), rg.map.clone());
+    }
+    Ok(builder.build())
+}
+
 /// Resolve a shared `--rg-tag` key (`CN`/`PL`/`PU`/...) to a non-standard
 /// read-group tag. `ID` is the read-group key, not a field, so setting it is a
 /// fail-fast error (`SM`/`LB` are already rejected by the grammar).
@@ -521,6 +546,15 @@ impl MultiWriter {
 mod tests {
     use super::*;
     use crate::grammar::{OutputPattern, StreamRef};
+    use crate::input::{InputReadGroup, ReadGroupInfo};
+
+    /// Render a header to its textual SAM form, the same way an output file
+    /// would carry it, so tests can assert on the emitted `@RG`/`@CO` lines.
+    fn header_text(header: &sam::Header) -> String {
+        let mut writer = sam::io::Writer::new(Vec::new());
+        writer.write_header(header).unwrap();
+        String::from_utf8(writer.into_inner()).unwrap()
+    }
 
     /// Parse a pattern through the grammar so tests use real `OutputPattern`
     /// values.
@@ -884,6 +918,34 @@ mod tests {
         let field = |tag| rg.other_fields().get(tag).map(|v| v.to_string());
         assert_eq!(field(&rg_tag::SAMPLE).as_deref(), Some("lib01"), "SM=pool");
         assert_eq!(field(&rg_tag::LIBRARY).as_deref(), Some("lib01"), "LB=pool");
+    }
+
+    #[test]
+    fn aux_tag_header_carries_original_read_groups_and_a_split_comment() {
+        let rg_info = ReadGroupInfo {
+            read_groups: vec![InputReadGroup {
+                id: b"rg1".to_vec(),
+                sample: Some("sampleA".into()),
+                library: Some("lib1".into()),
+                map: Map::<ReadGroup>::builder()
+                    .insert(rg_tag::SAMPLE, "sampleA")
+                    .build()
+                    .unwrap(),
+            }],
+            has_sq: false,
+        };
+        let header = aux_tag_header(&rg_info, "pool", &[], None, *b"CB").unwrap();
+        let text = header_text(&header);
+        assert!(text.contains("ID:rg1"));
+        assert!(text.contains("@CO"));
+        assert!(text.contains("CB"));
+    }
+
+    #[test]
+    fn aux_tag_header_falls_back_to_pool_read_group_when_input_has_none() {
+        let rg_info = ReadGroupInfo::default();
+        let header = aux_tag_header(&rg_info, "pool", &[], None, *b"CB").unwrap();
+        assert!(header_text(&header).contains("SM:pool"));
     }
 
     #[test]
