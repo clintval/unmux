@@ -801,7 +801,7 @@ mod tests {
                 .build()
                 .expect("a read group map has no required fields")
         };
-        let mut constituent: HashMap<Target, Vec<(Vec<u8>, Map<ReadGroup>)>> = HashMap::new();
+        let mut constituent: ConstituentReadGroups = HashMap::new();
         constituent.insert(
             sample_a.clone(),
             vec![
@@ -847,7 +847,7 @@ mod tests {
                 .build()
                 .expect("a read group map has no required fields")
         };
-        let mut constituent: HashMap<Target, Vec<(Vec<u8>, Map<ReadGroup>)>> = HashMap::new();
+        let mut constituent: ConstituentReadGroups = HashMap::new();
         constituent.insert(
             sample_a.clone(),
             vec![
