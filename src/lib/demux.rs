@@ -265,8 +265,9 @@ fn load_tag_sets(
 
 /// Resolve every `@RG` group in the plan against the input header's read
 /// groups, once, keyed by group name. Built right after the reader opens (so
-/// the header is available) and shared by [`load_tag_sets`], `compile_groups`
-/// (Task 5), and `build_routing` (Task 7).
+/// the header is available) and shared by the tag-set loader, the group
+/// compiler, and the routing builder ([`load_tag_sets`], `compile_groups`,
+/// `build_routing`).
 fn resolve_read_group_groups(
     plan: &DemuxPlan,
     rg_info: &crate::input::ReadGroupInfo,
@@ -3876,7 +3877,7 @@ mod tests {
 
     #[test]
     fn test_bam_output_honors_compression_level() {
-        // Per the spec, --compression sets the BAM BGZF level. The same data at
+        // unmux maps --compression to the BAM BGZF level. The same data at
         // level 0 (stored) must produce a clearly larger file than at level 9
         // (max), and both must round-trip every record.
         let dir = tempfile::tempdir().unwrap();
@@ -4133,8 +4134,9 @@ mod tests {
         };
 
         // 4 is the pooled-BGZF floor: read-ahead + main + >=1 writer + >=1
-        // matcher. Below it (Task 2), compression runs inline; here both runs
-        // use the pool so the bytes are identical.
+        // matcher. With fewer worker threads than that, compression runs inline
+        // instead of through the pool; here both runs clear the floor, so both
+        // use the pool and the bytes are identical.
         let out_min = dir.path().join("min.bam");
         let out_many = dir.path().join("many.bam");
         run(4, &out_min);
