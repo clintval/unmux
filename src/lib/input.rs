@@ -26,7 +26,9 @@ use noodles::sam::alignment::record::data::field::Tag;
 use noodles::sam::alignment::record_buf::data::field::Value;
 use noodles::sam::alignment::record_buf::Data;
 use noodles::sam::alignment::RecordBuf;
-use noodles::sam::header::record::value::map::{read_group::tag as rgt, ReadGroup};
+use noodles::sam::header::record::value::map::{
+    header::tag as hdt, read_group::tag as rgt, ReadGroup,
+};
 use noodles::sam::header::record::value::Map;
 use noodles::{bam, bgzf, cram, fasta, fastq, sam};
 use smallvec::SmallVec;
@@ -787,6 +789,16 @@ pub struct ReadGroupInfo {
     pub has_sq: bool,
 }
 
+/// Whether an `@HD` `SS` (sub-sort) value proves the records are grouped by the
+/// 2-char aux `tag`. `samtools sort -t XX` writes `unsorted:XX:<order>` (any
+/// secondary order groups the tag), so the test is the exact `unsorted:XX:`
+/// prefix. `SO`/`GO` are not consulted; a plain `coordinate` is not proof.
+pub fn grouped_by_tag(subsort: Option<&[u8]>, tag: [u8; 2]) -> bool {
+    let Some(ss) = subsort else { return false };
+    let prefix = [b"unsorted:".as_slice(), &tag, b":"].concat();
+    ss.starts_with(&prefix)
+}
+
 /// Reads logical records across all inputs. With several `--in` files, one
 /// record is pulled from each in lockstep; a single FASTX input is
 /// auto-detected as interleaved (two mates per fragment) unless `--per-record`
@@ -907,6 +919,24 @@ impl FragmentReader {
             }
         }
         Ok(info)
+    }
+
+    /// The `@HD` sub-sort order (`SS`) of the first alignment input that has a
+    /// header, as raw bytes; `None` when no input carries a header or none sets
+    /// `SS`. Used to decide whether an `@tag::XX` split may stream.
+    pub fn subsort_order(&self) -> Option<Vec<u8>> {
+        for reader in &self.readers {
+            let Some(header) = reader.header() else {
+                continue;
+            };
+            let Some(hd) = header.header() else {
+                continue;
+            };
+            if let Some(ss) = hd.other_fields().get(&hdt::SUBSORT_ORDER) {
+                return Some(AsRef::<[u8]>::as_ref(ss).to_vec());
+            }
+        }
+        None
     }
 
     /// The number of records every fragment carries: two for a single
@@ -1826,5 +1856,55 @@ mod tests {
         assert_eq!(info.read_groups[0].library.as_deref(), Some("lib1"));
         assert_eq!(info.read_groups[1].sample.as_deref(), Some("sampleB"));
         assert_eq!(info.read_groups[1].library, None);
+    }
+
+    #[test]
+    fn grouped_by_tag_accepts_the_samtools_markers() {
+        assert!(grouped_by_tag(Some(b"unsorted:CB:coordinate"), *b"CB"));
+        assert!(grouped_by_tag(
+            Some(b"unsorted:CB:queryname:natural"),
+            *b"CB"
+        ));
+        assert!(grouped_by_tag(
+            Some(b"unsorted:CB:queryname:lexicographical"),
+            *b"CB"
+        ));
+    }
+
+    #[test]
+    fn grouped_by_tag_rejects_other_or_missing_markers() {
+        assert!(!grouped_by_tag(Some(b"unsorted:RX:coordinate"), *b"CB")); // different tag
+        assert!(!grouped_by_tag(Some(b"coordinate"), *b"CB")); // a plain SO value, not SS
+        assert!(!grouped_by_tag(Some(b"unsorted:CBX:coordinate"), *b"CB")); // CB is a prefix but not the field
+        assert!(!grouped_by_tag(None, *b"CB")); // no SS at all
+    }
+
+    #[test]
+    fn subsort_order_reads_the_hd_ss_field() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("in.sam");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, "@HD\tVN:1.6\tSS:unsorted:CB:coordinate").unwrap();
+        drop(f);
+
+        let reader = FragmentReader::open(&[path], false).unwrap();
+        assert_eq!(
+            reader.subsort_order().as_deref(),
+            Some(&b"unsorted:CB:coordinate"[..])
+        );
+    }
+
+    #[test]
+    fn subsort_order_is_none_without_an_ss_field() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("in.sam");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, "@HD\tVN:1.6").unwrap();
+        drop(f);
+
+        let reader = FragmentReader::open(&[path], false).unwrap();
+        assert_eq!(reader.subsort_order(), None);
     }
 }
