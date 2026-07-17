@@ -27,6 +27,13 @@ concurrency:
 jobs:
   render:
     runs-on: ubuntu-latest
+    env:
+      # ubuntu-latest is x86_64, where AVX2 is not enabled by default, so sassy's `ensure_simd`
+      # release gate aborts a flag-less `cargo build --release`. x86-64-v3 (AVX2) is guaranteed on
+      # every GitHub ubuntu runner and stays portable across runner generations, matching how the CI
+      # workflow builds. `--help` is identical across the SIMD and scalar backends, so this keeps the
+      # rendered demo built from the real shipped binary.
+      RUSTFLAGS: "-C target-cpu=x86-64-v3"
     steps:
       - uses: actions/checkout@v4
 
