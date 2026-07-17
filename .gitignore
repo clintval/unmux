@@ -26,3 +26,6 @@
 # python bytecode
 __pycache__/
 *.pyc
+
+# transient render intermediates from .github/img/make-help-demo.sh
+.github/img/.tall.*

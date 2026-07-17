@@ -1,0 +1,349 @@
+Flexible record parsing and demultiplexing to FASTX/SAM/BAM/CRAM.
+
+This tool reads multiple FASTX/SAM/BAM/CRAM inputs, identifies and extracts
+technical sequences (barcodes, UMIs, adapters) with error tolerance using an
+approximate matcher, writes FASTX/SAM/BAM/CRAM data with preserved
+per-record segment qualities, fanning a record pool out into per-sample, and
+optionally per-sample and per-library, files. And, in a single pass!
+
+MENTAL MODEL
+
+ 1. Scan the inputs and match each tag --group(s) against each record
+ 2. Pull those matched bases into named --extract streams
+ 3. Route the record: assign to a --sample, else unassigned, or --remove it
+ 4. Set streams as the primary record sequences with --template
+ 5. Also set streams into SAM tags with --tag(s)
+ 6. Write records by fanning them to files by sample, sub-sample, ordinal
+
+A "pool" is all input records for one run of unmux.
+
+EXAMPLES
+
+ 1. Simply convert FASTQ to uBAM:
+
+  unmux in.fq --out out.bam
+
+ 2. Extract a slice of each input record into a new FASTQ:
+
+  unmux in.fq --extract myslice=0:0:9 --template myslice > out.fq
+
+ 3. Demux a library where the barcodes can be anywhere into per-sample BAMs:
+
+  unmux r1.fq r2.fq --group bc=bc.tsv --sample s=bc::t01 --out %sample.bam
+
+ 4. Split a multi-read-group BAM into per-sample BAMs by its @RG header:
+
+  unmux in.bam --group rg=@RG::SM --sample-from-group rg --out %sample.bam
+
+Notation (also see param docs below with expressive examples):
+
+  file:start:end   0-based, half-open; end is the record LENGTH;
+                   negative counts from the record END. The FIRST number
+                   is the input file index. 1:5:9 = file 1 & bases [5,9).
+  @grp             a group's matched span. @grp+off:len & @grp-off:len
+                   step past & before it (trailing number is a LENGTH!).
+  @grpA..@grpB     the region between two matched spans.
+  @RG[::F[::F]]    an input read-group --group source (SAM/BAM/CRAM only);
+                   bare = by RG ID, or by subfield(s), e.g. @RG::SM::LB.
+  +                concat streams (cb+umi) or 'AND' samples (gA::a+gB::b).
+  ~                reverse-complement the stream (~cb, BC=~bc).
+  ,                list separator ('OR' a tag pool & attribute lists).
+  %XX              percent-escape a byte in a tag sep/qual-sep value or an
+                   output path (%20=space, %09=tab, %2C=comma).
+  %pool            the pool ID (see --pool).
+  %sample          the sample ID (--out only)
+  %sub_sample      the sub-sample ID (@RG LB) (--out only).
+  %ordinal         1-based read ordinal (R%ordinal → R1, R2) (--out only).
+  %source          0-based input file idx (--unassigned or --remove only).
+
+Usage: unmux [READS]... [OPTIONS]
+
+Arguments:
+  [READS]...
+          Input files, positional (FASTX/SAM/BAM/CRAM; auto-detected).
+          
+          0-based by order, the first file is index 0 (splitcode-style). With no
+          inputs at all, file 0 defaults to stdin, so bare unmux reads stdin.
+          Mutually exclusive with --in. Inputs must agree on yes/no qualities
+          FASTA cannot blend with a quality-containing FASTQ/SAM/BAM/CRAM.
+          
+            unmux r1.fq r2.fq i1.fq   files 0, 1, 2
+            unmux < reads.fq          file 0 from stdin (no args = stdin)
+
+Options:
+      --in <N=PATH>
+          Input files set with N=PATH for explicit 0-based file indices.
+          
+          Repeatable; indices must be unique and contiguous from 0 (flag order
+          is free; a gap or non-zero start is an error). PATH may be '-' for
+          stdin (at most once). Mutually exclusive with positional inputs.
+          
+            --in 0=r1.fq.gz --in 1=r2.fq.gz   file 0 = r1, file 1 = r2
+            --in 0=- --in 1=r2.fq.gz          file 0 from stdin, file 1 = r2
+          
+          [default: /dev/stdin]
+
+      --pool <ID>
+          Identifier for the input pool; fills the placeholder %pool.
+          
+          Optional, and defaults to the common stem of the input filenames.
+          
+            --pool lib01   the %pool placeholder is now set to 'lib01'
+
+      --out <PATTERN>
+          Output path for demultiplexed records.
+          
+          Format set by extension (FASTX/SAM/BAM/CRAM). '-' or /dev/stdout
+          writes standard output in the input format. Read groups and SAM tags
+          are SAM/BAM/CRAM-only; FASTX puts --tag values in the record-name
+          comment. Missing parent dirs are created. Placeholders fan-out the
+          pool into multiple files including %pool, %sample, %sub_sample,
+          and %ordinal.
+          
+            --out out.bam                   one file with all assigned records
+            --out %sample.bam               one file per sample
+            --out %sample.%sub_sample.bam   per sample and sub-sample
+            --out %pool.R%ordinal.fq.gz     per pool, per template ordinal
+          
+          [default: /dev/stdout]
+
+      --group <SPEC>
+          Tag-group definition or attributes (repeatable; accumulates).
+          
+          NAME=SOURCE is the UMI/barcode/adapter set; NAME::ATTRS constrains
+          matching. Tags may use IUPAC codes. A matched @grp span is
+          error-corrected by default.
+          
+          Sources (NAME::SOURCE):
+          
+            bc=tags.tsv        from a TSV file with id and seq columns
+            bc={AAC,ACG,TTG}   inline set, auto tag IDs
+            bc={a=AAC,b=ACG}   inline set, explicit tag IDs
+            rg=@RG             the input @RG read groups, keyed by RG ID
+            rg=@RG::SM         ...keyed by a subfield (SM here; also LB)
+            rg=@RG::SM::LB     ...two tiers: SM then LB (sample, sub_sample)
+          
+          Attributes (NAME::key=val):
+          
+            bc::loc=1:0:8            file 1 bases [0,8) (default: whole record)
+            bc::dist=1               allow 1 substitution (default: 0)
+            bc::dist=1:1:2           1 sub + 1 indel, total ≤ 2
+            bc::mode=nearest         keep best only if it beats runner-up...
+            bc::delta=2              ...by ≥ 2 (needs mode=nearest)
+            bc::next=bc3:0-4         bc3 follows, 0-4 bp past this match
+            bc::prev=bc1             require bc1 to have matched earlier
+            bc::minFindsPerGroup=1   group matches ≥ once (keeplist)
+            bc::maxFindsPerGroup=1   group matches ≤ once
+            bc::minFindsPerTag=1     per-tag bounds (also use maxFindsPerTag)
+            bc::findOne              exactly one match (unambiguous single tag)
+            bc::bothStrands=true     match forward and reverse-complement
+            bc::partial5=3           5' truncation ok but ≥3 bp must match
+            bc::partial3=3:0.1       same at the 3'-end, and ≤10% mismatches
+            bc::anchor=5p            anchor tags' 5-prime base at loc.start
+            bc::anchor=3p            anchor tags' 3-prime base at loc.end
+            bc::match=i7+i5          match tags on joined --extract streams
+          
+          An @RG source reads the input header's read groups instead of
+          matching sequences (SAM/BAM/CRAM only; no barcode attributes, no
+          @-span). Pair with --sample-from-group to write one file per
+          read group, sample, or library. Output is UNMAPPED, so aligned
+          inputs lose alignments (a warning is printed); carrying mapped
+          data through a split is planned for later.
+
+      --extract <SPEC>
+          Make a named record segment into a stream NAME=[SPEC] (repeatable).
+          
+          NAME becomes a stream for --template, --tag, and group match=. An
+          extracted stream carries both bases AND qualities.
+          
+          file:start:end is 0-based half-open; the trailing number is an END
+          (full record length); negatives count from the record end. The
+          anchored @grp forms take a LENGTH as the trailing number instead.
+          
+            r=0:9:end          file 0, base 9 to the end
+            bc=1:0:8           file 1, bases [0,8)
+            tail=0:-10:end     last 10 bases of file 0
+            mid=0:5:-2         file 0, base 5 to (length - 2)
+            cb=@grp            the group's own matched span
+            umi=@grp+19:9      9 bases, 19 past grp's match end
+            up=@grp-0:9        9 bases just left of grp's match
+            ins=@grpA..@grpB   region between two anchors
+
+      --template <SPEC>...
+          Set which streams become the primary record sequences (repeatable).
+          
+          Each name is an --extract stream (an input record is not a stream
+          until extracted). Concatenate with '+'; one value per output record
+          (R1, R2, ...). Optional; with none the full input is the raw output.
+          
+          SAM/BAM/CRAM allows at most two ordinals; multi-FASTX may have more.
+          ::raw=true emits observed bases for a stream from a corrected @grp
+          (default: corrected; no effect on a never-corrected stream).
+          
+            --template cdna               one record = the whole cdna stream
+            --template cb+umi             concatenate two streams into one
+            --template r1 r2              two output records (a pair)
+            --template r1 --template r2   same, repeated-flag form
+            --template cb::raw=true       observed bases of a corrected stream
+            --template ~r1                reverse-complement the stream
+
+      --tag <SPEC>
+          SAM tag binding or attributes (repeatable; accumulates).
+          
+          TAG=STREAM[+STREAM] concats record bases (join with '+'); TAG::ATTRS
+          sets qual/sep/raw. A multi-stream tag joins sequences with sep
+          (default: '-') and qualities with qual-sep (default: a space).
+          Default qual tags pre-exist for: CB/CY CR/CY RX/QX BC/QT OX/BZ.
+          
+            --tag RX=umi             UMI tag (auto quality tag QX)
+            --tag CB=bc1+bc2+bc3     join three barcode streams
+            --tag CB::sep=_          join sequences with '_' not '-'
+            --tag CB::qual=CY        name the paired quality tag
+            --tag CB::qual=none      emit no quality tag
+            --tag CB::qual-sep=%20   join qualities with a space
+            --tag CR=bc::raw=true    set the observed (uncorrected) bases
+            --tag BC=~bc             reverse-complement the stream
+
+      --rg-tag <K=V>...
+          Shared @RG header fields for every output read group (repeatable).
+          
+            --rg-tag PL=ILLUMINA CN=Acme   sequencing platform and center
+            --rg-tag PU=run1.lane1         platform unit
+
+      --qc-tag [<TAG>]
+          Per-record QC in a UTF-8 JSON tag value for how the record was routed.
+          
+          Bare --qc-tag uses tag ZS; --qc-tag=TAG names another 2-char tag which
+          must start with X/Y/Z or contain a lowercase char. QC is available for
+          assigned, unassigned, and removed records.
+          
+            ...           no --qc-tag means no QC is written
+            --qc-tag      JSON in tag ZS (the default)
+            --qc-tag=ZQ   JSON in tag ZQ
+
+      --sample <SPEC>
+          Sample fan-out target SAMPLE[::SUB_SAMPLE]=SELECTOR (repeatable).
+          
+          SELECTOR is group::id-or-seq[,...] (comma is OR pool), a bare group
+          (any of its tags), or several joined with '+' (AND across groups).
+          SAMPLE → @RG SM and SUB_SAMPLE → @RG LB.
+          
+          Exclusive with --sample-sheet and --sample-from-group.
+          
+            --sample s1=bc::t01          route tag t01 to sample s1
+            --sample s1=bc::t01,t02      OR pool: any listed tag
+            --sample s1=i7::a+i5::b      AND: needs both indices
+            --sample s1::lib9=bc::t01    sub_sample lib9 (→ @RG LB)
+            --sample s1::%pool=bc::t01   sub_sample from pool ID
+
+      --sample-sheet <FILE>
+          Input sample sheet in TSV format (the table form of --sample).
+          
+          A required sample column (→ @RG SM), an optional sub_sample
+          column (→ @RG LB), then one column per group. A group cell holds a
+          tag ID or sequence; sample/sub_sample cells are plain labels. Rows
+          sharing a sample are OR'd into one pool; group columns filled in the
+          same row are AND'd (a match is needed in each). Below, s1 needs i7 a
+          AND i5 b; s2 pools (i7 c AND i5 d) OR (i7 e AND i5 f).
+          
+          Exclusive with --sample and --sample-from-group.
+          
+            --sample-sheet samples.tsv
+          
+          Example:
+          
+            sample  sub_sample  i7  i5
+            s1      lib9        a   b
+            s2                  c   d
+            s2                  e   f
+
+      --sample-from-group <GROUP>
+          Make every tag in GROUP its own sample, 1-to-1 (a shortcut).
+          
+          The "just split by barcode" mode: each tag in GROUP becomes a sample
+          with no --sample lines and no sheet to maintain. Each sample's ID
+          (@RG SM, and thus %sample in --out) is the tag's ID: the id
+          column when the tag file names it, else the sequence itself for an
+          inline tag written without id=. An optional sub_sample column in the
+          group's tag file sets @RG LB. Records whose GROUP tag matches
+          nothing are unassigned, as with --sample.
+          
+          Exclusive with --sample and --sample-sheet.
+          
+            --sample-from-group bc   one sample per tag in group bc
+            --sample-from-group rg   one sample per tag; rg may be an @RG group
+          
+          With --out %sample.bam the files are named by that tag ID:
+          
+            named tags (id column)    s01.bam, s02.bam, ...
+            inline tags with no id=   ACGT.bam, TGCA.bam, ...
+
+      --unassigned <PATTERN>
+          Output path pattern for records matching no sample.
+          
+          The only placeholders are %pool and %source (input file index);
+          %source fans these to one file per input record. Without this flag,
+          unassigned records are dropped. Unmux warns when unassigned fraction
+          reaches ≥20% of the pool.
+          
+            --unassigned unmatched.%source.fq.gz   one file per input file
+            --unassigned unmatched.fa              all segments in one FASTA
+
+      --remove <SEL[=PATH_PATTERN]>
+          Records to remove via SEL[=PATH_PATTERN] (repeatable).
+          
+          A record matching SEL (a group or group::id) is removed and tallied as
+          removed (distinct from --unassigned). With =PATH_PATTERN the removed
+          records are written to the output path otherwise they are simply
+          ignored. SEL is required. The only placeholders allowed in
+          PATH_PATTERN are %pool and %source (input file index).
+          
+            --remove phiX                      drop records matching phiX group
+            --remove bc::t99                   drop one specific tag's records
+            --remove phiX=phiX.%source.fq.gz   ...and write them out
+
+      --metrics-per-sample <PATTERN>
+          Per-sample metrics TSV with one data row per fan-out target.
+          
+          Only %pool is a valid path placeholder.
+          
+            --metrics-per-sample %pool.unmux.per_sample.tsv
+
+      --metrics-summary <PATTERN>
+          Pool-level summary metrics TSV.
+          
+          Only %pool is a valid path placeholder.
+          
+            --metrics-summary %pool.unmux.summary.tsv
+
+      --require-samples-explain-all-tags
+          Fail fast unless every tag of every group named by a --sample and
+          --sample-sheet selector is claimed by some sample (no tag in
+          a sampled group left unclaimed). Off by default; applies only when
+          samples are declared.
+
+      --per-record
+          Disable auto pair-detection. Treat each record as single-end, even
+          when one input looks interleaved (mate-name pairing). Interleaving is
+          otherwise auto-detected.
+
+      --compression <LEVEL>
+          Compression level 0-9 for BGZF (BAM) and gzip (FASTX.gz).
+          CRAM uses its own codecs and ignores this.
+          
+          [default: 5]
+
+      --threads <THREADS>
+          Worker thread count.
+          
+          More threads speed up large inputs; 1 runs fully serially.
+          
+          [default: 8]
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version
+
+MIT License 2026 · Clint Valentine
