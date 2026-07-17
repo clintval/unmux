@@ -11,16 +11,6 @@ Flexible record parsing and demultiplexing to FASTX/SAM/BAM/CRAM, splitcode-styl
 
 ![unmux](.github/img/cover.jpg)
 
-Install with mamba, conda, or run directly with pixi:
-
-```bash
-pixi exec \
-    -c conda-forge -c bioconda \
-    unmux --help
-```
-
-![unmux --help](.github/img/help.avif)
-
 ## Introduction
 
 The tool `unmux` reads multiple FASTX/SAM/BAM/CRAM inputs, identifies and extracts technical sequences (barcodes, UMIs, adapters) with error tolerance using the [`sassy`](https://github.com/RagnarGrootKoerkamp/sassy) approximate matcher, and writes FASTX/SAM/BAM/CRAM files with preserved per-record segment qualities, fanning a record pool out into per-sample, and optionally per-sample and per-library, files in a single pass.
@@ -43,6 +33,16 @@ It aims to do in one shot what otherwise would take a combination of separate to
 - [`UMI-tools extract`](https://github.com/CGATOxford/UMI-tools): pull UMIs out of records and onto the read names
 
 </details>
+
+Install with mamba, conda, or run directly with pixi:
+
+```bash
+pixi exec \
+    -c conda-forge -c bioconda \
+    unmux --help
+```
+
+![unmux --help](.github/img/help.avif)
 
 ## Quick Start
 
