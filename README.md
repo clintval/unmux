@@ -19,8 +19,6 @@ pixi exec \
     unmux --help
 ```
 
-The whole CLI is documented in `unmux --help`, with worked examples for every flag:
-
 ![unmux --help](.github/img/help.avif)
 
 ## Introduction
