@@ -57,6 +57,7 @@ clap = { version = "4", features = ["derive", "wrap_help"] }
 csv = "1"
 env_logger = "0.11"
 flate2 = { version = "1", features = ["zlib-ng"] }
+libc = "0.2"
 log = "0.4"
 memchr = "2"
 mimalloc = "0.1"
@@ -64,6 +65,7 @@ noodles = { version = "0.109", features = ["bam", "bgzf", "core", "cram", "fasta
 pa-types = "1.5"
 pooled-writer = "0.4"
 rayon = "1"
+rlimit = "0.10"
 sassy = { version = "0.2", default-features = false }
 smallvec = "1"
 serde = { version = "1", features = ["derive"] }

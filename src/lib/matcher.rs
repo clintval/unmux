@@ -176,6 +176,9 @@ pub struct CompiledGroup {
     /// For an `@RG` group: RG id -> tag index, used to route a record by its
     /// `RG:Z` instead of a sequence search. `None` for a normal group.
     pub read_group: Option<std::collections::HashMap<Vec<u8>, usize>>,
+    /// `Some(tag)` when this group is a `@tag::XX` source (route each record by
+    /// its 2-char aux value `tag`); it does no sequence matching.
+    pub aux_tag: Option<[u8; 2]>,
 }
 
 /// Which find-count constraint a group outcome violated, with the observed
@@ -243,6 +246,7 @@ impl CompiledGroup {
             encoded: Vec::new(),
             batched_tags: AHashSet::new(),
             read_group: None,
+            aux_tag: None,
         }
     }
 

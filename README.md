@@ -27,7 +27,7 @@ It aims to do in one shot what otherwise would take a combination of separate to
 - [`fqtk`](https://github.com/fulcrumgenomics/fqtk): fast sample demultiplexing driven by per-read barcode structures
 - [`Picard FastqToSam`](https://github.com/broadinstitute/picard): convert raw FASTQs into an unmapped BAM
 - [`qualrepair`](https://bioconda.github.io/recipes/qualrepair/README.html): repair the base qualities that splitcode mangles during extraction
-- [`samtools split`](https://github.com/samtools/samtools): split one BAM into per-read-group (per-sample) BAMs
+- [`samtools split`](https://github.com/samtools/samtools): split one BAM into per-read-group (per-sample) BAMs; `unmux`'s `@tag::XX` aux-tag split goes further, splitting by any per-record SAM tag (a cell barcode, for example) instead of just `@RG`
 - [`splitcode`](https://github.com/pachterlab/splitcode): identify, extract, and edit technical sequences from a declarative config
 - [`splitseq-toolbox`](https://github.com/RebekkaWegmann/splitseq_toolbox): demultiplex SPLiT-seq combinatorial split-pool cell barcodes
 - [`UMI-tools extract`](https://github.com/CGATOxford/UMI-tools): pull UMIs out of records and onto the read names
@@ -81,7 +81,7 @@ unmux "R1.fastq.gz" "R2.fastq.gz" \
 
 - **FASTX/SAM/BAM/CRAM in and out** (SAM/BAM/CRAM written unmapped), with per-segment qualities carried through extraction.
 - **splitcode-style matching**: tag groups, variable-length tags, location windows, mismatch/indel tolerance, sequential `next`/`prev` anchoring, `@extract` spans, and error-correction to canonical barcodes.
-- **Single-pass demultiplexing, optionally nested**: split a pool into per-sample outputs and, if you like, each sample into sub-samples (a library of samples, sub-libraries of lysates, and so on), each written as its own FASTX/SAM/BAM/CRAM with `SM`/`LB` read group identifiers.
+- **Single-pass demultiplexing, optionally nested**: split a pool into per-sample outputs and, if you like, each sample into sub-samples (a library of samples, sub-libraries of lysates, and so on), each written as its own FASTX/SAM/BAM/CRAM with `SM`/`LB` read group identifiers. A `--group` source can be a matched barcode set, the input's own `@RG` read groups, or a per-record `@tag::XX` aux tag.
 - **Configured on the CLI or in sheets** with the same grammar: flags repeat and accumulate, so a spec can be built up piece by piece (`--group g1::loc=... --group g1::dist=...`), or written compactly with comma lists (`--group g1::loc=...,dist=...`).
 
 ## Development and Testing

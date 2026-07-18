@@ -257,6 +257,7 @@ fn load_tag_sets(
                 .with_context(|| format!("failed to load tag set for group `{}`", group.name))?,
             GroupSource::Inline(tags) => TagSet::from_inline(tags),
             GroupSource::ReadGroup(_) => resolved[&group.name].tag_set.clone(),
+            GroupSource::AuxTag(_) => TagSet::default(),
         };
         tag_sets.insert(group.name.clone(), tag_set);
     }
@@ -336,15 +337,22 @@ fn compile_groups(
     let mut name_prereqs = Vec::with_capacity(plan.groups.len());
     for group in &plan.groups {
         let is_read_group = matches!(group.source, GroupSource::ReadGroup(_));
+        let aux_tag = match group.source {
+            GroupSource::AuxTag(tag) => Some(tag),
+            _ => None,
+        };
+        // Neither an `@RG` nor a `@tag::XX` group does sequence matching: both
+        // route by a value already carried on the record (an `RG:Z` or another
+        // aux tag), so their "tags" are routing tokens, not DNA.
+        let is_special = is_read_group || aux_tag.is_some();
         let attrs = &group.attrs;
         let dist = attrs.dist.unwrap_or_default();
         let mode = attrs.mode.unwrap_or(MatchMode::All);
         // Guard the IUPAC tag set up front: reject a combinatorial explosion or
         // an indistinguishable tag pair, and warn on a within-`dist` overlap
-        // that `mode=nearest` would only disambiguate. An `@RG` group's "tags"
-        // are synthetic routing tokens (not DNA), so this sequence machinery
-        // does not apply to it.
-        if !is_read_group {
+        // that `mode=nearest` would only disambiguate. This sequence machinery
+        // does not apply to a special (`@RG`/`@tag::XX`) group.
+        if !is_special {
             for warning in crate::iupac::validate_group(
                 &group.name,
                 &tag_sets[&group.name].seqs(),
@@ -375,12 +383,13 @@ fn compile_groups(
             encoded: Vec::new(),
             batched_tags: Default::default(),
             read_group: resolved.get(&group.name).map(|r| r.rg_to_idx.clone()),
+            aux_tag,
         };
         // Precompute the sassy v2 batched search batches (and their covered tag
-        // set) for large equal-length tag buckets. Skipped for an `@RG` group:
-        // its tags are routing tokens, not DNA, so a sassy search over them is
-        // meaningless.
-        if !is_read_group {
+        // set) for large equal-length tag buckets. Skipped for a special
+        // (`@RG`/`@tag::XX`) group: its tags are routing tokens, not DNA, so a
+        // sassy search over them is meaningless.
+        if !is_special {
             compiled_group.encode();
             if let Some(warning) = anchor5p_window_overrun_warning(&compiled_group) {
                 log::warn!("{warning}");
@@ -734,19 +743,37 @@ fn enumerate_dests(
     }
     // The `--unassigned` and `--remove` bins (raw segments; `%source` fans out
     // over the input files).
+    for path in enumerate_bins(plan, pool) {
+        add(Some(path), &mut seen, &mut paths);
+    }
+    Ok(paths)
+}
+
+/// Every `--unassigned` / `--remove` bin file path (raw segments; `%source` fans
+/// out over the input files), deduped. Split out of [`enumerate_dests`] so a
+/// `@tag::XX` run, whose `--out` targets are discovered per record rather than
+/// enumerated up front, can pre-create just the bins.
+fn enumerate_bins(plan: &DemuxPlan, pool: &str) -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = Vec::new();
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+    let mut add = |path: PathBuf| {
+        if seen.insert(path.clone()) {
+            paths.push(path);
+        }
+    };
     if let Some(pattern) = &plan.unassigned {
         for path in bin_paths(pattern, pool, plan.inputs.len()) {
-            add(Some(path), &mut seen, &mut paths);
+            add(path);
         }
     }
     for rule in &plan.remove {
         if let Some(pattern) = &rule.pattern {
             for path in bin_paths(pattern, pool, plan.inputs.len()) {
-                add(Some(path), &mut seen, &mut paths);
+                add(path);
             }
         }
     }
-    Ok(paths)
+    paths
 }
 
 /// The `--out` file path(s) for one target (or `None` for a pure pass-through),
@@ -960,6 +987,9 @@ struct Engine<'a> {
     /// `@RG` line is carried verbatim by the header, see [`build_constituent_rgs`])
     /// rather than being rewritten to a synthesized per-target read group.
     is_read_group_split: bool,
+    /// `Some(tag)` for a `@tag::XX` split: route each record by its aux value
+    /// `tag` (discovered per record) instead of the static `Routing`.
+    aux_tag: Option<[u8; 2]>,
 }
 
 /// Run the demux engine: match tag groups per record, route each record with
@@ -978,7 +1008,16 @@ fn run_engine(plan: &DemuxPlan, command_line: Option<&str>) -> Result<()> {
         .groups
         .iter()
         .any(|g| matches!(g.source, GroupSource::ReadGroup(_)));
-    let rg_info = if has_read_group_source {
+    let aux_tag_source = plan.groups.iter().find_map(|g| match g.source {
+        GroupSource::AuxTag(tag) => Some((g.name.as_str(), tag)),
+        _ => None,
+    });
+    let is_aux_tag_split = matches!(
+        (&plan.samples, aux_tag_source),
+        (SampleSpec::FromGroup(g), Some((name, _))) if g == name
+    );
+    let needs_input_header = has_read_group_source || is_aux_tag_split;
+    let rg_info = if needs_input_header {
         reader.input_read_groups()?
     } else {
         crate::input::ReadGroupInfo::default()
@@ -989,6 +1028,64 @@ fn run_engine(plan: &DemuxPlan, command_line: Option<&str>) -> Result<()> {
     let (groups, group_index) = compile_groups(plan, &tag_sets, &resolved)?;
     let pool = pool_id(plan);
     let routing = build_routing(plan, &tag_sets, &group_index, &pool, &resolved)?;
+
+    // A `@tag::XX` split routes each record by its own aux value (discovered per
+    // record), so the mode is decided from the input's sort order: if the input
+    // is grouped by the tag (`samtools sort -t XX`) a single output file is open
+    // at a time (streaming); otherwise every value's file is open at once, so
+    // the soft open-file limit is raised toward the hard cap first.
+    let aux_tag = if is_aux_tag_split {
+        aux_tag_source.map(|(_, tag)| tag)
+    } else {
+        None
+    };
+    let aux_streaming = match aux_tag {
+        Some(tag) => crate::input::grouped_by_tag(reader.subsort_order().as_deref(), tag),
+        None => false,
+    };
+    // The consumer-side controller for a `@tag::XX` split: streaming closes each
+    // value's file on a value change (guarding a recurrence), while the all-open
+    // fallback bounds the number of concurrently open outputs. `None` for any
+    // non-`@tag` run.
+    let mut aux: Option<AuxTagSink> = None;
+    if let Some(tag) = aux_tag {
+        if aux_streaming {
+            log::info!(
+                "input is grouped by aux tag {}; splitting one file at a time",
+                String::from_utf8_lossy(&tag)
+            );
+            aux = Some(AuxTagSink {
+                streaming: true,
+                // Unused in streaming mode: only one output file is open at a
+                // time.
+                ceiling: usize::MAX,
+                current_key: None,
+                current_paths: Vec::new(),
+                closed: crate::auxtag::ClosedKeys::default(),
+            });
+        } else {
+            // Not grouped by the tag, so every value's file is open at once:
+            // raise the soft open-file limit toward the hard cap once, and feed
+            // that same soft limit to both the log and the open-file ceiling
+            // (the number of outputs that may be open, reserving stdio, the
+            // input files, and slack).
+            let soft = crate::auxtag::raise_open_file_limit();
+            let ceiling = crate::auxtag::open_file_ceiling(soft, 16 + plan.inputs.len() as u64);
+            log::info!(
+                "input is not grouped by aux tag {}; splitting with all files open (soft open-file limit {}). Sort by the tag (`samtools sort -t {}`) to stream one file at a time.",
+                String::from_utf8_lossy(&tag),
+                soft,
+                String::from_utf8_lossy(&tag)
+            );
+            aux = Some(AuxTagSink {
+                streaming: false,
+                ceiling,
+                current_key: None,
+                current_paths: Vec::new(),
+                closed: crate::auxtag::ClosedKeys::default(),
+            });
+        }
+    }
 
     // An `@RG`-split run (`--sample-from-group` over an `@RG` source) is faithful
     // to the input header: each output file lists its constituent original `@RG`
@@ -1003,9 +1100,9 @@ fn run_engine(plan: &DemuxPlan, command_line: Option<&str>) -> Result<()> {
         None
     };
 
-    if is_read_group_split && rg_info.has_sq {
+    if (is_read_group_split || is_aux_tag_split) && rg_info.has_sq {
         log::warn!(
-            "input is aligned (@SQ present); this @RG split writes UNMAPPED records: alignments, \
+            "input is aligned (@SQ present); this split writes UNMAPPED records: alignments, \
              CIGAR/MAPQ, and mate/alignment tags are dropped and reverse-strand reads are restored \
              to sequenced orientation. Carrying mapped data through a split is planned for a future \
              release; for an alignment-preserving split now, use `samtools split`."
@@ -1048,8 +1145,15 @@ fn run_engine(plan: &DemuxPlan, command_line: Option<&str>) -> Result<()> {
     // provenance plus a default `@RG` whose ID/SM/LB are the pool id, so every
     // SAM/BAM/CRAM record carries a read group even with no `--sample`. A
     // worker uses it for encode-on-workers exactly where `MultiWriter::open`
-    // would, so the bytes stay identical.
-    let default_header = default_read_group_header(&pool, &plan.rg_tags, command_line)?;
+    // would, so the bytes stay identical. A `@tag::XX` split leaves `headers`
+    // empty (its output paths are discovered per record), so every per-value
+    // file resolves to this shared header: the input's original `@RG` line(s)
+    // plus a `@CO` naming the split tag.
+    let default_header = if let Some(tag) = aux_tag {
+        crate::output::aux_tag_header(&rg_info, &pool, &plan.rg_tags, command_line, tag)?
+    } else {
+        default_read_group_header(&pool, &plan.rg_tags, command_line)?
+    };
     // Declared before `writer` so that, on any unwind, `writer` (and its
     // PooledWriters) drops before the pool: a PooledWriter dropped after the
     // pool is stopped would panic. The explicit shutdown below also enforces
@@ -1062,14 +1166,22 @@ fn run_engine(plan: &DemuxPlan, command_line: Option<&str>) -> Result<()> {
         plan.compression,
     );
     // Every directed output file, created up front so a directed file always
-    // exists, even empty.
-    let dests = enumerate_dests(
-        plan,
-        &routing,
-        &pool,
-        &input_formats,
-        reader.fragment_width(),
-    )?;
+    // exists, even empty. A `@tag::XX` split has no static targets (each value's
+    // file is discovered from the records and opened on first sight), so only
+    // the `--unassigned`/`--remove` bins are pre-created; enumerating `--out`
+    // here would resolve `%sample` to the empty string and pre-create a bogus
+    // file.
+    let dests = if is_aux_tag_split {
+        enumerate_bins(plan, &pool)
+    } else {
+        enumerate_dests(
+            plan,
+            &routing,
+            &pool,
+            &input_formats,
+            reader.fragment_width(),
+        )?
+    };
     log_run_shape(plan, &input_formats, &dests);
 
     // Route poolable destinations (gzipped FASTX and BAM) through a shared BGZF
@@ -1168,6 +1280,7 @@ fn run_engine(plan: &DemuxPlan, command_line: Option<&str>) -> Result<()> {
         headers: &headers,
         default_header: &default_header,
         is_read_group_split,
+        aux_tag,
     };
     let mut metrics = Metrics::new(pool.clone(), routing.targets());
 
@@ -1184,9 +1297,9 @@ fn run_engine(plan: &DemuxPlan, command_line: Option<&str>) -> Result<()> {
     let run_result = (|| -> Result<()> {
         writer.create_all(&dests)?;
         match threads {
-            1 => drive_serial(&engine, reader, &mut writer, &mut metrics),
-            2 => drive_pipelined(&engine, reader, &mut writer, &mut metrics),
-            _ => drive_parallel(&engine, budget, reader, &mut writer, &mut metrics),
+            1 => drive_serial(&engine, reader, &mut writer, &mut metrics, &mut aux),
+            2 => drive_pipelined(&engine, reader, &mut writer, &mut metrics, &mut aux),
+            _ => drive_parallel(&engine, budget, reader, &mut writer, &mut metrics, &mut aux),
         }
     })();
     let finished = writer.finish();
@@ -1360,6 +1473,11 @@ fn match_fragment(
     // relative `next` link windows the downstream search; a bare `next`/`prev`
     // link skips the downstream group when the upstream did not match).
     for (idx, group) in engine.groups.iter().enumerate() {
+        if group.aux_tag.is_some() {
+            // A @tag group routes by the record's own value in `prepare`; it
+            // does no sequence matching and leaves its hit slot empty.
+            continue;
+        }
         if let Some(rg_to_idx) = &group.read_group {
             if let Some(tag_idx) = match_read_group(rg_to_idx, fragment) {
                 hits[idx] = Some(GroupHit {
@@ -1506,6 +1624,17 @@ fn prepare(engine: &Engine, fragment: &Fragment, fmatch: FragmentMatch) -> Resul
         })
         .collect();
 
+    if let Some(tag) = engine.aux_tag {
+        if let Disposition::Removed(remove) = engine.routing.route(&hits) {
+            return Ok(Prepared {
+                lengths,
+                tally: Tally::Removed,
+                writes: prepare_removed(engine, fragment, remove, &hits),
+            });
+        }
+        return prepare_aux_tag(engine, tag, fragment, &hits, &segments, lengths);
+    }
+
     let (tally, writes) = match engine.routing.route(&hits) {
         Disposition::Removed(remove) => (
             Tally::Removed,
@@ -1560,13 +1689,137 @@ fn prepare(engine: &Engine, fragment: &Fragment, fmatch: FragmentMatch) -> Resul
     })
 }
 
+/// Route a fragment for a `@tag::XX` split: read its aux value, and either
+/// assign it to a `Target` named by that value (files fan out by `%sample`) or
+/// send it to the `--unassigned` bin. The value names the sample but is never
+/// written as an `@RG`; each record keeps its own tags.
+fn prepare_aux_tag(
+    engine: &Engine,
+    tag: [u8; 2],
+    fragment: &Fragment,
+    hits: &[Option<GroupHit>],
+    segments: &[Segment],
+    lengths: SmallVec<[usize; 4]>,
+) -> Result<Prepared> {
+    let Some(value) = crate::auxtag::match_aux_tag(tag, fragment) else {
+        return Ok(Prepared {
+            lengths,
+            tally: Tally::Unassigned,
+            writes: prepare_unassigned(engine, fragment, &Unassigned::NoSample, hits),
+        });
+    };
+    let target = Target {
+        sample: String::from_utf8_lossy(&value).into_owned(),
+        sub_sample: None,
+    };
+    let (denom, unext) = frac_bases(engine, segments, hits)?;
+    match prepare_body(engine, Some(&target), hits, segments, fragment)? {
+        BodyOutcome::Assembled(writes) => Ok(Prepared {
+            lengths,
+            tally: Tally::Assigned {
+                target,
+                denom,
+                unext,
+            },
+            writes,
+        }),
+        BodyOutcome::MissingStream(missing) => Ok(Prepared {
+            lengths,
+            tally: Tally::Unassigned,
+            writes: prepare_unassigned(engine, fragment, &Unassigned::MissingStream(missing), hits),
+        }),
+    }
+}
+
+/// Consumer-side state for a `@tag::XX` split. In streaming mode it closes the
+/// previous value's file when the value changes and errors on a value that
+/// reappears after closing; in all-open mode it enforces the open-file ceiling.
+struct AuxTagSink {
+    streaming: bool,
+    ceiling: usize,
+    /// The split value whose files are currently open; `None` before the first
+    /// assigned record. A value change is keyed on this (not on a single path),
+    /// so multi-body output closes every one of the value's body files.
+    current_key: Option<Vec<u8>>,
+    /// Every output path open for `current_key` (one per output body), closed as
+    /// a group when the value changes.
+    current_paths: Vec<PathBuf>,
+    closed: crate::auxtag::ClosedKeys,
+}
+
+impl AuxTagSink {
+    /// Prepare the writer for an assigned record whose output files are `paths`
+    /// (one per output body) and whose split value is `key`. Streaming: on a
+    /// value change, guard against recurrence, then close every file the
+    /// previous value had open. All-open: refuse to exceed the descriptor
+    /// ceiling with an actionable error.
+    fn before_write(
+        &mut self,
+        writer: &mut MultiWriter,
+        key: &[u8],
+        paths: &[Option<PathBuf>],
+    ) -> Result<()> {
+        if self.streaming {
+            if self.current_key.as_deref() != Some(key) {
+                self.closed.enter(key)?; // fatal if this value already closed
+                for prev in self.current_paths.drain(..) {
+                    writer.close_dest(Some(&prev))?;
+                }
+                if let Some(prev_key) = self.current_key.take() {
+                    self.closed.close(&prev_key);
+                }
+                self.current_key = Some(key.to_vec());
+                self.current_paths = paths.iter().flatten().cloned().collect();
+            }
+        } else {
+            // Every body this record would newly open counts against the
+            // ceiling, so project the open count across all of its paths.
+            let mut open = writer.open_count();
+            for path in paths.iter().map(Option::as_deref) {
+                if path.is_some() && !writer.is_open(path) {
+                    if open >= self.ceiling {
+                        return Err(too_many_open_files_error(open));
+                    }
+                    open += 1;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The actionable error when a `@tag::XX` all-open split cannot open another
+/// output file: `count` files are already open and the process's limit is
+/// reached. Points at sorting by the tag (to stream one file at a time) or
+/// raising the open-file limit.
+fn too_many_open_files_error(count: usize) -> anyhow::Error {
+    anyhow!(
+        "splitting by aux tag reached {} open files (the limit available to this process). Sort by the tag (`samtools sort -t <TAG>`) to stream one file at a time, or raise the open-file limit (`ulimit -n`).",
+        count
+    )
+}
+
+/// Whether an error chain carries the OS refusing another open file
+/// (`EMFILE`/`ENFILE`), so an all-open `@tag` write can be remapped to the
+/// actionable [`too_many_open_files_error`] even if the estimated ceiling was
+/// too generous.
+fn is_open_file_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(crate::auxtag::is_too_many_open_files)
+    })
+}
+
 /// Apply one [`Prepared`] on the serial consumer: tally it and issue its writes
 /// in order. The writer and metrics are single-threaded; everything else now
-/// happens on the worker in [`prepare`].
+/// happens on the worker in [`prepare`]. For a `@tag::XX` split, `aux` drives
+/// the streaming close / open-file guard before an assigned record's write.
 fn apply_prepared(
     prepared: Prepared,
     writer: &mut MultiWriter,
     metrics: &mut Metrics,
+    aux: &mut Option<AuxTagSink>,
 ) -> Result<()> {
     metrics.record_processed();
     metrics.record_read_lengths(prepared.lengths.iter().copied());
@@ -1580,17 +1833,42 @@ fn apply_prepared(
             unext,
         } => metrics.record_assigned(target, *denom, *unext),
     }
+    // A `@tag::XX` split discovers its targets from the records, so register the
+    // target for the per-sample TSV, then prepare the fan-out writer for this
+    // value before issuing its writes: stream the value's files one value at a
+    // time (closing the previous value's files, guarding a recurrence) or
+    // enforce the open-file ceiling. An assigned record may produce more than one
+    // output body (a `%ordinal` FASTX pair), so all of its paths are passed.
+    if let (Some(aux), Tally::Assigned { target, .. }) = (aux.as_mut(), &prepared.tally) {
+        metrics.ensure_target(target);
+        let paths: Vec<Option<PathBuf>> = prepared
+            .writes
+            .iter()
+            .map(|write| write.path.clone())
+            .collect();
+        aux.before_write(writer, target.sample.as_bytes(), &paths)?;
+    }
+    // In all-open mode the estimated ceiling is a best guess, so map the OS
+    // refusing another open file to the same actionable error as a backstop.
+    let all_open = aux.as_ref().is_some_and(|aux| !aux.streaming);
     for write in &prepared.writes {
-        match &write.payload {
+        let path = write.path.as_deref();
+        let result = match &write.payload {
             // Encoded on the worker: the consumer only appends the bytes (the
             // merge-point lever).
-            WritePayload::Encoded(bytes) => writer.write_encoded(write.path.as_deref(), bytes)?,
+            WritePayload::Encoded(bytes) => writer.write_encoded(path, bytes),
             // CRAM fallback: the consumer encodes the structured reads.
             WritePayload::Records(reads) => {
                 let outputs: SmallVec<[OutputRead; 2]> =
                     reads.iter().map(PreparedRead::as_output).collect();
-                writer.write(write.path.as_deref(), &outputs)?;
+                writer.write(path, &outputs)
             }
+        };
+        match result {
+            Err(error) if all_open && is_open_file_error(&error) => {
+                return Err(too_many_open_files_error(writer.open_count()));
+            }
+            other => other?,
         }
     }
     Ok(())
@@ -1690,10 +1968,11 @@ fn apply_chunk(
     prepared: Vec<Result<Prepared>>,
     writer: &mut MultiWriter,
     metrics: &mut Metrics,
+    aux: &mut Option<AuxTagSink>,
     progress: &mut Progress,
 ) -> Result<()> {
     for outcome in prepared {
-        apply_prepared(outcome?, writer, metrics)?;
+        apply_prepared(outcome?, writer, metrics, aux)?;
         progress.record();
     }
     Ok(())
@@ -1728,12 +2007,13 @@ fn drive_serial(
     mut reader: FragmentReader,
     writer: &mut MultiWriter,
     metrics: &mut Metrics,
+    aux: &mut Option<AuxTagSink>,
 ) -> Result<()> {
     let mut progress = Progress::new();
     let mut scratch = Scratch::new();
     while let Some(chunk) = next_chunk(&mut reader, READ_CHUNK)? {
         let prepared = match_chunk_serial(engine, &mut scratch, &chunk);
-        apply_chunk(prepared, writer, metrics, &mut progress)?;
+        apply_chunk(prepared, writer, metrics, aux, &mut progress)?;
     }
     Ok(())
 }
@@ -1749,6 +2029,7 @@ fn drive_pipelined(
     reader: FragmentReader,
     writer: &mut MultiWriter,
     metrics: &mut Metrics,
+    aux: &mut Option<AuxTagSink>,
 ) -> Result<()> {
     let mut progress = Progress::new();
     let mut scratch = Scratch::new();
@@ -1758,7 +2039,7 @@ fn drive_pipelined(
     let mut outcome: Result<()> = Ok(());
     for chunk in &rx {
         let prepared = match_chunk_serial(engine, &mut scratch, &chunk);
-        if let Err(error) = apply_chunk(prepared, writer, metrics, &mut progress) {
+        if let Err(error) = apply_chunk(prepared, writer, metrics, aux, &mut progress) {
             outcome = Err(error);
             break;
         }
@@ -1788,6 +2069,7 @@ fn drive_parallel(
     reader: FragmentReader,
     writer: &mut MultiWriter,
     metrics: &mut Metrics,
+    aux: &mut Option<AuxTagSink>,
 ) -> Result<()> {
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(budget.matchers)
@@ -1816,7 +2098,7 @@ fn drive_parallel(
                 })
                 .collect()
         });
-        if let Err(error) = apply_chunk(prepared, writer, metrics, &mut progress) {
+        if let Err(error) = apply_chunk(prepared, writer, metrics, aux, &mut progress) {
             outcome = Err(error);
             break;
         }
@@ -2195,11 +2477,11 @@ fn prepare_body(
     let tag_data = build_tag_data(&plan.tags, &streams);
     // An assigned read carries its sample's read group; a pass-through read (no
     // target) carries the default pool read group, so a SAM/BAM/CRAM `--out`
-    // matches the default `@RG` in its header. On an `@RG`-split run the record
-    // keeps its carried original `RG:Z` instead (already in `read.tags` via
-    // `merge_data`); `None` leaves it untouched, since `writer::build_record`
-    // only inserts `RG:Z` when a read group is set.
-    let read_group = if engine.is_read_group_split {
+    // matches the default `@RG` in its header. On an `@RG`-split or `@tag`-split
+    // run the record keeps its own carried `RG:Z` instead (already in
+    // `read.tags` via `merge_data`); `None` leaves it untouched, since
+    // `writer::build_record` only inserts `RG:Z` when a read group is set.
+    let read_group = if engine.is_read_group_split || engine.aux_tag.is_some() {
         None
     } else {
         target.map(Target::label).or_else(|| Some(pool.to_string()))
@@ -4868,5 +5150,189 @@ mod tests {
             None,
             "an RG id absent from the map means no route"
         );
+    }
+
+    /// An [`Engine`] for a `@tag::<tag>` split: a single aux-tag group, `aux_tag`
+    /// set so `prepare` routes each record by its own value, and an optional
+    /// `--out` pattern. Enough to drive `match_fragment` and `prepare` directly
+    /// in a unit test. The backing state is leaked to satisfy `Engine`'s borrowed
+    /// fields with a `'static` fixture; it is a one-shot allocation for the test
+    /// process.
+    fn engine_with_single_aux_tag_group(
+        tag: [u8; 2],
+        out: Option<OutputPattern>,
+    ) -> Engine<'static> {
+        let mut group = CompiledGroup::new("cb", Vec::new());
+        group.aux_tag = Some(tag);
+        let groups: &'static [CompiledGroup] = Box::leak(Box::new(vec![group]));
+        let group_index: &'static HashMap<String, usize> =
+            Box::leak(Box::new([("cb".to_string(), 0)].into_iter().collect()));
+        let plan: &'static DemuxPlan = Box::leak(Box::new(DemuxPlan {
+            pool: None,
+            inputs: Vec::new(),
+            groups: Vec::new(),
+            extracts: Vec::new(),
+            templates: Vec::new(),
+            tags: Vec::new(),
+            rg_tags: Vec::new(),
+            samples: SampleSpec::None,
+            require_samples_explain_all_tags: false,
+            qc_tag: None,
+            remove: Vec::new(),
+            out,
+            unassigned: None,
+            metrics_per_sample: None,
+            metrics_summary: None,
+            per_record: false,
+            compression: 0,
+            threads: 1,
+        }));
+        let routing: &'static Routing = Box::leak(Box::new(
+            compile_routing(&[], &[], &HashMap::new(), group_index, "pool", false, false).unwrap(),
+        ));
+        let movable_streams: &'static HashSet<&str> = Box::leak(Box::new(HashSet::new()));
+        let routed_streams: &'static HashSet<&str> = Box::leak(Box::new(HashSet::new()));
+        let headers: &'static HashMap<Option<PathBuf>, Header> =
+            Box::leak(Box::new(HashMap::new()));
+        let default_header: &'static Header = Box::leak(Box::new(Header::default()));
+
+        Engine {
+            plan,
+            groups,
+            group_index,
+            routing,
+            pool: "pool",
+            input_formats: &[],
+            movable_streams,
+            routed_streams,
+            headers,
+            default_header,
+            is_read_group_split: false,
+            aux_tag: Some(tag),
+        }
+    }
+
+    /// A one-record fragment carrying `CB:Z:<cb>`.
+    fn fragment_with_cb(cb: &[u8]) -> Fragment {
+        let mut data = Data::default();
+        data.insert(Tag::new(b'C', b'B'), Value::String(cb.to_vec().into()));
+        Fragment {
+            records: vec![InputRecord {
+                name: b"r1".to_vec(),
+                bases: b"ACGT".to_vec(),
+                quals: None,
+                tags: Some(data),
+            }],
+        }
+    }
+
+    #[test]
+    fn aux_tag_group_produces_no_hit() {
+        // A @tag group does no sequence matching and emits no GroupHit; its
+        // slot stays None. Routing by value is handled later in `prepare`.
+        let engine = engine_with_single_aux_tag_group(*b"CB", None);
+        let fragment = fragment_with_cb(b"AAAA");
+        let mut scratch = Scratch::new();
+        let m = match_fragment(&engine, &mut scratch, &fragment).unwrap();
+        let FragmentMatch::Routed { hits } = m else {
+            panic!("expected Routed")
+        };
+        assert!(hits.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn prepare_routes_by_aux_tag_value() {
+        // A @tag::CB split routes each record to a sample named by its own CB
+        // value, bypassing the index-based routing table; a record carrying no
+        // CB lands in the unassigned bin.
+        let out =
+            crate::grammar::parse_output_pattern("%sample.bam", &[Placeholder::Sample]).unwrap();
+        let engine = engine_with_single_aux_tag_group(*b"CB", Some(out));
+        let mut scratch = Scratch::new();
+
+        let fragment = fragment_with_cb(b"AAAA");
+        let m = match_fragment(&engine, &mut scratch, &fragment).unwrap();
+        let prepared = prepare(&engine, &fragment, m).unwrap();
+        let Tally::Assigned { target, .. } = prepared.tally else {
+            panic!("expected the CB value to assign a sample");
+        };
+        assert_eq!(target.sample, "AAAA", "the sample is named by the CB value");
+
+        let fragment = Fragment {
+            records: vec![InputRecord {
+                name: b"r1".to_vec(),
+                bases: b"ACGT".to_vec(),
+                quals: None,
+                tags: None,
+            }],
+        };
+        let m = match_fragment(&engine, &mut scratch, &fragment).unwrap();
+        let prepared = prepare(&engine, &fragment, m).unwrap();
+        assert!(
+            matches!(prepared.tally, Tally::Unassigned),
+            "a record carrying no CB is unassigned"
+        );
+    }
+
+    #[test]
+    fn aux_tag_streaming_closes_all_body_files_on_value_change() {
+        // A streaming value with multiple output bodies (e.g. an R1/R2 FASTX
+        // pair) must close EVERY one of its files when the value changes, not
+        // just the first, so at most O(1) files stay open regardless of
+        // cardinality. A value that reappears after closing is still fatal.
+        let dir = tempfile::tempdir().unwrap();
+        let a1 = dir.path().join("cellA.1.sam");
+        let a2 = dir.path().join("cellA.2.sam");
+        let b1 = dir.path().join("cellB.1.sam");
+        let mut writer = MultiWriter::new(
+            HashMap::new(),
+            crate::output::provenance_header(None),
+            vec![SniffedFormat::Sam],
+            5,
+        );
+        let read = |name: &'static [u8]| OutputRead {
+            name,
+            bases: b"ACGT",
+            quals: Some(&[30, 30, 30, 30]),
+            tags: None,
+            read_group: None,
+        };
+        let mut aux = AuxTagSink {
+            streaming: true,
+            ceiling: usize::MAX,
+            current_key: None,
+            current_paths: Vec::new(),
+            closed: crate::auxtag::ClosedKeys::default(),
+        };
+
+        // Value A opens two body files.
+        aux.before_write(&mut writer, b"cellA", &[Some(a1.clone()), Some(a2.clone())])
+            .unwrap();
+        writer.write(Some(&a1), &[read(b"ra1")]).unwrap();
+        writer.write(Some(&a2), &[read(b"ra2")]).unwrap();
+        assert_eq!(writer.open_count(), 2);
+
+        // The value changes: BOTH of A's files close, so the open count drops by
+        // two, not one. This is the discriminating check for the multi-body fix.
+        aux.before_write(&mut writer, b"cellB", &[Some(b1.clone())])
+            .unwrap();
+        assert_eq!(
+            writer.open_count(),
+            0,
+            "both of value A's files were closed"
+        );
+        assert!(!writer.is_open(Some(&a1)));
+        assert!(!writer.is_open(Some(&a2)));
+
+        writer.write(Some(&b1), &[read(b"rb1")]).unwrap();
+        assert_eq!(writer.open_count(), 1);
+
+        // Re-seeing a value whose files were already closed is a fatal recurrence.
+        let err = aux
+            .before_write(&mut writer, b"cellA", &[Some(a1.clone())])
+            .unwrap_err();
+        assert!(err.to_string().contains("reappeared"));
+
+        writer.finish().unwrap();
     }
 }
