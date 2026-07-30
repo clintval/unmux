@@ -25,9 +25,11 @@ It aims to do in one shot what otherwise would take a combination of separate to
 - [`barQC`](https://github.com/mayflylab/barQC): extract, error-correct, and determine combinatorial cell barcodes and UMIs into uBAM
 - [`fgbio FastqToBam`](https://github.com/fulcrumgenomics/fgbio): stitch multiple FASTQs into one unmapped BAM via read structures and SAM tags
 - [`fqtk`](https://github.com/fulcrumgenomics/fqtk): fast sample demultiplexing driven by per-read barcode structures
+- [`matchbox`](https://github.com/jakob-schuster/matchbox): flexible read processor using matchbox scripts
 - [`Picard FastqToSam`](https://github.com/broadinstitute/picard): convert raw FASTQs into an unmapped BAM
 - [`qualrepair`](https://bioconda.github.io/recipes/qualrepair/README.html): repair the base qualities that splitcode mangles during extraction
 - [`samtools split`](https://github.com/samtools/samtools): split one BAM into per-read-group (per-sample) BAMs
+- [`seqproc`](https://github.com/COMBINE-lab/seqproc): a general purpose read processor with a strict grammar
 - [`splitcode`](https://github.com/pachterlab/splitcode): identify, extract, and edit technical sequences from a declarative config
 - [`splitseq-toolbox`](https://github.com/RebekkaWegmann/splitseq_toolbox): demultiplex SPLiT-seq combinatorial split-pool cell barcodes
 - [`UMI-tools extract`](https://github.com/CGATOxford/UMI-tools): pull UMIs out of records and onto the read names
