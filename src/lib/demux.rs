@@ -82,6 +82,9 @@ pub struct DemuxArgs {
     pub samples: Vec<String>,
     /// `--sample-sheet`: table form of `--sample`.
     pub sample_sheet: Option<PathBuf>,
+    /// `--sample-sheet-ignore`: sample-sheet columns to skip unread (each must
+    /// be in the header and be neither reserved nor a declared group).
+    pub sample_sheet_ignore: Vec<String>,
     /// `--sample-from-group`: treat each matched tag of a group as its own
     /// sample (1:1).
     pub sample_from_group: Option<String>,
@@ -581,9 +584,10 @@ fn build_routing(
     let (samples, demux) = match &plan.samples {
         SampleSpec::None => (Vec::new(), false),
         SampleSpec::Inline(samples) => (samples.clone(), true),
-        SampleSpec::Sheet(path) => {
+        SampleSpec::Sheet(path, ignore) => {
             let declared: HashSet<&str> = plan.groups.iter().map(|g| g.name.as_str()).collect();
-            (load_sample_sheet(path, &declared)?, true)
+            let ignored: HashSet<&str> = ignore.iter().map(String::as_str).collect();
+            (load_sample_sheet(path, &declared, &ignored)?, true)
         }
         SampleSpec::FromGroup(group) => match resolved.get(group) {
             Some(r) => (r.samples.clone(), true),
@@ -2488,6 +2492,7 @@ mod tests {
             rg_tags: Vec::new(),
             samples: Vec::new(),
             sample_sheet: None,
+            sample_sheet_ignore: Vec::new(),
             sample_from_group: None,
             require_samples_explain_all_tags: false,
             remove: Vec::new(),
@@ -4350,6 +4355,37 @@ mod tests {
         args.out = Some(format!("{}/%sample.fq", dir.path().display()));
         run_demux(args).unwrap();
 
+        assert_eq!(read_back(&dir.path().join("dna01.fq"))[0].name, b"a");
+        assert_eq!(read_back(&dir.path().join("dna02.fq"))[0].name, b"b");
+    }
+
+    #[test]
+    fn test_sample_sheet_ignored_column_fans_out_through_engine() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = write_file(
+            dir.path(),
+            "in.fq",
+            b"@a\nAAAA\n+\nIIII\n@b\nCCCC\n+\nIIII\n",
+        );
+        let sheet = write_file(
+            dir.path(),
+            "sheet.tsv",
+            b"sample\tassay\tgrp\ndna01\tscATAC\tA\ndna02\tanything at all\tB\n",
+        );
+        let mut args = base_args();
+        args.inputs = vec![format!("0={}", input.display())];
+        args.groups = vec![
+            "grp={A=AAAA,B=CCCC}".to_string(),
+            "grp::loc=0:0,dist=0".to_string(),
+        ];
+        args.sample_sheet = Some(sheet);
+        args.out = Some(format!("{}/%sample.fq", dir.path().display()));
+
+        let err = run_demux(args.clone()).unwrap_err();
+        assert!(format!("{err:#}").contains("`assay`"), "{err:#}");
+
+        args.sample_sheet_ignore = vec!["assay".to_string()];
+        run_demux(args).unwrap();
         assert_eq!(read_back(&dir.path().join("dna01.fq"))[0].name, b"a");
         assert_eq!(read_back(&dir.path().join("dna02.fq"))[0].name, b"b");
     }

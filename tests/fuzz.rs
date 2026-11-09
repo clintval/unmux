@@ -37,7 +37,7 @@ fn fuzz_parse_sample_sheet() {
     bolero::check!()
         .with_type::<String>()
         .for_each(|text: &String| {
-            let _ = unmux::parse_sample_sheet(text, &declared);
+            let _ = unmux::parse_sample_sheet(text, &declared, &HashSet::new());
         });
 }
 

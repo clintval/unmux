@@ -486,7 +486,15 @@ pub fn expand_from_group(group: &str, tag_set: &TagSet) -> Vec<Sample> {
 /// tokens themselves are resolved against the group tag sets later, at
 /// routing-compile time. `#` comments and blank lines are skipped and CRLF line
 /// endings are tolerated.
-pub fn parse_sample_sheet(text: &str, declared_groups: &HashSet<&str>) -> Result<Vec<Sample>> {
+///
+/// Columns named in `ignored_columns` (`--sample-sheet-ignore`) are skipped
+/// unread. Each must appear in the header and may not be a reserved column or a
+/// declared group, so a typo still fails rather than silently skipping nothing.
+pub fn parse_sample_sheet(
+    text: &str,
+    declared_groups: &HashSet<&str>,
+    ignored_columns: &HashSet<&str>,
+) -> Result<Vec<Sample>> {
     let mut rows = text
         .lines()
         .map(|line| line.trim_end_matches('\r'))
@@ -503,12 +511,34 @@ pub fn parse_sample_sheet(text: &str, declared_groups: &HashSet<&str>) -> Result
         .context("sample sheet has no `sample` column")?;
     let sub_sample_col = columns.iter().position(|c| *c == "sub_sample");
 
+    let mut ignored: Vec<&str> = ignored_columns.iter().copied().collect();
+    ignored.sort_unstable();
+    for column in ignored {
+        if column == "sample" || column == "sub_sample" {
+            bail!("--sample-sheet-ignore cannot skip the reserved column `{column}`");
+        }
+        if declared_groups.contains(column) {
+            bail!(
+                "--sample-sheet-ignore names `{column}`, a declared --group; a group column cannot be ignored"
+            );
+        }
+        if !columns.contains(&column) {
+            bail!(
+                "--sample-sheet-ignore names `{column}`, which is not a column in the sample sheet header"
+            );
+        }
+    }
+
     // Every remaining non-empty column must name a declared group; its cells
     // select within it.
     let mut group_cols = Vec::new();
     let mut seen_groups = HashSet::new();
     for (i, column) in columns.iter().enumerate() {
-        if i == sample_col || Some(i) == sub_sample_col || column.is_empty() {
+        if i == sample_col
+            || Some(i) == sub_sample_col
+            || column.is_empty()
+            || ignored_columns.contains(column)
+        {
             continue;
         }
         if !declared_groups.contains(column) {
@@ -576,10 +606,14 @@ pub fn parse_sample_sheet(text: &str, declared_groups: &HashSet<&str>) -> Result
 }
 
 /// Load and parse a `--sample-sheet` from a file.
-pub fn load_sample_sheet(path: &Path, declared_groups: &HashSet<&str>) -> Result<Vec<Sample>> {
+pub fn load_sample_sheet(
+    path: &Path,
+    declared_groups: &HashSet<&str>,
+    ignored_columns: &HashSet<&str>,
+) -> Result<Vec<Sample>> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read sample sheet: {}", path.display()))?;
-    parse_sample_sheet(&text, declared_groups)
+    parse_sample_sheet(&text, declared_groups, ignored_columns)
         .with_context(|| format!("failed to parse sample sheet: {}", path.display()))
 }
 
@@ -1143,7 +1177,7 @@ mod tests {
                      dna01\tsub1\tcbt02\n\
                      dna01\tsub2\tcbt03\n\
                      dna02\tsub1\tcbt07\n";
-        let samples = parse_sample_sheet(sheet, &groups).unwrap();
+        let samples = parse_sample_sheet(sheet, &groups, &HashSet::new()).unwrap();
         assert_eq!(samples.len(), 4);
         // dna01/sub1 appears twice (an OR pool of cbt01 and cbt02).
         assert_eq!(samples[0].sample, "dna01");
@@ -1166,7 +1200,7 @@ mod tests {
         // Two group columns on one row are AND-joined.
         let groups: HashSet<&str> = ["grp_x", "grp_y"].into_iter().collect();
         let sheet = "sample\tgrp_x\tgrp_y\ns1\tX\tY\n";
-        let samples = parse_sample_sheet(sheet, &groups).unwrap();
+        let samples = parse_sample_sheet(sheet, &groups, &HashSet::new()).unwrap();
         assert_eq!(samples[0].selector.terms.len(), 2);
         assert_eq!(samples[0].sub_sample, None);
     }
@@ -1175,7 +1209,7 @@ mod tests {
     fn test_parse_sample_sheet_unknown_column_is_error() {
         let groups: HashSet<&str> = ["grp_x"].into_iter().collect();
         let sheet = "sample\tgrp_x\tnonsense\ns1\tX\tZ\n";
-        let err = parse_sample_sheet(sheet, &groups).unwrap_err();
+        let err = parse_sample_sheet(sheet, &groups, &HashSet::new()).unwrap_err();
         assert!(err.to_string().contains("nonsense"), "{err}");
         assert!(err.to_string().contains("declared --group"), "{err}");
     }
@@ -1183,7 +1217,7 @@ mod tests {
     #[test]
     fn test_parse_sample_sheet_missing_sample_column_is_error() {
         let groups: HashSet<&str> = ["grp_x"].into_iter().collect();
-        let err = parse_sample_sheet("id\tgrp_x\ns1\tX\n", &groups).unwrap_err();
+        let err = parse_sample_sheet("id\tgrp_x\ns1\tX\n", &groups, &HashSet::new()).unwrap_err();
         assert!(err.to_string().contains("no `sample` column"), "{err}");
     }
 
@@ -1191,7 +1225,7 @@ mod tests {
     fn test_parse_sample_sheet_skips_comments_and_blanks() {
         let groups: HashSet<&str> = ["grp"].into_iter().collect();
         let sheet = "# header comment\n\nsample\tgrp\n# row comment\ns1\ta\n\n";
-        let samples = parse_sample_sheet(sheet, &groups).unwrap();
+        let samples = parse_sample_sheet(sheet, &groups, &HashSet::new()).unwrap();
         assert_eq!(samples.len(), 1);
         assert_eq!(samples[0].sample, "s1");
     }
@@ -1200,7 +1234,7 @@ mod tests {
     fn test_parse_sample_sheet_pool_sub_sample_cell() {
         let groups: HashSet<&str> = ["grp"].into_iter().collect();
         let sheet = "sample\tsub_sample\tgrp\ndna01\t%pool\ta\n";
-        let samples = parse_sample_sheet(sheet, &groups).unwrap();
+        let samples = parse_sample_sheet(sheet, &groups, &HashSet::new()).unwrap();
         assert_eq!(samples[0].sub_sample, Some(SubSample::Pool));
     }
 
@@ -1209,7 +1243,7 @@ mod tests {
         // A parsed sheet feeds compile_routing exactly like inline --sample.
         let groups: HashSet<&str> = ["grp"].into_iter().collect();
         let sheet = "sample\tgrp\ndna01\tcbt01\ndna02\tcbt02\n";
-        let samples = parse_sample_sheet(sheet, &groups).unwrap();
+        let samples = parse_sample_sheet(sheet, &groups, &HashSet::new()).unwrap();
         let tag_sets = sets(&[("grp", tagset(&[("cbt01", "AAAA"), ("cbt02", "CCCC")]))]);
         let (routing, index) = compile(&samples, &[], &tag_sets, "p", true, false).unwrap();
         assert_eq!(
@@ -1228,7 +1262,7 @@ mod tests {
         let mut file = tempfile::NamedTempFile::new().unwrap();
         write!(file, "sample\tgrp\ns1\tcbt01\n").unwrap();
         file.flush().unwrap();
-        let samples = load_sample_sheet(file.path(), &groups).unwrap();
+        let samples = load_sample_sheet(file.path(), &groups, &HashSet::new()).unwrap();
         assert_eq!(samples[0].sample, "s1");
     }
 
@@ -1256,7 +1290,8 @@ mod tests {
         // Two columns headed by the same group AND-join it with itself (a dead
         // route); reject it.
         let groups: HashSet<&str> = ["grp"].into_iter().collect();
-        let err = parse_sample_sheet("sample\tgrp\tgrp\ns1\ta\tb\n", &groups).unwrap_err();
+        let err = parse_sample_sheet("sample\tgrp\tgrp\ns1\ta\tb\n", &groups, &HashSet::new())
+            .unwrap_err();
         assert!(err.to_string().contains("more than one column"), "{err}");
     }
 
@@ -1268,5 +1303,63 @@ mod tests {
         let samples = vec![sample("s1", None, &[("grp", &[])])];
         let err = compile(&samples, &[], &HashMap::new(), "p", true, false).unwrap_err();
         assert!(err.to_string().contains("no loaded tag set"), "{err}");
+    }
+
+    #[test]
+    fn test_parse_sample_sheet_ignored_column_is_skipped() {
+        // An ignored column's cells are never read, so any value is fine.
+        let groups: HashSet<&str> = ["grp"].into_iter().collect();
+        let ignored: HashSet<&str> = ["assay"].into_iter().collect();
+        let sheet = "sample\tassay\tgrp\ns1\tscATAC\ta\ns2\t%not a tag, ::+\tb\ns3\t\tc\n";
+        let samples = parse_sample_sheet(sheet, &groups, &ignored).unwrap();
+        assert_eq!(samples.len(), 3);
+        for sample in &samples {
+            assert_eq!(sample.selector.terms.len(), 1);
+            assert_eq!(sample.selector.terms[0].group, "grp");
+        }
+        assert_eq!(samples[1].selector.terms[0].members, vec!["b".to_string()]);
+    }
+
+    #[test]
+    fn test_parse_sample_sheet_ignored_column_absent_from_header_is_error() {
+        let groups: HashSet<&str> = ["grp"].into_iter().collect();
+        let ignored: HashSet<&str> = ["asay"].into_iter().collect();
+        let sheet = "sample\tassay\tgrp\ns1\tx\ta\n";
+        let err = parse_sample_sheet(sheet, &groups, &ignored).unwrap_err();
+        assert!(err.to_string().contains("`asay`"), "{err}");
+        assert!(err.to_string().contains("not a column"), "{err}");
+    }
+
+    #[test]
+    fn test_parse_sample_sheet_ignoring_reserved_column_is_error() {
+        let groups: HashSet<&str> = ["grp"].into_iter().collect();
+        let sheet = "sample\tsub_sample\tgrp\ns1\tlib\ta\n";
+        for reserved in ["sample", "sub_sample"] {
+            let ignored: HashSet<&str> = [reserved].into_iter().collect();
+            let err = parse_sample_sheet(sheet, &groups, &ignored).unwrap_err();
+            assert!(err.to_string().contains("reserved column"), "{err}");
+            assert!(err.to_string().contains(reserved), "{err}");
+        }
+    }
+
+    #[test]
+    fn test_parse_sample_sheet_ignoring_declared_group_is_error() {
+        let groups: HashSet<&str> = ["grp", "other"].into_iter().collect();
+        let ignored: HashSet<&str> = ["other"].into_iter().collect();
+        let sheet = "sample\tgrp\tother\ns1\ta\tb\n";
+        let err = parse_sample_sheet(sheet, &groups, &ignored).unwrap_err();
+        assert!(err.to_string().contains("declared --group"), "{err}");
+        assert!(err.to_string().contains("`other`"), "{err}");
+    }
+
+    #[test]
+    fn test_parse_sample_sheet_ignore_leaves_other_columns_strict() {
+        // Ignoring one extra column does not relax the check on another.
+        let groups: HashSet<&str> = ["grp"].into_iter().collect();
+        let ignored: HashSet<&str> = ["assay"].into_iter().collect();
+        let sheet = "sample\tassay\tgrp\tnotes\ns1\tx\ta\ty\n";
+        let err = parse_sample_sheet(sheet, &groups, &ignored).unwrap_err();
+        assert!(err.to_string().contains("`notes`"), "{err}");
+        assert!(err.to_string().contains("declared --group"), "{err}");
     }
 }
