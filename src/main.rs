@@ -321,7 +321,9 @@ struct DemuxCmd {
     /// same row are AND'd (a match is needed in each). Below, s1 needs i7 `a`
     /// AND i5 `b`; s2 pools (i7 `c` AND i5 `d`) OR (i7 `e` AND i5 `f`).
     ///
-    /// Exclusive with `--sample` and `--sample-from-group`.
+    /// Every other column must name a group; skip extra metadata columns
+    /// with `--sample-sheet-ignore`. Exclusive with `--sample` and
+    /// `--sample-from-group`.
     ///
     ///   --sample-sheet samples.tsv
     ///
@@ -338,6 +340,23 @@ struct DemuxCmd {
         verbatim_doc_comment
     )]
     sample_sheet: Option<PathBuf>,
+
+    /// A `--sample-sheet` column to skip unread (repeatable).
+    ///
+    /// For per-sample metadata unmux does not use. The ignored column's cells
+    /// may hold any value. It must be in the sheet's header and may not be
+    /// `sample`, `sub_sample`, or a declared group. Requires `--sample-sheet`.
+    ///
+    ///   --sample-sheet-ignore assay   skip the assay column
+    ///   --sample-sheet-ignore notes   repeat the flag to skip more
+    #[arg(
+        long = "sample-sheet-ignore",
+        value_name = "COLUMN",
+        requires = "sample_sheet",
+        conflicts_with_all = ["samples", "sample_from_group"],
+        verbatim_doc_comment
+    )]
+    sample_sheet_ignore: Vec<String>,
 
     /// Make every tag in `GROUP` its own sample, 1-to-1 (a shortcut).
     ///
@@ -676,6 +695,7 @@ fn run_demux_cmd(cmd: DemuxCmd) -> Result<()> {
         rg_tags: cmd.rg_tags,
         samples: cmd.samples,
         sample_sheet: cmd.sample_sheet,
+        sample_sheet_ignore: cmd.sample_sheet_ignore,
         sample_from_group: cmd.sample_from_group,
         require_samples_explain_all_tags: cmd.require_samples_explain_all_tags,
         remove: cmd.remove,

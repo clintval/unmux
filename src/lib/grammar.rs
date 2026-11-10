@@ -421,8 +421,9 @@ pub enum SampleSpec {
     None,
     /// `--sample`: inline targets.
     Inline(Vec<Sample>),
-    /// `--sample-sheet`: a table of targets, resolved at load time.
-    Sheet(PathBuf),
+    /// `--sample-sheet`: a table of targets, resolved at load time, plus the
+    /// `--sample-sheet-ignore` columns to skip.
+    Sheet(PathBuf, Vec<String>),
     /// `--sample-from-group`: 1:1 tag-to-sample over the named group.
     FromGroup(String),
 }
@@ -1447,8 +1448,16 @@ fn parse_sample_spec(args: &DemuxArgs) -> Result<SampleSpec> {
         validate_ident(group, "sample-from-group")?;
         return Ok(SampleSpec::FromGroup(group.to_string()));
     }
+    if args.sample_sheet.is_none() && !args.sample_sheet_ignore.is_empty() {
+        bail!("--sample-sheet-ignore requires --sample-sheet");
+    }
     if let Some(sheet) = &args.sample_sheet {
-        return Ok(SampleSpec::Sheet(sheet.clone()));
+        let ignore = args
+            .sample_sheet_ignore
+            .iter()
+            .map(|c| c.trim().to_string())
+            .collect();
+        return Ok(SampleSpec::Sheet(sheet.clone(), ignore));
     }
     if !args.samples.is_empty() {
         let mut samples = Vec::new();
@@ -1971,7 +1980,7 @@ fn validate_plan(plan: &DemuxPlan) -> Result<()> {
         SampleSpec::FromGroup(group) => {
             require_group(&group_names, group, "--sample-from-group")?;
         }
-        SampleSpec::Sheet(_) | SampleSpec::None => {}
+        SampleSpec::Sheet(..) | SampleSpec::None => {}
     }
     for rule in &plan.remove {
         let group = match &rule.selector {
@@ -2051,7 +2060,7 @@ fn plan_warnings(plan: &DemuxPlan) -> Vec<String> {
     // only a genuinely inert one is flagged. A `--sample-sheet` may reference
     // any group (resolved later, at load), so suppress the warning entirely
     // under a sheet.
-    if !matches!(plan.samples, SampleSpec::Sheet(_)) {
+    if !matches!(plan.samples, SampleSpec::Sheet(..)) {
         let emitted: HashSet<&str> = plan
             .templates
             .iter()
@@ -2259,6 +2268,7 @@ mod tests {
             rg_tags: Vec::new(),
             samples: Vec::new(),
             sample_sheet: None,
+            sample_sheet_ignore: Vec::new(),
             sample_from_group: None,
             require_samples_explain_all_tags: false,
             remove: Vec::new(),
@@ -2994,6 +3004,31 @@ mod tests {
         assert_eq!(sample.selector.terms.len(), 2);
         assert!(sample.selector.terms[1].members.is_empty());
         assert_eq!(sample.selector.terms[1].group, "grp_plate");
+    }
+
+    #[test]
+    fn test_parse_sample_spec_ignore_without_sheet_is_error() {
+        for samples in [Vec::new(), vec!["s1=g::a".to_string()]] {
+            let mut a = args();
+            a.samples = samples;
+            a.sample_sheet_ignore = vec!["assay".to_string()];
+            let err = parse_sample_spec(&a).unwrap_err();
+            assert!(err.to_string().contains("requires --sample-sheet"), "{err}");
+        }
+    }
+
+    #[test]
+    fn test_parse_sample_spec_sheet_carries_ignored_columns() {
+        let mut a = args();
+        a.sample_sheet = Some(PathBuf::from("sheet.tsv"));
+        a.sample_sheet_ignore = vec!["assay".to_string(), " notes ".to_string()];
+        assert_eq!(
+            parse_sample_spec(&a).unwrap(),
+            SampleSpec::Sheet(
+                PathBuf::from("sheet.tsv"),
+                vec!["assay".to_string(), "notes".to_string()]
+            )
+        );
     }
 
     #[test]
