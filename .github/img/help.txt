@@ -246,7 +246,9 @@ Options:
           same row are AND'd (a match is needed in each). Below, s1 needs i7 a
           AND i5 b; s2 pools (i7 c AND i5 d) OR (i7 e AND i5 f).
           
-          Exclusive with --sample and --sample-from-group.
+          Every other column must name a group; skip extra metadata columns
+          with --sample-sheet-ignore. Exclusive with --sample and
+          --sample-from-group.
           
             --sample-sheet samples.tsv
           
@@ -256,6 +258,16 @@ Options:
             s1      lib9        a   b
             s2                  c   d
             s2                  e   f
+
+      --sample-sheet-ignore <COLUMN>
+          A --sample-sheet column to skip unread (repeatable).
+          
+          For per-sample metadata unmux does not use. The ignored column's cells
+          may hold any value. It must be in the sheet's header and may not be
+          sample, sub_sample, or a declared group. Requires --sample-sheet.
+          
+            --sample-sheet-ignore assay   skip the assay column
+            --sample-sheet-ignore notes   repeat the flag to skip more
 
       --sample-from-group <GROUP>
           Make every tag in GROUP its own sample, 1-to-1 (a shortcut).
