@@ -117,6 +117,8 @@ pub struct DemuxArgs {
     /// metric columns; one row per pool; headered, concatenable). The path may
     /// use `%pool` (the only valid placeholder).
     pub metrics_summary: Option<PathBuf>,
+    /// `--metrics-unassigned`: unassigned record counts by reason; only `%pool` is valid.
+    pub metrics_unassigned: Option<PathBuf>,
     /// `--qc-tag`: emit a per-record JSON demux-provenance slug under this SAM
     /// tag (a local-use tag, default `ZS`). `None` = off (the default).
     pub qc_tag: Option<String>,
@@ -1216,6 +1218,9 @@ fn run_engine(plan: &DemuxPlan, command_line: Option<&str>) -> Result<()> {
     if let Some(pattern) = &plan.metrics_summary {
         metrics.write_summary_tsv(&resolve_metrics_path(pattern, &pool))?;
     }
+    if let Some(pattern) = &plan.metrics_unassigned {
+        metrics.write_unassigned_tsv(&resolve_metrics_path(pattern, &pool), &groups)?;
+    }
     Ok(())
 }
 
@@ -1299,7 +1304,7 @@ struct PreparedWrite {
 /// crosses the worker boundary. Commutative integer sums, applied on the
 /// consumer in input order (order is irrelevant to the sums).
 enum Tally {
-    Unassigned,
+    Unassigned(Unassigned),
     Removed,
     PassThrough {
         denom: u64,
@@ -1495,7 +1500,7 @@ fn prepare(engine: &Engine, fragment: &Fragment, fmatch: FragmentMatch) -> Resul
             let writes = prepare_unassigned(engine, fragment, &reason, &hits);
             return Ok(Prepared {
                 lengths,
-                tally: Tally::Unassigned,
+                tally: Tally::Unassigned(reason),
                 writes,
             });
         }
@@ -1515,23 +1520,14 @@ fn prepare(engine: &Engine, fragment: &Fragment, fmatch: FragmentMatch) -> Resul
             Tally::Removed,
             prepare_removed(engine, fragment, remove, &hits),
         ),
-        Disposition::Unassigned => (
-            Tally::Unassigned,
-            prepare_unassigned(engine, fragment, &Unassigned::NoSample, &hits),
-        ),
+        Disposition::Unassigned => unassigned(engine, fragment, Unassigned::NoSample, &hits),
         Disposition::PassThrough => {
             let (denom, unext) = frac_bases(engine, &segments, &hits)?;
             match prepare_body(engine, None, &hits, &segments, fragment)? {
                 BodyOutcome::Assembled(writes) => (Tally::PassThrough { denom, unext }, writes),
-                BodyOutcome::MissingStream(missing) => (
-                    Tally::Unassigned,
-                    prepare_unassigned(
-                        engine,
-                        fragment,
-                        &Unassigned::MissingStream(missing),
-                        &hits,
-                    ),
-                ),
+                BodyOutcome::MissingStream(missing) => {
+                    unassigned(engine, fragment, Unassigned::MissingStream(missing), &hits)
+                }
             }
         }
         Disposition::Assigned(target) => {
@@ -1545,15 +1541,9 @@ fn prepare(engine: &Engine, fragment: &Fragment, fmatch: FragmentMatch) -> Resul
                     },
                     writes,
                 ),
-                BodyOutcome::MissingStream(missing) => (
-                    Tally::Unassigned,
-                    prepare_unassigned(
-                        engine,
-                        fragment,
-                        &Unassigned::MissingStream(missing),
-                        &hits,
-                    ),
-                ),
+                BodyOutcome::MissingStream(missing) => {
+                    unassigned(engine, fragment, Unassigned::MissingStream(missing), &hits)
+                }
             }
         }
     };
@@ -1562,6 +1552,17 @@ fn prepare(engine: &Engine, fragment: &Fragment, fmatch: FragmentMatch) -> Resul
         tally,
         writes,
     })
+}
+
+/// The tally and writes of a record routed to the `--unassigned` bin.
+fn unassigned(
+    engine: &Engine,
+    fragment: &Fragment,
+    reason: Unassigned,
+    hits: &GroupHits,
+) -> (Tally, Vec<PreparedWrite>) {
+    let writes = prepare_unassigned(engine, fragment, &reason, hits);
+    (Tally::Unassigned(reason), writes)
 }
 
 /// Apply one [`Prepared`] on the serial consumer: tally it and issue its writes
@@ -1575,7 +1576,7 @@ fn apply_prepared(
     metrics.record_processed();
     metrics.record_read_lengths(prepared.lengths.iter().copied());
     match &prepared.tally {
-        Tally::Unassigned => metrics.record_unassigned(),
+        Tally::Unassigned(reason) => metrics.record_unassigned(reason),
         Tally::Removed => metrics.record_removed(),
         Tally::PassThrough { denom, unext } => metrics.record_pass_through(*denom, *unext),
         Tally::Assigned {
@@ -2500,6 +2501,7 @@ mod tests {
             unassigned: None,
             metrics_per_sample: None,
             metrics_summary: None,
+            metrics_unassigned: None,
             qc_tag: None,
             per_record: false,
             compression: 5,
