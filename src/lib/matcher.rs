@@ -193,7 +193,7 @@ pub struct FindFailure {
 
 /// The kind of find-count constraint, for [`FindFailure`]; [`FindKind::as_str`]
 /// is the attribute name used in the slug.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum FindKind {
     /// `minFindsPerGroup`: too few of the group's tags matched the record.
     MinPerGroup,

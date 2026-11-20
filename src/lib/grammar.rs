@@ -546,6 +546,8 @@ pub struct DemuxPlan {
     /// `--metrics-summary` TSV path pattern. Pool-level file, so only `%pool`
     /// is valid.
     pub metrics_summary: Option<OutputPattern>,
+    /// `--metrics-unassigned` TSV path pattern; only `%pool` is valid.
+    pub metrics_unassigned: Option<OutputPattern>,
     /// `--per-record`: disable auto pair-detection.
     pub per_record: bool,
     /// `--compression` level (0-9).
@@ -608,6 +610,10 @@ pub fn parse_demux(args: &DemuxArgs) -> Result<DemuxPlan> {
         metrics_summary: parse_metrics_pattern(
             args.metrics_summary.as_deref(),
             "--metrics-summary",
+        )?,
+        metrics_unassigned: parse_metrics_pattern(
+            args.metrics_unassigned.as_deref(),
+            "--metrics-unassigned",
         )?,
         per_record: args.per_record,
         compression: args.compression,
@@ -2276,6 +2282,7 @@ mod tests {
             unassigned: None,
             metrics_per_sample: None,
             metrics_summary: None,
+            metrics_unassigned: None,
             qc_tag: None,
             per_record: false,
             compression: 5,

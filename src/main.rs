@@ -430,6 +430,18 @@ struct DemuxCmd {
     #[arg(long = "metrics-summary", value_name = "PATTERN", verbatim_doc_comment)]
     metrics_summary: Option<PathBuf>,
 
+    /// Unassigned-reason metrics TSV with one row per reason seen.
+    ///
+    /// Only `%pool` is a valid path placeholder.
+    ///
+    ///   --metrics-unassigned %pool.unmux.unassigned.tsv
+    #[arg(
+        long = "metrics-unassigned",
+        value_name = "PATTERN",
+        verbatim_doc_comment
+    )]
+    metrics_unassigned: Option<PathBuf>,
+
     /// Fail fast unless every tag of every group named by a `--sample` and
     /// `--sample-sheet` selector is claimed by some sample (no tag in
     /// a sampled group left unclaimed). Off by default; applies only when
@@ -703,6 +715,7 @@ fn run_demux_cmd(cmd: DemuxCmd) -> Result<()> {
         unassigned: cmd.unassigned,
         metrics_per_sample: cmd.metrics_per_sample,
         metrics_summary: cmd.metrics_summary,
+        metrics_unassigned: cmd.metrics_unassigned,
         qc_tag: cmd.qc_tag,
         per_record: cmd.per_record,
         compression: cmd.compression,

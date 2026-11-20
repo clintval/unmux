@@ -1,13 +1,14 @@
 //! Demux metrics: per-fan-out-target and pool-level record counts plus
 //! `frac_bases_unextracted`, written as headered, concatenable TSVs
-//! (`--metrics-per-sample` / `--metrics-summary`) and always logged to stderr.
+//! (`--metrics-per-sample` / `--metrics-summary`) and always logged to stderr,
+//! and unassigned record counts by reason (`--metrics-unassigned`).
 //!
 //! `frac_bases_unextracted` is the fraction of bases in retained records not
 //! routed into a `--template` or `--tag` stream, pooled as `sum(unextracted) /
 //! sum(denominator)` over the target's records (0 for a pure pass-through run,
 //! where the whole record is the output).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::BufWriter;
 use std::path::Path;
@@ -18,6 +19,29 @@ use serde::Serialize;
 use thousands::Separable;
 
 use crate::fanout::Target;
+use crate::matcher::{CompiledGroup, FindKind};
+use crate::qc::Unassigned;
+
+/// One `--metrics-unassigned` row's reason; the derived order is the row order.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum UnassignedReason {
+    FindConstraint { group: usize, kind: FindKind },
+    MissingStream(String),
+    NoSample,
+}
+
+impl From<&Unassigned> for UnassignedReason {
+    fn from(reason: &Unassigned) -> Self {
+        match reason {
+            Unassigned::FindConstraint { group, failure } => Self::FindConstraint {
+                group: *group,
+                kind: failure.kind,
+            },
+            Unassigned::MissingStream(stream) => Self::MissingStream(stream.clone()),
+            Unassigned::NoSample => Self::NoSample,
+        }
+    }
+}
 
 /// A running per-target tally: records routed to it, and the pooled
 /// `frac_bases_unextracted` numerator and denominator.
@@ -36,6 +60,7 @@ pub struct Metrics {
     total: u64,
     pass_through: u64,
     unassigned: u64,
+    unassigned_by_reason: BTreeMap<UnassignedReason, u64>,
     removed: u64,
     retained_denominator_bases: u64,
     retained_unextracted_bases: u64,
@@ -61,6 +86,7 @@ impl Metrics {
             total: 0,
             pass_through: 0,
             unassigned: 0,
+            unassigned_by_reason: BTreeMap::new(),
             removed: 0,
             retained_denominator_bases: 0,
             retained_unextracted_bases: 0,
@@ -120,9 +146,13 @@ impl Metrics {
         self.retain_bases(denominator, unextracted);
     }
 
-    /// Count a record that matched no sample.
-    pub fn record_unassigned(&mut self) {
+    /// Count a record that matched no sample, and why.
+    pub fn record_unassigned(&mut self, reason: &Unassigned) {
         self.unassigned += 1;
+        *self
+            .unassigned_by_reason
+            .entry(UnassignedReason::from(reason))
+            .or_default() += 1;
     }
 
     /// Count a record removed by a `--remove` rule.
@@ -194,6 +224,38 @@ impl Metrics {
                 mean_read_len_by_input: self.mean_read_len_by_input(),
             })
             .context("failed to write the summary metrics row")?;
+        writer.flush().context("failed to flush metrics")
+    }
+
+    /// Write the unassigned TSV, one row per reason seen, adding up to `reads_unassigned`.
+    pub fn write_unassigned_tsv(&self, path: &Path, groups: &[CompiledGroup]) -> Result<()> {
+        let mut writer = tsv_writer(path)?;
+        if self.unassigned_by_reason.is_empty() {
+            writer
+                .write_record(UNASSIGNED_HEADER)
+                .context("failed to write the unassigned metrics header")?;
+        }
+        for (reason, &reads) in &self.unassigned_by_reason {
+            let (reason, group, stream) = match reason {
+                UnassignedReason::FindConstraint { group, kind } => (
+                    kind.as_str(),
+                    groups.get(*group).map_or("", |g| g.name.as_str()),
+                    "",
+                ),
+                UnassignedReason::MissingStream(stream) => ("missing_stream", "", stream.as_str()),
+                UnassignedReason::NoSample => ("no_sample", "", ""),
+            };
+            writer
+                .serialize(UnassignedRow {
+                    pool: &self.pool,
+                    reason,
+                    group,
+                    stream,
+                    reads,
+                    frac_of_pool: frac(reads, self.total),
+                })
+                .context("failed to write an unassigned metrics row")?;
+        }
         writer.flush().context("failed to flush metrics")
     }
 
@@ -292,6 +354,21 @@ struct SummaryRow<'a> {
     mean_read_len_by_input: String,
 }
 
+/// One unassigned metrics row; the field names are the TSV header, in column order.
+#[derive(Serialize)]
+struct UnassignedRow<'a> {
+    pool: &'a str,
+    reason: &'a str,
+    group: &'a str,
+    stream: &'a str,
+    reads: u64,
+    #[serde(serialize_with = "six_dp")]
+    frac_of_pool: f64,
+}
+
+/// The [`UnassignedRow`] header, for a file with no rows, where serde writes none.
+const UNASSIGNED_HEADER: [&str; 6] = ["pool", "reason", "group", "stream", "reads", "frac_of_pool"];
+
 /// A tab-delimited, `\n`-terminated `csv::Writer` at `path`. The header row is
 /// the serialized struct's field names (written before the first record).
 /// Missing parent directories are created.
@@ -352,8 +429,8 @@ mod tests {
         for _ in 0..2 {
             metrics.record_assigned(&targets[1], 50, 0);
         }
-        metrics.record_unassigned();
-        metrics.record_unassigned();
+        metrics.record_unassigned(&Unassigned::NoSample);
+        metrics.record_unassigned(&Unassigned::NoSample);
 
         let path = dir.path().join("per_sample.tsv");
         metrics.write_per_sample_tsv(&path).unwrap();
@@ -382,7 +459,7 @@ mod tests {
         }
         metrics.record_assigned(&targets[0], 100, 10);
         metrics.record_assigned(&targets[0], 100, 10);
-        metrics.record_unassigned();
+        metrics.record_unassigned(&Unassigned::NoSample);
         metrics.record_removed();
         metrics.record_removed();
 
@@ -397,6 +474,64 @@ mod tests {
     }
 
     #[test]
+    fn test_unassigned_tsv_counts_each_reason_in_row_order() {
+        use crate::matcher::FindFailure;
+
+        let dir = tempfile::tempdir().unwrap();
+        let groups = vec![
+            CompiledGroup::new("bc1", vec![b"AAAA".to_vec()]),
+            CompiledGroup::new("bc2", vec![b"CCCC".to_vec()]),
+        ];
+        let constraint = |group, kind, observed, bound| Unassigned::FindConstraint {
+            group,
+            failure: FindFailure {
+                kind,
+                observed,
+                bound,
+            },
+        };
+        let mut metrics = Metrics::new("p", &[]);
+        for _ in 0..10 {
+            metrics.record_processed();
+        }
+        // Out of row order, and with observed counts that must not split rows.
+        metrics.record_unassigned(&Unassigned::NoSample);
+        metrics.record_unassigned(&Unassigned::MissingStream("umi".to_string()));
+        metrics.record_unassigned(&constraint(1, FindKind::MinPerGroup, 0, 1));
+        metrics.record_unassigned(&constraint(0, FindKind::MaxPerGroup, 2, 1));
+        metrics.record_unassigned(&constraint(0, FindKind::MaxPerGroup, 3, 1));
+        metrics.record_unassigned(&constraint(0, FindKind::MinPerGroup, 0, 1));
+
+        let path = dir.path().join("unassigned.tsv");
+        metrics.write_unassigned_tsv(&path, &groups).unwrap();
+        assert_eq!(
+            lines(&path),
+            vec![
+                "pool\treason\tgroup\tstream\treads\tfrac_of_pool",
+                "p\tmin_finds_per_group\tbc1\t\t1\t0.100000",
+                "p\tmax_finds_per_group\tbc1\t\t2\t0.200000",
+                "p\tmin_finds_per_group\tbc2\t\t1\t0.100000",
+                "p\tmissing_stream\t\tumi\t1\t0.100000",
+                "p\tno_sample\t\t\t1\t0.100000",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_unassigned_tsv_is_header_only_when_nothing_is_unassigned() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut metrics = Metrics::new("p", &[]);
+        metrics.record_processed();
+        metrics.record_pass_through(10, 0);
+        let path = dir.path().join("unassigned.tsv");
+        metrics.write_unassigned_tsv(&path, &[]).unwrap();
+        assert_eq!(
+            lines(&path),
+            vec!["pool\treason\tgroup\tstream\treads\tfrac_of_pool"]
+        );
+    }
+
+    #[test]
     fn test_unassigned_rate_threshold() {
         // The stderr warning fires at >= 20% unassigned; the rate predicate
         // drives it.
@@ -404,7 +539,7 @@ mod tests {
         for _ in 0..10 {
             low.record_processed();
         }
-        low.record_unassigned();
+        low.record_unassigned(&Unassigned::NoSample);
         assert!(low.unassigned_rate() < 0.20, "1/10 is below the threshold");
 
         let mut high = Metrics::new("p", &[]);
@@ -412,7 +547,7 @@ mod tests {
             high.record_processed();
         }
         for _ in 0..3 {
-            high.record_unassigned();
+            high.record_unassigned(&Unassigned::NoSample);
         }
         assert!(high.unassigned_rate() >= 0.20, "3/10 meets the threshold");
     }

@@ -174,6 +174,18 @@ async fn file_contains(world: &mut SassWorld, name: String, needle: String) {
     );
 }
 
+#[then(regex = r#"^the file "([^"]+)" is:$"#)]
+async fn file_is(world: &mut SassWorld, name: String, step: &Step) {
+    let path = world.work_dir().join(&name);
+    let content = fs::read_to_string(&path).unwrap_or_else(|_| panic!("read output file {name:?}"));
+    // The same docstring framing trim as `a file "..." containing:`.
+    let expected = format!("{}\n", step.docstring.clone().unwrap_or_default().trim());
+    assert_eq!(
+        content, expected,
+        "{name:?} differs from the expected content"
+    );
+}
+
 #[then(regex = r#"^stdout does not contain "(.*)"$"#)]
 async fn stdout_lacks(world: &mut SassWorld, needle: String) {
     assert!(
