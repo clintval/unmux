@@ -1,6 +1,7 @@
 //! The demux engine: parse records, extract tags/UMIs (carrying qualities), and
-//! fan out to per-sample FASTX/SAM/BAM/CRAM (SAM/BAM/CRAM written unmapped),
-//! splitcode-style, on the `sassy` matcher.
+//! fan out to per-sample FASTX/SAM/BAM/CRAM (SAM/BAM/CRAM written unmapped,
+//! except an aligned `@RG` split, which keeps its alignments), splitcode-style,
+//! on the `sassy` matcher.
 //!
 //! [`run_demux`] parses the quote-free flag surface into a
 //! [`crate::DemuxPlan`], then drives the engine: load each `--group` tag set,
@@ -25,6 +26,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use noodles::sam::alignment::record::data::field::Tag;
 use noodles::sam::alignment::record_buf::data::field::Value;
 use noodles::sam::alignment::record_buf::Data;
+use noodles::sam::alignment::RecordBuf;
 use noodles::sam::Header;
 use pooled_writer::{bgzf::BgzfCompressor, Pool, PoolBuilder, PooledWriter};
 use rayon::prelude::*;
@@ -49,8 +51,9 @@ use crate::matcher::{
 };
 use crate::metrics::Metrics;
 use crate::output::{
-    build_tag_data, default_read_group_header, insert_string_tag, qual_tag_name, read_group_header,
-    resolve_metrics_path, resolve_pattern, ConstituentReadGroups, MultiWriter, PathContext,
+    alignment_header, build_tag_data, default_read_group_header, insert_string_tag, qual_tag_name,
+    read_group_header, resolve_metrics_path, resolve_pattern, ConstituentReadGroups, MultiWriter,
+    PathContext,
 };
 use crate::qc::{removed_slug, routed_slug, unassigned_slug, Unassigned};
 use crate::tags::{load_tag_file, TagSet};
@@ -131,6 +134,9 @@ pub struct DemuxArgs {
     pub compression: u8,
     /// `--threads`: worker thread count.
     pub threads: usize,
+    /// `--reference`: an indexed FASTA for reading reference-compressed CRAM and
+    /// writing aligned records to CRAM.
+    pub reference: Option<PathBuf>,
     /// The full command line, recorded in the output `@PG CL` provenance field.
     /// `None` (e.g. a library/test caller) omits the `CL` field.
     pub command_line: Option<String>,
@@ -846,6 +852,8 @@ fn bin_paths(pattern: &OutputPattern, pool: &str, num_sources: usize) -> Vec<Pat
 /// destination, so a per-sample file lists its own read groups and a
 /// single-file `--out` lists every target's. FASTX destinations and the raw
 /// bins are absent from the map and get the default `@PG`-only header.
+/// With `input_header` set (aligned records pass through), each header is the
+/// input header narrowed to the file's own `@RG` lines instead.
 fn out_headers(
     plan: &DemuxPlan,
     routing: &Routing,
@@ -853,16 +861,92 @@ fn out_headers(
     input_formats: &[SniffedFormat],
     command_line: Option<&str>,
     constituent: Option<&ConstituentReadGroups>,
+    input_header: Option<&Header>,
 ) -> Result<HashMap<Option<PathBuf>, noodles::sam::Header>> {
     let mut headers = HashMap::new();
     for (dest, targets, _) in out_destinations(plan, routing, pool, input_formats)? {
         let refs: Vec<&Target> = targets.iter().collect();
-        headers.insert(
-            dest,
-            read_group_header(&refs, &plan.rg_tags, command_line, constituent)?,
-        );
+        let header = match (input_header, constituent) {
+            (Some(input), Some(constituent)) => {
+                alignment_header(input, Some((&refs, constituent)), command_line)?
+            }
+            _ => read_group_header(&refs, &plan.rg_tags, command_line, constituent)?,
+        };
+        headers.insert(dest, header);
     }
     Ok(headers)
+}
+
+/// The SAM/BAM/CRAM formats among every destination a run can write: `--out`
+/// (a file pattern or stdout) and the `--unassigned`/`--remove` bins.
+fn alignment_formats(
+    plan: &DemuxPlan,
+    routing: &Routing,
+    pool: &str,
+    input_formats: &[SniffedFormat],
+) -> Result<Vec<OutputFormat>> {
+    let mut formats: Vec<OutputFormat> = out_destinations(plan, routing, pool, input_formats)?
+        .into_iter()
+        .map(|(_, _, format)| format)
+        .collect();
+    if plan.out.is_none() {
+        formats.push(output_format(None, input_formats)?);
+    }
+    let bins = plan
+        .unassigned
+        .iter()
+        .chain(plan.remove.iter().filter_map(|rule| rule.pattern.as_ref()));
+    for pattern in bins {
+        let ctx = PathContext {
+            pool,
+            source: Some(0),
+            ..Default::default()
+        };
+        let path = resolve_pattern(pattern, &ctx);
+        formats.push(output_format(path.as_deref(), input_formats)?);
+    }
+    formats.retain(|format| {
+        matches!(
+            format,
+            OutputFormat::Sam | OutputFormat::Bam | OutputFormat::Cram
+        )
+    });
+    Ok(formats)
+}
+
+/// Whether an `@RG` split passes its aligned records through unchanged: the
+/// input is aligned and some destination is SAM/BAM/CRAM. Fails fast on a run
+/// that would have to drop alignments to proceed, or that cannot encode them.
+fn passes_alignments_through(
+    plan: &DemuxPlan,
+    aligned_split: bool,
+    formats: &[OutputFormat],
+) -> Result<bool> {
+    if !aligned_split || formats.is_empty() {
+        return Ok(false);
+    }
+    if !plan.templates.is_empty() {
+        bail!(
+            "the input is aligned (@SQ present), and an @RG split into SAM/BAM/CRAM passes each \
+             record through unchanged, but --template would rewrite each record's sequence and \
+             qualities and drop its alignment; remove --template, write FASTX instead, or unalign \
+             the input first (e.g. `samtools reset`)"
+        );
+    }
+    if plan.inputs.len() > 1 {
+        bail!(
+            "an @RG split of aligned input (@SQ present) into SAM/BAM/CRAM takes a single input; \
+             got {} inputs",
+            plan.inputs.len()
+        );
+    }
+    if formats.contains(&OutputFormat::Cram) && plan.reference.is_none() {
+        bail!(
+            "writing aligned records to CRAM needs the reference they were aligned to; pass its \
+             indexed FASTA with --reference"
+        );
+    }
+    Ok(true)
 }
 
 /// The most BGZF compressor threads the writer pool uses, regardless of
@@ -973,7 +1057,13 @@ struct Engine<'a> {
 /// fields and an `@RG` read group) or to the `--remove` / `--unassigned` bins,
 /// tally metrics, and emit the metrics TSVs / stderr log.
 fn run_engine(plan: &DemuxPlan, command_line: Option<&str>) -> Result<()> {
-    let reader = FragmentReader::open(&plan.inputs, plan.per_record)?;
+    let reference = plan
+        .reference
+        .as_deref()
+        .map(crate::input::load_reference)
+        .transpose()?;
+    let mut reader =
+        FragmentReader::open_with_reference(&plan.inputs, plan.per_record, reference.as_ref())?;
     let input_formats = reader.formats().to_vec();
     // Only read (and conflict-check) the input `@RG` header when an `@RG`
     // group is actually present: `input_read_groups` bails on a repeated RG id
@@ -1009,14 +1099,22 @@ fn run_engine(plan: &DemuxPlan, command_line: Option<&str>) -> Result<()> {
         None
     };
 
-    if is_read_group_split && rg_info.has_sq {
-        log::warn!(
-            "input is aligned (@SQ present); this @RG split writes UNMAPPED records: alignments, \
-             CIGAR/MAPQ, and mate/alignment tags are dropped and reverse-strand reads are restored \
-             to sequenced orientation. Carrying mapped data through a split is planned for a future \
-             release; for an alignment-preserving split now, use `samtools split`."
+    let keep_alignments = passes_alignments_through(
+        plan,
+        is_read_group_split && rg_info.has_sq,
+        &alignment_formats(plan, &routing, &pool, &input_formats)?,
+    )?;
+    if keep_alignments {
+        log::info!(
+            "input is aligned (@SQ present); records pass through unchanged with their alignments"
         );
+        reader.keep_alignments();
     }
+    let input_header = if keep_alignments {
+        reader.alignment_header().cloned()
+    } else {
+        None
+    };
 
     if is_read_group_split {
         if let Some(pattern) = &plan.out {
@@ -1048,6 +1146,7 @@ fn run_engine(plan: &DemuxPlan, command_line: Option<&str>) -> Result<()> {
         &input_formats,
         command_line,
         constituent.as_ref(),
+        input_header.as_ref(),
     )?;
     // The fallback header for any destination absent from `headers`
     // (pass-through `--out`, the raw `--unassigned`/`--remove` bins): `@PG`
@@ -1055,7 +1154,10 @@ fn run_engine(plan: &DemuxPlan, command_line: Option<&str>) -> Result<()> {
     // SAM/BAM/CRAM record carries a read group even with no `--sample`. A
     // worker uses it for encode-on-workers exactly where `MultiWriter::open`
     // would, so the bytes stay identical.
-    let default_header = default_read_group_header(&pool, &plan.rg_tags, command_line)?;
+    let default_header = match &input_header {
+        Some(input) => alignment_header(input, None, command_line)?,
+        None => default_read_group_header(&pool, &plan.rg_tags, command_line)?,
+    };
     // Declared before `writer` so that, on any unwind, `writer` (and its
     // PooledWriters) drops before the pool: a PooledWriter dropped after the
     // pool is stopped would panic. The explicit shutdown below also enforces
@@ -1067,6 +1169,9 @@ fn run_engine(plan: &DemuxPlan, command_line: Option<&str>) -> Result<()> {
         input_formats.clone(),
         plan.compression,
     );
+    if let Some(reference) = reference {
+        writer.set_reference(reference);
+    }
     // Every directed output file, created up front so a directed file always
     // exists, even empty.
     let dests = enumerate_dests(
@@ -1261,6 +1366,7 @@ struct PreparedRead {
     quals: Option<Vec<u8>>,
     tags: Option<Data>,
     read_group: Option<String>,
+    alignment: Option<RecordBuf>,
 }
 
 impl PreparedRead {
@@ -1273,6 +1379,7 @@ impl PreparedRead {
             quals: self.quals.as_deref(),
             tags: self.tags.as_ref(),
             read_group: self.read_group.as_deref(),
+            alignment: self.alignment.as_ref(),
         }
     }
 }
@@ -2121,12 +2228,19 @@ fn prepared_raw_read(record: &InputRecord, pool: &str, slug: Option<(&str, &str)
         }
         None => record.tags.clone(),
     };
+    let alignment = record.alignment.clone().map(|mut alignment| {
+        if let Some((tag, value)) = slug {
+            insert_string_tag(alignment.data_mut(), tag, value);
+        }
+        alignment
+    });
     PreparedRead {
         name: record.name.clone(),
         bases: record.bases.clone(),
         quals: record.quals.clone(),
         tags,
         read_group: Some(pool.to_string()),
+        alignment,
     }
 }
 
@@ -2189,7 +2303,31 @@ fn prepare_body(
         }
     }
 
-    let bodies = match assemble_bodies(plan, fragment, &mut streams, engine.movable_streams) {
+    let sample = target.map(|t| t.sample.as_str());
+    let sub_sample = target.and_then(|t| t.sub_sample.as_deref());
+    // The format is fixed by the path extension (or the stdout mirror),
+    // independent of the ordinal.
+    let probe = PathContext {
+        pool,
+        sample,
+        sub_sample,
+        ordinal: Some(1),
+        source: None,
+    };
+    let probe_path = plan.out.as_ref().and_then(|p| resolve_pattern(p, &probe));
+    let format = output_format(probe_path.as_deref(), input_formats)?;
+    let is_alignment = matches!(
+        format,
+        OutputFormat::Sam | OutputFormat::Bam | OutputFormat::Cram
+    );
+
+    let bodies = match assemble_bodies(
+        plan,
+        fragment,
+        &mut streams,
+        engine.movable_streams,
+        is_alignment,
+    ) {
         Ok(bodies) => bodies,
         // A templated stream is absent (its anchoring group did not match): the
         // caller reroutes to unassigned, naming the missing stream in the QC
@@ -2209,8 +2347,6 @@ fn prepare_body(
     } else {
         target.map(Target::label).or_else(|| Some(pool.to_string()))
     };
-    let sample = target.map(|t| t.sample.as_str());
-    let sub_sample = target.and_then(|t| t.sub_sample.as_deref());
 
     let mut datas: Vec<Data> = bodies
         .iter()
@@ -2219,29 +2355,18 @@ fn prepare_body(
     // With `--qc-tag`, every output body of this record carries the
     // routing-outcome slug (assigned with its sample, or pass-through). Built
     // once from the read's group hits and observed bases.
-    if let Some(tag) = &plan.qc_tag {
+    let slug = plan.qc_tag.as_ref().map(|tag| {
         let base_segments: Vec<&[u8]> = segments.iter().map(|segment| segment.bases).collect();
-        let slug = routed_slug(engine.groups, hits, &base_segments, sample, sub_sample);
+        (
+            tag.as_str(),
+            routed_slug(engine.groups, hits, &base_segments, sample, sub_sample),
+        )
+    });
+    if let Some((tag, slug)) = &slug {
         for data in &mut datas {
-            insert_string_tag(data, tag, &slug);
+            insert_string_tag(data, tag, slug);
         }
     }
-
-    // The format is fixed by the path extension (or the stdout mirror),
-    // independent of the ordinal.
-    let probe = PathContext {
-        pool,
-        sample,
-        sub_sample,
-        ordinal: Some(1),
-        source: None,
-    };
-    let probe_path = plan.out.as_ref().and_then(|p| resolve_pattern(p, &probe));
-    let format = output_format(probe_path.as_deref(), input_formats)?;
-    let is_alignment = matches!(
-        format,
-        OutputFormat::Sam | OutputFormat::Bam | OutputFormat::Cram
-    );
 
     // Multi-read FASTX to a file fans out one file per `%ordinal`; SAM/BAM (a
     // pair in one file), single-read FASTX, and stdout all write every read to
@@ -2287,13 +2412,20 @@ fn prepare_body(
         let reads = bodies
             .into_iter()
             .zip(datas)
-            .map(|(body, data)| {
-                let read_group = if is_alignment {
-                    read_group.clone()
-                } else {
-                    None
-                };
-                prepared_body_read(body, data, read_group)
+            .map(|(mut body, data)| match body.alignment.take() {
+                Some(record) => passed_through_read(
+                    record,
+                    &tag_data,
+                    slug.as_ref().map(|(tag, value)| (*tag, value.as_str())),
+                ),
+                None => {
+                    let read_group = if is_alignment {
+                        read_group.clone()
+                    } else {
+                        None
+                    };
+                    prepared_body_read(body, data, read_group)
+                }
             })
             .collect();
         vec![PreparedWrite {
@@ -2315,6 +2447,30 @@ fn prepared_body_read(body: Body, data: Data, read_group: Option<String>) -> Pre
         quals: body.quals,
         tags: (!data.is_empty()).then_some(data),
         read_group,
+        alignment: None,
+    }
+}
+
+/// An aligned record passed through whole, gaining only `--tag` and `--qc-tag`.
+fn passed_through_read(
+    mut record: RecordBuf,
+    tag_data: &Data,
+    slug: Option<(&str, &str)>,
+) -> PreparedRead {
+    let data = record.data_mut();
+    for (tag, value) in tag_data.iter() {
+        data.insert(tag, value.clone());
+    }
+    if let Some((tag, value)) = slug {
+        insert_string_tag(data, tag, value);
+    }
+    PreparedRead {
+        name: Vec::new(),
+        bases: Vec::new(),
+        quals: None,
+        tags: None,
+        read_group: None,
+        alignment: Some(record),
     }
 }
 
@@ -2325,10 +2481,12 @@ struct Body {
     bases: Vec<u8>,
     quals: Option<Vec<u8>>,
     carried: Option<Data>,
+    alignment: Option<RecordBuf>,
 }
 
 /// Assemble a record's output bodies: the raw input segments (each carrying its
-/// tags) when there is no `--template`, else one body per `--template`. Returns
+/// tags, and its source alignment when `keep_alignment` is set) when there is no
+/// `--template`, else one body per `--template`. Returns
 /// `Err(missing_stream_name)` when a template references a stream that was not
 /// extracted (its anchoring group did not match), naming the absent stream for
 /// the `--qc-tag` slug.
@@ -2337,17 +2495,30 @@ fn assemble_bodies(
     fragment: &Fragment,
     streams: &mut HashMap<&str, Extracted>,
     movable: &HashSet<&str>,
+    keep_alignment: bool,
 ) -> std::result::Result<Vec<Body>, String> {
     if plan.templates.is_empty() {
         return Ok(fragment
             .records
             .iter()
-            .map(|record| Body {
-                name: record.name.clone(),
-                bases: record.bases.clone(),
-                quals: record.quals.clone(),
-                carried: record.tags.clone(),
-            })
+            .map(
+                |record| match record.alignment.as_ref().filter(|_| keep_alignment) {
+                    Some(alignment) => Body {
+                        name: Vec::new(),
+                        bases: Vec::new(),
+                        quals: None,
+                        carried: None,
+                        alignment: Some(alignment.clone()),
+                    },
+                    None => Body {
+                        name: record.name.clone(),
+                        bases: record.bases.clone(),
+                        quals: record.quals.clone(),
+                        carried: record.tags.clone(),
+                        alignment: None,
+                    },
+                },
+            )
             .collect());
     }
     let name = fragment
@@ -2389,6 +2560,7 @@ fn assemble_bodies(
             bases,
             quals,
             carried: None,
+            alignment: None,
         });
     }
     Ok(bodies)
@@ -2506,6 +2678,7 @@ mod tests {
             per_record: false,
             compression: 5,
             threads: 8,
+            reference: None,
             command_line: None,
         }
     }
@@ -4872,6 +5045,7 @@ mod tests {
                     .into_iter()
                     .collect(),
             ),
+            alignment: None,
         };
 
         let fragment = Fragment {
@@ -4888,6 +5062,7 @@ mod tests {
             bases: b"ACGT".to_vec(),
             quals: None,
             tags: None,
+            alignment: None,
         };
         let fragment = Fragment {
             records: vec![no_rg],
@@ -4906,5 +5081,55 @@ mod tests {
             None,
             "an RG id absent from the map means no route"
         );
+    }
+
+    #[test]
+    fn test_passes_alignments_through_only_for_an_aligned_split_into_alignments() {
+        let mut args = base_args();
+        args.inputs = vec!["0=in.bam".to_string()];
+        let plan = crate::grammar::parse_demux(&args).unwrap();
+        let bam = [OutputFormat::Bam];
+        assert!(passes_alignments_through(&plan, true, &bam).unwrap());
+        assert!(!passes_alignments_through(&plan, false, &bam).unwrap());
+        assert!(!passes_alignments_through(&plan, true, &[]).unwrap());
+    }
+
+    #[test]
+    fn test_passes_alignments_through_refuses_a_template() {
+        let mut args = base_args();
+        args.inputs = vec!["0=in.bam".to_string()];
+        args.extracts = vec!["head=0:0:4".to_string()];
+        args.templates = vec!["head".to_string()];
+        let plan = crate::grammar::parse_demux(&args).unwrap();
+        let err = passes_alignments_through(&plan, true, &[OutputFormat::Sam])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--template"), "{err}");
+        assert!(!passes_alignments_through(&plan, true, &[]).unwrap());
+    }
+
+    #[test]
+    fn test_passes_alignments_through_refuses_several_inputs() {
+        let mut args = base_args();
+        args.inputs = vec!["0=a.bam".to_string(), "1=b.bam".to_string()];
+        let plan = crate::grammar::parse_demux(&args).unwrap();
+        let err = passes_alignments_through(&plan, true, &[OutputFormat::Bam])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("single input"), "{err}");
+    }
+
+    #[test]
+    fn test_passes_alignments_through_needs_a_reference_for_cram() {
+        let mut args = base_args();
+        args.inputs = vec!["0=in.bam".to_string()];
+        let plan = crate::grammar::parse_demux(&args).unwrap();
+        let err = passes_alignments_through(&plan, true, &[OutputFormat::Cram])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--reference"), "{err}");
+        args.reference = Some(PathBuf::from("ref.fa"));
+        let plan = crate::grammar::parse_demux(&args).unwrap();
+        assert!(passes_alignments_through(&plan, true, &[OutputFormat::Cram]).unwrap());
     }
 }

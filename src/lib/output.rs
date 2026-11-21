@@ -283,23 +283,7 @@ pub fn read_group_header(
 ) -> Result<sam::Header> {
     let mut builder = provenance_header_builder(command_line);
     if let Some(constituent) = constituent {
-        // An @RG-split run: emit each target's original @RG line(s) verbatim,
-        // deduped by id across targets that share this file, and skip the synth
-        // per-target @RG path entirely. The bucket built by
-        // `build_constituent_rgs` iterates a HashMap, so its order is not
-        // deterministic; sort by id here so the emitted line order is stable
-        // run-to-run regardless of upstream iteration order.
-        let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
-        let mut deduped: Vec<(Vec<u8>, Map<ReadGroup>)> = Vec::new();
-        for target in targets {
-            for (id, map) in constituent.get(target).into_iter().flatten() {
-                if seen.insert(id.clone()) {
-                    deduped.push((id.clone(), map.clone()));
-                }
-            }
-        }
-        deduped.sort_by(|(a, _), (b, _)| a.cmp(b));
-        for (id, map) in deduped {
+        for (id, map) in file_read_groups(targets, constituent) {
             builder = builder.add_read_group(id, map);
         }
         return Ok(builder.build());
@@ -319,6 +303,46 @@ pub fn read_group_header(
         builder = builder.add_read_group(target.label(), map);
     }
     Ok(builder.build())
+}
+
+/// The original `@RG` lines of the targets sharing one file, deduped and sorted by id.
+fn file_read_groups(
+    targets: &[&Target],
+    constituent: &ConstituentReadGroups,
+) -> Vec<(Vec<u8>, Map<ReadGroup>)> {
+    let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+    let mut deduped: Vec<(Vec<u8>, Map<ReadGroup>)> = Vec::new();
+    for target in targets {
+        for (id, map) in constituent.get(target).into_iter().flatten() {
+            if seen.insert(id.clone()) {
+                deduped.push((id.clone(), map.clone()));
+            }
+        }
+    }
+    deduped.sort_by(|(a, _), (b, _)| a.cmp(b));
+    deduped
+}
+
+/// The input header with the unmux `@PG` chained on, its `@RG` lines narrowed
+/// to the targets sharing this file when `targets` is given.
+pub fn alignment_header(
+    input: &sam::Header,
+    targets: Option<(&[&Target], &ConstituentReadGroups)>,
+    command_line: Option<&str>,
+) -> Result<sam::Header> {
+    let mut header = input.clone();
+    if let Some((targets, constituent)) = targets {
+        let read_groups = header.read_groups_mut();
+        read_groups.clear();
+        for (id, map) in file_read_groups(targets, constituent) {
+            read_groups.insert(id.into(), map);
+        }
+    }
+    header
+        .programs_mut()
+        .add("unmux", program_record(command_line))
+        .map_err(|e| anyhow::anyhow!("failed to add the unmux @PG to the output header: {e}"))?;
+    Ok(header)
 }
 
 /// Build the fallback header for destinations with no per-sample read group:
@@ -403,6 +427,8 @@ pub struct MultiWriter {
     /// the raw `--unassigned`/`--remove` bins): `@PG` provenance plus the
     /// default pool `@RG`.
     default_header: sam::Header,
+    /// The `--reference` repository CRAM sinks encode against, if any.
+    reference: Option<noodles::fasta::Repository>,
 }
 
 impl MultiWriter {
@@ -429,7 +455,14 @@ impl MultiWriter {
             input_formats,
             compression,
             default_header,
+            reference: None,
         }
+    }
+
+    /// Encode CRAM destinations against `reference`, so aligned records can be
+    /// written to CRAM.
+    pub fn set_reference(&mut self, reference: noodles::fasta::Repository) {
+        self.reference = Some(reference);
     }
 
     /// Install the pre-exchanged BGZF pool writers, keyed by destination path.
@@ -500,7 +533,13 @@ impl MultiWriter {
             // writers ignore it.
             return OutputWriter::from_pooled(pooled, format, header);
         }
-        OutputWriter::create_with_header(path, format, self.compression, header)
+        OutputWriter::create_with_reference(
+            path,
+            format,
+            self.compression,
+            header,
+            self.reference.as_ref(),
+        )
     }
 
     /// Finalize every opened writer (flush, gzip trailers, BGZF EOF), returning
@@ -526,6 +565,51 @@ mod tests {
     /// values.
     fn pattern(text: &str, allowed: &[Placeholder]) -> OutputPattern {
         crate::grammar::parse_output_pattern(text, allowed).unwrap()
+    }
+
+    #[test]
+    fn test_alignment_header_keeps_input_and_narrows_read_groups() {
+        let input = sam::io::Reader::new(
+            &b"@HD\tVN:1.6\tSO:coordinate\n@SQ\tSN:chr1\tLN:100\n\
+               @RG\tID:rg1\tSM:sA\n@RG\tID:rg2\tSM:sB\n@PG\tID:bwa\tPN:bwa\n@CO\tnote\n"[..],
+        )
+        .read_header()
+        .unwrap();
+        let target = Target {
+            sample: "sA".to_string(),
+            sub_sample: None,
+        };
+        let rg1 = input.read_groups().get(&b"rg1"[..]).unwrap().clone();
+        let constituent: ConstituentReadGroups =
+            HashMap::from([(target.clone(), vec![(b"rg1".to_vec(), rg1)])]);
+        let render = |header: &sam::Header| {
+            let mut buf = Vec::new();
+            sam::io::Writer::new(&mut buf).write_header(header).unwrap();
+            String::from_utf8(buf).unwrap()
+        };
+
+        let narrowed =
+            alignment_header(&input, Some((&[&target], &constituent)), Some("unmux x")).unwrap();
+        let text = render(&narrowed);
+        assert!(text.starts_with("@HD\tVN:1.6\tSO:coordinate\n@SQ\tSN:chr1\tLN:100\n"));
+        assert!(text.contains("@RG\tID:rg1\tSM:sA\n"));
+        assert!(!text.contains("ID:rg2"));
+        assert!(text.contains("@PG\tID:bwa\tPN:bwa\n"));
+        assert!(text.contains("@PG\tID:unmux\tPN:unmux"));
+        assert!(text.contains("PP:bwa"));
+        assert!(text.contains("@CO\tnote"));
+
+        let full = render(&alignment_header(&input, None, None).unwrap());
+        assert!(full.contains("ID:rg1") && full.contains("ID:rg2"));
+    }
+
+    #[test]
+    fn test_alignment_header_dedups_a_repeated_unmux_program_id() {
+        let input = sam::io::Reader::new(&b"@HD\tVN:1.6\n@PG\tID:unmux\tPN:unmux\n"[..])
+            .read_header()
+            .unwrap();
+        let header = alignment_header(&input, None, None).unwrap();
+        assert_eq!(header.programs().as_ref().len(), 2);
     }
 
     #[test]
@@ -905,6 +989,7 @@ mod tests {
             quals: Some(&[30, 30, 30, 30]),
             tags: None,
             read_group: None,
+            alignment: None,
         };
         writer.write(Some(&a), &[read(b"ra")]).unwrap();
         writer.write(Some(&b), &[read(b"rb")]).unwrap();
