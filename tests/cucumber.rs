@@ -70,11 +70,42 @@ impl SassWorld {
     }
 }
 
+/// The alignment records of a SAM or BAM file (by extension) as SAM text lines,
+/// header excluded, in file order.
+fn record_lines(path: &Path) -> String {
+    use noodles::sam::alignment::io::Write as _;
+    if path.extension().is_some_and(|ext| ext == "bam") {
+        let file = std::fs::File::open(path).unwrap_or_else(|_| panic!("open BAM file {path:?}"));
+        let mut reader = bam::io::Reader::new(file);
+        let header = reader.read_header().expect("read BAM header");
+        let mut buf = Vec::new();
+        let mut writer = sam::io::Writer::new(&mut buf);
+        for record in reader.records() {
+            let record = record.expect("read BAM record");
+            writer
+                .write_alignment_record(&header, &record)
+                .expect("render BAM record as SAM");
+        }
+        String::from_utf8_lossy(&buf).into_owned()
+    } else {
+        let text = fs::read_to_string(path).unwrap_or_else(|_| panic!("read SAM file {path:?}"));
+        text.lines()
+            .filter(|line| !line.starts_with('@'))
+            .map(|line| format!("{line}\n"))
+            .collect()
+    }
+}
+
 fn run_unmux(dir: &Path, args: &[String]) -> Output {
+    run_unmux_with_stdin(dir, args, Vec::new())
+}
+
+fn run_unmux_with_stdin(dir: &Path, args: &[String], stdin: Vec<u8>) -> Output {
     Command::cargo_bin("unmux")
         .expect("binary `unmux` builds")
         .current_dir(dir)
         .args(args)
+        .write_stdin(stdin)
         .output()
         .expect("unmux runs")
 }
@@ -109,6 +140,18 @@ async fn i_run(world: &mut SassWorld, arg_line: String) {
     let dir = world.work_dir();
     let args: Vec<String> = arg_line.split_whitespace().map(str::to_owned).collect();
     let out = run_unmux(&dir, &args);
+    world.code = out.status.code();
+    world.stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    world.stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    world.args = args;
+}
+
+#[when(regex = r#"^I run `unmux ?(.*)` with "([^"]+)" on stdin$"#)]
+async fn i_run_with_stdin(world: &mut SassWorld, arg_line: String, stdin: String) {
+    let dir = world.work_dir();
+    let args: Vec<String> = arg_line.split_whitespace().map(str::to_owned).collect();
+    let bytes = fs::read(dir.join(&stdin)).unwrap_or_else(|_| panic!("read stdin file {stdin:?}"));
+    let out = run_unmux_with_stdin(&dir, &args, bytes);
     world.code = out.status.code();
     world.stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     world.stderr = String::from_utf8_lossy(&out.stderr).into_owned();
@@ -184,6 +227,13 @@ async fn file_is(world: &mut SassWorld, name: String, step: &Step) {
         content, expected,
         "{name:?} differs from the expected content"
     );
+}
+
+#[then(regex = r#"^the records of "([^"]+)" are:$"#)]
+async fn records_are(world: &mut SassWorld, name: String, step: &Step) {
+    let actual = record_lines(&world.work_dir().join(&name));
+    let expected = format!("{}\n", step.docstring.clone().unwrap_or_default().trim());
+    assert_eq!(actual, expected, "the records of {name:?} differ");
 }
 
 #[then(regex = r#"^stdout does not contain "(.*)"$"#)]

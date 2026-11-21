@@ -554,6 +554,8 @@ pub struct DemuxPlan {
     pub compression: u8,
     /// `--threads` worker count.
     pub threads: usize,
+    /// `--reference`: an indexed FASTA for CRAM input and output.
+    pub reference: Option<PathBuf>,
 }
 
 /// Parse and structurally validate the raw flag surface into a [`DemuxPlan`].
@@ -618,6 +620,7 @@ pub fn parse_demux(args: &DemuxArgs) -> Result<DemuxPlan> {
         per_record: args.per_record,
         compression: args.compression,
         threads: args.threads,
+        reference: args.reference.clone(),
     };
     validate_plan(&plan)?;
     for warning in plan_warnings(&plan) {
@@ -2287,6 +2290,7 @@ mod tests {
             per_record: false,
             compression: 5,
             threads: 8,
+            reference: None,
             command_line: None,
         }
     }

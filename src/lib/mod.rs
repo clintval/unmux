@@ -1,6 +1,6 @@
 //! `unmux`: flexible record parsing and demultiplexing to FASTX/SAM/BAM/CRAM
-//! (SAM/BAM/CRAM written unmapped), splitcode-style, on the `sassy`
-//! approximate matcher.
+//! (SAM/BAM/CRAM written unmapped, except an aligned `@RG` split, which keeps
+//! its alignments), splitcode-style, on the `sassy` approximate matcher.
 //!
 //! The command language is one quote-free grammar shared by the CLI and sheets.
 //! The demux command exposes a `DemuxArgs` struct and a `run_demux` entry
