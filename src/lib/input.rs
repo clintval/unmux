@@ -11,9 +11,9 @@
 //! and extraction consume. SAM/BAM/CRAM inputs carry their record tags through
 //! for the writer to re-emit. A single FASTX input is auto-detected as
 //! interleaved (two mates per fragment). An input path of `-` reads stdin (at
-//! most one). CRAM input is read reference-free unless a `--reference` FASTA
-//! is given; without one, a reference-compressed CRAM (one carrying `@SQ`) is
-//! rejected.
+//! most one). CRAM input decodes against a `--reference` FASTA when given; a
+//! CRAM that needs one and has none fails at its first reference-compressed
+//! slice.
 
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read};
@@ -335,34 +335,6 @@ enum FormatReader {
     /// returns `None`. Used when the input has no content and no format could
     /// be inferred from its extension.
     Empty,
-}
-
-/// Reject a reference-compressed CRAM (one whose header carries `@SQ` reference
-/// sequences). Such a CRAM stores SEQ as deltas against an external reference
-/// unmux does not have, and noodles panics (rather than erroring) when decoding
-/// it with the empty repository, so it is rejected up front. Reference-free /
-/// unmapped CRAM (no `@SQ` - what unmux writes and what raw demux inputs are)
-/// reads with the default empty repository. Conservative: an `@SQ`-bearing but
-/// all-unmapped CRAM is also rejected, since unmux has no reference repository
-/// to decode against.
-///
-/// Residual (corrupt input only): a CRAM with an EMPTY `@SQ` header but a
-/// mapped slice referencing a reference id - invalid per the CRAM spec, so no
-/// conforming writer emits it - would still abort via a noodles panic during
-/// decode. The slice-level reference context is not exposed by noodles 0.92's
-/// public API, so it cannot be pre-checked here; well-formed CRAM
-/// (reference-free, or reference-compressed which this rejects) never reaches
-/// that path.
-fn ensure_reference_free_cram(header: &sam::Header, path: &Path) -> Result<()> {
-    let references = header.reference_sequences().len();
-    if references > 0 {
-        bail!(
-            "CRAM input is reference-compressed (carries {references} @SQ reference sequence(s)); \
-             pass its FASTA with --reference: {}",
-            path.display()
-        );
-    }
-    Ok(())
 }
 
 /// Decode the next CRAM container into owned records, or `None` at end of
@@ -724,14 +696,11 @@ fn open_format_reader(
             // already rejected).
             let mut reader = cram::io::Reader::new(reader);
             let header = reader.read_header().context("failed to read CRAM header")?;
-            if reference.is_none() {
-                ensure_reference_free_cram(&header, path)?;
-            }
             FormatReader::Cram {
                 reader,
                 header: Box::new(header),
                 container: cram::io::reader::Container::default(),
-                decoder: CramDecoder::new(reference.cloned()),
+                decoder: CramDecoder::new(reference.cloned(), path),
                 buffered: Vec::new().into_iter(),
                 eof: false,
             }
@@ -1674,29 +1643,31 @@ mod tests {
     }
 
     #[test]
-    fn test_cram_reference_compressed_is_rejected() {
-        use noodles::sam::header::record::value::{map, Map};
-        use noodles::sam::Header;
-        use std::num::NonZeroUsize;
-
-        // A header with @SQ reference sequences is (potentially)
-        // reference-compressed: rejected up front (unmux has no reference, and
-        // noodles would panic decoding it). A reference-free header (no @SQ) is
-        // accepted.
-        let with_sq = Header::builder()
-            .set_header(Map::<map::Header>::default())
-            .add_reference_sequence(
-                b"chr1".to_vec(),
-                Map::<map::ReferenceSequence>::new(NonZeroUsize::new(100).unwrap()),
-            )
-            .build();
-        let err = ensure_reference_free_cram(&with_sq, Path::new("in.cram"))
-            .expect_err("reference-compressed CRAM should be rejected");
+    fn test_reference_compressed_cram_without_reference_names_the_sequence() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/aligned.htslib-3.0.cram");
+        let mut reader = FragmentReader::open(&[path], true).unwrap();
+        let error = loop {
+            match reader.next_fragment() {
+                Ok(Some(_)) => continue,
+                Ok(None) => panic!("a reference-compressed CRAM decoded without a reference"),
+                Err(error) => break error,
+            }
+        };
         assert!(
-            format!("{err:#}").contains("reference-compressed"),
-            "{err:#}"
+            format!("{error:#}").contains("needs reference sequence `chr1` to decode"),
+            "{error:#}"
         );
-        assert!(ensure_reference_free_cram(&Header::default(), Path::new("in.cram")).is_ok());
+    }
+
+    #[test]
+    fn test_cram_written_without_a_reference_reads_without_one() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/contigs.no-ref.cram");
+        let mut reader = FragmentReader::open(&[path], true).unwrap();
+        let mut count = 0;
+        while reader.next_fragment().unwrap().is_some() {
+            count += 1;
+        }
+        assert_eq!(count, 26);
     }
 
     #[test]

@@ -175,7 +175,28 @@ Feature: Split an aligned input by read group, keeping alignments
     Given the test file "aligned.htslib-3.1.cram"
     When I run `unmux aligned.htslib-3.1.cram --group rg=@RG --sample-from-group rg --out out/%sample.sam`
     Then the exit code is 1
+    And stderr contains "CRAM input aligned.htslib-3.1.cram needs reference sequence `chr1` to decode"
     And stderr contains "--reference"
+
+  Scenario: a CRAM with an embedded reference splits without --reference
+    Given the test file "contigs.embedded-ref.cram"
+    When I run `unmux contigs.embedded-ref.cram --group sm=@RG::SM --sample-from-group sm --out out/%sample.sam`
+    Then the exit code is 0
+    And the file "out/sB.sam" contains "ctgBmism	16	ctgB	61	60	30M	*	0	0	GTCGAACCTCGGTCCAAGATCGGGACTCGG"
+
+  Scenario: a CRAM written without a reference splits without --reference
+    Given the test file "contigs.no-ref.cram"
+    When I run `unmux contigs.no-ref.cram --group sm=@RG::SM --sample-from-group sm --out out/%sample.sam`
+    Then the exit code is 0
+    And the records of "out/sA.sam" are the "RG:Z:rg1" records of the test file "contigs.sam"
+    And the records of "out/sB.sam" are the "RG:Z:rg2" records of the test file "contigs.sam"
+
+  Scenario: --reference without a CRAM input is unused and says so
+    Given the test file "ref.fa"
+    And the test file "ref.fa.fai"
+    When I run `unmux in.sam --reference ref.fa --group sm=@RG::SM --sample-from-group sm --out out/%sample.bam`
+    Then the exit code is 0
+    And stderr contains "--reference is unused: no input is CRAM"
 
   Scenario: no drop warning when every primary record has a known read group
     When I run `unmux in.sam --group sm=@RG::SM --sample-from-group sm --out out/%sample.bam`

@@ -2,7 +2,7 @@
 
 use std::fs::File;
 use std::io::{self, Seek, SeekFrom};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -82,6 +82,7 @@ fn is_second_sequence(error: &io::Error) -> bool {
 struct BoundedAdapter {
     reference: Option<Reference>,
     loads_left: Arc<AtomicUsize>,
+    path: PathBuf,
 }
 
 impl fasta::repository::Adapter for BoundedAdapter {
@@ -90,8 +91,9 @@ impl fasta::repository::Adapter for BoundedAdapter {
             return Some(Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!(
-                    "decoding needs reference sequence `{}`; pass the FASTA the CRAM was written \
-                     against with --reference",
+                    "CRAM input {} needs reference sequence `{}` to decode; pass the FASTA it was \
+                     written against with --reference",
+                    self.path.display(),
                     String::from_utf8_lossy(name)
                 ),
             )));
@@ -134,12 +136,13 @@ pub(crate) struct CramDecoder {
 }
 
 impl CramDecoder {
-    /// A decoder reading sequences from `reference`, when given.
-    pub(crate) fn new(reference: Option<Reference>) -> Self {
+    /// A decoder for the CRAM at `path`, reading sequences from `reference` when given.
+    pub(crate) fn new(reference: Option<Reference>, path: &Path) -> Self {
         let loads_left = Arc::new(AtomicUsize::new(0));
         let repository = fasta::Repository::new(BoundedAdapter {
             reference: reference.clone(),
             loads_left: Arc::clone(&loads_left),
+            path: path.to_path_buf(),
         });
         Self {
             reference,
@@ -419,7 +422,7 @@ mod tests {
         let reference = Reference::load(&test_data("contigs.fa")).unwrap();
         let mut reader = cram::io::Reader::new(File::open(test_data(name)).unwrap());
         let header = reader.read_header().unwrap();
-        let mut decoder = CramDecoder::new(Some(reference));
+        let mut decoder = CramDecoder::new(Some(reference), &test_data(name));
         let mut container = cram::io::reader::Container::default();
         let mut records = Vec::new();
         let mut most = 0;

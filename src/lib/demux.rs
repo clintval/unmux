@@ -1082,6 +1082,9 @@ fn run_engine(plan: &DemuxPlan, command_line: Option<&str>) -> Result<()> {
     let mut reader =
         FragmentReader::open_with_reference(&plan.inputs, plan.per_record, reference.as_ref())?;
     let input_formats = reader.formats().to_vec();
+    if plan.reference.is_some() && !input_formats.contains(&SniffedFormat::Cram) {
+        log::warn!("--reference is unused: no input is CRAM");
+    }
     // Only read (and conflict-check) the input `@RG` header when an `@RG`
     // group is actually present: `input_read_groups` bails on a repeated RG id
     // with conflicting SM/LB across inputs, which is a legitimate outcome for
