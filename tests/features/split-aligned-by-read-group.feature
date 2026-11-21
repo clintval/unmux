@@ -4,9 +4,9 @@ Feature: Split an aligned input by read group, keeping alignments
   flags, position, CIGAR, MAPQ, mate fields, and every tag. Each output keeps
   the input header (`@HD` with its sort order, `@SQ`, `@PG`, `@CO`) with only
   its own `@RG` lines and an unmux `@PG`, and records keep their input order.
-  A `--template`, aligned CRAM output, several inputs, and a `--tag` that would
-  overwrite a read group or alignment tag are refused. For unmapped records,
-  run `samtools reset` on the outputs.
+  A `--template`, a `--tag`, a sequence-matching group, aligned CRAM output,
+  and several inputs are refused. For unmapped records, run `samtools reset`
+  on the outputs.
 
   Background:
     Given a file "in.sam" containing:

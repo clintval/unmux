@@ -957,6 +957,24 @@ fn passes_alignments_through(
             );
         }
     }
+    let by_sequence = plan
+        .groups
+        .iter()
+        .find(|group| !matches!(group.source, GroupSource::ReadGroup(_)))
+        .map(|group| format!("group `{}` matches", group.name))
+        .or_else(|| {
+            plan.tags
+                .first()
+                .map(|binding| format!("--tag `{}` is drawn from", binding.tag))
+        });
+    if let Some(what) = by_sequence {
+        bail!(
+            "this aligned @RG split keeps secondary and supplementary records, but {what} record \
+             sequences, which those records may lack (SEQ `*`) or hard-clip, so they could be \
+             routed or tagged apart from their primary; drop it, write FASTX, or unmap the input \
+             first (e.g. `samtools reset`)"
+        );
+    }
     Ok(true)
 }
 
@@ -5234,12 +5252,42 @@ mod tests {
                 .to_string();
             assert!(err.contains(&format!("`{tag}` would overwrite")), "{err}");
         }
+    }
+
+    #[test]
+    fn test_passes_alignments_through_refuses_a_tag_drawn_from_sequence() {
         let mut args = base_args();
         args.inputs = vec!["0=in.bam".to_string()];
         args.extracts = vec!["head=0:0:4".to_string()];
         args.tags = vec!["XH=head".to_string()];
         let plan = crate::grammar::parse_demux(&args).unwrap();
-        assert!(passes_alignments_through(&plan, true, &[OutputFormat::Bam]).unwrap());
+        let err = passes_alignments_through(&plan, true, &[OutputFormat::Bam])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("--tag `XH` is drawn from record sequences"),
+            "{err}"
+        );
+        assert!(!passes_alignments_through(&plan, true, &[]).unwrap());
+    }
+
+    #[test]
+    fn test_passes_alignments_through_refuses_a_sequence_group() {
+        let mut args = base_args();
+        args.inputs = vec!["0=in.bam".to_string()];
+        args.groups = vec![
+            "rg=@RG::SM".to_string(),
+            "ad={X=AACCGGTT}".to_string(),
+            "ad::loc=0:0:8".to_string(),
+        ];
+        args.sample_from_group = Some("rg".to_string());
+        args.remove = vec!["ad".to_string()];
+        let plan = crate::grammar::parse_demux(&args).unwrap();
+        let err = passes_alignments_through(&plan, true, &[OutputFormat::Sam])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("group `ad` matches record sequences"), "{err}");
+        assert!(!passes_alignments_through(&plan, true, &[]).unwrap());
     }
 
     #[test]

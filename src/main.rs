@@ -221,7 +221,8 @@ struct DemuxCmd {
     /// CIGAR, MAPQ, mate fields, and tags. Each file gets the input `@HD`,
     /// `@SQ`, `@PG`, and `@CO` lines, only its own `@RG` lines, and an unmux
     /// `@PG`; records keep input order. `--rg-tag` has no effect there, and
-    /// `--template`, aligned CRAM output, and several inputs are errors.
+    /// `--template`, `--tag`, sequence-matching groups, aligned CRAM output,
+    /// and several inputs are errors.
     /// For unmapped records, run `samtools reset` on the outputs.
     #[arg(long = "group", value_name = "SPEC", verbatim_doc_comment)]
     groups: Vec<String>,
