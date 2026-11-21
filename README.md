@@ -1,4 +1,6 @@
-# unmux
+![Banner for unmux](https://raw.githubusercontent.com/clintval/unmux/main/.github/img/unmux_banner.svg)
+
+---
 
 [![Install with bioconda](https://img.shields.io/badge/Install%20with-bioconda-brightgreen.svg)](http://bioconda.github.io/recipes/unmux/README.html)
 [![Anaconda Version](https://anaconda.org/bioconda/unmux/badges/version.svg)](http://bioconda.github.io/recipes/unmux/README.html)
@@ -8,8 +10,6 @@
 [![Language](https://img.shields.io/badge/language-rust-dea588.svg)](https://www.rust-lang.org/)
 
 Flexible record parsing and demultiplexing to FASTX/SAM/BAM/CRAM, splitcode-style.
-
-![unmux](.github/img/cover.jpg)
 
 ## Introduction
 
