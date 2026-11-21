@@ -5,8 +5,8 @@ Feature: Split an aligned input by read group, keeping alignments
   the input header (`@HD` with its sort order, `@SQ`, `@PG`, `@CO`) with only
   its own `@RG` lines and an unmux `@PG`, and records keep their input order.
   A `--template`, aligned CRAM output, several inputs, and a `--tag` that would
-  overwrite a read group or alignment tag are refused; `--unmapped-output`
-  restores the older unmapped output.
+  overwrite a read group or alignment tag are refused. For unmapped records,
+  run `samtools reset` on the outputs.
 
   Background:
     Given a file "in.sam" containing:
@@ -106,7 +106,7 @@ Feature: Split an aligned input by read group, keeping alignments
     When I run `unmux in.sam --group sm=@RG::SM --sample-from-group sm --extract head=0:0:4 --template head --out out/%sample.bam`
     Then the exit code is 1
     And stderr contains "--template would rewrite"
-    And stderr contains "--unmapped-output"
+    And stderr contains "samtools reset"
     And a file "out/sampleA.bam" does not exist
 
   Scenario: a --template on an aligned split into FASTQ still works
@@ -114,37 +114,19 @@ Feature: Split an aligned input by read group, keeping alignments
     Then the exit code is 0
     And the file "out/sampleA.fq" contains "ACGT"
 
-  Scenario: --unmapped-output keeps the older unmapped split
-    When I run `unmux in.sam --group sm=@RG::SM --sample-from-group sm --extract head=0:0:4 --template head --out out/%sample.bam --unmapped-output`
-    Then the exit code is 0
-    And stderr contains "UNMAPPED"
-    And the BAM header of "out/sampleA.bam" does not contain "@SQ"
-    And the records of "out/sampleA.bam" are:
-      """
-      q1	4	*	0	255	*	*	0	0	ACGT	ABCD
-      q1	4	*	0	255	*	*	0	0	AAAA	ABCD
-      q3	4	*	0	255	*	*	0	0	AACC	IIII
-      q3	4	*	0	255	*	*	0	0	AACC	IIII
-      """
-
   Scenario: an aligned split into CRAM is refused before any file is written
     When I run `unmux in.sam --group sm=@RG::SM --sample-from-group sm --out out/%sample.cram`
     Then the exit code is 1
     And stderr contains "writing aligned records to CRAM is not supported"
-    And stderr contains "--unmapped-output"
+    And stderr contains "samtools view -C"
     And a file "out/sampleA.cram" does not exist
     And a file "out/sampleB.cram" does not exist
 
-  Scenario: --unmapped-output still writes CRAM
-    When I run `unmux in.sam --group sm=@RG::SM --sample-from-group sm --out out/%sample.cram --unmapped-output`
-    Then the exit code is 0
-    And a file "out/sampleA.cram" exists
-
-  Scenario: several aligned inputs are refused, pointing at --unmapped-output
+  Scenario: several aligned inputs are refused, pointing at samtools merge
     When I run `unmux --in 0=in.sam --in 1=in.sam --group sm=@RG::SM --sample-from-group sm --out out/%sample.bam`
     Then the exit code is 1
     And stderr contains "single input"
-    And stderr contains "--unmapped-output"
+    And stderr contains "samtools merge"
 
   Scenario Outline: an htslib CRAM <version> input with several containers is split from a file
     Given the test file "aligned.htslib-<version>.cram"

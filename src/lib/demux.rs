@@ -136,9 +136,6 @@ pub struct DemuxArgs {
     pub threads: usize,
     /// `--reference`: an indexed FASTA for reading reference-compressed CRAM.
     pub reference: Option<PathBuf>,
-    /// `--unmapped-output`: write an aligned `@RG` split unmapped, as before
-    /// alignments were passed through.
-    pub unmapped_output: bool,
     /// The full command line, recorded in the output `@PG CL` provenance field.
     /// `None` (e.g. a library/test caller) omits the `CL` field.
     pub command_line: Option<String>,
@@ -927,32 +924,24 @@ fn passes_alignments_through(
     if !aligned_split || formats.is_empty() {
         return Ok(false);
     }
-    if plan.unmapped_output {
-        log::warn!(
-            "input is aligned (@SQ present); --unmapped-output writes this @RG split UNMAPPED: \
-             alignments, @SQ lines, and alignment tags are dropped"
-        );
-        return Ok(false);
-    }
-    const OPT_OUT: &str = "or pass --unmapped-output to write the split unmapped";
     if !plan.templates.is_empty() {
         bail!(
             "the input is aligned (@SQ present), so this @RG split keeps each record whole, but \
              --template would rewrite its sequence and qualities; remove --template, write FASTX \
-             instead, {OPT_OUT}"
+             instead, or unmap the input first (e.g. `samtools reset`)"
         );
     }
     if plan.inputs.len() > 1 {
         bail!(
             "an @RG split that keeps alignments takes a single input, got {}; merge the inputs \
-             first (e.g. `samtools merge`), {OPT_OUT}",
+             first (e.g. `samtools merge`)",
             plan.inputs.len()
         );
     }
     if formats.contains(&OutputFormat::Cram) {
         bail!(
             "writing aligned records to CRAM is not supported; write BAM and convert it (e.g. \
-             `samtools view -C -T ref.fa`), {OPT_OUT}"
+             `samtools view -C -T ref.fa`)"
         );
     }
     let claimed = plan
@@ -964,7 +953,7 @@ fn passes_alignments_through(
         if tag == "RG" || crate::input::ALIGNMENT_TAGS.contains(&tag_bytes(tag)) {
             bail!(
                 "--tag/--qc-tag `{tag}` would overwrite a read group or alignment tag of records \
-                 kept whole by this aligned @RG split; choose another tag, {OPT_OUT}"
+                 kept whole by this aligned @RG split; choose another tag"
             );
         }
     }
@@ -2762,7 +2751,6 @@ mod tests {
             compression: 5,
             threads: 8,
             reference: None,
-            unmapped_output: false,
             command_line: None,
         }
     }
@@ -5213,7 +5201,6 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("CRAM is not supported"), "{err}");
-        assert!(err.contains("--unmapped-output"), "{err}");
     }
 
     #[test]
@@ -5235,17 +5222,6 @@ mod tests {
         args.tags = vec!["XH=head".to_string()];
         let plan = crate::grammar::parse_demux(&args).unwrap();
         assert!(passes_alignments_through(&plan, true, &[OutputFormat::Bam]).unwrap());
-    }
-
-    #[test]
-    fn test_unmapped_output_opts_out_of_every_refusal() {
-        let mut args = base_args();
-        args.inputs = vec!["0=a.bam".to_string(), "1=b.bam".to_string()];
-        args.extracts = vec!["head=0:0:4".to_string()];
-        args.templates = vec!["head".to_string()];
-        args.unmapped_output = true;
-        let plan = crate::grammar::parse_demux(&args).unwrap();
-        assert!(!passes_alignments_through(&plan, true, &[OutputFormat::Cram]).unwrap());
     }
 
     #[test]

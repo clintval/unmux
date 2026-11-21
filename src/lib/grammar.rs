@@ -556,8 +556,6 @@ pub struct DemuxPlan {
     pub threads: usize,
     /// `--reference`: an indexed FASTA for reference-compressed CRAM input.
     pub reference: Option<PathBuf>,
-    /// `--unmapped-output`: write an aligned `@RG` split unmapped.
-    pub unmapped_output: bool,
 }
 
 /// Parse and structurally validate the raw flag surface into a [`DemuxPlan`].
@@ -623,7 +621,6 @@ pub fn parse_demux(args: &DemuxArgs) -> Result<DemuxPlan> {
         compression: args.compression,
         threads: args.threads,
         reference: args.reference.clone(),
-        unmapped_output: args.unmapped_output,
     };
     validate_plan(&plan)?;
     for warning in plan_warnings(&plan) {
@@ -2294,7 +2291,6 @@ mod tests {
             compression: 5,
             threads: 8,
             reference: None,
-            unmapped_output: false,
             command_line: None,
         }
     }
