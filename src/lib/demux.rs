@@ -134,9 +134,11 @@ pub struct DemuxArgs {
     pub compression: u8,
     /// `--threads`: worker thread count.
     pub threads: usize,
-    /// `--reference`: an indexed FASTA for reading reference-compressed CRAM and
-    /// writing aligned records to CRAM.
+    /// `--reference`: an indexed FASTA for reading reference-compressed CRAM.
     pub reference: Option<PathBuf>,
+    /// `--unmapped-output`: write an aligned `@RG` split unmapped, as before
+    /// alignments were passed through.
+    pub unmapped_output: bool,
     /// The full command line, recorded in the output `@PG CL` provenance field.
     /// `None` (e.g. a library/test caller) omits the `CL` field.
     pub command_line: Option<String>,
@@ -925,28 +927,54 @@ fn passes_alignments_through(
     if !aligned_split || formats.is_empty() {
         return Ok(false);
     }
+    if plan.unmapped_output {
+        log::warn!(
+            "input is aligned (@SQ present); --unmapped-output writes this @RG split UNMAPPED: \
+             alignments, @SQ lines, and alignment tags are dropped"
+        );
+        return Ok(false);
+    }
+    const OPT_OUT: &str = "or pass --unmapped-output to write the split unmapped";
     if !plan.templates.is_empty() {
         bail!(
-            "the input is aligned (@SQ present), and an @RG split into SAM/BAM/CRAM passes each \
-             record through unchanged, but --template would rewrite each record's sequence and \
-             qualities and drop its alignment; remove --template, write FASTX instead, or unalign \
-             the input first (e.g. `samtools reset`)"
+            "the input is aligned (@SQ present), so this @RG split keeps each record whole, but \
+             --template would rewrite its sequence and qualities; remove --template, write FASTX \
+             instead, {OPT_OUT}"
         );
     }
     if plan.inputs.len() > 1 {
         bail!(
-            "an @RG split of aligned input (@SQ present) into SAM/BAM/CRAM takes a single input; \
-             got {} inputs",
+            "an @RG split that keeps alignments takes a single input, got {}; merge the inputs \
+             first (e.g. `samtools merge`), {OPT_OUT}",
             plan.inputs.len()
         );
     }
-    if formats.contains(&OutputFormat::Cram) && plan.reference.is_none() {
+    if formats.contains(&OutputFormat::Cram) {
         bail!(
-            "writing aligned records to CRAM needs the reference they were aligned to; pass its \
-             indexed FASTA with --reference"
+            "writing aligned records to CRAM is not supported; write BAM and convert it (e.g. \
+             `samtools view -C -T ref.fa`), {OPT_OUT}"
         );
     }
+    let claimed = plan
+        .tags
+        .iter()
+        .flat_map(|binding| std::iter::once(binding.tag.as_str()).chain(qual_tag_name(binding)))
+        .chain(plan.qc_tag.as_deref());
+    for tag in claimed {
+        if tag == "RG" || crate::input::ALIGNMENT_TAGS.contains(&tag_bytes(tag)) {
+            bail!(
+                "--tag/--qc-tag `{tag}` would overwrite a read group or alignment tag of records \
+                 kept whole by this aligned @RG split; choose another tag, {OPT_OUT}"
+            );
+        }
+    }
     Ok(true)
+}
+
+/// A validated two-character SAM tag name as bytes.
+fn tag_bytes(tag: &str) -> [u8; 2] {
+    let bytes = tag.as_bytes();
+    [bytes[0], bytes[1]]
 }
 
 /// The most BGZF compressor threads the writer pool uses, regardless of
@@ -1169,9 +1197,6 @@ fn run_engine(plan: &DemuxPlan, command_line: Option<&str>) -> Result<()> {
         input_formats.clone(),
         plan.compression,
     );
-    if let Some(reference) = reference {
-        writer.set_reference(reference);
-    }
     // Every directed output file, created up front so a directed file always
     // exists, even empty.
     let dests = enumerate_dests(
@@ -1317,6 +1342,13 @@ fn run_engine(plan: &DemuxPlan, command_line: Option<&str>) -> Result<()> {
     // into the output headers, which would force a full post-pass rewrite of
     // each file).
     metrics.log();
+    if is_read_group_split && plan.unassigned.is_none() && metrics.unassigned() > 0 {
+        log::warn!(
+            "{} records carried no RG:Z, or one the header does not declare, and were dropped; \
+             keep them with --unassigned",
+            metrics.unassigned().separate_with_commas()
+        );
+    }
     if let Some(pattern) = &plan.metrics_per_sample {
         metrics.write_per_sample_tsv(&resolve_metrics_path(pattern, &pool))?;
     }
@@ -1422,6 +1454,7 @@ enum Tally {
         denom: u64,
         unext: u64,
     },
+    NonPrimary,
 }
 
 /// The fully-prepared outcome of one fragment: the per-record base lengths (for
@@ -1550,8 +1583,37 @@ fn process_fragment(
 ) -> Result<Prepared> {
     let fmatch = match_fragment(engine, scratch, fragment)?;
     let mut prepared = prepare(engine, fragment, fmatch)?;
+    if is_non_primary(fragment) {
+        prepared.tally = Tally::NonPrimary;
+        let mut kept = Vec::with_capacity(prepared.writes.len());
+        for write in prepared.writes {
+            if is_alignment_format(output_format(write.path.as_deref(), engine.input_formats)?) {
+                kept.push(write);
+            }
+        }
+        prepared.writes = kept;
+    }
     encode_writes(engine, &mut prepared.writes)?;
     Ok(prepared)
+}
+
+/// Whether a fragment is a kept secondary or supplementary alignment: it goes
+/// only to SAM/BAM destinations and is left out of the metrics.
+fn is_non_primary(fragment: &Fragment) -> bool {
+    fragment.records.iter().any(|record| {
+        record.alignment.as_ref().is_some_and(|alignment| {
+            let flags = alignment.flags();
+            flags.is_secondary() || flags.is_supplementary()
+        })
+    })
+}
+
+/// Whether `format` is SAM, BAM, or CRAM.
+fn is_alignment_format(format: OutputFormat) -> bool {
+    matches!(
+        format,
+        OutputFormat::Sam | OutputFormat::Bam | OutputFormat::Cram
+    )
 }
 
 /// Encode each write's records into the destination's on-disk bytes here on the
@@ -1680,8 +1742,10 @@ fn apply_prepared(
     writer: &mut MultiWriter,
     metrics: &mut Metrics,
 ) -> Result<()> {
-    metrics.record_processed();
-    metrics.record_read_lengths(prepared.lengths.iter().copied());
+    if !matches!(prepared.tally, Tally::NonPrimary) {
+        metrics.record_processed();
+        metrics.record_read_lengths(prepared.lengths.iter().copied());
+    }
     match &prepared.tally {
         Tally::Unassigned(reason) => metrics.record_unassigned(reason),
         Tally::Removed => metrics.record_removed(),
@@ -1691,6 +1755,7 @@ fn apply_prepared(
             denom,
             unext,
         } => metrics.record_assigned(target, *denom, *unext),
+        Tally::NonPrimary => metrics.record_non_primary(),
     }
     for write in &prepared.writes {
         match &write.payload {
@@ -1829,6 +1894,22 @@ fn read_chunks(
     Ok(())
 }
 
+/// The read-ahead thread's stack: noodles' CRAM 3.1 rANS Nx16 decoder overflows
+/// the 2 MiB default in optimized builds.
+const READER_STACK_BYTES: usize = 64 << 20;
+
+/// Spawn the read-ahead thread ([`read_chunks`]) with [`READER_STACK_BYTES`].
+fn spawn_reader(
+    reader: FragmentReader,
+    tx: std::sync::mpsc::SyncSender<Vec<Fragment>>,
+) -> Result<std::thread::JoinHandle<Result<()>>> {
+    std::thread::Builder::new()
+        .name("unmux-reader".to_string())
+        .stack_size(READER_STACK_BYTES)
+        .spawn(move || read_chunks(reader, tx, READ_CHUNK))
+        .context("failed to spawn the read-ahead thread")
+}
+
 /// Drive the engine on a single thread (`--threads 1`): no read-ahead thread,
 /// no rayon pool, no BGZF pool. Read a chunk, match it serially with one warm
 /// `Scratch`, then apply it, all on this thread; compression, if any, runs
@@ -1865,7 +1946,7 @@ fn drive_pipelined(
     let mut progress = Progress::new();
     let mut scratch = Scratch::new();
     let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<Fragment>>(READ_AHEAD_CHUNKS);
-    let reader_handle = std::thread::spawn(move || read_chunks(reader, tx, READ_CHUNK));
+    let reader_handle = spawn_reader(reader, tx)?;
 
     let mut outcome: Result<()> = Ok(());
     for chunk in &rx {
@@ -1912,7 +1993,7 @@ fn drive_parallel(
     let mut progress = Progress::new();
 
     let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<Fragment>>(READ_AHEAD_CHUNKS);
-    let reader_handle = std::thread::spawn(move || read_chunks(reader, tx, READ_CHUNK));
+    let reader_handle = spawn_reader(reader, tx)?;
 
     let mut outcome: Result<()> = Ok(());
     for chunk in &rx {
@@ -2459,7 +2540,9 @@ fn passed_through_read(
 ) -> PreparedRead {
     let data = record.data_mut();
     for (tag, value) in tag_data.iter() {
-        data.insert(tag, value.clone());
+        if !matches!(value, Value::String(text) if text.is_empty()) {
+            data.insert(tag, value.clone());
+        }
     }
     if let Some((tag, value)) = slug {
         insert_string_tag(data, tag, value);
@@ -2679,6 +2762,7 @@ mod tests {
             compression: 5,
             threads: 8,
             reference: None,
+            unmapped_output: false,
             command_line: None,
         }
     }
@@ -5120,16 +5204,67 @@ mod tests {
     }
 
     #[test]
-    fn test_passes_alignments_through_needs_a_reference_for_cram() {
+    fn test_passes_alignments_through_refuses_cram() {
         let mut args = base_args();
         args.inputs = vec!["0=in.bam".to_string()];
-        let plan = crate::grammar::parse_demux(&args).unwrap();
-        let err = passes_alignments_through(&plan, true, &[OutputFormat::Cram])
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("--reference"), "{err}");
         args.reference = Some(PathBuf::from("ref.fa"));
         let plan = crate::grammar::parse_demux(&args).unwrap();
-        assert!(passes_alignments_through(&plan, true, &[OutputFormat::Cram]).unwrap());
+        let err = passes_alignments_through(&plan, true, &[OutputFormat::Bam, OutputFormat::Cram])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("CRAM is not supported"), "{err}");
+        assert!(err.contains("--unmapped-output"), "{err}");
+    }
+
+    #[test]
+    fn test_passes_alignments_through_refuses_tags_it_would_overwrite() {
+        for tag in ["RG", "NM", "MD", "MC", "SA"] {
+            let mut args = base_args();
+            args.inputs = vec!["0=in.bam".to_string()];
+            args.extracts = vec!["head=0:0:4".to_string()];
+            args.tags = vec![format!("{tag}=head")];
+            let plan = crate::grammar::parse_demux(&args).unwrap();
+            let err = passes_alignments_through(&plan, true, &[OutputFormat::Bam])
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(&format!("`{tag}` would overwrite")), "{err}");
+        }
+        let mut args = base_args();
+        args.inputs = vec!["0=in.bam".to_string()];
+        args.extracts = vec!["head=0:0:4".to_string()];
+        args.tags = vec!["XH=head".to_string()];
+        let plan = crate::grammar::parse_demux(&args).unwrap();
+        assert!(passes_alignments_through(&plan, true, &[OutputFormat::Bam]).unwrap());
+    }
+
+    #[test]
+    fn test_unmapped_output_opts_out_of_every_refusal() {
+        let mut args = base_args();
+        args.inputs = vec!["0=a.bam".to_string(), "1=b.bam".to_string()];
+        args.extracts = vec!["head=0:0:4".to_string()];
+        args.templates = vec!["head".to_string()];
+        args.unmapped_output = true;
+        let plan = crate::grammar::parse_demux(&args).unwrap();
+        assert!(!passes_alignments_through(&plan, true, &[OutputFormat::Cram]).unwrap());
+    }
+
+    #[test]
+    fn test_non_primary_fragments_are_detected() {
+        use noodles::sam::alignment::record::Flags;
+        let fragment = |flags: Flags| Fragment {
+            records: vec![InputRecord {
+                name: b"r".to_vec(),
+                bases: Vec::new(),
+                quals: None,
+                tags: None,
+                alignment: Some(RecordBuf::builder().set_flags(flags).build()),
+            }],
+        };
+        assert!(is_non_primary(&fragment(Flags::SECONDARY)));
+        assert!(is_non_primary(&fragment(Flags::SUPPLEMENTARY)));
+        assert!(!is_non_primary(&fragment(Flags::empty())));
+        let mut unkept = fragment(Flags::SECONDARY);
+        unkept.records[0].alignment = None;
+        assert!(!is_non_primary(&unkept));
     }
 }

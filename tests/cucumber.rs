@@ -125,6 +125,15 @@ async fn given_file(world: &mut SassWorld, name: String, step: &Step) {
     fs::write(&path, content).expect("write fixture file");
 }
 
+#[given(regex = r#"^the test file "([^"]+)"$"#)]
+async fn given_test_file(world: &mut SassWorld, name: String) {
+    let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/data")
+        .join(&name);
+    fs::copy(&source, world.work_dir().join(&name))
+        .unwrap_or_else(|_| panic!("copy test file {source:?}"));
+}
+
 #[given(regex = r#"^an empty file "([^"]+)"$"#)]
 async fn given_empty_file(world: &mut SassWorld, name: String) {
     let dir = world.work_dir();
@@ -234,6 +243,40 @@ async fn records_are(world: &mut SassWorld, name: String, step: &Step) {
     let actual = record_lines(&world.work_dir().join(&name));
     let expected = format!("{}\n", step.docstring.clone().unwrap_or_default().trim());
     assert_eq!(actual, expected, "the records of {name:?} differ");
+}
+
+#[then(
+    regex = r#"^the records of "([^"]+)" are the "([^"]+)" records of the test file "([^"]+)"$"#
+)]
+async fn records_match_test_file(
+    world: &mut SassWorld,
+    name: String,
+    needle: String,
+    file: String,
+) {
+    let actual = record_lines(&world.work_dir().join(&name));
+    let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/data")
+        .join(&file);
+    let expected: String = record_lines(&source)
+        .lines()
+        .filter(|line| line.contains(&needle))
+        .map(|line| format!("{line}\n"))
+        .collect();
+    assert!(!expected.is_empty(), "no {needle:?} records in {file:?}");
+    assert_eq!(
+        actual, expected,
+        "the records of {name:?} differ from {file:?}"
+    );
+}
+
+#[then(regex = r#"^stderr does not contain "(.*)"$"#)]
+async fn stderr_lacks(world: &mut SassWorld, needle: String) {
+    assert!(
+        !world.stderr.contains(&needle),
+        "stderr unexpectedly contained {needle:?}\nstderr:\n{}",
+        world.stderr
+    );
 }
 
 #[then(regex = r#"^stdout does not contain "(.*)"$"#)]

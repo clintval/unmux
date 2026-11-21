@@ -81,8 +81,8 @@ unmux "R1.fastq.gz" "R2.fastq.gz" \
 
 ## Features
 
-- **FASTX/SAM/BAM/CRAM in and out** (SAM/BAM/CRAM written unmapped), with per-segment qualities carried through extraction.
-- **Alignment-preserving read-group splits**: `unmux "in.bam" --group sm=@RG::SM --sample-from-group sm --out "%sample.bam"` splits an aligned BAM into per-sample BAMs with every record, the `@SQ` dictionary, and the sort order kept intact.
+- **FASTX/SAM/BAM/CRAM in and out**, with per-segment qualities carried through extraction. Demultiplexed SAM/BAM/CRAM is written unmapped, except an aligned read-group split.
+- **Alignment-preserving read-group splits**: `unmux "in.bam" --group sm=@RG::SM --sample-from-group sm --out "%sample.bam"` splits an aligned SAM/BAM into per-sample SAM/BAM files with every record (secondary and supplementary included), the `@SQ` dictionary, and the sort order kept intact. Add `--unmapped-output` for the older unmapped split.
 - **splitcode-style matching**: tag groups, variable-length tags, location windows, mismatch/indel tolerance, sequential `next`/`prev` anchoring, `@extract` spans, and error-correction to canonical barcodes.
 - **Single-pass demultiplexing, optionally nested**: split a pool into per-sample outputs and, if you like, each sample into sub-samples (a library of samples, sub-libraries of lysates, and so on), each written as its own FASTX/SAM/BAM/CRAM with `SM`/`LB` read group identifiers.
 - **Configured on the CLI or in sheets** with the same grammar: flags repeat and accumulate, so a spec can be built up piece by piece (`--group g1::loc=... --group g1::dist=...`), or written compactly with comma lists (`--group g1::loc=...,dist=...`).
