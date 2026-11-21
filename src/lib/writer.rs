@@ -35,7 +35,7 @@ use noodles::sam::alignment::RecordBuf;
 use noodles::{bam, bgzf, cram, fasta, fastq, sam};
 use pooled_writer::PooledWriter;
 
-use crate::input::{SniffedFormat, PHRED_OFFSET};
+use crate::input::{Alignment, SniffedFormat, PHRED_OFFSET};
 
 /// One output record to emit: its name, bases, raw-Phred qualities,
 /// carried/derived tags, and the fan-out read group.
@@ -56,7 +56,7 @@ pub struct OutputRead<'a> {
     pub read_group: Option<&'a str>,
     /// A source alignment to write verbatim on SAM/BAM, in place of a record
     /// built from the fields above. FASTX ignores it.
-    pub alignment: Option<&'a RecordBuf>,
+    pub alignment: Option<&'a Alignment>,
 }
 
 /// A resolved output format. FASTX variants carry whether the sink is
@@ -848,7 +848,9 @@ fn write_alignments<W: AlignmentWrite>(
     }
     for (index, read) in reads.iter().enumerate() {
         let written = match read.alignment {
-            Some(record) => writer.write_alignment_record(header, record),
+            Some(alignment) => {
+                writer.write_alignment_record(header, alignment.to_record_buf()?.as_ref())
+            }
             None => {
                 let record = build_record(read, segment_flags(index, reads.len()));
                 writer.write_alignment_record(header, &record)
@@ -922,15 +924,34 @@ pub fn encode_fragment(
             write_alignments(&mut writer, header, reads)?;
             writer.into_inner()
         }
-        OutputFormat::Bam => {
-            let mut writer = bam::io::Writer::from(Vec::new());
-            write_alignments(&mut writer, header, reads)?;
-            writer.into_inner()
-        }
+        OutputFormat::Bam => match raw_bam_records(reads) {
+            Some(raw) => raw,
+            None => {
+                let mut writer = bam::io::Writer::from(Vec::new());
+                write_alignments(&mut writer, header, reads)?;
+                writer.into_inner()
+            }
+        },
         OutputFormat::Cram => {
             bail!("internal error: CRAM is not eligible for encode-on-workers")
         }
     })
+}
+
+/// The concatenated raw bytes of `reads` when every one is a raw BAM alignment,
+/// which BAM output writes back verbatim.
+fn raw_bam_records(reads: &[OutputRead]) -> Option<Vec<u8>> {
+    if reads.len() > 2 {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    for read in reads {
+        match read.alignment {
+            Some(Alignment::RawBam(raw)) => bytes.extend_from_slice(raw),
+            _ => return None,
+        }
+    }
+    Some(bytes)
 }
 
 /// The flags for output record `index` of `total`: a lone record is just
@@ -1437,13 +1458,14 @@ mod tests {
         let header = reader.read_header().unwrap();
         let mut record = RecordBuf::default();
         reader.read_record_buf(&header, &mut record).unwrap();
+        let alignment = Alignment::Record(record.clone());
         let read = OutputRead {
             name: b"ignored",
             bases: b"T",
             quals: None,
             tags: None,
             read_group: Some("ignored"),
-            alignment: Some(&record),
+            alignment: Some(&alignment),
         };
         let sam_bytes =
             encode_fragment(OutputFormat::Sam, &header, std::slice::from_ref(&read)).unwrap();

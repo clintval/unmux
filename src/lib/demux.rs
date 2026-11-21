@@ -44,7 +44,9 @@ use crate::grammar::{
     Anchor, DemuxPlan, Endpoint, GroupSource, MatchMode, OutputPattern, Placeholder, SampleSpec,
     SpanBody, Template,
 };
-use crate::input::{Fragment, FragmentReader, InputRecord, SniffedFormat};
+use crate::input::{
+    Alignment, Fragment, FragmentReader, InputRecord, PendingFragment, SniffedFormat,
+};
 use crate::matcher::{
     match_group, match_group_at, window_after, CompiledGroup, GroupOutcome, MatchStrand, Prereq,
     RelativeWindow, Scratch,
@@ -999,7 +1001,8 @@ fn tag_bytes(tag: &str) -> [u8; 2] {
 pub const MAX_WRITER_THREADS: usize = 6;
 
 /// How one `--threads N` is split across the engine's roles. Our input is a
-/// single lockstep cursor, so one read-ahead thread suffices; the main/consumer
+/// single lockstep cursor, so one read-ahead thread suffices; `decode` threads
+/// inflate BAM or decode CRAM input ahead of it; the main/consumer
 /// thread owns the writer and applies outcomes in input order; `writer` threads
 /// run the BGZF compressor pool (zero when there is no pooled output); every
 /// remaining thread joins the rayon matcher pool. For compressed output the
@@ -1009,8 +1012,10 @@ pub const MAX_WRITER_THREADS: usize = 6;
 /// matcher.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ThreadBudget {
-    /// The read-ahead/decompress thread.
+    /// The read-ahead thread.
     pub reader: usize,
+    /// The BAM inflate or CRAM decode pool size; zero for FASTX/SAM input.
+    pub decode: usize,
     /// The orchestrator/consumer thread (owns the writer; applies outcomes in
     /// order).
     pub main: usize,
@@ -1036,17 +1041,36 @@ fn writer_pool_size(threads: usize, has_poolable: bool) -> usize {
     (threads.saturating_sub(2) / 2).clamp(1, MAX_WRITER_THREADS)
 }
 
+/// The most threads that inflate BAM or decode CRAM input.
+pub const MAX_DECODE_THREADS: usize = 4;
+
+/// The BAM inflate / CRAM decode pool size for `threads` total threads: none
+/// below 4 threads, where the read-ahead thread decodes inline, else an eighth
+/// of the threads, capped at [`MAX_DECODE_THREADS`].
+pub fn decode_pool_size(threads: usize) -> usize {
+    if threads < 4 {
+        return 0;
+    }
+    (threads / 8).clamp(1, MAX_DECODE_THREADS)
+}
+
 /// Partition `--threads N` into the engine's [`ThreadBudget`] after reserving
-/// `writer_threads` for the BGZF pool. Assumes the caller has checked `threads`
-/// leaves at least one matcher; the `max(1)` is a defensive floor.
-pub fn partition_threads(threads: usize, writer_threads: usize) -> ThreadBudget {
+/// `writer_threads` for the BGZF pool and `decode_threads` for input decoding.
+/// The read-ahead thread only frames records once a decode pool inflates for it,
+/// so the pool shares its slot. The `max(1)` keeps at least one matcher.
+pub fn partition_threads(
+    threads: usize,
+    writer_threads: usize,
+    decode_threads: usize,
+) -> ThreadBudget {
     let reader = 1;
     let main = 1;
     let matchers = threads
-        .saturating_sub(reader + main + writer_threads)
+        .saturating_sub(reader.max(decode_threads) + main + writer_threads)
         .max(1);
     ThreadBudget {
         reader,
+        decode: decode_threads,
         main,
         writer: writer_threads,
         matchers,
@@ -1105,12 +1129,25 @@ fn run_engine(plan: &DemuxPlan, command_line: Option<&str>) -> Result<()> {
             crate::reference::Reference::open(path, !plan.skip_reference_check, plan.threads)
         })
         .transpose()?;
-    let mut reader =
-        FragmentReader::open_with_reference(&plan.inputs, plan.per_record, reference.as_ref())?;
+    let decode_threads = decode_pool_size(plan.threads.max(1));
+    let mut reader = FragmentReader::open_with_threads(
+        &plan.inputs,
+        plan.per_record,
+        reference.as_ref(),
+        decode_threads,
+    )?;
     let input_formats = reader.formats().to_vec();
     if plan.reference.is_some() && !input_formats.contains(&SniffedFormat::Cram) {
         log::warn!("--reference is unused: no input is CRAM");
     }
+    let decode_threads = if input_formats
+        .iter()
+        .any(|format| matches!(format, SniffedFormat::Bam | SniffedFormat::Cram))
+    {
+        decode_threads
+    } else {
+        0
+    };
     // Only read (and conflict-check) the input `@RG` header when an `@RG`
     // group is actually present: `input_read_groups` bails on a repeated RG id
     // with conflicting SM/LB across inputs, which is a legitimate outcome for
@@ -1273,14 +1310,15 @@ fn run_engine(plan: &DemuxPlan, command_line: Option<&str>) -> Result<()> {
     // library callers.
     let threads = plan.threads.max(1);
     let writer_threads = writer_pool_size(threads, !poolable.is_empty());
-    let budget = partition_threads(threads, writer_threads);
+    let budget = partition_threads(threads, writer_threads, decode_threads);
     match threads {
         1 => log::info!("threads=1: serial (read + match + write inline, no pools)"),
         2 => log::info!("threads=2: reader=1, match + write inline (no rayon, no BGZF pool)"),
         _ => log::info!(
-            "threads={}: reader={}, main={}, matchers={}, writer={} (rayon + BGZF pool)",
+            "threads={}: reader={}, decode={}, main={}, matchers={}, writer={} (rayon + BGZF pool)",
             threads,
             budget.reader,
+            budget.decode,
             budget.main,
             budget.matchers,
             budget.writer,
@@ -1435,7 +1473,7 @@ struct PreparedRead {
     quals: Option<Vec<u8>>,
     tags: Option<Data>,
     read_group: Option<String>,
-    alignment: Option<RecordBuf>,
+    alignment: Option<Alignment>,
 }
 
 impl PreparedRead {
@@ -1664,14 +1702,8 @@ fn is_alignment_format(format: OutputFormat) -> bool {
 fn encode_writes(engine: &Engine, writes: &mut [PreparedWrite]) -> Result<()> {
     for write in writes {
         let format = output_format(write.path.as_deref(), engine.input_formats)?;
-        // Encode only the alignment formats here. BAM/SAM go through the
-        // heavier build_record + serialize path, so moving it to the worker is
-        // a measured ~1.8x win on BAM `--out`; FASTQ/FASTA text formatting is
-        // light enough that the per-fragment byte handoff makes
-        // encode-on-workers a slight net loss (measured), and CRAM is
-        // container/slice-coded (not pre-encodable per fragment). Those stay on
-        // the serial consumer path.
-        if !matches!(format, OutputFormat::Bam | OutputFormat::Sam) {
+        // CRAM is container/slice-coded, so it cannot be pre-encoded per fragment.
+        if matches!(format, OutputFormat::Cram) {
             continue;
         }
         let bytes = {
@@ -1703,7 +1735,7 @@ fn prepare(engine: &Engine, fragment: &Fragment, fmatch: FragmentMatch) -> Resul
     let lengths: SmallVec<[usize; 4]> = fragment.records.iter().map(|r| r.bases.len()).collect();
     let hits = match fmatch {
         FragmentMatch::Unassigned { reason, hits } => {
-            let writes = prepare_unassigned(engine, fragment, &reason, &hits);
+            let writes = prepare_unassigned(engine, fragment, &reason, &hits)?;
             return Ok(Prepared {
                 lengths,
                 tally: Tally::Unassigned(reason),
@@ -1724,15 +1756,15 @@ fn prepare(engine: &Engine, fragment: &Fragment, fmatch: FragmentMatch) -> Resul
     let (tally, writes) = match engine.routing.route(&hits) {
         Disposition::Removed(remove) => (
             Tally::Removed,
-            prepare_removed(engine, fragment, remove, &hits),
+            prepare_removed(engine, fragment, remove, &hits)?,
         ),
-        Disposition::Unassigned => unassigned(engine, fragment, Unassigned::NoSample, &hits),
+        Disposition::Unassigned => unassigned(engine, fragment, Unassigned::NoSample, &hits)?,
         Disposition::PassThrough => {
             let (denom, unext) = frac_bases(engine, &segments, &hits)?;
             match prepare_body(engine, None, &hits, &segments, fragment)? {
                 BodyOutcome::Assembled(writes) => (Tally::PassThrough { denom, unext }, writes),
                 BodyOutcome::MissingStream(missing) => {
-                    unassigned(engine, fragment, Unassigned::MissingStream(missing), &hits)
+                    unassigned(engine, fragment, Unassigned::MissingStream(missing), &hits)?
                 }
             }
         }
@@ -1748,7 +1780,7 @@ fn prepare(engine: &Engine, fragment: &Fragment, fmatch: FragmentMatch) -> Resul
                     writes,
                 ),
                 BodyOutcome::MissingStream(missing) => {
-                    unassigned(engine, fragment, Unassigned::MissingStream(missing), &hits)
+                    unassigned(engine, fragment, Unassigned::MissingStream(missing), &hits)?
                 }
             }
         }
@@ -1766,9 +1798,9 @@ fn unassigned(
     fragment: &Fragment,
     reason: Unassigned,
     hits: &GroupHits,
-) -> (Tally, Vec<PreparedWrite>) {
-    let writes = prepare_unassigned(engine, fragment, &reason, hits);
-    (Tally::Unassigned(reason), writes)
+) -> Result<(Tally, Vec<PreparedWrite>)> {
+    let writes = prepare_unassigned(engine, fragment, &reason, hits)?;
+    Ok((Tally::Unassigned(reason), writes))
 }
 
 /// Apply one [`Prepared`] on the serial consumer: tally it and issue its writes
@@ -1866,10 +1898,13 @@ impl Drop for Progress {
 /// `Ok(None)` at end of input. Shared by the read-ahead thread (`read_chunks`)
 /// and the serial driver (`drive_serial`), which both need the same bounded
 /// pull. A read error propagates.
-fn next_chunk(reader: &mut FragmentReader, chunk_size: usize) -> Result<Option<Vec<Fragment>>> {
+fn next_chunk(
+    reader: &mut FragmentReader,
+    chunk_size: usize,
+) -> Result<Option<Vec<PendingFragment>>> {
     let mut chunk = Vec::with_capacity(chunk_size);
     for _ in 0..chunk_size {
-        match reader.next_fragment()? {
+        match reader.next_pending_fragment()? {
             Some(fragment) => chunk.push(fragment),
             None => break,
         }
@@ -1888,12 +1923,24 @@ fn next_chunk(reader: &mut FragmentReader, chunk_size: usize) -> Result<Option<V
 fn match_chunk_serial(
     engine: &Engine,
     scratch: &mut Scratch,
-    chunk: &[Fragment],
+    record: &mut RecordBuf,
+    chunk: Vec<PendingFragment>,
 ) -> Vec<Result<Prepared>> {
     chunk
-        .iter()
-        .map(|fragment| process_fragment(engine, scratch, fragment))
+        .into_iter()
+        .map(|pending| process_pending(engine, scratch, record, pending))
         .collect()
+}
+
+/// Decode a fragment's raw records, reusing `record`, then run [`process_fragment`].
+fn process_pending(
+    engine: &Engine,
+    scratch: &mut Scratch,
+    record: &mut RecordBuf,
+    pending: PendingFragment,
+) -> Result<Prepared> {
+    let fragment = pending.decode(record)?;
+    process_fragment(engine, scratch, &fragment)
 }
 
 /// Apply one chunk's prepared outcomes to the writer in input order, tallying
@@ -1920,7 +1967,7 @@ fn apply_chunk(
 /// signalling end-of-input to the consumer.
 fn read_chunks(
     mut reader: FragmentReader,
-    tx: std::sync::mpsc::SyncSender<Vec<Fragment>>,
+    tx: std::sync::mpsc::SyncSender<Vec<PendingFragment>>,
     chunk_size: usize,
 ) -> Result<()> {
     while let Some(chunk) = next_chunk(&mut reader, chunk_size)? {
@@ -1938,7 +1985,7 @@ const READER_STACK_BYTES: usize = 64 << 20;
 /// Spawn the read-ahead thread ([`read_chunks`]) with [`READER_STACK_BYTES`].
 fn spawn_reader(
     reader: FragmentReader,
-    tx: std::sync::mpsc::SyncSender<Vec<Fragment>>,
+    tx: std::sync::mpsc::SyncSender<Vec<PendingFragment>>,
 ) -> Result<std::thread::JoinHandle<Result<()>>> {
     std::thread::Builder::new()
         .name("unmux-reader".to_string())
@@ -1961,8 +2008,9 @@ fn drive_serial(
 ) -> Result<()> {
     let mut progress = Progress::new();
     let mut scratch = Scratch::new();
+    let mut record = RecordBuf::default();
     while let Some(chunk) = next_chunk(&mut reader, READ_CHUNK)? {
-        let prepared = match_chunk_serial(engine, &mut scratch, &chunk);
+        let prepared = match_chunk_serial(engine, &mut scratch, &mut record, chunk);
         apply_chunk(prepared, writer, metrics, &mut progress)?;
     }
     Ok(())
@@ -1982,12 +2030,13 @@ fn drive_pipelined(
 ) -> Result<()> {
     let mut progress = Progress::new();
     let mut scratch = Scratch::new();
-    let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<Fragment>>(READ_AHEAD_CHUNKS);
+    let mut record = RecordBuf::default();
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<PendingFragment>>(READ_AHEAD_CHUNKS);
     let reader_handle = spawn_reader(reader, tx)?;
 
     let mut outcome: Result<()> = Ok(());
     for chunk in &rx {
-        let prepared = match_chunk_serial(engine, &mut scratch, &chunk);
+        let prepared = match_chunk_serial(engine, &mut scratch, &mut record, chunk);
         if let Err(error) = apply_chunk(prepared, writer, metrics, &mut progress) {
             outcome = Err(error);
             break;
@@ -2002,16 +2051,13 @@ fn drive_pipelined(
     }
 }
 
-/// Drive the engine in parallel: a read-ahead thread streams bounded chunks of
-/// fragments to a rayon worker pool, and the consumer applies each chunk's
-/// outcomes to the single writer in input order. The full per-record pipeline
-/// ([`process_fragment`]: match + route + extract + assemble + encode) runs on
-/// the pool with a thread-local [`Scratch`] per worker, returning owned
-/// [`Prepared`] outcomes; only the metric tally and the inherently-serial
-/// writes stay on the consumer (main) thread, while the now-`Send` reader is
-/// moved to the read-ahead thread. Output stays in input order (the serial
-/// sinks and round-trip tests observe it, and it makes runs deterministic
-/// regardless of `--threads`).
+/// Drive the engine in parallel as three overlapped stages: a read-ahead thread
+/// streams bounded chunks of raw fragments; a process thread hands each chunk to
+/// the rayon pool, which decodes and fully prepares every record
+/// ([`process_pending`]); and the consumer (main) thread applies each prepared
+/// chunk to the single writer in input order while the pool works on the next.
+/// Output stays in input order, so runs are deterministic regardless of
+/// `--threads`.
 fn drive_parallel(
     engine: &Engine,
     budget: ThreadBudget,
@@ -2024,38 +2070,43 @@ fn drive_parallel(
         .build()
         .context("failed to build the matcher thread pool")?;
 
-    // Progress: a line every PROGRESS_UNIT records and a final total when this
-    // counter drops (on return, including the error path), so a long run
-    // reports steadily and on completion.
     let mut progress = Progress::new();
 
-    let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<Fragment>>(READ_AHEAD_CHUNKS);
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<PendingFragment>>(READ_AHEAD_CHUNKS);
     let reader_handle = spawn_reader(reader, tx)?;
 
-    let mut outcome: Result<()> = Ok(());
-    for chunk in &rx {
-        // Match + route + extract + assemble + encode every read in the chunk
-        // in parallel, preserving positional order in `prepared`; only the
-        // metric tally and the (serial, ordered) writes stay on the consumer.
-        let prepared: Vec<Result<Prepared>> = pool.install(|| {
-            chunk
-                .par_iter()
-                .with_min_len(MATCHER_MIN_JOB)
-                .map_init(Scratch::new, |scratch, fragment| {
-                    process_fragment(engine, scratch, fragment)
-                })
-                .collect()
+    let (prepared_tx, prepared_rx) = std::sync::mpsc::sync_channel::<Vec<Result<Prepared>>>(1);
+    let outcome = std::thread::scope(|scope| {
+        scope.spawn(move || {
+            for chunk in rx {
+                let prepared: Vec<Result<Prepared>> = pool.install(|| {
+                    chunk
+                        .into_par_iter()
+                        .with_min_len(MATCHER_MIN_JOB)
+                        .map_init(
+                            || (Scratch::new(), RecordBuf::default()),
+                            |(scratch, record), pending| {
+                                process_pending(engine, scratch, record, pending)
+                            },
+                        )
+                        .collect()
+                });
+                if prepared_tx.send(prepared).is_err() {
+                    return;
+                }
+            }
         });
-        if let Err(error) = apply_chunk(prepared, writer, metrics, &mut progress) {
-            outcome = Err(error);
-            break;
+        let mut outcome: Result<()> = Ok(());
+        for prepared in &prepared_rx {
+            if let Err(error) = apply_chunk(prepared, writer, metrics, &mut progress) {
+                outcome = Err(error);
+                break;
+            }
         }
-    }
-    // Unblock the reader if we bailed early (closing `rx` makes its next `send`
-    // fail), then join it. A consumer error is the most actionable, so it takes
-    // precedence over both a read error and a reader-thread panic; absent one,
-    // surface a read error or the panic.
-    drop(rx);
+        // Closing the channel stops the process thread, which closes the reader's.
+        drop(prepared_rx);
+        outcome
+    });
     let reader_result = reader_handle.join();
     outcome?;
     match reader_result {
@@ -2217,9 +2268,9 @@ fn prepare_removed(
     fragment: &Fragment,
     remove: &RemoveTarget,
     hits: &GroupHits,
-) -> Vec<PreparedWrite> {
+) -> Result<Vec<PreparedWrite>> {
     let Some(pattern) = &remove.pattern else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     let slug = engine.plan.qc_tag.as_ref().map(|tag| {
         let base_segments: Vec<&[u8]> = fragment
@@ -2256,7 +2307,7 @@ fn prepare_unassigned(
     fragment: &Fragment,
     reason: &Unassigned,
     hits: &GroupHits,
-) -> Vec<PreparedWrite> {
+) -> Result<Vec<PreparedWrite>> {
     match &engine.plan.unassigned {
         Some(pattern) => {
             let slug = engine.plan.qc_tag.as_ref().map(|tag| {
@@ -2278,7 +2329,7 @@ fn prepare_unassigned(
                 slug.as_ref().map(|(tag, value)| (*tag, value.as_str())),
             )
         }
-        None => Vec::new(),
+        None => Ok(Vec::new()),
     }
 }
 
@@ -2293,7 +2344,7 @@ fn prepare_raw_bin(
     num_sources: usize,
     fragment: &Fragment,
     slug: Option<(&str, &str)>,
-) -> Vec<PreparedWrite> {
+) -> Result<Vec<PreparedWrite>> {
     if num_sources > 1 && pattern.uses(Placeholder::Source) {
         fragment
             .records
@@ -2305,10 +2356,10 @@ fn prepare_raw_bin(
                     source: Some(source),
                     ..Default::default()
                 };
-                PreparedWrite {
+                Ok(PreparedWrite {
                     path: resolve_pattern(pattern, &ctx),
-                    payload: WritePayload::Records(vec![prepared_raw_read(record, pool, slug)]),
-                }
+                    payload: WritePayload::Records(vec![prepared_raw_read(record, pool, slug)?]),
+                })
             })
             .collect()
     } else {
@@ -2319,16 +2370,16 @@ fn prepare_raw_bin(
             source: Some(0),
             ..Default::default()
         };
-        vec![PreparedWrite {
+        Ok(vec![PreparedWrite {
             path: resolve_pattern(pattern, &ctx),
             payload: WritePayload::Records(
                 fragment
                     .records
                     .iter()
                     .map(|record| prepared_raw_read(record, pool, slug))
-                    .collect(),
+                    .collect::<Result<_>>()?,
             ),
-        }]
+        }])
     }
 }
 
@@ -2337,7 +2388,11 @@ fn prepare_raw_bin(
 /// input tags, optionally augmented with the `--qc-tag` slug. Carries the
 /// default pool read group (`RG:Z:<pool>`) so a SAM/BAM/CRAM bin matches the
 /// default `@RG` in its header; FASTX output ignores the read group.
-fn prepared_raw_read(record: &InputRecord, pool: &str, slug: Option<(&str, &str)>) -> PreparedRead {
+fn prepared_raw_read(
+    record: &InputRecord,
+    pool: &str,
+    slug: Option<(&str, &str)>,
+) -> Result<PreparedRead> {
     let tags = match slug {
         Some((tag, value)) => {
             let mut data = record.tags.clone().unwrap_or_default();
@@ -2346,20 +2401,22 @@ fn prepared_raw_read(record: &InputRecord, pool: &str, slug: Option<(&str, &str)
         }
         None => record.tags.clone(),
     };
-    let alignment = record.alignment.clone().map(|mut alignment| {
-        if let Some((tag, value)) = slug {
-            insert_string_tag(alignment.data_mut(), tag, value);
+    let alignment = match (record.alignment.clone(), slug) {
+        (Some(alignment), Some((tag, value))) => {
+            let mut record = alignment.into_record_buf()?;
+            insert_string_tag(record.data_mut(), tag, value);
+            Some(Alignment::Record(record))
         }
-        alignment
-    });
-    PreparedRead {
+        (alignment, _) => alignment,
+    };
+    Ok(PreparedRead {
         name: record.name.clone(),
         bases: record.bases.clone(),
         quals: record.quals.clone(),
         tags,
         read_group: Some(pool.to_string()),
         alignment,
-    }
+    })
 }
 
 /// The canonical (corrected) tag sequence for a matched `@grp` self-span, plus
@@ -2542,10 +2599,10 @@ fn prepare_body(
                     } else {
                         None
                     };
-                    prepared_body_read(body, data, read_group)
+                    Ok(prepared_body_read(body, data, read_group))
                 }
             })
-            .collect();
+            .collect::<Result<_>>()?;
         vec![PreparedWrite {
             path,
             payload: WritePayload::Records(reads),
@@ -2570,28 +2627,38 @@ fn prepared_body_read(body: Body, data: Data, read_group: Option<String>) -> Pre
 }
 
 /// An aligned record passed through whole, gaining only `--tag` and `--qc-tag`.
+/// Without either it stays as read, so raw BAM bytes are written back verbatim.
 fn passed_through_read(
-    mut record: RecordBuf,
+    alignment: Alignment,
     tag_data: &Data,
     slug: Option<(&str, &str)>,
-) -> PreparedRead {
-    let data = record.data_mut();
-    for (tag, value) in tag_data.iter() {
-        if !matches!(value, Value::String(text) if text.is_empty()) {
-            data.insert(tag, value.clone());
+) -> Result<PreparedRead> {
+    let inserted = tag_data
+        .iter()
+        .any(|(_, value)| !matches!(value, Value::String(text) if text.is_empty()));
+    let alignment = if !inserted && slug.is_none() {
+        alignment
+    } else {
+        let mut record = alignment.into_record_buf()?;
+        let data = record.data_mut();
+        for (tag, value) in tag_data.iter() {
+            if !matches!(value, Value::String(text) if text.is_empty()) {
+                data.insert(tag, value.clone());
+            }
         }
-    }
-    if let Some((tag, value)) = slug {
-        insert_string_tag(data, tag, value);
-    }
-    PreparedRead {
+        if let Some((tag, value)) = slug {
+            insert_string_tag(data, tag, value);
+        }
+        Alignment::Record(record)
+    };
+    Ok(PreparedRead {
         name: Vec::new(),
         bases: Vec::new(),
         quals: None,
         tags: None,
         read_group: None,
-        alignment: Some(record),
-    }
+        alignment: Some(alignment),
+    })
 }
 
 /// One assembled output record: its name, bases, qualities, and (for a raw
@@ -2601,7 +2668,7 @@ struct Body {
     bases: Vec<u8>,
     quals: Option<Vec<u8>>,
     carried: Option<Data>,
-    alignment: Option<RecordBuf>,
+    alignment: Option<Alignment>,
 }
 
 /// Assemble a record's output bodies: the raw input segments (each carrying its
@@ -2810,7 +2877,7 @@ mod tests {
         // and 2 use the serial drivers. No pool: every spare thread is a
         // matcher.
         for threads in [3, 4, 5, 6, 7, 8, 16] {
-            let budget = partition_threads(threads, 0);
+            let budget = partition_threads(threads, 0, 0);
             assert_eq!(budget.reader, 1, "one read-ahead thread");
             assert_eq!(budget.main, 1, "one main/consumer thread");
             assert_eq!(budget.writer, 0, "no BGZF pool");
@@ -2823,7 +2890,7 @@ mod tests {
         }
         // With a BGZF pool, the writer threads come out of the matcher budget.
         for (threads, writer) in [(4, 1), (8, 2), (16, 4)] {
-            let budget = partition_threads(threads, writer);
+            let budget = partition_threads(threads, writer, 0);
             assert_eq!(budget.writer, writer);
             assert!(budget.matchers >= 1, "at least one matcher remains");
             assert_eq!(
@@ -2841,7 +2908,7 @@ mod tests {
         // --threads 8 this is the measured optimum writer=3/matchers=3
         // (matchers never below the writer count).
         assert_eq!(writer_pool_size(8, true), 3);
-        let budget = partition_threads(8, writer_pool_size(8, true));
+        let budget = partition_threads(8, writer_pool_size(8, true), 0);
         assert_eq!((budget.writer, budget.matchers), (3, 3));
         // Too few threads to afford a pool (reader + main + >=1 writer + >=1
         // matcher needs 4): the pool is empty and compression runs inline on
@@ -2917,6 +2984,132 @@ mod tests {
                 ref_records,
                 "BAM records at --threads {threads} must match the 16-thread run"
             );
+        }
+    }
+
+    /// A BAM file's decompressed header bytes and its raw records, each with its
+    /// `block_size` prefix.
+    fn raw_bam(path: &Path) -> (Vec<u8>, Vec<Vec<u8>>) {
+        use std::io::Read;
+        let mut bytes = Vec::new();
+        noodles::bgzf::io::Reader::new(File::open(path).unwrap())
+            .read_to_end(&mut bytes)
+            .unwrap();
+        let int = |at: usize| i32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+        let mut at = 8 + int(4);
+        let references = int(at);
+        at += 4;
+        for _ in 0..references {
+            at += 4 + int(at) + 4;
+        }
+        let header = bytes[..at].to_vec();
+        let mut records = Vec::new();
+        while at < bytes.len() {
+            let end = at + 4 + int(at);
+            records.push(bytes[at..end].to_vec());
+            at = end;
+        }
+        (header, records)
+    }
+
+    #[test]
+    fn test_bam_input_output_is_identical_across_threads() {
+        use noodles::sam::alignment::io::Write as _;
+        let dir = tempfile::tempdir().unwrap();
+        let mut sam = String::from(
+            "@HD\tVN:1.6\tSO:coordinate\n@SQ\tSN:chr1\tLN:10000000\n@SQ\tSN:chr2\tLN:10000000\n\
+             @RG\tID:rg0\tSM:s0\n@RG\tID:rg1\tSM:s1\n@RG\tID:rg2\tSM:s2\n",
+        );
+        let n = READ_CHUNK + 4321;
+        for i in 0..n {
+            let chrom = if i < n / 2 { "chr1" } else { "chr2" };
+            let pos = 1 + (i % (n / 2)) * 3;
+            let flag = match i % 7 {
+                0 => 99,
+                1 => 147,
+                2 => 256,
+                3 => 2048,
+                4 => 16,
+                5 => 73,
+                _ => 0,
+            };
+            let len = 20 + i % 3;
+            let seq: String = (0..len)
+                .map(|j| ["A", "C", "G", "T", "N"][(i + j) % 5])
+                .collect();
+            let qual: String = (0..len)
+                .map(|j| char::from(b'!' + ((i + j) % 40) as u8))
+                .collect();
+            sam.push_str(&format!(
+                "r{i}\t{flag}\t{chrom}\t{pos}\t{mapq}\t{len}M\t=\t{pos}\t0\t{seq}\t{qual}\t\
+                 RG:Z:rg{rg}\tNM:i:{nm}\tMC:Z:{len}M\tXB:B:s,1,-2,{xb}\n",
+                mapq = i % 61,
+                rg = i % 3,
+                xb = i % 30000,
+                nm = i % 4,
+            ));
+        }
+        let mut reader = noodles::sam::io::Reader::new(sam.as_bytes());
+        let header = reader.read_header().unwrap();
+        let input = dir.path().join("in.bam");
+        let mut writer = noodles::bam::io::Writer::new(File::create(&input).unwrap());
+        writer.write_header(&header).unwrap();
+        let mut record = RecordBuf::default();
+        while reader.read_record_buf(&header, &mut record).unwrap() > 0 {
+            writer.write_alignment_record(&header, &record).unwrap();
+        }
+        writer.try_finish().unwrap();
+        let (_, input_records) = raw_bam(&input);
+
+        let run = |threads: usize, ext: &str| -> PathBuf {
+            let out = dir.path().join(format!("t{threads}-{ext}"));
+            let mut args = base_args();
+            args.threads = threads;
+            args.inputs = vec![format!("0={}", input.display())];
+            args.groups = vec!["rg=@RG".to_string()];
+            args.sample_from_group = Some("rg".to_string());
+            args.out = Some(format!("{}/%sample.{ext}", out.display()));
+            run_demux(args).unwrap();
+            out
+        };
+
+        let reference = run(1, "bam");
+        for rg in 0..3 {
+            let (_, records) = raw_bam(&reference.join(format!("rg{rg}.bam")));
+            let expected: Vec<Vec<u8>> = input_records
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| i % 3 == rg)
+                .map(|(_, raw)| raw.clone())
+                .collect();
+            assert_eq!(
+                records, expected,
+                "rg{rg} holds its input records byte for byte"
+            );
+        }
+        for threads in [2usize, 4, 8] {
+            let out = run(threads, "bam");
+            for rg in 0..3 {
+                let name = format!("rg{rg}.bam");
+                assert_eq!(
+                    raw_bam(&out.join(&name)),
+                    raw_bam(&reference.join(&name)),
+                    "{name} at --threads {threads} matches --threads 1"
+                );
+            }
+        }
+
+        let reference = run(1, "fq");
+        for threads in [2usize, 4, 8] {
+            let out = run(threads, "fq");
+            for rg in 0..3 {
+                let name = format!("rg{rg}.fq");
+                assert_eq!(
+                    std::fs::read(out.join(&name)).unwrap(),
+                    std::fs::read(reference.join(&name)).unwrap(),
+                    "{name} at --threads {threads} matches --threads 1"
+                );
+            }
         }
     }
 
@@ -5312,7 +5505,9 @@ mod tests {
                 bases: Vec::new(),
                 quals: None,
                 tags: None,
-                alignment: Some(RecordBuf::builder().set_flags(flags).build()),
+                alignment: Some(Alignment::Record(
+                    RecordBuf::builder().set_flags(flags).build(),
+                )),
             }],
         };
         assert!(is_non_primary(&fragment(Flags::SECONDARY)));
