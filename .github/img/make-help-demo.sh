@@ -42,7 +42,7 @@ NO_COLOR=1 "$UNMUX_BIN" --help > "$img/help.txt"
 
 # Geometry and motion knobs.
 width=1200; font_size=21; padding=20; viewport_h=860
-speed=180; fps=40; hold_top=1.5; hold_bottom=2.0
+speed=180; fps=36; hold_top=1.5; hold_bottom=2.0
 
 # Size the capture terminal to the help so the whole thing fits without scrolling.
 help_lines=$(wc -l < "$img/help.txt")
@@ -95,8 +95,8 @@ pan_dur=$(awk "BEGIN { print ${maxy} / ${speed} }")
 total=$(awk "BEGIN { print ${hold_top} + ${pan_dur} + ${hold_bottom} }")
 
 echo "Panning ${width}x${viewport_h} down ${maxy}px over ${pan_dur}s; encoding AVIF..."
-# 240fps oversample -> tmix averages 3 sub-frames into motion blur -> 40fps output.
-ffmpeg -y -framerate 240 -loop 1 -i "${img}/.tall.png" -t "$total" \
+# 8x oversample -> tmix averages 3 sub-frames into motion blur -> fps output. Keep speed/fps a whole number of pixels per frame, or the AV1 file grows several fold.
+ffmpeg -y -framerate $((fps * 8)) -loop 1 -i "${img}/.tall.png" -t "$total" \
   -vf "crop=${width}:${viewport_h}:0:max(0\,min(${maxy}\,(t-${hold_top})*${speed})),tmix=frames=3:weights='1 1 1',fps=${fps},format=yuv420p" \
   -c:v libsvtav1 -crf 32 -preset 6 -g 300 -loop 0 "${img}/help.avif"
 
