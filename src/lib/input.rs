@@ -12,8 +12,8 @@
 //! for the writer to re-emit. A single FASTX input is auto-detected as
 //! interleaved (two mates per fragment). An input path of `-` reads stdin (at
 //! most one). CRAM input is read reference-free unless a `--reference` FASTA
-//! is given; without one, a reference-compressed CRAM (one carrying `@SQ`) is
-//! rejected.
+//! is given, which must match the CRAM's `@SQ` lines; without one, a
+//! reference-compressed CRAM (one carrying `@SQ`) is rejected.
 
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read};
@@ -30,6 +30,8 @@ use noodles::sam::header::record::value::map::{read_group::tag as rgt, ReadGroup
 use noodles::sam::header::record::value::Map;
 use noodles::{bam, bgzf, cram, fasta, fastq, sam};
 use smallvec::SmallVec;
+
+use crate::reference::Reference;
 
 /// A format identified by sniffing the start of an input stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -696,21 +698,6 @@ fn kept_alignment(record: RecordBuf) -> InputRecord {
     input
 }
 
-/// Load an indexed FASTA (`PATH.fai` alongside) as a CRAM reference repository.
-pub fn load_reference(path: &Path) -> Result<fasta::Repository> {
-    let reader = fasta::io::indexed_reader::Builder::default()
-        .build_from_path(path)
-        .with_context(|| {
-            format!(
-                "failed to open the --reference FASTA (it needs a .fai index): {}",
-                path.display()
-            )
-        })?;
-    Ok(fasta::Repository::new(
-        fasta::repository::adapters::IndexedReader::new(reader),
-    ))
-}
-
 /// Wrap a sniffed text stream for reading, transparently decoding a plain-gzip
 /// layer. BAM is BGZF and decodes inside its own reader, so it never passes
 /// through here.
@@ -734,7 +721,7 @@ fn text_bufread(reader: Box<dyn BufRead + Send>, gzipped: bool) -> Box<dyn BufRe
 /// validate the input family and mirror the format to stdout output).
 fn open_format_reader(
     path: &Path,
-    reference: Option<&fasta::Repository>,
+    reference: Option<&Reference>,
 ) -> Result<(SniffedFormat, FormatReader)> {
     let (format, gzipped, reader) =
         sniff_input(path).with_context(|| format!("failed to read: {}", path.display()))?;
@@ -772,14 +759,17 @@ fn open_format_reader(
             // already rejected).
             let mut reader = cram::io::Reader::new(reader);
             let header = reader.read_header().context("failed to read CRAM header")?;
-            if reference.is_none() {
-                ensure_reference_free_cram(&header, path)?;
+            match reference {
+                Some(reference) => reference.check_header(&header, path)?,
+                None => ensure_reference_free_cram(&header, path)?,
             }
             FormatReader::Cram {
                 reader,
                 header: Box::new(header),
                 container: cram::io::reader::Container::default(),
-                repository: reference.cloned().unwrap_or_default(),
+                repository: reference
+                    .map(|reference| reference.repository().clone())
+                    .unwrap_or_default(),
                 buffered: Vec::new().into_iter(),
                 eof: false,
             }
@@ -874,11 +864,11 @@ impl FragmentReader {
         Self::open_with_reference(paths, per_record, None)
     }
 
-    /// [`Self::open`], decoding CRAM input against `reference` when given.
+    /// [`Self::open`], checking and decoding CRAM input against `reference` when given.
     pub fn open_with_reference(
         paths: &[PathBuf],
         per_record: bool,
-        reference: Option<&fasta::Repository>,
+        reference: Option<&Reference>,
     ) -> Result<Self> {
         let opened = paths
             .iter()

@@ -464,10 +464,21 @@ struct DemuxCmd {
     /// Indexed FASTA (with a `.fai`) to read a reference-compressed CRAM.
     ///
     /// CRAM input does not regenerate `NM`/`MD` tags it did not store.
+    /// Before any output is written, every CRAM `@SQ` contig must be in the
+    /// FASTA (matched by `SN`) with the same `LN` and, where `@SQ` has
+    /// one, the same `M5`. Other `@SQ` fields such as `UR` are not used.
+    /// Ignored for SAM/BAM/FASTX input.
     ///
     ///   --reference ref.fa   decode CRAM input against ref.fa
     #[arg(long = "reference", value_name = "FASTA", verbatim_doc_comment)]
     reference: Option<PathBuf>,
+
+    /// Skip the `--reference` check against CRAM `@SQ` lines.
+    ///
+    /// For a CRAM whose header lists contigs the FASTA lacks and no record
+    /// uses. A record on a missing contig still fails as it is decoded.
+    #[arg(long, requires = "reference", verbatim_doc_comment)]
+    skip_reference_check: bool,
 
     /// Write an aligned `@RG` split unmapped, as unmux 0.6 did.
     ///
@@ -743,6 +754,7 @@ fn run_demux_cmd(cmd: DemuxCmd) -> Result<()> {
         compression: cmd.compression,
         threads: cmd.threads as usize,
         reference: cmd.reference,
+        skip_reference_check: cmd.skip_reference_check,
         unmapped_output: cmd.unmapped_output,
         command_line: Some(std::env::args().collect::<Vec<_>>().join(" ")),
     })

@@ -134,6 +134,38 @@ async fn given_test_file(world: &mut SassWorld, name: String) {
         .unwrap_or_else(|_| panic!("copy test file {source:?}"));
 }
 
+#[given(regex = r#"^a copy of the test file "([^"]+)" named "([^"]+)"$"#)]
+async fn given_test_file_copy(world: &mut SassWorld, source: String, name: String) {
+    copy_test_file(world, &source, &name, None);
+}
+
+#[given(
+    regex = r#"^a copy of the test file "([^"]+)" named "([^"]+)" with "([^"]+)" replaced by "([^"]*)"$"#
+)]
+async fn given_edited_test_file_copy(
+    world: &mut SassWorld,
+    source: String,
+    name: String,
+    old: String,
+    new: String,
+) {
+    copy_test_file(world, &source, &name, Some((&old, &new)));
+}
+
+/// Copy a `tests/data` file into the work directory, replacing the first `old` with `new`.
+fn copy_test_file(world: &mut SassWorld, source: &str, name: &str, edit: Option<(&str, &str)>) {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/data")
+        .join(source);
+    let mut content =
+        fs::read_to_string(&path).unwrap_or_else(|_| panic!("read test file {path:?}"));
+    if let Some((old, new)) = edit {
+        assert!(content.contains(old), "{source:?} does not contain {old:?}");
+        content = content.replacen(old, new, 1);
+    }
+    fs::write(world.work_dir().join(name), content).expect("write edited test file");
+}
+
 #[given(regex = r#"^an empty file "([^"]+)"$"#)]
 async fn given_empty_file(world: &mut SassWorld, name: String) {
     let dir = world.work_dir();
