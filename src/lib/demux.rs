@@ -57,7 +57,7 @@ use crate::output::{
 };
 use crate::qc::{removed_slug, routed_slug, unassigned_slug, Unassigned};
 use crate::tags::{load_tag_file, TagSet};
-use crate::writer::{encode_fragment, output_format, OutputFormat, OutputRead};
+use crate::writer::{encode_fragment, output_format, CreatedOutputs, OutputFormat, OutputRead};
 
 /// Resolved arguments for the `unmux` demux command.
 #[derive(Debug, Clone)]
@@ -1178,6 +1178,8 @@ fn run_engine(plan: &DemuxPlan, command_line: Option<&str>) -> Result<()> {
         Some(input) => alignment_header(input, None, command_line)?,
         None => default_read_group_header(&pool, &plan.rg_tags, command_line)?,
     };
+    // Declared first so it drops after every writer, removing what a failed run created.
+    let mut created = CreatedOutputs::default();
     // Declared before `writer` so that, on any unwind, `writer` (and its
     // PooledWriters) drops before the pool: a PooledWriter dropped after the
     // pool is stopped would panic. The explicit shutdown below also enforces
@@ -1199,6 +1201,18 @@ fn run_engine(plan: &DemuxPlan, command_line: Option<&str>) -> Result<()> {
         reader.fragment_width(),
     )?;
     log_run_shape(plan, &input_formats, &dests);
+    created.track(
+        dests.iter().cloned().chain(
+            [
+                &plan.metrics_per_sample,
+                &plan.metrics_summary,
+                &plan.metrics_unassigned,
+            ]
+            .into_iter()
+            .flatten()
+            .map(|pattern| resolve_metrics_path(pattern, &pool)),
+        ),
+    );
 
     // Route poolable destinations (gzipped FASTX and BAM) through a shared BGZF
     // compressor pool, so compression runs off the consumer thread (the
@@ -1350,6 +1364,7 @@ fn run_engine(plan: &DemuxPlan, command_line: Option<&str>) -> Result<()> {
     if let Some(pattern) = &plan.metrics_unassigned {
         metrics.write_unassigned_tsv(&resolve_metrics_path(pattern, &pool), &groups)?;
     }
+    created.keep();
     Ok(())
 }
 

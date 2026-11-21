@@ -19,7 +19,7 @@
 
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
 use noodles::sam::alignment::io::Write as AlignmentWrite;
@@ -486,6 +486,55 @@ fn bgzf_writer<W: Write>(inner: W, compression: u8) -> Result<bgzf::io::Writer<W
         .build_from_writer(inner))
 }
 
+/// Files and directories a run creates, removed on drop unless kept; existing paths are untracked.
+#[derive(Debug, Default)]
+pub(crate) struct CreatedOutputs {
+    files: Vec<PathBuf>,
+    dirs: Vec<PathBuf>,
+    kept: bool,
+}
+
+impl CreatedOutputs {
+    /// Track every path in `paths` that does not exist yet, with its missing parent directories.
+    pub(crate) fn track(&mut self, paths: impl IntoIterator<Item = PathBuf>) {
+        for path in paths {
+            if path.symlink_metadata().is_ok() {
+                continue;
+            }
+            for dir in path.ancestors().skip(1) {
+                if dir.as_os_str().is_empty() || dir.symlink_metadata().is_ok() {
+                    break;
+                }
+                if !self.dirs.iter().any(|known| known == dir) {
+                    self.dirs.push(dir.to_path_buf());
+                }
+            }
+            self.files.push(path);
+        }
+    }
+
+    /// Keep everything the run created.
+    pub(crate) fn keep(&mut self) {
+        self.kept = true;
+    }
+}
+
+impl Drop for CreatedOutputs {
+    fn drop(&mut self) {
+        if self.kept {
+            return;
+        }
+        for file in &self.files {
+            let _ = std::fs::remove_file(file);
+        }
+        self.dirs
+            .sort_by_key(|dir| std::cmp::Reverse(dir.components().count()));
+        for dir in &self.dirs {
+            let _ = std::fs::remove_dir(dir);
+        }
+    }
+}
+
 /// Create an output file, making any missing parent directories first. Shared
 /// by the inline writers and the pooled-writer exchange so both create files
 /// (and dirs) identically.
@@ -736,6 +785,33 @@ fn segment_flags(index: usize, total: usize) -> Flags {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_created_outputs_removes_only_what_the_run_created() {
+        let dir = tempfile::tempdir().unwrap();
+        let existing = dir.path().join("existing.bam");
+        std::fs::write(&existing, b"keep").unwrap();
+        let created_file = dir.path().join("new/nested/out.bam");
+        let mut created = CreatedOutputs::default();
+        created.track([existing.clone(), created_file.clone()]);
+        create_output_file(&created_file).unwrap();
+        drop(created);
+        assert_eq!(std::fs::read(&existing).unwrap(), b"keep");
+        assert!(!created_file.exists());
+        assert!(!dir.path().join("new").exists());
+    }
+
+    #[test]
+    fn test_created_outputs_keeps_everything_once_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let created_file = dir.path().join("out/out.bam");
+        let mut created = CreatedOutputs::default();
+        created.track([created_file.clone()]);
+        create_output_file(&created_file).unwrap();
+        created.keep();
+        drop(created);
+        assert!(created_file.exists());
+    }
 
     #[test]
     fn test_format_from_extension() {
