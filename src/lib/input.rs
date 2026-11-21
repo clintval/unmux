@@ -404,10 +404,14 @@ fn read_cram_container(
             )
             .context("failed to read CRAM slice records")?
         {
-            records.push(
-                RecordBuf::try_from_alignment_record(header, &record)
-                    .context("failed to convert CRAM record")?,
-            );
+            let mut record = RecordBuf::try_from_alignment_record(header, &record)
+                .context("failed to convert CRAM record")?;
+            // CRAM stores no MAPQ for an unmapped record; noodles reports 255, htslib 0.
+            if record.flags().is_unmapped() && record.mapping_quality().is_none() {
+                *record.mapping_quality_mut() =
+                    noodles::sam::alignment::record::MappingQuality::new(0);
+            }
+            records.push(record);
         }
     }
     Ok(Some(records))
@@ -638,7 +642,7 @@ fn parse_aux_field(field: &[u8]) -> Option<(Tag, Value)> {
 /// the union of `samtools reset`, Picard RevertSam, and the tags bwa mem /
 /// bwa-mem2 emit, plus `ms` (`samtools fixmate -m`). Read-group, UMI, barcode,
 /// and cell tags are deliberately kept.
-const ALIGNMENT_TAGS: &[[u8; 2]] = &[
+pub(crate) const ALIGNMENT_TAGS: &[[u8; 2]] = &[
     *b"AS", *b"NM", *b"MD", *b"SA", *b"MC", *b"MQ", *b"ms", *b"XS", *b"XA", *b"XB", *b"XR", *b"pa",
     *b"UQ", *b"CC", *b"CP", *b"CG", *b"H0", *b"H1", *b"H2", *b"HI", *b"IH", *b"NH", *b"TS",
 ];
@@ -1651,6 +1655,34 @@ mod tests {
         assert!(reader.next_fragment().unwrap().is_some());
         assert!(reader.next_fragment().unwrap().is_none());
         assert!(reader.next_fragment().unwrap().is_none());
+    }
+
+    #[test]
+    fn test_cram_unmapped_record_reads_mapq_zero() {
+        use noodles::sam::alignment::io::Write as _;
+        use noodles::sam::alignment::record::Flags;
+        use noodles::sam::alignment::record_buf::{QualityScores, Sequence};
+
+        let header = sam::Header::default();
+        let record = RecordBuf::builder()
+            .set_name(b"r1".to_vec())
+            .set_flags(Flags::UNMAPPED)
+            .set_sequence(Sequence::from(b"ACGT".to_vec()))
+            .set_quality_scores(QualityScores::from(vec![30; 4]))
+            .build();
+        let mut cram_bytes = Vec::new();
+        {
+            let mut writer = cram::io::Writer::new(&mut cram_bytes);
+            writer.write_header(&header).unwrap();
+            writer.write_alignment_record(&header, &record).unwrap();
+            writer.try_finish(&header).unwrap();
+        }
+        let cram = temp_with(&cram_bytes);
+        let mut reader = FragmentReader::open(&[cram.path().to_path_buf()], true).unwrap();
+        reader.keep_alignments();
+        let fragment = reader.next_fragment().unwrap().unwrap();
+        let kept = fragment.records[0].alignment.as_ref().unwrap();
+        assert_eq!(kept.mapping_quality().map(u8::from), Some(0));
     }
 
     #[test]

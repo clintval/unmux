@@ -1,10 +1,12 @@
 Feature: Split an aligned input by read group, keeping alignments
   An `@RG` split of an aligned input (one whose header carries `@SQ`) into
-  SAM/BAM/CRAM passes every record through unchanged: flags, position, CIGAR,
-  MAPQ, mate fields, and every tag. Each output keeps the input header (`@HD`
-  with its sort order, `@SQ`, `@PG`) with only its own `@RG` lines and the unmux
-  `@PG` chained on, and records keep their input order. A `--template` would
-  rewrite aligned records, so it is refused.
+  SAM/BAM keeps every record whole, secondary and supplementary included:
+  flags, position, CIGAR, MAPQ, mate fields, and every tag. Each output keeps
+  the input header (`@HD` with its sort order, `@SQ`, `@PG`, `@CO`) with only
+  its own `@RG` lines and an unmux `@PG`, and records keep their input order.
+  A `--template`, aligned CRAM output, several inputs, and a `--tag` that would
+  overwrite a read group or alignment tag are refused; `--unmapped-output`
+  restores the older unmapped output.
 
   Background:
     Given a file "in.sam" containing:
@@ -88,21 +90,23 @@ Feature: Split an aligned input by read group, keeping alignments
       """
     And the file "out/unassigned.sam" contains "SN:chr1"
 
-  Scenario: metrics count every passed-through record
+  Scenario: metrics count primary records only
     When I run `unmux in.sam --pool p1 --group sm=@RG::SM --sample-from-group sm --out out/%sample.bam --metrics-per-sample p.tsv --metrics-summary s.tsv`
     Then the exit code is 0
     And the file "p.tsv" is:
       """
       pool	sample	sub_sample	reads	frac_of_pool	frac_bases_unextracted
-      p1	sampleA		4	0.444444	0.000000
-      p1	sampleB		5	0.555556	0.000000
+      p1	sampleA		4	0.571429	0.000000
+      p1	sampleB		3	0.428571	0.000000
       """
     And the file "s.tsv" contains "reads_assigned"
+    And stderr contains "2 secondary/supplementary records passed through"
 
   Scenario: a --template on an aligned split into BAM is refused
     When I run `unmux in.sam --group sm=@RG::SM --sample-from-group sm --extract head=0:0:4 --template head --out out/%sample.bam`
     Then the exit code is 1
     And stderr contains "--template would rewrite"
+    And stderr contains "--unmapped-output"
     And a file "out/sampleA.bam" does not exist
 
   Scenario: a --template on an aligned split into FASTQ still works
@@ -110,38 +114,86 @@ Feature: Split an aligned input by read group, keeping alignments
     Then the exit code is 0
     And the file "out/sampleA.fq" contains "ACGT"
 
-  Scenario: an aligned split into CRAM needs --reference
+  Scenario: --unmapped-output keeps the older unmapped split
+    When I run `unmux in.sam --group sm=@RG::SM --sample-from-group sm --extract head=0:0:4 --template head --out out/%sample.bam --unmapped-output`
+    Then the exit code is 0
+    And stderr contains "UNMAPPED"
+    And the BAM header of "out/sampleA.bam" does not contain "@SQ"
+    And the records of "out/sampleA.bam" are:
+      """
+      q1	4	*	0	255	*	*	0	0	ACGT	ABCD
+      q1	4	*	0	255	*	*	0	0	AAAA	ABCD
+      q3	4	*	0	255	*	*	0	0	AACC	IIII
+      q3	4	*	0	255	*	*	0	0	AACC	IIII
+      """
+
+  Scenario: an aligned split into CRAM is refused before any file is written
     When I run `unmux in.sam --group sm=@RG::SM --sample-from-group sm --out out/%sample.cram`
+    Then the exit code is 1
+    And stderr contains "writing aligned records to CRAM is not supported"
+    And stderr contains "--unmapped-output"
+    And a file "out/sampleA.cram" does not exist
+    And a file "out/sampleB.cram" does not exist
+
+  Scenario: --unmapped-output still writes CRAM
+    When I run `unmux in.sam --group sm=@RG::SM --sample-from-group sm --out out/%sample.cram --unmapped-output`
+    Then the exit code is 0
+    And a file "out/sampleA.cram" exists
+
+  Scenario: several aligned inputs are refused, pointing at --unmapped-output
+    When I run `unmux --in 0=in.sam --in 1=in.sam --group sm=@RG::SM --sample-from-group sm --out out/%sample.bam`
+    Then the exit code is 1
+    And stderr contains "single input"
+    And stderr contains "--unmapped-output"
+
+  Scenario Outline: an htslib CRAM <version> input with several containers is split from a file
+    Given the test file "aligned.htslib-<version>.cram"
+    And the test file "ref.fa"
+    And the test file "ref.fa.fai"
+    When I run `unmux aligned.htslib-<version>.cram --reference ref.fa --group rg=@RG --sample-from-group rg --out out/%sample.sam`
+    Then the exit code is 0
+    And the records of "out/rg1.sam" are the "RG:Z:rg1" records of the test file "aligned.sam"
+    And the records of "out/rg2.sam" are the "RG:Z:rg2" records of the test file "aligned.sam"
+    And the file "out/rg1.sam" contains "SN:chr1"
+
+    Examples:
+      | version |
+      | 3.0     |
+      | 3.1     |
+
+  Scenario Outline: an htslib CRAM <version> input is split from stdin
+    Given the test file "aligned.htslib-<version>.cram"
+    And the test file "ref.fa"
+    And the test file "ref.fa.fai"
+    When I run `unmux - --reference ref.fa --group rg=@RG --sample-from-group rg --out out/%sample.bam` with "aligned.htslib-<version>.cram" on stdin
+    Then the exit code is 0
+    And the records of "out/rg2.bam" are the "RG:Z:rg2" records of the test file "aligned.sam"
+
+    Examples:
+      | version |
+      | 3.0     |
+      | 3.1     |
+
+  Scenario: a reference-compressed CRAM input needs --reference
+    Given the test file "aligned.htslib-3.1.cram"
+    When I run `unmux aligned.htslib-3.1.cram --group rg=@RG --sample-from-group rg --out out/%sample.sam`
     Then the exit code is 1
     And stderr contains "--reference"
 
-  Scenario: an aligned split into CRAM round-trips with --reference
-    Given a file "ref.fa" containing:
-      """
-      >chr1
-      ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT
-      """
-    And a file "ref.fa.fai" containing:
-      """
-      chr1	40	6	40	41
-      """
-    And a file "small.sam" containing:
+  Scenario: no drop warning when every primary record has a known read group
+    When I run `unmux in.sam --group sm=@RG::SM --sample-from-group sm --out out/%sample.bam`
+    Then the exit code is 0
+    And stderr does not contain "were dropped"
+
+  Scenario: a dropped record with an unknown read group is counted in a warning
+    Given a file "orphan.sam" containing:
       """
       @HD	VN:1.6	SO:coordinate
-      @SQ	SN:chr1	LN:40
+      @SQ	SN:chr1	LN:1000
       @RG	ID:rg1	SM:sampleA
-      @RG	ID:rg2	SM:sampleB
-      r1	99	chr1	1	60	8M	=	11	19	ACGTACGA	ABCDEFGH	MC:Z:8M	RG:Z:rg1
-      r2	0	chr1	5	40	2S6M	*	0	0	TTACGTAC	IIIIIIII	RG:Z:rg2
-      r1	147	chr1	11	60	3M1D5M	=	1	-19	GTAGTACG	HGFEDCBA	MC:Z:8M	RG:Z:rg1
+      r1	0	chr1	100	60	8M	*	0	0	AAAAAAAA	IIIIIIII	RG:Z:rg1
+      r2	0	chr1	300	50	8M	*	0	0	CCCCCCCC	IIIIIIII	RG:Z:ghost
       """
-    When I run `unmux small.sam --group rg=@RG --sample-from-group rg --out out/%sample.cram --reference ref.fa`
+    When I run `unmux orphan.sam --group rg=@RG --sample-from-group rg --out out/%sample.sam`
     Then the exit code is 0
-    When I run `unmux out/rg1.cram --group rg=@RG --sample-from-group rg --out back/%sample.sam --reference ref.fa`
-    Then the exit code is 0
-    And the records of "back/rg1.sam" are:
-      """
-      r1	99	chr1	1	60	8M	=	11	19	ACGTACGA	ABCDEFGH	MC:Z:8M	RG:Z:rg1
-      r1	147	chr1	11	60	3M1D5M	=	1	-19	GTAGTACG	HGFEDCBA	MC:Z:8M	RG:Z:rg1
-      """
-    And the file "back/rg1.sam" contains "SN:chr1"
+    And stderr contains "1 records carried no RG:Z, or one the header does not declare, and were dropped"

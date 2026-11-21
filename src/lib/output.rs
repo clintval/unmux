@@ -323,8 +323,8 @@ fn file_read_groups(
     deduped
 }
 
-/// The input header with the unmux `@PG` chained on, its `@RG` lines narrowed
-/// to the targets sharing this file when `targets` is given.
+/// The input header with the unmux `@PG` appended, its `@RG` lines narrowed (in
+/// input order) to the targets sharing this file when `targets` is given.
 pub fn alignment_header(
     input: &sam::Header,
     targets: Option<(&[&Target], &ConstituentReadGroups)>,
@@ -332,17 +332,63 @@ pub fn alignment_header(
 ) -> Result<sam::Header> {
     let mut header = input.clone();
     if let Some((targets, constituent)) = targets {
-        let read_groups = header.read_groups_mut();
-        read_groups.clear();
-        for (id, map) in file_read_groups(targets, constituent) {
-            read_groups.insert(id.into(), map);
+        let keep: std::collections::HashSet<Vec<u8>> = file_read_groups(targets, constituent)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        header
+            .read_groups_mut()
+            .retain(|id, _| keep.contains(AsRef::<[u8]>::as_ref(id)));
+    }
+    append_program(header.programs_mut(), program_record(command_line));
+    Ok(header)
+}
+
+/// Append the unmux `@PG` under the first free ID of `unmux`, `unmux.1`, ...,
+/// chained by `PP` to the last leaf program unless the existing chains have a
+/// dangling `PP` or a cycle, in which case it is left unchained.
+fn append_program(programs: &mut sam::header::Programs, mut map: Map<Program>) {
+    let inner = programs.as_mut();
+    let previous = |id: &[u8]| {
+        inner
+            .get(id)
+            .and_then(|map| map.other_fields().get(&program_tag::PREVIOUS_PROGRAM_ID))
+            .map(|pp| AsRef::<[u8]>::as_ref(pp).to_vec())
+    };
+    let chains_are_sound = inner.keys().all(|start| {
+        let mut seen = std::collections::HashSet::new();
+        let mut current = AsRef::<[u8]>::as_ref(start).to_vec();
+        while let Some(pp) = previous(&current) {
+            if !inner.contains_key(pp.as_slice()) || !seen.insert(pp.clone()) {
+                return false;
+            }
+            current = pp;
+        }
+        true
+    });
+    if chains_are_sound {
+        let referenced: std::collections::HashSet<Vec<u8>> = inner
+            .keys()
+            .filter_map(|id| previous(id.as_ref()))
+            .collect();
+        let leaf = inner
+            .keys()
+            .rev()
+            .find(|id| !referenced.contains(AsRef::<[u8]>::as_ref(*id)))
+            .cloned();
+        if let Some(leaf) = leaf {
+            map.other_fields_mut()
+                .insert(program_tag::PREVIOUS_PROGRAM_ID, leaf);
         }
     }
-    header
-        .programs_mut()
-        .add("unmux", program_record(command_line))
-        .map_err(|e| anyhow::anyhow!("failed to add the unmux @PG to the output header: {e}"))?;
-    Ok(header)
+    let id = (0..)
+        .map(|n| match n {
+            0 => "unmux".to_string(),
+            n => format!("unmux.{n}"),
+        })
+        .find(|id| !inner.contains_key(id.as_bytes()))
+        .expect("an unused program ID exists");
+    inner.insert(id.into(), map);
 }
 
 /// Build the fallback header for destinations with no per-sample read group:
@@ -427,8 +473,6 @@ pub struct MultiWriter {
     /// the raw `--unassigned`/`--remove` bins): `@PG` provenance plus the
     /// default pool `@RG`.
     default_header: sam::Header,
-    /// The `--reference` repository CRAM sinks encode against, if any.
-    reference: Option<noodles::fasta::Repository>,
 }
 
 impl MultiWriter {
@@ -455,14 +499,7 @@ impl MultiWriter {
             input_formats,
             compression,
             default_header,
-            reference: None,
         }
-    }
-
-    /// Encode CRAM destinations against `reference`, so aligned records can be
-    /// written to CRAM.
-    pub fn set_reference(&mut self, reference: noodles::fasta::Repository) {
-        self.reference = Some(reference);
     }
 
     /// Install the pre-exchanged BGZF pool writers, keyed by destination path.
@@ -533,13 +570,7 @@ impl MultiWriter {
             // writers ignore it.
             return OutputWriter::from_pooled(pooled, format, header);
         }
-        OutputWriter::create_with_reference(
-            path,
-            format,
-            self.compression,
-            header,
-            self.reference.as_ref(),
-        )
+        OutputWriter::create_with_header(path, format, self.compression, header)
     }
 
     /// Finalize every opened writer (flush, gzip trailers, BGZF EOF), returning
@@ -601,6 +632,53 @@ mod tests {
 
         let full = render(&alignment_header(&input, None, None).unwrap());
         assert!(full.contains("ID:rg1") && full.contains("ID:rg2"));
+    }
+
+    fn appended(text: &[u8]) -> Vec<(String, Option<String>)> {
+        let input = sam::io::Reader::new(text).read_header().unwrap();
+        let header = alignment_header(&input, None, None).unwrap();
+        header
+            .programs()
+            .as_ref()
+            .iter()
+            .map(|(id, map)| {
+                let pp = map
+                    .other_fields()
+                    .get(&program_tag::PREVIOUS_PROGRAM_ID)
+                    .map(|pp| pp.to_string());
+                (id.to_string(), pp)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_unmux_program_chains_to_the_last_leaf() {
+        let programs =
+            appended(b"@HD\tVN:1.6\n@PG\tID:a\tPN:a\n@PG\tID:b\tPN:b\tPP:a\n@PG\tID:c\tPN:c\n");
+        assert_eq!(
+            programs.last().unwrap(),
+            &("unmux".to_string(), Some("c".to_string()))
+        );
+        assert_eq!(programs.len(), 4, "one unmux @PG even with two leaves");
+    }
+
+    #[test]
+    fn test_unmux_program_is_unchained_after_a_dangling_link_or_cycle() {
+        let dangling = appended(b"@HD\tVN:1.6\n@PG\tID:a\tPN:a\tPP:missing\n");
+        assert_eq!(dangling.last().unwrap(), &("unmux".to_string(), None));
+        let cycle = appended(b"@HD\tVN:1.6\n@PG\tID:a\tPN:a\tPP:b\n@PG\tID:b\tPN:b\tPP:a\n");
+        assert_eq!(cycle.last().unwrap(), &("unmux".to_string(), None));
+    }
+
+    #[test]
+    fn test_unmux_program_id_takes_a_counter_suffix() {
+        let programs = appended(
+            b"@HD\tVN:1.6\n@PG\tID:unmux\tPN:unmux\n@PG\tID:unmux.1\tPN:unmux\tPP:unmux\n",
+        );
+        assert_eq!(
+            programs.last().unwrap(),
+            &("unmux.2".to_string(), Some("unmux.1".to_string()))
+        );
     }
 
     #[test]

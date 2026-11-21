@@ -62,6 +62,7 @@ pub struct Metrics {
     unassigned: u64,
     unassigned_by_reason: BTreeMap<UnassignedReason, u64>,
     removed: u64,
+    non_primary: u64,
     retained_denominator_bases: u64,
     retained_unextracted_bases: u64,
     /// Per-input-file (segment-index) record-length sum and count, for the mean
@@ -88,6 +89,7 @@ impl Metrics {
             unassigned: 0,
             unassigned_by_reason: BTreeMap::new(),
             removed: 0,
+            non_primary: 0,
             retained_denominator_bases: 0,
             retained_unextracted_bases: 0,
             input_len_sums: Vec::new(),
@@ -153,6 +155,17 @@ impl Metrics {
             .unassigned_by_reason
             .entry(UnassignedReason::from(reason))
             .or_default() += 1;
+    }
+
+    /// Count a secondary or supplementary record passed through by an aligned
+    /// `@RG` split; it is logged but left out of every other count.
+    pub fn record_non_primary(&mut self) {
+        self.non_primary += 1;
+    }
+
+    /// Records that matched no sample.
+    pub fn unassigned(&self) -> u64 {
+        self.unassigned
     }
 
     /// Count a record removed by a `--remove` rule.
@@ -275,6 +288,13 @@ impl Metrics {
             frac(self.retained_unextracted_bases, self.retained_denominator_bases),
             self.mean_read_len_by_input(),
         );
+        if self.non_primary > 0 {
+            log::info!(
+                "metrics pool={}: {} secondary/supplementary records passed through, not counted above",
+                self.pool,
+                self.non_primary.separate_with_commas(),
+            );
+        }
         for target in &self.targets {
             let tally = self.tally(target);
             log::info!(

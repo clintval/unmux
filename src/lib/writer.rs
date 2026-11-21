@@ -51,8 +51,8 @@ pub struct OutputRead<'a> {
     /// assigned record on SAM/BAM output (an `RG:Z` data field, matching an
     /// `@RG` header line). FASTX has no read groups, so it is ignored there.
     pub read_group: Option<&'a str>,
-    /// A source alignment to write verbatim on SAM/BAM/CRAM, in place of a
-    /// record built from the fields above. FASTX ignores it.
+    /// A source alignment to write verbatim on SAM/BAM, in place of a record
+    /// built from the fields above. FASTX ignores it.
     pub alignment: Option<&'a RecordBuf>,
 }
 
@@ -74,8 +74,8 @@ pub enum OutputFormat {
     Sam,
     /// BGZF-compressed BAM.
     Bam,
-    /// CRAM (its own per-block codecs; `--compression` does not apply),
-    /// reference-free unless a reference repository is supplied.
+    /// Reference-free unmapped CRAM (its own per-block codecs; `--compression`
+    /// does not apply).
     Cram,
 }
 
@@ -317,18 +317,6 @@ impl OutputWriter {
         compression: u8,
         header: sam::Header,
     ) -> Result<Self> {
-        Self::create_with_reference(out, format, compression, header, None)
-    }
-
-    /// [`Self::create_with_header`], encoding CRAM against `reference` when
-    /// given (needed to write aligned records to CRAM).
-    pub fn create_with_reference(
-        out: Option<&Path>,
-        format: OutputFormat,
-        compression: u8,
-        header: sam::Header,
-        reference: Option<&fasta::Repository>,
-    ) -> Result<Self> {
         let raw: Box<dyn Write> = match out {
             Some(path) => Box::new(create_output_file(path)?),
             None => Box::new(std::io::stdout()),
@@ -361,11 +349,9 @@ impl OutputWriter {
                 Sink::BamInline { writer, header }
             }
             OutputFormat::Cram => {
-                let mut builder = cram::io::writer::Builder::default();
-                if let Some(reference) = reference {
-                    builder = builder.set_reference_sequence_repository(reference.clone());
-                }
-                let mut writer = builder.build_from_writer(SinkWriter::Plain(buffered));
+                // Default (empty) reference repository: the output is
+                // reference-free unmapped CRAM.
+                let mut writer = cram::io::Writer::new(SinkWriter::Plain(buffered));
                 writer
                     .write_header(&header)
                     .context("failed to write CRAM header")?;
