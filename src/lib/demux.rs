@@ -136,6 +136,9 @@ pub struct DemuxArgs {
     pub threads: usize,
     /// `--reference`: an indexed FASTA for reading reference-compressed CRAM.
     pub reference: Option<PathBuf>,
+    /// `--skip-reference-check`: do not check `--reference` against CRAM `@SQ`
+    /// lines.
+    pub skip_reference_check: bool,
     /// The full command line, recorded in the output `@PG CL` provenance field.
     /// `None` (e.g. a library/test caller) omits the `CL` field.
     pub command_line: Option<String>,
@@ -1098,7 +1101,9 @@ fn run_engine(plan: &DemuxPlan, command_line: Option<&str>) -> Result<()> {
     let reference = plan
         .reference
         .as_deref()
-        .map(crate::reference::Reference::load)
+        .map(|path| {
+            crate::reference::Reference::open(path, !plan.skip_reference_check, plan.threads)
+        })
         .transpose()?;
     let mut reader =
         FragmentReader::open_with_reference(&plan.inputs, plan.per_record, reference.as_ref())?;
@@ -2791,6 +2796,7 @@ mod tests {
             compression: 5,
             threads: 8,
             reference: None,
+            skip_reference_check: false,
             command_line: None,
         }
     }

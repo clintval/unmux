@@ -1,6 +1,7 @@
 //! CRAM decoding against a `--reference` FASTA, holding only the reference sequences slices need.
 
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsString;
 use std::fs::File;
 use std::io::{self, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -8,6 +9,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Context, Result};
 use noodles::core::Region;
+use noodles::fasta::fai;
 use noodles::sam::alignment::record::cigar::op::Kind;
 use noodles::sam::alignment::record::data::field::Tag;
 use noodles::sam::alignment::record::MappingQuality;
@@ -16,27 +18,43 @@ use noodles::sam::alignment::{Record as _, RecordBuf};
 use noodles::{cram, fasta, sam};
 
 use crate::cram_raw::{self, EmbeddedReference, Recorder};
+use crate::reference_check::HeaderCheck;
 
 /// An indexed FASTA (with a `.fai`) that CRAM inputs decode against; clones share one reader.
 #[derive(Clone)]
 pub struct Reference {
     reader: Arc<Mutex<fasta::io::IndexedReader<fasta::io::BufReader<File>>>>,
+    check: Option<Arc<HeaderCheck>>,
 }
 
 impl Reference {
-    /// Open an indexed FASTA (`PATH.fai` alongside).
-    pub fn load(path: &Path) -> Result<Self> {
+    /// Open an indexed FASTA (`PATH.fai` alongside); `check` enables [`Self::check_header`].
+    pub fn open(path: &Path, check: bool, threads: usize) -> Result<Self> {
+        let context = || {
+            format!(
+                "failed to open the --reference FASTA (it needs a .fai index): {}",
+                path.display()
+            )
+        };
+        let mut index_path = OsString::from(path);
+        index_path.push(".fai");
+        let index = fai::fs::read(&index_path).with_context(context)?;
         let reader = fasta::io::indexed_reader::Builder::default()
+            .set_index(index.clone())
             .build_from_path(path)
-            .with_context(|| {
-                format!(
-                    "failed to open the --reference FASTA (it needs a .fai index): {}",
-                    path.display()
-                )
-            })?;
+            .with_context(context)?;
         Ok(Self {
             reader: Arc::new(Mutex::new(reader)),
+            check: check.then(|| Arc::new(HeaderCheck::new(path, index, threads))),
         })
+    }
+
+    /// Fail unless every `@SQ` contig is in this FASTA with the same `LN` and any `M5`.
+    pub fn check_header(&self, header: &sam::Header, input: &Path) -> Result<()> {
+        match &self.check {
+            Some(check) => check.check(header, input),
+            None => Ok(()),
+        }
     }
 
     /// Read one whole sequence by name into a buffer sized from the index.
@@ -770,7 +788,7 @@ mod tests {
     fn decode_all(name: &str) -> (Vec<RecordBuf>, usize) {
         decode_with(
             name,
-            Some(Reference::load(&test_data("contigs.fa")).unwrap()),
+            Some(Reference::open(&test_data("contigs.fa"), false, 1).unwrap()),
         )
     }
 
@@ -834,7 +852,7 @@ mod tests {
         let path = test_data("contigs.no-ref.multi-ref.cram");
         for reference in [
             None,
-            Some(Reference::load(&test_data("contigs.fa")).unwrap()),
+            Some(Reference::open(&test_data("contigs.fa"), false, 1).unwrap()),
         ] {
             let mut reader = cram::io::Reader::new(Recorder::new(File::open(&path).unwrap()));
             let header = reader.read_header().unwrap();
@@ -972,7 +990,7 @@ mod tests {
 
     #[test]
     fn test_retain_drops_unneeded_sequences_unless_keeping_the_rest_costs_more() {
-        let reference = Reference::load(&test_data("contigs.fa")).unwrap();
+        let reference = Reference::open(&test_data("contigs.fa"), false, 1).unwrap();
         let path = test_data("contigs.cram");
         let header = cram::io::Reader::new(Recorder::new(File::open(&path).unwrap()))
             .read_header()
@@ -1150,7 +1168,7 @@ mod tests {
         let path = test_data("contigs.cram");
         let mut reader = cram::io::Reader::new(Recorder::new(File::open(&path).unwrap()));
         let header = reader.read_header().unwrap();
-        let reference = Reference::load(&test_data("contigs.short.fa")).unwrap();
+        let reference = Reference::open(&test_data("contigs.short.fa"), false, 1).unwrap();
         let mut decoder = CramDecoder::new(Some(reference), &path, &header);
         let mut container = cram::io::reader::Container::default();
         read_container(&mut reader, &mut container).unwrap();
@@ -1168,7 +1186,7 @@ mod tests {
         let path = test_data("contigs.cram");
         let mut reader = cram::io::Reader::new(Recorder::new(File::open(&path).unwrap()));
         let header = reader.read_header().unwrap();
-        let reference = Reference::load(&test_data("contigs.short.fa")).unwrap();
+        let reference = Reference::open(&test_data("contigs.short.fa"), false, 1).unwrap();
         let mut decoder = CramDecoder::new(Some(reference), &path, &sam::Header::default());
         let mut container = cram::io::reader::Container::default();
         read_container(&mut reader, &mut container).unwrap();
@@ -1188,8 +1206,18 @@ mod tests {
     }
 
     #[test]
+    fn test_unchecked_reference_accepts_any_header() {
+        let text = "@SQ\tSN:chrM\tLN:1\tM5:x\n";
+        let header = sam::io::Reader::new(text.as_bytes()).read_header().unwrap();
+        Reference::open(&test_data("ref.fa"), false, 1)
+            .unwrap()
+            .check_header(&header, Path::new("in.cram"))
+            .unwrap();
+    }
+
+    #[test]
     fn test_reference_reads_a_whole_sequence() {
-        let reference = Reference::load(&test_data("contigs.fa")).unwrap();
+        let reference = Reference::open(&test_data("contigs.fa"), false, 1).unwrap();
         assert_eq!(reference.sequence(b"ctgB").unwrap().len(), 200);
         assert!(reference.sequence(b"missing").is_err());
     }

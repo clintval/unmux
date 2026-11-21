@@ -20,6 +20,7 @@ pub mod output;
 pub mod qc;
 pub mod readgroup;
 pub mod reference;
+mod reference_check;
 pub mod tags;
 pub mod writer;
 

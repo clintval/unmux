@@ -11,9 +11,9 @@
 //! and extraction consume. SAM/BAM/CRAM inputs carry their record tags through
 //! for the writer to re-emit. A single FASTX input is auto-detected as
 //! interleaved (two mates per fragment). An input path of `-` reads stdin (at
-//! most one). CRAM input decodes against a `--reference` FASTA when given; a
-//! CRAM that needs one and has none fails at its first reference-compressed
-//! slice.
+//! most one). CRAM input decodes against a `--reference` FASTA when given,
+//! which must match the CRAM's `@SQ` lines; a CRAM that needs one and has none
+//! fails at its first reference-compressed slice.
 
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read};
@@ -699,6 +699,9 @@ fn open_format_reader(
             let header = quietly(|| reader.read_header())
                 .ok_or_else(|| anyhow!("failed to read CRAM header: it is malformed"))?
                 .context("failed to read CRAM header")?;
+            if let Some(reference) = reference {
+                reference.check_header(&header, path)?;
+            }
             FormatReader::Cram {
                 reader,
                 decoder: CramDecoder::new(reference.cloned(), path, &header),
@@ -798,7 +801,7 @@ impl FragmentReader {
         Self::open_with_reference(paths, per_record, None)
     }
 
-    /// [`Self::open`], decoding CRAM input against `reference` when given.
+    /// [`Self::open`], checking and decoding CRAM input against `reference` when given.
     pub fn open_with_reference(
         paths: &[PathBuf],
         per_record: bool,
