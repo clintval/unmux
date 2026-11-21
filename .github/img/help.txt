@@ -328,6 +328,13 @@ Options:
           
             --metrics-summary %pool.unmux.summary.tsv
 
+      --metrics-unassigned <PATTERN>
+          Unassigned-reason metrics TSV with one row per reason seen.
+          
+          Only %pool is a valid path placeholder.
+          
+            --metrics-unassigned %pool.unmux.unassigned.tsv
+
       --require-samples-explain-all-tags
           Fail fast unless every tag of every group named by a --sample and
           --sample-sheet selector is claimed by some sample (no tag in
