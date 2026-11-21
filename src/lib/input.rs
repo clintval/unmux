@@ -14,10 +14,18 @@
 //! most one). CRAM input is read reference-free unless a `--reference` FASTA
 //! is given; without one, a reference-compressed CRAM (one carrying `@SQ`) is
 //! rejected.
+//!
+//! With decode threads to spare, BAM input inflates its BGZF blocks on a worker
+//! pool and CRAM input decodes its containers on one. BAM records leave the
+//! reader raw ([`PendingRecord::Bam`]) so their decode runs on the matcher
+//! workers, and an aligned BAM record passed through to BAM output is written
+//! back from those raw bytes without a decode and re-encode.
 
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read};
+use std::num::NonZero;
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 
 use std::collections::HashMap;
 
@@ -253,7 +261,168 @@ pub struct InputRecord {
     pub tags: Option<Data>,
     /// The untouched source record, kept only when the reader passes alignments
     /// through (see [`FragmentReader::keep_alignments`]).
-    pub alignment: Option<RecordBuf>,
+    pub alignment: Option<Alignment>,
+}
+
+/// A source alignment kept whole for pass-through output.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Alignment {
+    /// A decoded record, from SAM or CRAM input.
+    Record(RecordBuf),
+    /// A BAM record's raw bytes, `block_size` prefix included, from BAM input.
+    RawBam(Vec<u8>),
+}
+
+impl Alignment {
+    /// The alignment's `FLAG` field, read without a decode.
+    pub fn flags(&self) -> noodles::sam::alignment::record::Flags {
+        match self {
+            Alignment::Record(record) => record.flags(),
+            Alignment::RawBam(raw) => raw_bam_flags(raw),
+        }
+    }
+
+    /// This alignment as a decoded record, decoding raw BAM bytes on demand.
+    pub fn to_record_buf(&self) -> Result<std::borrow::Cow<'_, RecordBuf>> {
+        Ok(match self {
+            Alignment::Record(record) => std::borrow::Cow::Borrowed(record),
+            Alignment::RawBam(raw) => {
+                let mut record = RecordBuf::default();
+                decode_raw_bam(raw, &mut record)?;
+                std::borrow::Cow::Owned(record)
+            }
+        })
+    }
+
+    /// This alignment as an owned decoded record.
+    pub fn into_record_buf(self) -> Result<RecordBuf> {
+        match self {
+            Alignment::Record(record) => Ok(record),
+            Alignment::RawBam(raw) => {
+                let mut record = RecordBuf::default();
+                decode_raw_bam(&raw, &mut record)?;
+                Ok(record)
+            }
+        }
+    }
+}
+
+/// A placeholder header for BAM record decoding, which never consults it.
+static EMPTY_HEADER: LazyLock<sam::Header> = LazyLock::new(sam::Header::default);
+
+/// The size of a BAM record's fixed fields, after its `block_size` prefix.
+const BAM_FIXED_FIELDS: usize = 32;
+
+/// Decode raw BAM record bytes (`block_size` prefix included) into `record`.
+fn decode_raw_bam(raw: &[u8], record: &mut RecordBuf) -> Result<()> {
+    bam::io::Reader::from(raw)
+        .read_record_buf(&EMPTY_HEADER, record)
+        .context("failed to read BAM record")?;
+    Ok(())
+}
+
+/// Read one raw BAM record, `block_size` prefix included, or `None` at end of
+/// input. Rejects a record too short to hold its fixed fields and read name.
+fn read_raw_bam(reader: &mut dyn BufRead) -> Result<Option<Vec<u8>>> {
+    let mut size = [0u8; 4];
+    let mut filled = 0;
+    while filled < size.len() {
+        match reader.read(&mut size[filled..]) {
+            Ok(0) if filled == 0 => return Ok(None),
+            Ok(0) => bail!("failed to read BAM record: truncated block size"),
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e).context("failed to read BAM record"),
+        }
+    }
+    let block_size = u32::from_le_bytes(size) as usize;
+    let mut raw = vec![0u8; 4 + block_size];
+    raw[..4].copy_from_slice(&size);
+    reader
+        .read_exact(&mut raw[4..])
+        .context("failed to read BAM record")?;
+    let name_end = 4 + BAM_FIXED_FIELDS + raw.get(12).map_or(0, |&n| usize::from(n));
+    if block_size < BAM_FIXED_FIELDS || raw.len() < name_end {
+        bail!("failed to read BAM record: the record is truncated");
+    }
+    Ok(Some(raw))
+}
+
+/// The `FLAG` field of a raw BAM record.
+fn raw_bam_flags(raw: &[u8]) -> noodles::sam::alignment::record::Flags {
+    noodles::sam::alignment::record::Flags::from(u16::from_le_bytes([raw[18], raw[19]]))
+}
+
+/// The read name of a raw BAM record, empty for a missing (`*`) name.
+fn raw_bam_name(raw: &[u8]) -> &[u8] {
+    let len = usize::from(raw[12]);
+    let name = &raw[4 + BAM_FIXED_FIELDS..4 + BAM_FIXED_FIELDS + len.saturating_sub(1)];
+    if name == b"*" {
+        &[]
+    } else {
+        name
+    }
+}
+
+/// One input record as read, before decoding. A BAM record stays raw so its
+/// decode runs on the matcher workers instead of the single read-ahead thread.
+#[derive(Debug)]
+#[allow(clippy::large_enum_variant)] // boxing would add an allocation per FASTX record
+pub enum PendingRecord {
+    /// A record its reader already decoded (FASTX, SAM, CRAM).
+    Ready(InputRecord),
+    /// A raw BAM record, `block_size` prefix included.
+    Bam {
+        /// The record bytes.
+        raw: Vec<u8>,
+        /// Whether to keep the record whole for pass-through.
+        keep: bool,
+    },
+}
+
+impl PendingRecord {
+    /// The read name, as [`InputRecord::name`] will hold it.
+    fn name(&self) -> &[u8] {
+        match self {
+            PendingRecord::Ready(record) => &record.name,
+            PendingRecord::Bam { raw, .. } => raw_bam_name(raw),
+        }
+    }
+
+    /// Decode this record, reusing `scratch` for a BAM record's fields.
+    pub fn decode(self, scratch: &mut RecordBuf) -> Result<InputRecord> {
+        match self {
+            PendingRecord::Ready(record) => Ok(record),
+            PendingRecord::Bam { raw, keep } => {
+                decode_raw_bam(&raw, scratch)?;
+                let mut input = alignment_to_input(scratch);
+                if keep {
+                    input.alignment = Some(Alignment::RawBam(raw));
+                }
+                Ok(input)
+            }
+        }
+    }
+}
+
+/// A logical record as read, before its BAM records are decoded: one
+/// [`PendingRecord`] per segment, in the order [`Fragment::records`] holds them.
+#[derive(Debug)]
+pub struct PendingFragment {
+    /// The per-segment records.
+    pub records: SmallVec<[PendingRecord; 2]>,
+}
+
+impl PendingFragment {
+    /// Decode every segment into a [`Fragment`], reusing `scratch`.
+    pub fn decode(self, scratch: &mut RecordBuf) -> Result<Fragment> {
+        let records = self
+            .records
+            .into_iter()
+            .map(|record| record.decode(scratch))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Fragment { records })
+    }
 }
 
 /// A logical record assembled across all inputs: one [`InputRecord`] per
@@ -299,36 +468,24 @@ enum FormatReader {
         /// refills it each call).
         record: RecordBuf,
     },
-    /// BGZF-compressed BAM (the bam reader decodes BGZF internally).
+    /// BAM, its BGZF layer inflated by a worker pool when decode threads allow.
+    /// Records are read raw and decoded later by [`PendingRecord::decode`].
     Bam {
-        /// The record reader.
-        reader: bam::io::Reader<bgzf::io::Reader<Box<dyn BufRead + Send>>>,
-        /// The header, needed to decode each record.
+        /// The inflated stream, positioned after the header.
+        reader: Box<dyn BufRead + Send>,
+        /// The header.
         header: Box<sam::Header>,
-        /// The reused per-record parse buffer (`read_record_buf` clears and
-        /// refills it each call).
-        record: RecordBuf,
     },
-    /// Reference-free / unmapped CRAM. The records iterator borrows the reader
-    /// and header for its whole lifetime (so it cannot be stored), so we decode
-    /// one container at a time into `buffered` and serve from it, mirroring
-    /// `cram::io::reader::Slice::records`'s documented public loop.
+    /// CRAM, read reference-free unless a `--reference` is given. Containers
+    /// decode one at a time, or ahead on a worker pool, and their records are
+    /// served from `buffered`.
     Cram {
-        /// The record reader.
-        reader: cram::io::Reader<Box<dyn BufRead + Send>>,
-        /// The header, needed to decode each record.
+        /// The container source.
+        containers: CramContainers,
+        /// The header.
         header: Box<sam::Header>,
-        /// The reusable container buffer (one container of slices is decoded at
-        /// a time).
-        container: cram::io::reader::Container,
-        /// The `--reference` repository, or an empty one for reference-free
-        /// CRAM.
-        repository: fasta::Repository,
-        /// The decoded records of the current container, served one per
-        /// `read_next`.
+        /// The decoded records of the current container.
         buffered: std::vec::IntoIter<RecordBuf>,
-        /// Set at the EOF container, whose unread body would misparse as another.
-        eof: bool,
     },
     /// An empty input (zero records): no underlying reader. `read_next` always
     /// returns `None`. Used when the input has no content and no format could
@@ -364,27 +521,14 @@ fn ensure_reference_free_cram(header: &sam::Header, path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Decode the next CRAM container into owned records, or `None` at end of
-/// input. Mirrors the public loop documented on
-/// `cram::io::reader::Slice::records`: read a container, then for each slice
-/// decode its blocks and turn each raw record into an owned [`RecordBuf`]
-/// (shared with the BAM/SAM path). Buffers one container at a time (bounded by
-/// container size, not the whole file). Pinned to noodles-cram 0.92: the
-/// `Container`/`Slice` API and `Slice::records` signature could change on a
-/// bump.
-fn read_cram_container(
-    reader: &mut cram::io::Reader<Box<dyn BufRead + Send>>,
-    container: &mut cram::io::reader::Container,
+/// Decode one CRAM container into owned records, following the public loop
+/// documented on `cram::io::reader::Slice::records` (pinned to noodles-cram
+/// 0.92, whose `Container`/`Slice` API could change on a bump).
+fn decode_cram_container(
+    container: &cram::io::reader::Container,
     header: &sam::Header,
     repository: &fasta::Repository,
-) -> Result<Option<Vec<RecordBuf>>> {
-    if reader
-        .read_container(container)
-        .context("failed to read CRAM container")?
-        == 0
-    {
-        return Ok(None);
-    }
+) -> Result<Vec<RecordBuf>> {
     let compression_header = container
         .compression_header()
         .context("failed to read CRAM compression header")?;
@@ -414,7 +558,126 @@ fn read_cram_container(
             records.push(record);
         }
     }
-    Ok(Some(records))
+    Ok(records)
+}
+
+/// One container's decoded records (`None` at end of input), as a decode worker
+/// sends them back.
+type ContainerResult = crossbeam_channel::Receiver<Result<Option<Vec<RecordBuf>>>>;
+
+/// The stack for a CRAM decode thread; CRAM 3.1 codecs recurse deeply.
+const CRAM_DECODE_STACK: usize = 64 * 1024 * 1024;
+
+/// A CRAM container source: decoded inline, or ahead on a worker pool.
+enum CramContainers {
+    /// Read and decode each container on the calling thread.
+    Inline {
+        /// The record reader.
+        reader: cram::io::Reader<Box<dyn BufRead + Send>>,
+        /// The reusable container buffer.
+        container: cram::io::reader::Container,
+        /// The header, for decoding.
+        header: Box<sam::Header>,
+        /// The `--reference` repository, or an empty one.
+        repository: fasta::Repository,
+        /// Set at the EOF container, whose unread body would misparse as another.
+        eof: bool,
+    },
+    /// Decoded containers in input order: one receiver per container, queued
+    /// by a reader thread as it hands the container to a decode worker.
+    Pooled {
+        /// The per-container results, in input order.
+        order: crossbeam_channel::Receiver<ContainerResult>,
+    },
+}
+
+impl CramContainers {
+    /// Start decoding containers from `reader` on `workers` threads.
+    fn pooled(
+        mut reader: cram::io::Reader<Box<dyn BufRead + Send>>,
+        header: sam::Header,
+        repository: fasta::Repository,
+        workers: NonZero<usize>,
+    ) -> Result<Self> {
+        type Job = (
+            cram::io::reader::Container,
+            crossbeam_channel::Sender<Result<Option<Vec<RecordBuf>>>>,
+        );
+        let header = std::sync::Arc::new(header);
+        let (order_tx, order) = crossbeam_channel::bounded(2 * workers.get());
+        let (job_tx, job_rx) = crossbeam_channel::bounded::<Job>(workers.get());
+        for _ in 0..workers.get() {
+            let job_rx = job_rx.clone();
+            let header = std::sync::Arc::clone(&header);
+            let repository = repository.clone();
+            std::thread::Builder::new()
+                .stack_size(CRAM_DECODE_STACK)
+                .spawn(move || {
+                    for (container, result_tx) in job_rx {
+                        let decoded = decode_cram_container(&container, &header, &repository);
+                        let _ = result_tx.send(decoded.map(Some));
+                    }
+                })
+                .context("failed to start a CRAM decode thread")?;
+        }
+        std::thread::spawn(move || loop {
+            let (result_tx, result_rx) = crossbeam_channel::bounded(1);
+            if order_tx.send(result_rx).is_err() {
+                return;
+            }
+            let mut container = cram::io::reader::Container::default();
+            match reader.read_container(&mut container) {
+                Ok(0) => {
+                    let _ = result_tx.send(Ok(None));
+                    return;
+                }
+                Ok(_) => {
+                    if job_tx.send((container, result_tx)).is_err() {
+                        return;
+                    }
+                }
+                Err(e) => {
+                    let _ = result_tx.send(Err(e).context("failed to read CRAM container"));
+                    return;
+                }
+            }
+        });
+        Ok(CramContainers::Pooled { order })
+    }
+
+    /// The next container's records, or `None` at end of input.
+    fn next(&mut self) -> Result<Option<Vec<RecordBuf>>> {
+        match self {
+            CramContainers::Inline {
+                reader,
+                container,
+                header,
+                repository,
+                eof,
+            } => {
+                if *eof {
+                    return Ok(None);
+                }
+                if reader
+                    .read_container(container)
+                    .context("failed to read CRAM container")?
+                    == 0
+                {
+                    *eof = true;
+                    return Ok(None);
+                }
+                decode_cram_container(container, header, repository).map(Some)
+            }
+            CramContainers::Pooled { order } => {
+                let Ok(result) = order.recv() else {
+                    return Ok(None);
+                };
+                result
+                    .recv()
+                    .map_err(|_| anyhow!("a CRAM decode thread stopped unexpectedly"))?
+            }
+        }
+    }
 }
 
 impl FormatReader {
@@ -517,34 +780,14 @@ impl FormatReader {
                 }
                 return Ok(Some(alignment_to_input(record)));
             },
-            FormatReader::Bam {
-                reader,
-                header,
-                record,
-            } => loop {
-                if reader
-                    .read_record_buf(header, record)
-                    .context("failed to read BAM record")?
-                    == 0
-                {
-                    return Ok(None);
-                }
-                if keep {
-                    return Ok(Some(kept_alignment(std::mem::take(record))));
-                }
-                let flags = record.flags();
-                if flags.is_secondary() || flags.is_supplementary() {
-                    continue;
-                }
-                return Ok(Some(alignment_to_input(record)));
+            FormatReader::Bam { .. } => match self.read_pending(keep)? {
+                Some(pending) => pending.decode(&mut RecordBuf::default()).map(Some),
+                None => Ok(None),
             },
             FormatReader::Cram {
-                reader,
-                header,
-                container,
-                repository,
+                containers,
                 buffered,
-                eof,
+                ..
             } => loop {
                 if let Some(record) = buffered.next() {
                     if keep {
@@ -556,18 +799,28 @@ impl FormatReader {
                     }
                     return Ok(Some(alignment_to_input(&record)));
                 }
-                if *eof {
-                    return Ok(None);
-                }
-                match read_cram_container(reader, container, header, repository)? {
-                    None => {
-                        *eof = true;
-                        return Ok(None);
-                    }
+                match containers.next()? {
+                    None => return Ok(None),
                     Some(records) => *buffered = records.into_iter(),
                 }
             },
             FormatReader::Empty => Ok(None),
+        }
+    }
+
+    /// Read the next record, leaving a BAM record raw for a worker to decode.
+    fn read_pending(&mut self, keep: bool) -> Result<Option<PendingRecord>> {
+        let FormatReader::Bam { reader, .. } = self else {
+            return Ok(self.read_next(keep)?.map(PendingRecord::Ready));
+        };
+        loop {
+            let Some(raw) = read_raw_bam(reader.as_mut())? else {
+                return Ok(None);
+            };
+            let flags = raw_bam_flags(&raw);
+            if keep || !(flags.is_secondary() || flags.is_supplementary()) {
+                return Ok(Some(PendingRecord::Bam { raw, keep }));
+            }
         }
     }
 
@@ -692,7 +945,7 @@ fn alignment_to_input(record: &RecordBuf) -> InputRecord {
 /// that passes aligned records through unchanged.
 fn kept_alignment(record: RecordBuf) -> InputRecord {
     let mut input = alignment_to_input(&record);
-    input.alignment = Some(record);
+    input.alignment = Some(Alignment::Record(record));
     input
 }
 
@@ -731,10 +984,12 @@ fn text_bufread(reader: Box<dyn BufRead + Send>, gzipped: bool) -> Box<dyn BufRe
 
 /// Open one input by sniffing its format and dispatching to the matching
 /// noodles reader, returning the sniffed format alongside (so the caller can
-/// validate the input family and mirror the format to stdout output).
+/// validate the input family and mirror the format to stdout output). With
+/// `decode_threads`, BAM inflates and CRAM decodes on that many workers.
 fn open_format_reader(
     path: &Path,
     reference: Option<&fasta::Repository>,
+    decode_threads: Option<NonZero<usize>>,
 ) -> Result<(SniffedFormat, FormatReader)> {
     let (format, gzipped, reader) =
         sniff_input(path).with_context(|| format!("failed to read: {}", path.display()))?;
@@ -757,14 +1012,17 @@ fn open_format_reader(
             }
         }
         SniffedFormat::Bam => {
-            // BAM is BGZF, and the bam reader BGZF-decodes internally, so it
-            // takes the raw stream.
-            let mut reader = bam::io::Reader::new(reader);
+            let inflated: Box<dyn BufRead + Send> = match decode_threads {
+                Some(workers) => Box::new(bgzf::io::MultithreadedReader::with_worker_count(
+                    workers, reader,
+                )),
+                None => Box::new(bgzf::io::Reader::new(reader)),
+            };
+            let mut reader = bam::io::Reader::from(inflated);
             let header = reader.read_header().context("failed to read BAM header")?;
             FormatReader::Bam {
-                reader,
+                reader: reader.into_inner(),
                 header: Box::new(header),
-                record: RecordBuf::default(),
             }
         }
         SniffedFormat::Cram => {
@@ -775,13 +1033,23 @@ fn open_format_reader(
             if reference.is_none() {
                 ensure_reference_free_cram(&header, path)?;
             }
+            let repository = reference.cloned().unwrap_or_default();
+            let containers = match decode_threads {
+                Some(workers) => {
+                    CramContainers::pooled(reader, header.clone(), repository, workers)?
+                }
+                None => CramContainers::Inline {
+                    reader,
+                    container: cram::io::reader::Container::default(),
+                    header: Box::new(header.clone()),
+                    repository,
+                    eof: false,
+                },
+            };
             FormatReader::Cram {
-                reader,
+                containers,
                 header: Box::new(header),
-                container: cram::io::reader::Container::default(),
-                repository: reference.cloned().unwrap_or_default(),
                 buffered: Vec::new().into_iter(),
-                eof: false,
             }
         }
         SniffedFormat::Empty => FormatReader::Empty,
@@ -880,11 +1148,23 @@ impl FragmentReader {
         per_record: bool,
         reference: Option<&fasta::Repository>,
     ) -> Result<Self> {
+        Self::open_with_threads(paths, per_record, reference, 0)
+    }
+
+    /// [`Self::open_with_reference`], inflating BAM and decoding CRAM input on
+    /// `decode_threads` workers per input (zero decodes inline).
+    pub fn open_with_threads(
+        paths: &[PathBuf],
+        per_record: bool,
+        reference: Option<&fasta::Repository>,
+        decode_threads: usize,
+    ) -> Result<Self> {
+        let decode_threads = NonZero::new(decode_threads);
         let opened = paths
             .iter()
             .enumerate()
             .map(|(i, path)| {
-                open_format_reader(path, reference)
+                open_format_reader(path, reference, decode_threads)
                     .with_context(|| format!("failed to open input file {i} ({})", path.display()))
             })
             .collect::<Result<Vec<(SniffedFormat, FormatReader)>>>()?;
@@ -1011,29 +1291,38 @@ impl FragmentReader {
     /// input segments whose read names disagree, is a fail-fast error (both
     /// would silently mispair records).
     pub fn next_fragment(&mut self) -> Result<Option<Fragment>> {
+        match self.next_pending_fragment()? {
+            Some(pending) => pending.decode(&mut RecordBuf::default()).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// [`Self::next_fragment`], leaving BAM records raw so the caller can decode
+    /// them on another thread with [`PendingFragment::decode`].
+    pub fn next_pending_fragment(&mut self) -> Result<Option<PendingFragment>> {
         if self.readers.len() == 1 {
             let first = match self.next_from_first()? {
                 Some(record) => record,
                 None => return Ok(None),
             };
             if !self.interleaved {
-                return Ok(Some(Fragment {
-                    records: vec![first],
+                return Ok(Some(PendingFragment {
+                    records: smallvec::smallvec![first],
                 }));
             }
             let second = self.next_from_first()?.ok_or_else(|| {
                 anyhow!("interleaved input ended on an unpaired mate (odd number of records)")
             })?;
-            check_names_concord(&[&first, &second])?;
-            return Ok(Some(Fragment {
-                records: vec![first, second],
+            check_names_concord(&[first.name(), second.name()])?;
+            return Ok(Some(PendingFragment {
+                records: smallvec::smallvec![first, second],
             }));
         }
 
-        let mut maybe: SmallVec<[Option<InputRecord>; 4]> =
+        let mut maybe: SmallVec<[Option<PendingRecord>; 4]> =
             SmallVec::with_capacity(self.readers.len());
         for reader in &mut self.readers {
-            maybe.push(reader.read_next(self.keep_alignments)?);
+            maybe.push(reader.read_pending(self.keep_alignments)?);
         }
         let present = maybe.iter().filter(|record| record.is_some()).count();
         if present == 0 {
@@ -1042,18 +1331,23 @@ impl FragmentReader {
         if present != maybe.len() {
             bail!("input files have unequal record counts (one input ended before the others)");
         }
-        let records: Vec<InputRecord> = maybe.into_iter().map(Option::unwrap).collect();
-        check_names_concord(&records.iter().collect::<SmallVec<[&InputRecord; 4]>>())?;
-        Ok(Some(Fragment { records }))
+        let records: SmallVec<[PendingRecord; 2]> = maybe.into_iter().map(Option::unwrap).collect();
+        check_names_concord(
+            &records
+                .iter()
+                .map(PendingRecord::name)
+                .collect::<SmallVec<[&[u8]; 4]>>(),
+        )?;
+        Ok(Some(PendingFragment { records }))
     }
 
     /// The next record from the first input, draining any records buffered
     /// during interleaving detection before reading fresh ones.
-    fn next_from_first(&mut self) -> Result<Option<InputRecord>> {
+    fn next_from_first(&mut self) -> Result<Option<PendingRecord>> {
         if !self.buffered.is_empty() {
-            return Ok(Some(self.buffered.remove(0)));
+            return Ok(Some(PendingRecord::Ready(self.buffered.remove(0))));
         }
-        self.readers[0].read_next(self.keep_alignments)
+        self.readers[0].read_pending(self.keep_alignments)
     }
 }
 
@@ -1068,17 +1362,17 @@ fn mate_key(name: &[u8]) -> &[u8] {
 /// Verify every record in a fragment shares one mate-pairing key, catching
 /// mis-ordered or desynced inputs that would otherwise silently combine
 /// segments from different records.
-fn check_names_concord(records: &[&InputRecord]) -> Result<()> {
-    let Some((first, rest)) = records.split_first() else {
+fn check_names_concord(names: &[&[u8]]) -> Result<()> {
+    let Some((first, rest)) = names.split_first() else {
         return Ok(());
     };
-    let key = mate_key(&first.name);
+    let key = mate_key(first);
     for other in rest {
-        if mate_key(&other.name) != key {
+        if mate_key(other) != key {
             bail!(
                 "input segments have mismatched read names (`{}` vs `{}`); the inputs are not in the same record order",
-                String::from_utf8_lossy(&first.name),
-                String::from_utf8_lossy(&other.name)
+                String::from_utf8_lossy(first),
+                String::from_utf8_lossy(other)
             );
         }
     }
@@ -1681,8 +1975,73 @@ mod tests {
         let mut reader = FragmentReader::open(&[cram.path().to_path_buf()], true).unwrap();
         reader.keep_alignments();
         let fragment = reader.next_fragment().unwrap().unwrap();
-        let kept = fragment.records[0].alignment.as_ref().unwrap();
+        let Some(Alignment::Record(kept)) = fragment.records[0].alignment.as_ref() else {
+            panic!("the source record is kept");
+        };
         assert_eq!(kept.mapping_quality().map(u8::from), Some(0));
+    }
+
+    #[test]
+    fn test_pooled_cram_and_bam_decode_match_inline() {
+        use noodles::sam::alignment::io::Write as _;
+        use noodles::sam::alignment::record::Flags;
+        use noodles::sam::alignment::record_buf::{QualityScores, Sequence};
+
+        let header = sam::Header::default();
+        let records: Vec<RecordBuf> = (0..25_000)
+            .map(|i| {
+                let flags = if i % 5 == 0 {
+                    Flags::UNMAPPED | Flags::SECONDARY
+                } else {
+                    Flags::UNMAPPED
+                };
+                RecordBuf::builder()
+                    .set_name(format!("r{i}").into_bytes())
+                    .set_flags(flags)
+                    .set_sequence(Sequence::from(b"ACGTN"[..1 + i % 5].to_vec()))
+                    .set_quality_scores(QualityScores::from(vec![30; 1 + i % 5]))
+                    .build()
+            })
+            .collect();
+        let mut cram_bytes = Vec::new();
+        {
+            let mut writer = cram::io::Writer::new(&mut cram_bytes);
+            writer.write_header(&header).unwrap();
+            for record in &records {
+                writer.write_alignment_record(&header, record).unwrap();
+            }
+            writer.try_finish(&header).unwrap();
+        }
+        let mut bam_bytes = Vec::new();
+        {
+            let mut writer = bam::io::Writer::new(&mut bam_bytes);
+            writer.write_header(&header).unwrap();
+            for record in &records {
+                writer.write_alignment_record(&header, record).unwrap();
+            }
+            writer.try_finish().unwrap();
+        }
+        for bytes in [cram_bytes, bam_bytes] {
+            let file = temp_with(&bytes);
+            let read = |threads: usize, keep: bool| {
+                let path = file.path().to_path_buf();
+                let mut reader =
+                    FragmentReader::open_with_threads(&[path], true, None, threads).unwrap();
+                if keep {
+                    reader.keep_alignments();
+                }
+                let mut fragments = Vec::new();
+                while let Some(fragment) = reader.next_fragment().unwrap() {
+                    fragments.push(fragment);
+                }
+                fragments
+            };
+            for keep in [false, true] {
+                let inline = read(0, keep);
+                assert_eq!(inline.len(), if keep { 25_000 } else { 20_000 });
+                assert_eq!(read(3, keep), inline);
+            }
+        }
     }
 
     #[test]
@@ -1701,10 +2060,9 @@ mod tests {
         }
         let names: Vec<&[u8]> = kept.iter().map(|r| r.name.as_slice()).collect();
         assert_eq!(names, vec![&b"p1"[..], b"s1", b"x1"]);
-        let first = kept[0]
-            .alignment
-            .as_ref()
-            .expect("the source record is kept");
+        let Some(Alignment::Record(first)) = kept[0].alignment.as_ref() else {
+            panic!("the source record is kept");
+        };
         assert_eq!(first.alignment_start().map(usize::from), Some(10));
         assert_eq!(first.sequence().as_ref(), b"AACC");
         assert!(first.data().get(&Tag::new(b'N', b'M')).is_some());
