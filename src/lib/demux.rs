@@ -1077,7 +1077,7 @@ fn run_engine(plan: &DemuxPlan, command_line: Option<&str>) -> Result<()> {
     let reference = plan
         .reference
         .as_deref()
-        .map(crate::input::load_reference)
+        .map(crate::reference::Reference::load)
         .transpose()?;
     let mut reader =
         FragmentReader::open_with_reference(&plan.inputs, plan.per_record, reference.as_ref())?;

@@ -31,6 +31,8 @@ use noodles::sam::header::record::value::Map;
 use noodles::{bam, bgzf, cram, fasta, fastq, sam};
 use smallvec::SmallVec;
 
+use crate::reference::{CramDecoder, Reference};
+
 /// A format identified by sniffing the start of an input stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SniffedFormat {
@@ -321,9 +323,8 @@ enum FormatReader {
         /// The reusable container buffer (one container of slices is decoded at
         /// a time).
         container: cram::io::reader::Container,
-        /// The `--reference` repository, or an empty one for reference-free
-        /// CRAM.
-        repository: fasta::Repository,
+        /// Decodes each container, against the `--reference` FASTA when given.
+        decoder: CramDecoder,
         /// The decoded records of the current container, served one per
         /// `read_next`.
         buffered: std::vec::IntoIter<RecordBuf>,
@@ -365,18 +366,13 @@ fn ensure_reference_free_cram(header: &sam::Header, path: &Path) -> Result<()> {
 }
 
 /// Decode the next CRAM container into owned records, or `None` at end of
-/// input. Mirrors the public loop documented on
-/// `cram::io::reader::Slice::records`: read a container, then for each slice
-/// decode its blocks and turn each raw record into an owned [`RecordBuf`]
-/// (shared with the BAM/SAM path). Buffers one container at a time (bounded by
-/// container size, not the whole file). Pinned to noodles-cram 0.92: the
-/// `Container`/`Slice` API and `Slice::records` signature could change on a
-/// bump.
+/// input. Buffers one container at a time (bounded by container size, not the
+/// whole file).
 fn read_cram_container(
     reader: &mut cram::io::Reader<Box<dyn BufRead + Send>>,
     container: &mut cram::io::reader::Container,
     header: &sam::Header,
-    repository: &fasta::Repository,
+    decoder: &mut CramDecoder,
 ) -> Result<Option<Vec<RecordBuf>>> {
     if reader
         .read_container(container)
@@ -385,36 +381,7 @@ fn read_cram_container(
     {
         return Ok(None);
     }
-    let compression_header = container
-        .compression_header()
-        .context("failed to read CRAM compression header")?;
-    let mut records = Vec::new();
-    for slice in container.slices() {
-        let slice = slice.context("failed to read CRAM slice")?;
-        let (core, external) = slice
-            .decode_blocks()
-            .context("failed to decode CRAM slice blocks")?;
-        for record in slice
-            .records(
-                repository.clone(),
-                header,
-                &compression_header,
-                &core,
-                &external,
-            )
-            .context("failed to read CRAM slice records")?
-        {
-            let mut record = RecordBuf::try_from_alignment_record(header, &record)
-                .context("failed to convert CRAM record")?;
-            // CRAM stores no MAPQ for an unmapped record; noodles reports 255, htslib 0.
-            if record.flags().is_unmapped() && record.mapping_quality().is_none() {
-                *record.mapping_quality_mut() =
-                    noodles::sam::alignment::record::MappingQuality::new(0);
-            }
-            records.push(record);
-        }
-    }
-    Ok(Some(records))
+    decoder.decode(container, header).map(Some)
 }
 
 impl FormatReader {
@@ -542,7 +509,7 @@ impl FormatReader {
                 reader,
                 header,
                 container,
-                repository,
+                decoder,
                 buffered,
                 eof,
             } => loop {
@@ -559,7 +526,7 @@ impl FormatReader {
                 if *eof {
                     return Ok(None);
                 }
-                match read_cram_container(reader, container, header, repository)? {
+                match read_cram_container(reader, container, header, decoder)? {
                     None => {
                         *eof = true;
                         return Ok(None);
@@ -696,21 +663,6 @@ fn kept_alignment(record: RecordBuf) -> InputRecord {
     input
 }
 
-/// Load an indexed FASTA (`PATH.fai` alongside) as a CRAM reference repository.
-pub fn load_reference(path: &Path) -> Result<fasta::Repository> {
-    let reader = fasta::io::indexed_reader::Builder::default()
-        .build_from_path(path)
-        .with_context(|| {
-            format!(
-                "failed to open the --reference FASTA (it needs a .fai index): {}",
-                path.display()
-            )
-        })?;
-    Ok(fasta::Repository::new(
-        fasta::repository::adapters::IndexedReader::new(reader),
-    ))
-}
-
 /// Wrap a sniffed text stream for reading, transparently decoding a plain-gzip
 /// layer. BAM is BGZF and decodes inside its own reader, so it never passes
 /// through here.
@@ -734,7 +686,7 @@ fn text_bufread(reader: Box<dyn BufRead + Send>, gzipped: bool) -> Box<dyn BufRe
 /// validate the input family and mirror the format to stdout output).
 fn open_format_reader(
     path: &Path,
-    reference: Option<&fasta::Repository>,
+    reference: Option<&Reference>,
 ) -> Result<(SniffedFormat, FormatReader)> {
     let (format, gzipped, reader) =
         sniff_input(path).with_context(|| format!("failed to read: {}", path.display()))?;
@@ -779,7 +731,7 @@ fn open_format_reader(
                 reader,
                 header: Box::new(header),
                 container: cram::io::reader::Container::default(),
-                repository: reference.cloned().unwrap_or_default(),
+                decoder: CramDecoder::new(reference.cloned()),
                 buffered: Vec::new().into_iter(),
                 eof: false,
             }
@@ -878,7 +830,7 @@ impl FragmentReader {
     pub fn open_with_reference(
         paths: &[PathBuf],
         per_record: bool,
-        reference: Option<&fasta::Repository>,
+        reference: Option<&Reference>,
     ) -> Result<Self> {
         let opened = paths
             .iter()

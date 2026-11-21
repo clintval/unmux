@@ -18,6 +18,7 @@ pub mod metrics;
 pub mod output;
 pub mod qc;
 pub mod readgroup;
+pub mod reference;
 pub mod tags;
 pub mod writer;
 
