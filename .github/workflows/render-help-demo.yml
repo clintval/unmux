@@ -61,8 +61,8 @@ jobs:
         run: |
           set -euxo pipefail
           sudo apt-get update
-          # ttyd + ImageMagick, plus the shared libraries VHS's headless Chromium needs.
-          sudo apt-get install -y ttyd imagemagick \
+          # ttyd, zsh (the tape's shell) and ImageMagick, plus the shared libraries VHS's headless Chromium needs.
+          sudo apt-get install -y ttyd zsh imagemagick \
             fonts-liberation libnss3 libatk-bridge2.0-0 libatk1.0-0 libcups2 \
             libdrm2 libgbm1 libgtk-3-0 libasound2t64 libxkbcommon0 libxdamage1 \
             libxfixes3 libxrandr2 libxcomposite1 libpango-1.0-0

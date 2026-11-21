@@ -22,6 +22,7 @@ set -euo pipefail
 cd "$(dirname "$0")/../.."
 
 command -v vhs >/dev/null || { echo "error: 'vhs' not found on PATH" >&2; exit 1; }
+command -v zsh >/dev/null || { echo "error: 'zsh' not found on PATH (the VHS tape runs in zsh)" >&2; exit 1; }
 command -v ffmpeg >/dev/null || { echo "error: 'ffmpeg' not found on PATH" >&2; exit 1; }
 magick=$(command -v magick || command -v convert || true)
 [[ -n "$magick" ]] || { echo "error: ImageMagick (magick or convert) not found on PATH" >&2; exit 1; }
@@ -48,14 +49,16 @@ speed=180; fps=36; hold_top=1.5; hold_bottom=2.0
 help_lines=$(wc -l < "$img/help.txt")
 tall_h=$(( (help_lines + 4) * 26 + 2 * padding ))
 
-tape=$(mktemp -t help-tape.XXXXXX)
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+tape="$tmp/help.tape"
 # No `Set FontFamily`: VHS ships its own JetBrains Mono and uses it by default, which
 # renders identically everywhere. Naming a font explicitly makes VHS look for a system
 # install and fall back with broken cell metrics (wide gaps, wrapping) when absent.
 # The wrapper just dumps the real help into the tall terminal; $UNMUX_BIN and $@ are
 # escaped so the shell inside VHS expands them at run time.
 cat > "$tape" <<TAPE
-Output ${img}/.tall.gif
+Output "${tmp}/tall.gif"
 Set Shell "zsh"
 Set Theme "Dracula"
 Set FontSize ${font_size}
@@ -76,17 +79,20 @@ TAPE
 
 echo "Rendering ${help_lines}-line help in a ${width}x${tall_h} terminal..."
 vhs "$tape"
-rm -f "$tape"
 
 # The final frame holds the whole help; pull it out as a still.
-ffmpeg -y -i "${img}/.tall.gif" -vf reverse -frames:v 1 "${img}/.tall.png" 2>/dev/null
+ffmpeg -y -i "${tmp}/tall.gif" -vf reverse -frames:v 1 "${tmp}/tall.png" 2>/dev/null
 
 # Find the last row containing text so the pan ends exactly at the footer, whatever
 # the help length. Collapse each row to one pixel of average brightness after a
 # threshold, then take the last row that still has ink.
-bottom=$("$magick" "${img}/.tall.png" -colorspace Gray -threshold 18% -resize "1x${tall_h}!" -depth 8 txt:- \
+bottom=$("$magick" "${tmp}/tall.png" -colorspace Gray -threshold 18% -resize "1x${tall_h}!" -depth 8 txt:- \
   | sed -nE 's/^0,([0-9]+): \(([0-9]+).*/\1 \2/p' \
-  | awk '$2 > 1 { last = $1 } END { print last }')
+  | awk '$2 > 1 { last = $1 } END { print last + 0 }')
+if (( bottom < help_lines * 13 )); then
+  echo "error: the rendered help ends at row ${bottom} of ${tall_h}, expected about $(( help_lines * 24 )); check the VHS capture" >&2
+  exit 1
+fi
 content_bottom=$(( bottom + 30 ))
 maxy=$(( content_bottom - viewport_h ))
 (( maxy < 0 )) && maxy=0
@@ -96,9 +102,14 @@ total=$(awk "BEGIN { print ${hold_top} + ${pan_dur} + ${hold_bottom} }")
 
 echo "Panning ${width}x${viewport_h} down ${maxy}px over ${pan_dur}s; encoding AVIF..."
 # 8x oversample -> tmix averages 3 sub-frames into motion blur -> fps output. Keep speed/fps a whole number of pixels per frame, or the AV1 file grows several fold.
-ffmpeg -y -framerate $((fps * 8)) -loop 1 -i "${img}/.tall.png" -t "$total" \
+ffmpeg -y -framerate $((fps * 8)) -loop 1 -i "${tmp}/tall.png" -t "$total" \
   -vf "crop=${width}:${viewport_h}:0:max(0\,min(${maxy}\,(t-${hold_top})*${speed})),tmix=frames=3:weights='1 1 1',fps=${fps},format=yuv420p" \
   -c:v libsvtav1 -crf 32 -preset 6 -g 300 -loop 0 "${img}/help.avif"
 
-rm -f "${img}/.tall.gif" "${img}/.tall.png"
+duration=$({ ffmpeg -hide_banner -i "${img}/help.avif" 2>&1 || true; } \
+  | awk -F'[:, ]+' '/Duration:/ { print $3 * 3600 + $4 * 60 + $5; exit }')
+if awk "BEGIN { exit !(${duration:-0} + 0.5 < ${total}) }"; then
+  echo "error: ${img}/help.avif lasts ${duration:-0}s but the pan needs ${total}s" >&2
+  exit 1
+fi
 echo "Wrote ${img}/help.avif ($(du -h "${img}/help.avif" | cut -f1)) and ${img}/help.txt"
