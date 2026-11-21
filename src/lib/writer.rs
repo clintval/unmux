@@ -924,7 +924,7 @@ pub fn encode_fragment(
             write_alignments(&mut writer, header, reads)?;
             writer.into_inner()
         }
-        OutputFormat::Bam => match raw_bam_records(reads) {
+        OutputFormat::Bam => match raw_bam_records(header, reads) {
             Some(raw) => raw,
             None => {
                 let mut writer = bam::io::Writer::from(Vec::new());
@@ -938,16 +938,28 @@ pub fn encode_fragment(
     })
 }
 
-/// The concatenated raw bytes of `reads` when every one is a raw BAM alignment,
-/// which BAM output writes back verbatim.
-fn raw_bam_records(reads: &[OutputRead]) -> Option<Vec<u8>> {
+/// The concatenated raw bytes of `reads` when every one is a raw BAM alignment
+/// whose reference ids `header` declares, which BAM output writes back verbatim.
+fn raw_bam_records(header: &sam::Header, reads: &[OutputRead]) -> Option<Vec<u8>> {
     if reads.len() > 2 {
         return None;
     }
+    let references = header.reference_sequences().len();
+    let declared = |raw: &[u8], at: usize| {
+        let id = raw
+            .get(at..at + 4)
+            .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+        id == Some(-1)
+            || id
+                .and_then(|id| usize::try_from(id).ok())
+                .is_some_and(|id| id < references)
+    };
     let mut bytes = Vec::new();
     for read in reads {
         match read.alignment {
-            Some(Alignment::RawBam(raw)) => bytes.extend_from_slice(raw),
+            Some(Alignment::RawBam(raw)) if declared(raw, 4) && declared(raw, 24) => {
+                bytes.extend_from_slice(raw);
+            }
             _ => return None,
         }
     }
@@ -1487,5 +1499,42 @@ mod tests {
         let mut back = RecordBuf::default();
         reader.read_record_buf(&read_header, &mut back).unwrap();
         assert_eq!(back, record);
+    }
+
+    #[test]
+    fn test_raw_bam_with_an_undeclared_reference_id_fails_like_the_encoder() {
+        use noodles::sam::alignment::io::Write as _;
+        let text = b"@SQ\tSN:chr1\tLN:100\n\
+                     r1\t99\tchr1\t10\t60\t4M\t=\t40\t34\tACGT\tABCD\tRG:Z:x\n";
+        let mut reader = sam::io::Reader::new(&text[..]);
+        let header = reader.read_header().unwrap();
+        let mut record = RecordBuf::default();
+        reader.read_record_buf(&header, &mut record).unwrap();
+        let mut writer = bam::io::Writer::from(Vec::new());
+        writer.write_alignment_record(&header, &record).unwrap();
+        let raw = writer.into_inner();
+        let encode = |raw: Vec<u8>| {
+            let alignment = Alignment::RawBam(raw);
+            let read = OutputRead {
+                name: b"",
+                bases: b"",
+                quals: None,
+                tags: None,
+                read_group: None,
+                alignment: Some(&alignment),
+            };
+            encode_fragment(OutputFormat::Bam, &header, &[read]).map_err(|e| format!("{e:#}"))
+        };
+        assert_eq!(encode(raw.clone()).unwrap(), raw);
+        for (at, id, want) in [
+            (4, 7, "invalid reference sequence ID"),
+            (24, 9, "invalid mate reference sequence ID"),
+            (4, -2, "invalid reference sequence ID"),
+        ] {
+            let mut bad = raw.clone();
+            bad[at..at + 4].copy_from_slice(&i32::to_le_bytes(id));
+            let err = encode(bad).unwrap_err();
+            assert!(err.contains(want), "{err}");
+        }
     }
 }
