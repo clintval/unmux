@@ -324,6 +324,52 @@ fn decode_raw_bam(raw: &[u8], record: &mut RecordBuf) -> Result<()> {
     Ok(())
 }
 
+/// A multithreaded BGZF reader that reports, at end of input, a read error its
+/// reader thread hit (a truncated or unreadable frame).
+struct CheckedBgzf {
+    inner: bgzf::io::MultithreadedReader<Box<dyn BufRead + Send>>,
+    finished: bool,
+}
+
+impl CheckedBgzf {
+    fn new(workers: NonZero<usize>, reader: Box<dyn BufRead + Send>) -> Self {
+        Self {
+            inner: bgzf::io::MultithreadedReader::with_worker_count(workers, reader),
+            finished: false,
+        }
+    }
+}
+
+impl Read for CheckedBgzf {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let available = self.fill_buf()?;
+        let n = available.len().min(buf.len());
+        buf[..n].copy_from_slice(&available[..n]);
+        self.consume(n);
+        Ok(n)
+    }
+}
+
+impl BufRead for CheckedBgzf {
+    fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+        if self.finished {
+            return Ok(&[]);
+        }
+        if self.inner.fill_buf()?.is_empty() {
+            self.finished = true;
+            self.inner.finish()?;
+            return Ok(&[]);
+        }
+        self.inner.fill_buf()
+    }
+
+    fn consume(&mut self, amt: usize) {
+        if !self.finished {
+            self.inner.consume(amt);
+        }
+    }
+}
+
 /// Read one raw BAM record, `block_size` prefix included, or `None` at end of
 /// input. Rejects a record too short to hold its fixed fields and read name.
 fn read_raw_bam(reader: &mut dyn BufRead) -> Result<Option<Vec<u8>>> {
@@ -943,9 +989,7 @@ fn open_format_reader(
         }
         SniffedFormat::Bam => {
             let inflated: Box<dyn BufRead + Send> = match decode_threads {
-                Some(workers) => Box::new(bgzf::io::MultithreadedReader::with_worker_count(
-                    workers, reader,
-                )),
+                Some(workers) => Box::new(CheckedBgzf::new(workers, reader)),
                 None => Box::new(bgzf::io::Reader::new(reader)),
             };
             let mut reader = bam::io::Reader::from(inflated);
