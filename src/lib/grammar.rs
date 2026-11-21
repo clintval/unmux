@@ -556,6 +556,9 @@ pub struct DemuxPlan {
     pub threads: usize,
     /// `--reference`: an indexed FASTA for reference-compressed CRAM input.
     pub reference: Option<PathBuf>,
+    /// `--skip-reference-check`: do not check `--reference` against CRAM `@SQ`
+    /// lines.
+    pub skip_reference_check: bool,
     /// `--unmapped-output`: write an aligned `@RG` split unmapped.
     pub unmapped_output: bool,
 }
@@ -623,6 +626,7 @@ pub fn parse_demux(args: &DemuxArgs) -> Result<DemuxPlan> {
         compression: args.compression,
         threads: args.threads,
         reference: args.reference.clone(),
+        skip_reference_check: args.skip_reference_check,
         unmapped_output: args.unmapped_output,
     };
     validate_plan(&plan)?;
@@ -2294,6 +2298,7 @@ mod tests {
             compression: 5,
             threads: 8,
             reference: None,
+            skip_reference_check: false,
             unmapped_output: false,
             command_line: None,
         }

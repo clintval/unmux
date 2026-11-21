@@ -2299,6 +2299,7 @@ dependencies = [
  "flate2",
  "futures",
  "log",
+ "md-5",
  "memchr",
  "mimalloc",
  "noodles",

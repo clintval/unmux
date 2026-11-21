@@ -58,6 +58,7 @@ csv = "1"
 env_logger = "0.11"
 flate2 = { version = "1", features = ["zlib-ng"] }
 log = "0.4"
+md-5 = "0.10"
 memchr = "2"
 mimalloc = "0.1"
 noodles = { version = "0.109", features = ["bam", "bgzf", "core", "cram", "fasta", "fastq", "sam"] }
