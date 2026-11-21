@@ -134,8 +134,8 @@ Feature: Split an aligned input by read group, keeping alignments
     And the test file "ref.fa.fai"
     When I run `unmux aligned.htslib-<version>.cram --reference ref.fa --group rg=@RG --sample-from-group rg --out out/%sample.sam`
     Then the exit code is 0
-    And the records of "out/rg1.sam" are the "RG:Z:rg1" records of the test file "aligned.sam"
-    And the records of "out/rg2.sam" are the "RG:Z:rg2" records of the test file "aligned.sam"
+    And the records of "out/rg1.sam" are the "RG:Z:rg1" records of the test file "aligned.htslib.sam"
+    And the records of "out/rg2.sam" are the "RG:Z:rg2" records of the test file "aligned.htslib.sam"
     And the file "out/rg1.sam" contains "SN:chr1"
 
     Examples:
@@ -149,12 +149,27 @@ Feature: Split an aligned input by read group, keeping alignments
     And the test file "ref.fa.fai"
     When I run `unmux - --reference ref.fa --group rg=@RG --sample-from-group rg --out out/%sample.bam` with "aligned.htslib-<version>.cram" on stdin
     Then the exit code is 0
-    And the records of "out/rg2.bam" are the "RG:Z:rg2" records of the test file "aligned.sam"
+    And the records of "out/rg2.bam" are the "RG:Z:rg2" records of the test file "aligned.htslib.sam"
 
     Examples:
       | version |
       | 3.0     |
       | 3.1     |
+
+  Scenario Outline: a CRAM split matches htslib's decode, MD and NM tags included, from <file>
+    Given the test file "<file>"
+    And the test file "contigs.fa"
+    And the test file "contigs.fa.fai"
+    When I run `unmux <file> --reference contigs.fa --group sm=@RG::SM --sample-from-group sm --out out/%sample.sam --unassigned out/unassigned.sam`
+    Then the exit code is 0
+    And the records of "out/sA.sam" are the "RG:Z:rg1" records of the test file "contigs.htslib.sam"
+    And the records of "out/sB.sam" are the "RG:Z:rg2" records of the test file "contigs.htslib.sam"
+    And the file "out/unassigned.sam" contains "RG:Z:ghost	MD:Z:20	NM:i:0"
+
+    Examples:
+      | file                   |
+      | contigs.cram           |
+      | contigs.multi-ref.cram |
 
   Scenario: a reference-compressed CRAM input needs --reference
     Given the test file "aligned.htslib-3.1.cram"

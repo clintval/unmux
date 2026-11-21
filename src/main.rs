@@ -463,7 +463,8 @@ struct DemuxCmd {
 
     /// Indexed FASTA (with a `.fai`) to read a reference-compressed CRAM.
     ///
-    /// CRAM input does not regenerate `NM`/`MD` tags it did not store.
+    /// Records decode as samtools decodes them, including the `MD` and `NM`
+    /// tags the CRAM left out for the reference to restore.
     ///
     ///   --reference ref.fa   decode CRAM input against ref.fa
     #[arg(long = "reference", value_name = "FASTA", verbatim_doc_comment)]

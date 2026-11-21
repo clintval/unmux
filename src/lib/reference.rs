@@ -8,7 +8,10 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Context, Result};
 use noodles::core::Region;
+use noodles::sam::alignment::record::cigar::op::Kind;
+use noodles::sam::alignment::record::data::field::Tag;
 use noodles::sam::alignment::record::MappingQuality;
+use noodles::sam::alignment::record_buf::data::field::Value;
 use noodles::sam::alignment::{Record as _, RecordBuf};
 use noodles::{cram, fasta, sam};
 
@@ -173,8 +176,9 @@ impl CramDecoder {
             };
             match decoded {
                 Ok(records) => {
+                    let cached = |name: &[u8]| self.repository.get(name).and_then(Result::ok);
                     for record in &records {
-                        out.push(owned(header, record)?);
+                        out.push(owned(header, record, &cached)?);
                     }
                 }
                 Err(error) if is_second_sequence(&error) => {
@@ -234,8 +238,13 @@ where
 
     let mut slots: Vec<Option<RecordBuf>> = vec![None; count];
     for (i, name) in names.iter().enumerate() {
-        let records =
-            decode(pass(Some(name.clone()))).context("failed to read CRAM slice records")?;
+        let repository = pass(Some(name.clone()));
+        let records = decode(repository.clone()).context("failed to read CRAM slice records")?;
+        let loaded = |on: &[u8]| {
+            (on == name.as_slice())
+                .then(|| repository.get(on).and_then(Result::ok))
+                .flatten()
+        };
         for (slot, record) in slots.iter_mut().zip(&records) {
             if slot.is_some() {
                 continue;
@@ -246,7 +255,7 @@ where
                 _ => i == 0,
             };
             if wanted {
-                *slot = Some(owned(header, record)?);
+                *slot = Some(owned(header, record, &loaded)?);
             }
         }
     }
@@ -273,15 +282,125 @@ fn sequence_name<'h>(
         .map(|(name, _)| name.as_ref()))
 }
 
-/// Convert a decoded CRAM record into an owned record.
-fn owned(header: &sam::Header, record: &cram::Record<'_>) -> Result<RecordBuf> {
+/// The loaded reference sequence a record decoded against, looked up by name.
+type Loaded<'a> = &'a dyn Fn(&[u8]) -> Option<Arc<fasta::record::Sequence>>;
+
+/// Convert a decoded CRAM record into an owned record, as htslib would decode it.
+fn owned(header: &sam::Header, record: &cram::Record<'_>, loaded: Loaded<'_>) -> Result<RecordBuf> {
     let mut record = RecordBuf::try_from_alignment_record(header, record)
         .context("failed to convert CRAM record")?;
     // CRAM stores no MAPQ for an unmapped record; noodles reports 255, htslib 0.
     if record.flags().is_unmapped() && record.mapping_quality().is_none() {
         *record.mapping_quality_mut() = MappingQuality::new(0);
     }
+    record.sequence_mut().as_mut().make_ascii_uppercase();
+    regenerate_md_nm(header, &mut record, loaded);
     Ok(record)
+}
+
+/// Add the MD and NM tags htslib regenerates when it decodes a mapped record against its reference.
+fn regenerate_md_nm(header: &sam::Header, record: &mut RecordBuf, loaded: Loaded<'_>) {
+    let skip = take_cram_flags(record);
+    let want_md = skip & 1 == 0 && record.data().get(&Tag::MISMATCHED_POSITIONS).is_none();
+    let want_nm = skip & 2 == 0 && record.data().get(&Tag::EDIT_DISTANCE).is_none();
+    if !(want_md || want_nm) || record.flags().is_unmapped() || record.sequence().is_empty() {
+        return;
+    }
+    let Some(sequence) = record
+        .reference_sequence_id()
+        .and_then(|id| header.reference_sequences().get_index(id))
+        .and_then(|(name, _)| loaded(name))
+    else {
+        return;
+    };
+    if let Some((md, nm)) = md_nm(record, (*sequence).as_ref()) {
+        add_md_nm(header, record, want_md.then_some(md), want_nm.then_some(nm));
+    }
+}
+
+/// Remove htslib's private `cF` tag, returning its bits: 1 keeps MD absent, 2 keeps NM absent.
+fn take_cram_flags(record: &mut RecordBuf) -> i64 {
+    record
+        .data_mut()
+        .remove(&Tag::new(b'c', b'F'))
+        .and_then(|(_, value)| value.as_int())
+        .unwrap_or(0)
+}
+
+/// The MD string and edit distance htslib derives from a record's CIGAR, SEQ and reference.
+fn md_nm(record: &RecordBuf, reference: &[u8]) -> Option<(Vec<u8>, u32)> {
+    let read = record.sequence().as_ref();
+    let mut ref_pos = usize::from(record.alignment_start()?) - 1;
+    let mut read_pos = 0;
+    let mut md = Vec::new();
+    let mut nm = 0u32;
+    let mut run = 0u32;
+    for op in record.cigar().as_ref() {
+        let len = op.len();
+        match op.kind() {
+            Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch => {
+                for _ in 0..len {
+                    let base = reference.get(ref_pos)?.to_ascii_uppercase();
+                    if read.get(read_pos)?.to_ascii_uppercase() != base || base == b'N' {
+                        md.extend_from_slice(run.to_string().as_bytes());
+                        md.push(base);
+                        run = 0;
+                        nm += 1;
+                    } else {
+                        run += 1;
+                    }
+                    ref_pos += 1;
+                    read_pos += 1;
+                }
+            }
+            Kind::Deletion => {
+                let bases = reference.get(ref_pos..ref_pos + len)?;
+                md.extend_from_slice(run.to_string().as_bytes());
+                md.push(b'^');
+                md.extend(bases.iter().map(u8::to_ascii_uppercase));
+                run = 0;
+                nm += u32::try_from(len).ok()?;
+                ref_pos += len;
+            }
+            Kind::Insertion => {
+                nm += u32::try_from(len).ok()?;
+                read_pos += len;
+            }
+            Kind::SoftClip => read_pos += len,
+            Kind::Skip => ref_pos += len,
+            Kind::HardClip | Kind::Pad => {}
+        }
+    }
+    md.extend_from_slice(run.to_string().as_bytes());
+    Some((md, nm))
+}
+
+/// Add MD and NM where htslib does: after the stored tags, ahead of a declared `RG:Z`.
+fn add_md_nm(header: &sam::Header, record: &mut RecordBuf, md: Option<Vec<u8>>, nm: Option<u32>) {
+    let mut fields: Vec<(Tag, Value)> = record
+        .data()
+        .iter()
+        .map(|(tag, value)| (tag, value.clone()))
+        .collect();
+    let at = match fields.last() {
+        Some((tag, Value::String(id)))
+            if *tag == Tag::READ_GROUP && header.read_groups().contains_key(id.as_slice()) =>
+        {
+            fields.len() - 1
+        }
+        _ => fields.len(),
+    };
+    let md = md.map(|md| (Tag::MISMATCHED_POSITIONS, Value::String(md.into())));
+    let nm = nm.map(|nm| {
+        let value = match (u8::try_from(nm), u16::try_from(nm)) {
+            (Ok(nm), _) => Value::UInt8(nm),
+            (_, Ok(nm)) => Value::UInt16(nm),
+            _ => Value::UInt32(nm),
+        };
+        (Tag::EDIT_DISTANCE, value)
+    });
+    fields.splice(at..at, md.into_iter().chain(nm));
+    *record.data_mut() = fields.into_iter().collect();
 }
 
 #[cfg(test)]
@@ -324,6 +443,121 @@ mod tests {
         let (multi, most) = decode_all("contigs.multi-ref.cram");
         assert_eq!(multi, single);
         assert_eq!(most, 0);
+    }
+
+    /// The reference behind the MD/NM tests: an N run at 5-6 and lowercase bases at 11-14.
+    const CONTIG: &[u8] = b"ACGTNNACGTacgtACGTACGTACGTACGT";
+
+    /// Parse one SAM record against a header declaring contig `c` and read group `rg1`.
+    fn parse(line: &str) -> (sam::Header, RecordBuf) {
+        let text = format!("@SQ\tSN:c\tLN:30\n@RG\tID:rg1\n{line}\n");
+        let mut reader = sam::io::Reader::new(text.as_bytes());
+        let header = reader.read_header().unwrap();
+        let mut record = RecordBuf::default();
+        reader.read_record_buf(&header, &mut record).unwrap();
+        (header, record)
+    }
+
+    /// Regenerate MD/NM on a SAM record and render its tags as SAM text.
+    fn regenerated(line: &str) -> String {
+        use noodles::sam::alignment::io::Write as _;
+        let (header, mut record) = parse(line);
+        let contig = Arc::new(fasta::record::Sequence::from(CONTIG.to_vec()));
+        regenerate_md_nm(&header, &mut record, &|_: &[u8]| Some(Arc::clone(&contig)));
+        let mut out = Vec::new();
+        sam::io::Writer::new(&mut out)
+            .write_alignment_record(&header, &record)
+            .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        text.trim_end()
+            .split('\t')
+            .skip(11)
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    #[test]
+    fn test_md_nm_count_reference_n_as_a_mismatch() {
+        assert_eq!(
+            regenerated("r\t0\tc\t3\t60\t6M\t*\t0\t0\tGTNNAC\t*\tRG:Z:rg1"),
+            "MD:Z:2N0N2 NM:i:2 RG:Z:rg1"
+        );
+        assert_eq!(
+            regenerated("r\t0\tc\t1\t60\t6M\t*\t0\t0\tANGTAA\t*"),
+            "MD:Z:1C2N0N0 NM:i:3"
+        );
+    }
+
+    #[test]
+    fn test_md_nm_follow_indels_clips_and_skips() {
+        assert_eq!(
+            regenerated("r\t0\tc\t1\t60\t2S3M2I2M2D2M3N2M\t*\t0\t0\tTTACGGGTNCGGT\t*"),
+            "MD:Z:4N0^NA4 NM:i:5"
+        );
+        assert_eq!(
+            regenerated("r\t0\tc\t7\t60\t3H4M\t*\t0\t0\tACGT\t*"),
+            "MD:Z:4 NM:i:0"
+        );
+    }
+
+    #[test]
+    fn test_md_nm_compare_against_an_uppercased_reference() {
+        assert_eq!(
+            regenerated("r\t0\tc\t9\t60\t6M\t*\t0\t0\tGTACTA\t*"),
+            "MD:Z:4G0T0 NM:i:2"
+        );
+        assert_eq!(
+            regenerated("r\t0\tc\t10\t60\t3D2M\t*\t0\t0\tGT\t*"),
+            "MD:Z:0^TAC2 NM:i:3"
+        );
+    }
+
+    #[test]
+    fn test_md_nm_skip_unmapped_and_sequenceless_records() {
+        assert_eq!(regenerated("r\t4\tc\t1\t0\t*\t*\t0\t0\tACGT\t*"), "");
+        assert_eq!(regenerated("r\t256\tc\t1\t0\t4M\t*\t0\t0\t*\t*"), "");
+    }
+
+    #[test]
+    fn test_md_nm_keep_stored_tags_and_add_the_missing_one() {
+        assert_eq!(
+            regenerated("r\t0\tc\t1\t60\t4M\t*\t0\t0\tACGA\t*\tMD:Z:9\tRG:Z:rg1"),
+            "MD:Z:9 NM:i:1 RG:Z:rg1"
+        );
+        assert_eq!(
+            regenerated("r\t0\tc\t1\t60\t4M\t*\t0\t0\tACGA\t*\tNM:i:7"),
+            "NM:i:7 MD:Z:3T0"
+        );
+    }
+
+    #[test]
+    fn test_md_nm_follow_an_undeclared_read_group() {
+        assert_eq!(
+            regenerated("r\t0\tc\t1\t60\t4M\t*\t0\t0\tACGT\t*\tXA:Z:x\tRG:Z:ghost"),
+            "XA:Z:x RG:Z:ghost MD:Z:4 NM:i:0"
+        );
+    }
+
+    #[test]
+    fn test_cram_flags_tag_suppresses_md_or_nm_and_is_removed() {
+        let line = "r\t0\tc\t1\t60\t4M\t*\t0\t0\tACGT\t*\tcF:i:1\tRG:Z:rg1";
+        assert_eq!(regenerated(line), "NM:i:0 RG:Z:rg1");
+        let line = "r\t0\tc\t1\t60\t4M\t*\t0\t0\tACGT\t*\tcF:i:3";
+        assert_eq!(regenerated(line), "");
+    }
+
+    #[test]
+    fn test_nm_takes_the_narrowest_unsigned_type() {
+        let (header, mut record) = parse("r\t0\tc\t1\t60\t4M\t*\t0\t0\tACGT\t*");
+        for (nm, want) in [
+            (255, Value::UInt8(255)),
+            (256, Value::UInt16(256)),
+            (70_000, Value::UInt32(70_000)),
+        ] {
+            record.data_mut().clear();
+            add_md_nm(&header, &mut record, None, Some(nm));
+            assert_eq!(record.data().get(&Tag::EDIT_DISTANCE), Some(&want));
+        }
     }
 
     #[test]
