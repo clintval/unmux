@@ -11,9 +11,9 @@
 //! and extraction consume. SAM/BAM/CRAM inputs carry their record tags through
 //! for the writer to re-emit. A single FASTX input is auto-detected as
 //! interleaved (two mates per fragment). An input path of `-` reads stdin (at
-//! most one). CRAM input is read reference-free (unmapped); a
-//! reference-compressed CRAM (one carrying `@SQ`) is rejected, since no
-//! reference is configured.
+//! most one). CRAM input is read reference-free unless a `--reference` FASTA
+//! is given; without one, a reference-compressed CRAM (one carrying `@SQ`) is
+//! rejected.
 
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read};
@@ -251,6 +251,9 @@ pub struct InputRecord {
     /// Carried SAM tags from an alignment input (`None` for FASTX), re-emitted
     /// to the output record.
     pub tags: Option<Data>,
+    /// The untouched source record, kept only when the reader passes alignments
+    /// through (see [`FragmentReader::keep_alignments`]).
+    pub alignment: Option<RecordBuf>,
 }
 
 /// A logical record assembled across all inputs: one [`InputRecord`] per
@@ -318,12 +321,14 @@ enum FormatReader {
         /// The reusable container buffer (one container of slices is decoded at
         /// a time).
         container: cram::io::reader::Container,
-        /// The empty reference repository (reference-free CRAM never consults
-        /// it).
+        /// The `--reference` repository, or an empty one for reference-free
+        /// CRAM.
         repository: fasta::Repository,
         /// The decoded records of the current container, served one per
         /// `read_next`.
         buffered: std::vec::IntoIter<RecordBuf>,
+        /// Set at the EOF container, whose unread body would misparse as another.
+        eof: bool,
     },
     /// An empty input (zero records): no underlying reader. `read_next` always
     /// returns `None`. Used when the input has no content and no format could
@@ -352,7 +357,7 @@ fn ensure_reference_free_cram(header: &sam::Header, path: &Path) -> Result<()> {
     if references > 0 {
         bail!(
             "CRAM input is reference-compressed (carries {references} @SQ reference sequence(s)); \
-             unmux demux expects unmapped/reference-free CRAM: {}",
+             pass its FASTA with --reference: {}",
             path.display()
         );
     }
@@ -399,18 +404,24 @@ fn read_cram_container(
             )
             .context("failed to read CRAM slice records")?
         {
-            records.push(
-                RecordBuf::try_from_alignment_record(header, &record)
-                    .context("failed to convert CRAM record")?,
-            );
+            let mut record = RecordBuf::try_from_alignment_record(header, &record)
+                .context("failed to convert CRAM record")?;
+            // CRAM stores no MAPQ for an unmapped record; noodles reports 255, htslib 0.
+            if record.flags().is_unmapped() && record.mapping_quality().is_none() {
+                *record.mapping_quality_mut() =
+                    noodles::sam::alignment::record::MappingQuality::new(0);
+            }
+            records.push(record);
         }
     }
     Ok(Some(records))
 }
 
 impl FormatReader {
-    /// Read the next record from this stream, or `None` at end of input.
-    fn read_next(&mut self) -> Result<Option<InputRecord>> {
+    /// Read the next record from this stream, or `None` at end of input. With
+    /// `keep` set, secondary and supplementary records are returned too and each
+    /// record carries its untouched source alignment.
+    fn read_next(&mut self, keep: bool) -> Result<Option<InputRecord>> {
         match self {
             FormatReader::Fastq { reader, record } => {
                 if reader
@@ -443,6 +454,7 @@ impl FormatReader {
                             .collect(),
                     ),
                     tags: parse_comment_tags(record.description()),
+                    alignment: None,
                 }))
             }
             FormatReader::Fasta { reader, definition } => {
@@ -478,6 +490,7 @@ impl FormatReader {
                     bases,
                     quals: None,
                     tags: parse_comment_tags(comment.as_bytes()),
+                    alignment: None,
                 }))
             }
             FormatReader::Sam {
@@ -491,6 +504,9 @@ impl FormatReader {
                     == 0
                 {
                     return Ok(None);
+                }
+                if keep {
+                    return Ok(Some(kept_alignment(std::mem::take(record))));
                 }
                 // Secondary/supplementary alignments are not distinct reads;
                 // skip to the next primary record so the per-file segment count
@@ -513,6 +529,9 @@ impl FormatReader {
                 {
                     return Ok(None);
                 }
+                if keep {
+                    return Ok(Some(kept_alignment(std::mem::take(record))));
+                }
                 let flags = record.flags();
                 if flags.is_secondary() || flags.is_supplementary() {
                     continue;
@@ -525,16 +544,26 @@ impl FormatReader {
                 container,
                 repository,
                 buffered,
+                eof,
             } => loop {
                 if let Some(record) = buffered.next() {
+                    if keep {
+                        return Ok(Some(kept_alignment(record)));
+                    }
                     let flags = record.flags();
                     if flags.is_secondary() || flags.is_supplementary() {
                         continue;
                     }
                     return Ok(Some(alignment_to_input(&record)));
                 }
+                if *eof {
+                    return Ok(None);
+                }
                 match read_cram_container(reader, container, header, repository)? {
-                    None => return Ok(None),
+                    None => {
+                        *eof = true;
+                        return Ok(None);
+                    }
                     Some(records) => *buffered = records.into_iter(),
                 }
             },
@@ -613,7 +642,7 @@ fn parse_aux_field(field: &[u8]) -> Option<(Tag, Value)> {
 /// the union of `samtools reset`, Picard RevertSam, and the tags bwa mem /
 /// bwa-mem2 emit, plus `ms` (`samtools fixmate -m`). Read-group, UMI, barcode,
 /// and cell tags are deliberately kept.
-const ALIGNMENT_TAGS: &[[u8; 2]] = &[
+pub(crate) const ALIGNMENT_TAGS: &[[u8; 2]] = &[
     *b"AS", *b"NM", *b"MD", *b"SA", *b"MC", *b"MQ", *b"ms", *b"XS", *b"XA", *b"XB", *b"XR", *b"pa",
     *b"UQ", *b"CC", *b"CP", *b"CG", *b"H0", *b"H1", *b"H2", *b"HI", *b"IH", *b"NH", *b"TS",
 ];
@@ -655,7 +684,31 @@ fn alignment_to_input(record: &RecordBuf) -> InputRecord {
         bases,
         quals,
         tags: Some(tags),
+        alignment: None,
     }
+}
+
+/// An [`InputRecord`] that also keeps its untouched source alignment, for a run
+/// that passes aligned records through unchanged.
+fn kept_alignment(record: RecordBuf) -> InputRecord {
+    let mut input = alignment_to_input(&record);
+    input.alignment = Some(record);
+    input
+}
+
+/// Load an indexed FASTA (`PATH.fai` alongside) as a CRAM reference repository.
+pub fn load_reference(path: &Path) -> Result<fasta::Repository> {
+    let reader = fasta::io::indexed_reader::Builder::default()
+        .build_from_path(path)
+        .with_context(|| {
+            format!(
+                "failed to open the --reference FASTA (it needs a .fai index): {}",
+                path.display()
+            )
+        })?;
+    Ok(fasta::Repository::new(
+        fasta::repository::adapters::IndexedReader::new(reader),
+    ))
 }
 
 /// Wrap a sniffed text stream for reading, transparently decoding a plain-gzip
@@ -679,7 +732,10 @@ fn text_bufread(reader: Box<dyn BufRead + Send>, gzipped: bool) -> Box<dyn BufRe
 /// Open one input by sniffing its format and dispatching to the matching
 /// noodles reader, returning the sniffed format alongside (so the caller can
 /// validate the input family and mirror the format to stdout output).
-fn open_format_reader(path: &Path) -> Result<(SniffedFormat, FormatReader)> {
+fn open_format_reader(
+    path: &Path,
+    reference: Option<&fasta::Repository>,
+) -> Result<(SniffedFormat, FormatReader)> {
     let (format, gzipped, reader) =
         sniff_input(path).with_context(|| format!("failed to read: {}", path.display()))?;
     let format_reader = match format {
@@ -716,13 +772,16 @@ fn open_format_reader(path: &Path) -> Result<(SniffedFormat, FormatReader)> {
             // already rejected).
             let mut reader = cram::io::Reader::new(reader);
             let header = reader.read_header().context("failed to read CRAM header")?;
-            ensure_reference_free_cram(&header, path)?;
+            if reference.is_none() {
+                ensure_reference_free_cram(&header, path)?;
+            }
             FormatReader::Cram {
                 reader,
                 header: Box::new(header),
                 container: cram::io::reader::Container::default(),
-                repository: fasta::Repository::default(),
+                repository: reference.cloned().unwrap_or_default(),
                 buffered: Vec::new().into_iter(),
+                eof: false,
             }
         }
         SniffedFormat::Empty => FormatReader::Empty,
@@ -802,6 +861,8 @@ pub struct FragmentReader {
     /// Records buffered from `readers[0]` during interleaving detection, served
     /// before fresh reads.
     buffered: Vec<InputRecord>,
+    /// Pass SAM/BAM/CRAM records through whole (see [`Self::keep_alignments`]).
+    keep_alignments: bool,
 }
 
 impl FragmentReader {
@@ -810,11 +871,20 @@ impl FragmentReader {
     /// probed for interleaving: a leading `/1` mate, or two adjacent records
     /// that share a mate-pairing key, marks it interleaved.
     pub fn open(paths: &[PathBuf], per_record: bool) -> Result<Self> {
+        Self::open_with_reference(paths, per_record, None)
+    }
+
+    /// [`Self::open`], decoding CRAM input against `reference` when given.
+    pub fn open_with_reference(
+        paths: &[PathBuf],
+        per_record: bool,
+        reference: Option<&fasta::Repository>,
+    ) -> Result<Self> {
         let opened = paths
             .iter()
             .enumerate()
             .map(|(i, path)| {
-                open_format_reader(path)
+                open_format_reader(path, reference)
                     .with_context(|| format!("failed to open input file {i} ({})", path.display()))
             })
             .collect::<Result<Vec<(SniffedFormat, FormatReader)>>>()?;
@@ -834,7 +904,7 @@ impl FragmentReader {
                 FormatReader::Fastq { .. } | FormatReader::Fasta { .. }
             )
         {
-            if let Some(first) = readers[0].read_next()? {
+            if let Some(first) = readers[0].read_next(false)? {
                 if first.name.ends_with(b"/2") {
                     bail!(
                         "interleaved input starts with a `/2` mate (mates out of order): {}",
@@ -845,7 +915,7 @@ impl FragmentReader {
                 buffered.push(first);
                 if first_is_r1 {
                     interleaved = true;
-                } else if let Some(second) = readers[0].read_next()? {
+                } else if let Some(second) = readers[0].read_next(false)? {
                     interleaved = mate_key(&second.name) == mate_key(&buffered[0].name);
                     buffered.push(second);
                 }
@@ -857,7 +927,20 @@ impl FragmentReader {
             formats,
             interleaved,
             buffered,
+            keep_alignments: false,
         })
+    }
+
+    /// Pass SAM/BAM/CRAM records through whole: every record, secondary and
+    /// supplementary included, is yielded with its untouched source alignment
+    /// in [`InputRecord::alignment`].
+    pub fn keep_alignments(&mut self) {
+        self.keep_alignments = true;
+    }
+
+    /// The first input's SAM header, or `None` for a FASTX or empty input.
+    pub fn alignment_header(&self) -> Option<&sam::Header> {
+        self.readers.first().and_then(FormatReader::header)
     }
 
     /// The sniffed format of each input, in `--in` order. The writer uses this
@@ -950,7 +1033,7 @@ impl FragmentReader {
         let mut maybe: SmallVec<[Option<InputRecord>; 4]> =
             SmallVec::with_capacity(self.readers.len());
         for reader in &mut self.readers {
-            maybe.push(reader.read_next()?);
+            maybe.push(reader.read_next(self.keep_alignments)?);
         }
         let present = maybe.iter().filter(|record| record.is_some()).count();
         if present == 0 {
@@ -970,7 +1053,7 @@ impl FragmentReader {
         if !self.buffered.is_empty() {
             return Ok(Some(self.buffered.remove(0)));
         }
-        self.readers[0].read_next()
+        self.readers[0].read_next(self.keep_alignments)
     }
 }
 
@@ -1545,6 +1628,97 @@ mod tests {
         );
         assert_eq!(fragments[1].records[0].name, b"rev");
         assert_eq!(fragments[1].records[0].bases, b"AACG"); // reverse complement of CGTT
+    }
+
+    #[test]
+    fn test_cram_read_after_eof_stays_at_end() {
+        use noodles::sam::alignment::io::Write as _;
+        use noodles::sam::alignment::record::Flags;
+        use noodles::sam::alignment::record_buf::{QualityScores, Sequence};
+
+        let header = sam::Header::default();
+        let record = RecordBuf::builder()
+            .set_name(b"r1".to_vec())
+            .set_flags(Flags::UNMAPPED)
+            .set_sequence(Sequence::from(b"ACGT".to_vec()))
+            .set_quality_scores(QualityScores::from(vec![30; 4]))
+            .build();
+        let mut cram_bytes = Vec::new();
+        {
+            let mut writer = cram::io::Writer::new(&mut cram_bytes);
+            writer.write_header(&header).unwrap();
+            writer.write_alignment_record(&header, &record).unwrap();
+            writer.try_finish(&header).unwrap();
+        }
+        let cram = temp_with(&cram_bytes);
+        let mut reader = FragmentReader::open(&[cram.path().to_path_buf()], true).unwrap();
+        assert!(reader.next_fragment().unwrap().is_some());
+        assert!(reader.next_fragment().unwrap().is_none());
+        assert!(reader.next_fragment().unwrap().is_none());
+    }
+
+    #[test]
+    fn test_cram_unmapped_record_reads_mapq_zero() {
+        use noodles::sam::alignment::io::Write as _;
+        use noodles::sam::alignment::record::Flags;
+        use noodles::sam::alignment::record_buf::{QualityScores, Sequence};
+
+        let header = sam::Header::default();
+        let record = RecordBuf::builder()
+            .set_name(b"r1".to_vec())
+            .set_flags(Flags::UNMAPPED)
+            .set_sequence(Sequence::from(b"ACGT".to_vec()))
+            .set_quality_scores(QualityScores::from(vec![30; 4]))
+            .build();
+        let mut cram_bytes = Vec::new();
+        {
+            let mut writer = cram::io::Writer::new(&mut cram_bytes);
+            writer.write_header(&header).unwrap();
+            writer.write_alignment_record(&header, &record).unwrap();
+            writer.try_finish(&header).unwrap();
+        }
+        let cram = temp_with(&cram_bytes);
+        let mut reader = FragmentReader::open(&[cram.path().to_path_buf()], true).unwrap();
+        reader.keep_alignments();
+        let fragment = reader.next_fragment().unwrap().unwrap();
+        let kept = fragment.records[0].alignment.as_ref().unwrap();
+        assert_eq!(kept.mapping_quality().map(u8::from), Some(0));
+    }
+
+    #[test]
+    fn test_keep_alignments_yields_every_record_whole() {
+        let sam = b"@HD\tVN:1.6\tSO:coordinate\n@SQ\tSN:chr1\tLN:100\n\
+                    p1\t16\tchr1\t10\t60\t4M\t*\t0\t0\tAACC\tABCD\tNM:i:0\n\
+                    s1\t256\tchr1\t20\t0\t4M\t*\t0\t0\t*\t*\n\
+                    x1\t2048\tchr1\t30\t9\t2H2M\t*\t0\t0\tGG\tII\n";
+        let file = temp_with(sam);
+        let mut reader = FragmentReader::open(&[file.path().to_path_buf()], false).unwrap();
+        reader.keep_alignments();
+        assert!(reader.alignment_header().is_some());
+        let mut kept = Vec::new();
+        while let Some(fragment) = reader.next_fragment().unwrap() {
+            kept.push(fragment.records.into_iter().next().unwrap());
+        }
+        let names: Vec<&[u8]> = kept.iter().map(|r| r.name.as_slice()).collect();
+        assert_eq!(names, vec![&b"p1"[..], b"s1", b"x1"]);
+        let first = kept[0]
+            .alignment
+            .as_ref()
+            .expect("the source record is kept");
+        assert_eq!(first.alignment_start().map(usize::from), Some(10));
+        assert_eq!(first.sequence().as_ref(), b"AACC");
+        assert!(first.data().get(&Tag::new(b'N', b'M')).is_some());
+        assert_eq!(
+            kept[0].bases, b"GGTT",
+            "matching still sees the sequenced orientation"
+        );
+    }
+
+    #[test]
+    fn test_default_reader_keeps_no_alignment() {
+        let file = temp_with(b"@HD\tVN:1.6\nr1\t4\t*\t0\t0\t*\t*\t0\t0\tACGT\tIIII\n");
+        let fragments = read_all(&file);
+        assert!(fragments[0].records[0].alignment.is_none());
     }
 
     #[test]

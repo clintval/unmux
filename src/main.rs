@@ -214,9 +214,15 @@ struct DemuxCmd {
     /// An `@RG` source reads the input header's read groups instead of
     /// matching sequences (SAM/BAM/CRAM only; no barcode attributes, no
     /// `@`-span). Pair with `--sample-from-group` to write one file per
-    /// read group, sample, or library. Output is UNMAPPED, so aligned
-    /// inputs lose alignments (a warning is printed); carrying mapped
-    /// data through a split is planned for later.
+    /// read group, sample, or library.
+    ///
+    /// An aligned input (`@SQ` present) split into SAM/BAM keeps every
+    /// record whole, secondary and supplementary included: flags, position,
+    /// CIGAR, MAPQ, mate fields, and tags. Each file gets the input `@HD`,
+    /// `@SQ`, `@PG`, and `@CO` lines, only its own `@RG` lines, and an unmux
+    /// `@PG`; records keep input order. `--rg-tag` has no effect there, and
+    /// `--template`, aligned CRAM output, and several inputs are errors.
+    /// `--unmapped-output` restores the older unmapped output instead.
     #[arg(long = "group", value_name = "SPEC", verbatim_doc_comment)]
     groups: Vec<String>,
 
@@ -454,6 +460,22 @@ struct DemuxCmd {
     /// otherwise auto-detected.
     #[arg(long, verbatim_doc_comment)]
     per_record: bool,
+
+    /// Indexed FASTA (with a `.fai`) to read a reference-compressed CRAM.
+    ///
+    /// CRAM input does not regenerate `NM`/`MD` tags it did not store.
+    ///
+    ///   --reference ref.fa   decode CRAM input against ref.fa
+    #[arg(long = "reference", value_name = "FASTA", verbatim_doc_comment)]
+    reference: Option<PathBuf>,
+
+    /// Write an aligned `@RG` split unmapped, as unmux 0.6 did.
+    ///
+    /// Drops each record's alignment and `@SQ` lines, restores reverse-strand
+    /// reads to sequenced orientation, and allows `--template`, CRAM output,
+    /// and several inputs.
+    #[arg(long, verbatim_doc_comment)]
+    unmapped_output: bool,
 
     /// Compression level 0-9 for BGZF (BAM) and gzip (FASTX.gz).
     /// CRAM uses its own codecs and ignores this.
@@ -720,6 +742,8 @@ fn run_demux_cmd(cmd: DemuxCmd) -> Result<()> {
         per_record: cmd.per_record,
         compression: cmd.compression,
         threads: cmd.threads as usize,
+        reference: cmd.reference,
+        unmapped_output: cmd.unmapped_output,
         command_line: Some(std::env::args().collect::<Vec<_>>().join(" ")),
     })
 }

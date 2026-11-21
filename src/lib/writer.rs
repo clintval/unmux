@@ -51,6 +51,9 @@ pub struct OutputRead<'a> {
     /// assigned record on SAM/BAM output (an `RG:Z` data field, matching an
     /// `@RG` header line). FASTX has no read groups, so it is ignored there.
     pub read_group: Option<&'a str>,
+    /// A source alignment to write verbatim on SAM/BAM, in place of a record
+    /// built from the fields above. FASTX ignores it.
+    pub alignment: Option<&'a RecordBuf>,
 }
 
 /// A resolved output format. FASTX variants carry whether the sink is
@@ -627,10 +630,14 @@ fn write_alignments<W: AlignmentWrite>(
         );
     }
     for (index, read) in reads.iter().enumerate() {
-        let record = build_record(read, segment_flags(index, reads.len()));
-        writer
-            .write_alignment_record(header, &record)
-            .context("failed to write SAM/BAM/CRAM record")?;
+        let written = match read.alignment {
+            Some(record) => writer.write_alignment_record(header, record),
+            None => {
+                let record = build_record(read, segment_flags(index, reads.len()));
+                writer.write_alignment_record(header, &record)
+            }
+        };
+        written.context("failed to write SAM/BAM/CRAM record")?;
     }
     Ok(())
 }
@@ -838,6 +845,7 @@ mod tests {
                 quals: Some(&[30, 30, 30, 30]),
                 tags: None,
                 read_group: Some("dna01.lib01"),
+                alignment: None,
             }])
             .unwrap();
         writer.finish().unwrap();
@@ -889,6 +897,7 @@ mod tests {
                 quals: Some(&[30, 31, 32, 33, 34, 35, 36, 37]),
                 tags: None,
                 read_group: Some("dna01"),
+                alignment: None,
             }],
             vec![
                 OutputRead {
@@ -897,6 +906,7 @@ mod tests {
                     quals: Some(&q),
                     tags: None,
                     read_group: Some("dna01"),
+                    alignment: None,
                 },
                 OutputRead {
                     name: b"r2",
@@ -904,6 +914,7 @@ mod tests {
                     quals: Some(&q),
                     tags: None,
                     read_group: Some("dna01"),
+                    alignment: None,
                 },
             ],
         ];
@@ -1001,6 +1012,7 @@ mod tests {
             quals: Some(&[30, 30, 30, 30]),
             tags: None,
             read_group: None,
+            alignment: None,
         }])
         .unwrap();
         w.finish().unwrap();
@@ -1049,6 +1061,7 @@ mod tests {
                 quals: Some(&q),
                 tags: None,
                 read_group: None,
+                alignment: None,
             })
             .collect();
         let err = w.write_fragment(&reads).unwrap_err().to_string();
@@ -1073,5 +1086,43 @@ mod tests {
         assert_eq!(gzip.write(b"abc").unwrap(), 3);
         gzip.flush().unwrap();
         gzip.finish().unwrap();
+    }
+
+    #[test]
+    fn test_alignment_is_written_verbatim_to_sam_and_bam() {
+        let text = b"@HD\tVN:1.6\tSO:coordinate\n@SQ\tSN:chr1\tLN:100\n\
+                     r1\t83\tchr1\t10\t60\t2S4M\t=\t40\t-36\tAACCGG\tABCDEF\tMC:Z:6M\tRG:Z:x\n";
+        let mut reader = sam::io::Reader::new(&text[..]);
+        let header = reader.read_header().unwrap();
+        let mut record = RecordBuf::default();
+        reader.read_record_buf(&header, &mut record).unwrap();
+        let read = OutputRead {
+            name: b"ignored",
+            bases: b"T",
+            quals: None,
+            tags: None,
+            read_group: Some("ignored"),
+            alignment: Some(&record),
+        };
+        let sam_bytes =
+            encode_fragment(OutputFormat::Sam, &header, std::slice::from_ref(&read)).unwrap();
+        assert_eq!(
+            String::from_utf8(sam_bytes).unwrap(),
+            "r1\t83\tchr1\t10\t60\t2S4M\t=\t40\t-36\tAACCGG\tABCDEF\tMC:Z:6M\tRG:Z:x\n"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out.bam");
+        let mut w =
+            OutputWriter::create_with_header(Some(&out), OutputFormat::Bam, 5, header.clone())
+                .unwrap();
+        w.write_fragment(&[read]).unwrap();
+        w.finish().unwrap();
+        let mut reader = bam::io::Reader::new(File::open(&out).unwrap());
+        let read_header = reader.read_header().unwrap();
+        assert_eq!(read_header.reference_sequences().len(), 1);
+        let mut back = RecordBuf::default();
+        reader.read_record_buf(&read_header, &mut back).unwrap();
+        assert_eq!(back, record);
     }
 }
