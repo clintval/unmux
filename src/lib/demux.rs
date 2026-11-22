@@ -1044,22 +1044,27 @@ fn writer_pool_size(threads: usize, has_poolable: bool) -> usize {
 /// The most threads that inflate BAM or decode CRAM input.
 pub const MAX_DECODE_THREADS: usize = 4;
 
-/// The BAM inflate / CRAM decode workers for `threads` total threads, shared
-/// across the inputs of `formats`: none below 5 threads, where the read-ahead
-/// thread decodes inline, else a quarter of the threads for CRAM, whose decode is
-/// the heaviest stage, or an eighth from 16 threads for BAM, whose inflate the
-/// read-ahead thread keeps up with below that; at most [`MAX_DECODE_THREADS`].
-pub fn decode_pool_size(threads: usize, formats: &[SniffedFormat]) -> usize {
-    let workers = if threads < 5 {
-        0
-    } else if formats.contains(&SniffedFormat::Cram) {
-        threads / 4
-    } else if formats.contains(&SniffedFormat::Bam) && threads >= 16 {
-        threads / 8
+/// The BAM inflate / CRAM decode workers for each input of `formats` at
+/// `threads` total threads. None below 5 threads, where the read-ahead thread
+/// decodes inline. The CRAM inputs share a quarter of the threads first, as
+/// their decode is the heaviest stage; the BAM inputs share an eighth from 16
+/// threads, below which the read-ahead thread keeps up with their inflate, out
+/// of what the CRAM inputs leave of [`MAX_DECODE_THREADS`].
+pub fn decode_workers(threads: usize, formats: &[SniffedFormat]) -> Vec<usize> {
+    use SniffedFormat::{Bam, Cram};
+    let cram = if threads >= 5 && formats.contains(&Cram) {
+        (threads / 4).min(MAX_DECODE_THREADS)
     } else {
         0
     };
-    workers.min(MAX_DECODE_THREADS)
+    let bam = if threads >= 16 && formats.contains(&Bam) {
+        (threads / 8).min(MAX_DECODE_THREADS - cram)
+    } else {
+        0
+    };
+    let cram = crate::input::decode_shares(formats, Cram, cram);
+    let bam = crate::input::decode_shares(formats, Bam, bam);
+    cram.iter().zip(bam).map(|(cram, bam)| cram + bam).collect()
 }
 
 /// Partition `--threads N` into the engine's [`ThreadBudget`] after reserving
@@ -1140,7 +1145,7 @@ fn run_engine(plan: &DemuxPlan, command_line: Option<&str>) -> Result<()> {
         &plan.inputs,
         plan.per_record,
         reference.as_ref(),
-        |formats| decode_pool_size(plan.threads.max(1), formats),
+        |formats| decode_workers(plan.threads.max(1), formats),
     )?;
     let input_formats = reader.formats().to_vec();
     if plan.reference.is_some() && !input_formats.contains(&SniffedFormat::Cram) {
@@ -2873,9 +2878,12 @@ mod tests {
     #[test]
     fn test_decode_workers_fit_inside_the_thread_budget() {
         use SniffedFormat::{Bam, Cram, Fastq};
-        for formats in [&[Bam][..], &[Bam, Bam], &[Cram], &[Fastq, Bam], &[Fastq]] {
+        let mixed = [&[Bam, Cram][..], &[Cram, Bam], &[Bam, Bam, Cram]];
+        let single = [&[Bam][..], &[Bam, Bam], &[Cram], &[Fastq, Bam], &[Fastq]];
+        for formats in single.into_iter().chain(mixed) {
             for threads in 3..=40 {
-                let decode = decode_pool_size(threads, formats);
+                let decode: usize = decode_workers(threads, formats).iter().sum();
+                assert!(decode <= MAX_DECODE_THREADS);
                 let writer = writer_pool_size(threads - decode, true);
                 let budget = partition_threads(threads, writer, decode);
                 assert!(budget.matchers >= 1);
@@ -2886,11 +2894,24 @@ mod tests {
                 );
             }
         }
-        assert_eq!(decode_pool_size(8, &[Bam]), 0);
-        assert_eq!(decode_pool_size(16, &[Bam]), 2);
-        assert_eq!(decode_pool_size(8, &[Cram]), 2);
-        assert_eq!(decode_pool_size(4, &[Cram]), 0);
-        assert_eq!(decode_pool_size(64, &[Fastq]), 0);
+        assert_eq!(decode_workers(8, &[Bam]), [0]);
+        assert_eq!(decode_workers(16, &[Bam]), [2]);
+        assert_eq!(decode_workers(8, &[Cram]), [2]);
+        assert_eq!(decode_workers(4, &[Cram]), [0]);
+        assert_eq!(decode_workers(64, &[Fastq]), [0]);
+    }
+
+    #[test]
+    fn test_decode_workers_go_to_cram_inputs_first() {
+        use SniffedFormat::{Bam, Cram};
+        for threads in 5..=7 {
+            assert_eq!(decode_workers(threads, &[Bam, Cram]), [0, 1]);
+        }
+        assert_eq!(decode_workers(8, &[Bam, Cram]), [0, 2]);
+        assert_eq!(decode_workers(12, &[Cram, Bam]), [3, 0]);
+        assert_eq!(decode_workers(16, &[Bam, Cram]), [0, 4]);
+        assert_eq!(decode_workers(32, &[Bam, Bam, Cram]), [0, 0, 4]);
+        assert_eq!(decode_workers(32, &[Bam, Bam]), [2, 2]);
     }
 
     #[test]

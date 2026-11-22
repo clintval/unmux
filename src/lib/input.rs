@@ -30,7 +30,7 @@ use std::sync::LazyLock;
 
 use std::collections::HashMap;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, bail, ensure, Context, Result};
 use noodles::sam::alignment::record::data::field::Tag;
 use noodles::sam::alignment::record_buf::data::field::Value;
 use noodles::sam::alignment::record_buf::Data;
@@ -959,21 +959,22 @@ fn text_bufread(reader: Box<dyn BufRead + Send>, gzipped: bool) -> Box<dyn BufRe
     }
 }
 
-/// Split `decode_threads` workers across the BAM and CRAM inputs among
-/// `formats`, the earlier inputs taking any remainder; other inputs get none.
-fn decode_shares(formats: &[SniffedFormat], decode_threads: usize) -> Vec<usize> {
-    let decoding = formats
-        .iter()
-        .filter(|format| matches!(format, SniffedFormat::Bam | SniffedFormat::Cram))
-        .count();
+/// Split `workers` across the inputs among `formats` that are `format`, the
+/// earlier inputs taking any remainder; other inputs get none.
+pub fn decode_shares(
+    formats: &[SniffedFormat],
+    format: SniffedFormat,
+    workers: usize,
+) -> Vec<usize> {
+    let inputs = formats.iter().filter(|&&f| f == format).count();
     let mut nth = 0;
     formats
         .iter()
-        .map(|format| {
-            if !matches!(format, SniffedFormat::Bam | SniffedFormat::Cram) {
+        .map(|&f| {
+            if f != format {
                 return 0;
             }
-            let share = decode_threads / decoding + usize::from(nth < decode_threads % decoding);
+            let share = workers / inputs + usize::from(nth < workers % inputs);
             nth += 1;
             share
         })
@@ -1140,17 +1141,19 @@ impl FragmentReader {
         per_record: bool,
         reference: Option<&Reference>,
     ) -> Result<Self> {
-        Self::open_with_threads(paths, per_record, reference, |_| 0)
+        Self::open_with_threads(paths, per_record, reference, |formats| {
+            vec![0; formats.len()]
+        })
     }
 
     /// [`Self::open_with_reference`], inflating BAM and decoding CRAM input on
-    /// the workers `decode_threads` allots for the sniffed formats, shared out
-    /// across those inputs; an input left without one decodes inline.
+    /// the workers `decode_threads` allots each input from the sniffed formats;
+    /// an input left without one decodes inline.
     pub fn open_with_threads(
         paths: &[PathBuf],
         per_record: bool,
         reference: Option<&Reference>,
-        decode_threads: impl FnOnce(&[SniffedFormat]) -> usize,
+        decode_threads: impl FnOnce(&[SniffedFormat]) -> Vec<usize>,
     ) -> Result<Self> {
         let open_error =
             |i: usize, path: &Path| format!("failed to open input file {i} ({})", path.display());
@@ -1164,7 +1167,13 @@ impl FragmentReader {
             })
             .collect::<Result<Vec<_>>>()?;
         let formats: Vec<SniffedFormat> = sniffed.iter().map(|(format, _, _)| *format).collect();
-        let shares = decode_shares(&formats, decode_threads(&formats));
+        let shares = decode_threads(&formats);
+        ensure!(
+            shares.len() == formats.len(),
+            "decode workers were allotted for {} inputs, not {}",
+            shares.len(),
+            formats.len()
+        );
         let mut readers = Vec::with_capacity(paths.len());
         for (i, (path, sniffed)) in paths.iter().zip(sniffed).enumerate() {
             let reader = open_format_reader(path, sniffed, reference, NonZero::new(shares[i]))
@@ -2003,13 +2012,13 @@ mod tests {
     }
 
     #[test]
-    fn test_decode_shares_split_workers_across_bam_and_cram_inputs() {
+    fn test_decode_shares_split_workers_across_the_inputs_of_one_format() {
         use SniffedFormat::{Bam, Cram, Fastq};
-        assert_eq!(decode_shares(&[Bam], 2), vec![2]);
-        assert_eq!(decode_shares(&[Bam, Cram], 3), vec![2, 1]);
-        assert_eq!(decode_shares(&[Fastq, Bam, Bam], 1), vec![0, 1, 0]);
-        assert_eq!(decode_shares(&[Fastq], 4), vec![0]);
-        assert_eq!(decode_shares(&[Bam, Bam], 0), vec![0, 0]);
+        assert_eq!(decode_shares(&[Bam], Bam, 2), vec![2]);
+        assert_eq!(decode_shares(&[Bam, Cram], Cram, 3), vec![0, 3]);
+        assert_eq!(decode_shares(&[Bam, Cram], Bam, 0), vec![0, 0]);
+        assert_eq!(decode_shares(&[Fastq, Bam, Bam], Bam, 3), vec![0, 2, 1]);
+        assert_eq!(decode_shares(&[Fastq], Bam, 4), vec![0]);
     }
 
     #[test]
@@ -2057,7 +2066,8 @@ mod tests {
             let read = |threads: usize, keep: bool| {
                 let path = file.path().to_path_buf();
                 let mut reader =
-                    FragmentReader::open_with_threads(&[path], true, None, |_| threads).unwrap();
+                    FragmentReader::open_with_threads(&[path], true, None, |_| vec![threads])
+                        .unwrap();
                 if keep {
                     reader.keep_alignments();
                 }
