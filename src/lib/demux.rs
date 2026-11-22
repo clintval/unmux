@@ -1227,6 +1227,9 @@ fn run_engine(plan: &DemuxPlan, command_line: Option<&str>) -> Result<()> {
         reader.fragment_width(),
     )?;
     log_run_shape(plan, &input_formats, &dests);
+    if let Some(reference) = &reference {
+        reader.check_reference(&plan.inputs, reference)?;
+    }
     staged.stage(
         dests.iter().cloned().chain(
             [

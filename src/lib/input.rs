@@ -699,9 +699,6 @@ fn open_format_reader(
             let header = quietly(|| reader.read_header())
                 .ok_or_else(|| anyhow!("failed to read CRAM header: it is malformed"))?
                 .context("failed to read CRAM header")?;
-            if let Some(reference) = reference {
-                reference.check_header(&header, path)?;
-            }
             FormatReader::Cram {
                 reader,
                 decoder: CramDecoder::new(reference.cloned(), path, &header),
@@ -801,7 +798,7 @@ impl FragmentReader {
         Self::open_with_reference(paths, per_record, None)
     }
 
-    /// [`Self::open`], checking and decoding CRAM input against `reference` when given.
+    /// [`Self::open`], decoding CRAM input against `reference` when given; see [`Self::check_reference`].
     pub fn open_with_reference(
         paths: &[PathBuf],
         per_record: bool,
@@ -917,6 +914,21 @@ impl FragmentReader {
             }
         }
         Ok(info)
+    }
+
+    /// Check each CRAM input's `@SQ` lines against `reference`, `paths` being the inputs in `--in` order.
+    pub fn check_reference(&self, paths: &[PathBuf], reference: &Reference) -> Result<()> {
+        for (i, (reader, path)) in self.readers.iter().zip(paths).enumerate() {
+            if let FormatReader::Cram { header, .. } = reader {
+                reference.check_header(header, path).with_context(|| {
+                    format!(
+                        "failed to check input file {i} ({}) against --reference",
+                        path.display()
+                    )
+                })?;
+            }
+        }
+        Ok(())
     }
 
     /// The number of records every fragment carries: two for a single

@@ -138,6 +138,16 @@ Feature: --reference is checked against the CRAM @SQ lines
     And stderr does not contain "checksum mismatch"
     And a file "out" does not exist
 
+  Scenario: an invalid run fails on its arguments before the reference is checked
+    Given the test file "aligned.htslib-3.1.cram"
+    And a copy of the test file "ref.fa" named "renamed.fa" with ">chr1" replaced by ">chrX"
+    And a copy of the test file "ref.fa.fai" named "renamed.fa.fai" with "chr1" replaced by "chrX"
+    When I run `unmux aligned.htslib-3.1.cram aligned.htslib-3.1.cram --reference renamed.fa --group rg=@RG --sample-from-group rg --out out/%sample.sam`
+    Then the exit code is 1
+    And stderr contains "an @RG split that keeps alignments takes a single input, got 2"
+    And stderr does not contain "missing from the --reference FASTA"
+    And a file "out" does not exist
+
   Scenario: a SAM input ignores --reference
     Given the test file "aligned.sam"
     And a copy of the test file "ref.fa" named "renamed.fa" with ">chr1" replaced by ">chrX"
