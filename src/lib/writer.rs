@@ -54,8 +54,9 @@ pub struct OutputRead<'a> {
     /// assigned record on SAM/BAM output (an `RG:Z` data field, matching an
     /// `@RG` header line). FASTX has no read groups, so it is ignored there.
     pub read_group: Option<&'a str>,
-    /// A source alignment to write verbatim on SAM/BAM, in place of a record
-    /// built from the fields above. FASTX ignores it.
+    /// A source alignment to write on SAM/BAM in place of a record built from
+    /// the fields above; BAM output keeps a raw BAM record's input bytes. FASTX
+    /// ignores it.
     pub alignment: Option<&'a Alignment>,
 }
 
@@ -423,8 +424,7 @@ impl OutputWriter {
     /// after the header written at open. The bytes are injected into the sink's
     /// underlying stream so they pass through its compression stage (gzip /
     /// inline BGZF / the pooled BGZF) exactly as if the records had been
-    /// encoded here, keeping output byte-identical to
-    /// [`OutputWriter::write_fragment`]. CRAM is not supported (its records are
+    /// encoded here. CRAM is not supported (its records are
     /// not independent per-fragment byte slices); callers route CRAM through
     /// `write_fragment`.
     pub fn write_encoded(&mut self, bytes: &[u8]) -> Result<()> {
@@ -885,13 +885,13 @@ pub fn build_record(read: &OutputRead, flags: Flags) -> RecordBuf {
     builder.build()
 }
 
-/// Encode one fragment's records into the exact bytes the matching sink would
-/// write for `format`, via a throwaway in-memory writer. The result is
-/// byte-identical to what [`OutputWriter::write_fragment`] emits for the same
-/// records (header excluded), so it can be produced on a worker thread and
-/// appended verbatim by [`OutputWriter::write_encoded`] in input order
-/// (encode-on-workers). `header` is used only for SAM/BAM record encoding and
-/// ignored for FASTX. CRAM is NOT supported here (its records are
+/// Encode one fragment's records into the bytes the matching sink writes for
+/// `format`, via a throwaway in-memory writer, so they can be produced on a
+/// worker thread and appended by [`OutputWriter::write_encoded`] in input order
+/// (encode-on-workers). A raw BAM record bound for BAM output keeps its input
+/// bytes (tag order and bin included) rather than being re-encoded as
+/// [`OutputWriter::write_fragment`] would. `header` is used only for SAM/BAM
+/// record encoding and ignored for FASTX. CRAM is NOT supported here (its records are
 /// container/slice-coded, not independent per-fragment byte slices); route CRAM
 /// through the record path. The throwaway BAM writer is built via `From` (no
 /// inner BGZF), so it yields raw record blocks that the destination sink's own

@@ -19,7 +19,8 @@
 //! pool and CRAM input decodes its containers on one. BAM records leave the
 //! reader raw ([`PendingRecord::Bam`]) so their decode runs on the matcher
 //! workers, and an aligned BAM record passed through to BAM output is written
-//! back from those raw bytes without a decode and re-encode.
+//! back from those raw bytes without a decode and re-encode, so it keeps the
+//! input's tag order and bin.
 
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read};

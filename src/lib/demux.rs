@@ -1698,7 +1698,8 @@ fn is_alignment_format(format: OutputFormat) -> bool {
 /// independent per-fragment byte slices) and is encoded by the consumer. The
 /// format and header are resolved exactly as the consumer's `MultiWriter::open`
 /// does (per path, falling back to the provenance default), so the appended
-/// bytes are byte-identical.
+/// bytes match what the consumer would encode, except that a raw BAM record
+/// keeps its input bytes.
 fn encode_writes(engine: &Engine, writes: &mut [PreparedWrite]) -> Result<()> {
     for write in writes {
         let format = output_format(write.path.as_deref(), engine.input_formats)?;
