@@ -40,6 +40,7 @@ impl HeaderCheck {
 
     /// Fail unless every `@SQ` contig is in this FASTA with the same `LN` and any `M5`.
     pub(crate) fn check(&self, header: &sam::Header, input: &Path) -> Result<()> {
+        let input = &input_name(input);
         let expected = expected_contigs(header, input)?;
         let positions = self.positions_for(&expected, input)?;
         let hashed: Vec<(&ExpectedContig, usize)> = expected
@@ -52,7 +53,7 @@ impl HeaderCheck {
             log::warn!(
                 "{unhashed} of {} @SQ contig(s) in {} have no M5, so only their lengths were checked against the --reference FASTA",
                 expected.len(),
-                input.display()
+                input
             );
         }
         let pool = rayon::ThreadPoolBuilder::new()
@@ -75,7 +76,7 @@ impl HeaderCheck {
                     to_hex(actual),
                     self.path.display(),
                     to_hex(&md5),
-                    input.display()
+                    input
                 );
             }
         }
@@ -92,7 +93,7 @@ impl HeaderCheck {
     }
 
     /// The `.fai` position of each contig, failing on one missing or of another length.
-    fn positions_for(&self, expected: &[ExpectedContig], input: &Path) -> Result<Vec<usize>> {
+    fn positions_for(&self, expected: &[ExpectedContig], input: &str) -> Result<Vec<usize>> {
         let by_name: HashMap<&[u8], (usize, &fai::Record)> = self
             .index
             .as_ref()
@@ -107,7 +108,7 @@ impl HeaderCheck {
                     anyhow!(
                         "contig `{}` (@SQ in {}) is missing from the --reference FASTA {}; pass the FASTA the CRAM was written against, or --skip-reference-check if no record is on that contig",
                         contig.name,
-                        input.display(),
+                        input,
                         self.path.display()
                     )
                 })?;
@@ -118,7 +119,7 @@ impl HeaderCheck {
                         record.length(),
                         self.path.display(),
                         contig.length,
-                        input.display()
+                        input
                     );
                 }
                 Ok(i)
@@ -230,7 +231,7 @@ struct ExpectedContig {
 }
 
 /// The `@SQ` lines of `header`, in header order.
-fn expected_contigs(header: &sam::Header, input: &Path) -> Result<Vec<ExpectedContig>> {
+fn expected_contigs(header: &sam::Header, input: &str) -> Result<Vec<ExpectedContig>> {
     header
         .reference_sequences()
         .iter()
@@ -243,7 +244,7 @@ fn expected_contigs(header: &sam::Header, input: &Path) -> Result<Vec<ExpectedCo
                     parse_md5(value).ok_or_else(|| {
                         anyhow!(
                             "contig `{name}` has a malformed @SQ M5:{value} in {} (expected 32 hex digits)",
-                            input.display()
+                            input
                         )
                     })
                 })
@@ -255,6 +256,15 @@ fn expected_contigs(header: &sam::Header, input: &Path) -> Result<Vec<ExpectedCo
             })
         })
         .collect()
+}
+
+/// An input path for messages, with `-` read as stdin.
+fn input_name(input: &Path) -> String {
+    if input.as_os_str() == "-" {
+        "stdin".to_string()
+    } else {
+        input.display().to_string()
+    }
 }
 
 /// Parse a 32-digit hex MD5, in either case.
@@ -351,6 +361,15 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("malformed @SQ M5:e1a8"), "{err}");
+    }
+
+    #[test]
+    fn test_stdin_input_is_named_stdin() {
+        let err = open(Path::new(FIXTURE), 1)
+            .check(&header(&[("chrM", 16569, None)]), Path::new("-"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("(@SQ in stdin)"), "{err}");
     }
 
     #[test]

@@ -86,6 +86,22 @@ Feature: --reference is checked against the CRAM @SQ lines
     And stderr contains "contig `chr1` is listed more than once in the .fai index dup.fa.fai"
     And a file "out" does not exist
 
+  Scenario: a CRAM on stdin is named stdin in a failed check
+    Given the test file "aligned.htslib-3.1.cram"
+    And a copy of the test file "ref.fa" named "renamed.fa" with ">chr1" replaced by ">chrX"
+    And a copy of the test file "ref.fa.fai" named "renamed.fa.fai" with "chr1" replaced by "chrX"
+    When I run `unmux - --reference renamed.fa --group rg=@RG --sample-from-group rg --out out/%sample.sam` with "aligned.htslib-3.1.cram" on stdin
+    Then the exit code is 1
+    And stderr contains "contig `chr1` (@SQ in stdin) is missing from the --reference FASTA renamed.fa"
+
+  Scenario: a --reference FASTA without its .fai names the missing index
+    Given the test file "aligned.htslib-3.1.cram"
+    And a copy of the test file "ref.fa" named "unindexed.fa"
+    When I run `unmux aligned.htslib-3.1.cram --reference unindexed.fa --group rg=@RG --sample-from-group rg --out out/%sample.sam`
+    Then the exit code is 1
+    And stderr contains "failed to read the .fai index unindexed.fa.fai of the --reference FASTA unindexed.fa; create it with samtools faidx"
+    And a file "out" does not exist
+
   Scenario: a skipped check still fails on a record whose contig is missing
     Given the test file "aligned.htslib-3.1.cram"
     And a copy of the test file "ref.fa" named "renamed.fa" with ">chr1" replaced by ">chrX"

@@ -30,16 +30,19 @@ pub struct Reference {
 impl Reference {
     /// Open an indexed FASTA (`PATH.fai` alongside); `check` enables [`Self::check_header`].
     pub fn open(path: &Path, check: bool, threads: usize) -> Result<Self> {
-        let context = || {
-            format!(
-                "failed to open the --reference FASTA (it needs a .fai index): {}",
-                path.display()
-            )
-        };
+        let context = || format!("failed to open the --reference FASTA {}", path.display());
+        File::open(path).with_context(context)?;
         let mut index_path = OsString::from(path);
         index_path.push(".fai");
-        let index = fai::fs::read(&index_path).with_context(context)?;
-        reject_duplicate_names(&index, Path::new(&index_path))?;
+        let index_path = PathBuf::from(index_path);
+        let index = fai::fs::read(&index_path).with_context(|| {
+            format!(
+                "failed to read the .fai index {} of the --reference FASTA {}; create it with samtools faidx",
+                index_path.display(),
+                path.display()
+            )
+        })?;
+        reject_duplicate_names(&index, &index_path)?;
         let reader = fasta::io::indexed_reader::Builder::default()
             .set_index(index.clone())
             .build_from_path(path)
@@ -1230,6 +1233,23 @@ mod tests {
             .unwrap()
             .check_header(&header, Path::new("in.cram"))
             .unwrap();
+    }
+
+    #[test]
+    fn test_a_missing_fasta_or_fai_is_named() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ref.fa");
+        let err = format!("{:#}", Reference::open(&path, true, 1).err().unwrap());
+        assert!(
+            err.starts_with("failed to open the --reference FASTA"),
+            "{err}"
+        );
+        assert!(!err.contains(".fai"), "{err}");
+        std::fs::write(&path, ">a\nACGT\n").unwrap();
+        let err = format!("{:#}", Reference::open(&path, true, 1).err().unwrap());
+        assert!(err.starts_with("failed to read the .fai index"), "{err}");
+        assert!(err.contains("ref.fa.fai of the --reference FASTA"), "{err}");
+        assert!(err.contains("samtools faidx"), "{err}");
     }
 
     #[test]
