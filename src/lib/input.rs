@@ -525,6 +525,9 @@ enum FormatReader {
         reader: Box<dyn BufRead + Send>,
         /// The header.
         header: Box<sam::Header>,
+        /// The reused buffer that skipped secondary and supplementary records
+        /// decode into, so a corrupt one fails the read.
+        skipped: RecordBuf,
     },
     /// CRAM, read reference-free unless a `--reference` is given. Containers
     /// decode one at a time, or ahead on a worker pool, and their records are
@@ -802,7 +805,10 @@ impl FormatReader {
 
     /// Read the next record, leaving a BAM record raw for a worker to decode.
     fn read_pending(&mut self, keep: bool) -> Result<Option<PendingRecord>> {
-        let FormatReader::Bam { reader, .. } = self else {
+        let FormatReader::Bam {
+            reader, skipped, ..
+        } = self
+        else {
             return Ok(self.read_next(keep)?.map(PendingRecord::Ready));
         };
         loop {
@@ -813,6 +819,7 @@ impl FormatReader {
             if keep || !(flags.is_secondary() || flags.is_supplementary()) {
                 return Ok(Some(PendingRecord::Bam { raw, keep }));
             }
+            decode_raw_bam(&raw, skipped)?;
         }
     }
 
@@ -1017,6 +1024,7 @@ fn open_format_reader(
             FormatReader::Bam {
                 reader: reader.into_inner(),
                 header: Box::new(header),
+                skipped: RecordBuf::default(),
             }
         }
         SniffedFormat::Cram => {
@@ -1614,6 +1622,54 @@ mod tests {
         file.write_all(bytes).unwrap();
         file.flush().unwrap();
         file
+    }
+
+    #[test]
+    fn test_corrupt_skipped_bam_record_fails_the_read() {
+        use noodles::sam::alignment::io::Write as _;
+        let text = b"@SQ\tSN:chr1\tLN:100\n\
+                     r1\t0\tchr1\t10\t60\t4M\t*\t0\t0\tACGT\tABCD\n\
+                     r1\t256\tchr1\t20\t0\t4M\t*\t0\t0\t*\t*\tXX:Z:broken\n\
+                     r2\t2048\tchr1\t30\t60\t4M\t*\t0\t0\tACGT\tABCD\tXX:Z:broken\n\
+                     r2\t0\tchr1\t40\t60\t4M\t*\t0\t0\tACGT\tABCD\n";
+        let mut reader = sam::io::Reader::new(&text[..]);
+        let header = reader.read_header().unwrap();
+        let mut writer = bam::io::Writer::from(Vec::new());
+        writer.write_header(&header).unwrap();
+        for result in reader.record_bufs(&header) {
+            writer
+                .write_alignment_record(&header, &result.unwrap())
+                .unwrap();
+        }
+        let raw = writer.into_inner();
+        let tag = b"XXZbroken\0";
+        let corrupted = |nth: usize| {
+            let mut raw = raw.clone();
+            let at = raw
+                .windows(tag.len())
+                .enumerate()
+                .filter(|(_, window)| *window == tag)
+                .nth(nth)
+                .unwrap()
+                .0;
+            raw[at + 2] = b'?';
+            let mut bgzf = bgzf::io::Writer::new(Vec::new());
+            bgzf.write_all(&raw).unwrap();
+            temp_with(&bgzf.finish().unwrap())
+        };
+        for (nth, threads) in [(0, 0), (1, 0), (0, 2), (1, 2)] {
+            let file = corrupted(nth);
+            let path = file.path().to_path_buf();
+            let mut reader =
+                FragmentReader::open_with_threads(&[path], true, None, |_| vec![threads]).unwrap();
+            let error = std::iter::from_fn(|| reader.next_fragment().transpose())
+                .find_map(Result::err)
+                .expect("a corrupt skipped record must fail the read");
+            assert!(
+                format!("{error:#}").contains("failed to read BAM record"),
+                "{error:#}"
+            );
+        }
     }
 
     #[test]
