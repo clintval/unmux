@@ -506,16 +506,18 @@ struct StagedFile {
 
 impl StagedOutputs {
     /// Stage every path in `paths`, noting its missing parent directories. A path that exists but
-    /// is not a regular file, such as a device or a FIFO, is written in place.
+    /// is not a regular file, such as a device or a FIFO, is written in place; a symbolic link,
+    /// dangling or not, is staged beside the file it points to.
     pub(crate) fn stage(&mut self, paths: impl IntoIterator<Item = PathBuf>) {
         for path in paths {
             if self.files.contains_key(&path) {
                 continue;
             }
-            let destination = match std::fs::metadata(&path) {
+            let target = link_target(&path);
+            let destination = match std::fs::metadata(&target) {
                 Ok(metadata) if !metadata.is_file() => continue,
-                Ok(_) => std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone()),
-                Err(_) => path.clone(),
+                Ok(_) => std::fs::canonicalize(&target).unwrap_or(target),
+                Err(_) => target,
             };
             let Some(name) = destination.file_name() else {
                 continue;
@@ -562,7 +564,7 @@ impl StagedOutputs {
             if file.temporary.symlink_metadata().is_err() {
                 continue;
             }
-            std::fs::rename(&file.temporary, &file.destination).with_context(|| {
+            replace(&file.temporary, &file.destination).with_context(|| {
                 format!(
                     "failed to move the finished output into place: {}",
                     file.destination.display()
@@ -588,6 +590,55 @@ impl Drop for StagedOutputs {
             let _ = std::fs::remove_dir(dir);
         }
     }
+}
+
+/// The file `path` finally points to, following symbolic links even when the last one dangles.
+fn link_target(path: &Path) -> PathBuf {
+    let mut target = path.to_path_buf();
+    for _ in 0..40 {
+        match std::fs::read_link(&target) {
+            Ok(next) => target = target.parent().unwrap_or(Path::new("")).join(next),
+            Err(_) => return target,
+        }
+    }
+    path.to_path_buf()
+}
+
+/// Move finished file `temporary` onto `destination`, keeping an existing destination's mode,
+/// owner and hard links: renamed when they carry over, else copied into the destination in place.
+fn replace(temporary: &Path, destination: &Path) -> io::Result<()> {
+    let Ok(existing) = std::fs::metadata(destination) else {
+        return std::fs::rename(temporary, destination);
+    };
+    if carries_over(&existing, temporary) {
+        std::fs::set_permissions(temporary, existing.permissions())?;
+        return std::fs::rename(temporary, destination);
+    }
+    let mut out = std::fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(destination)?;
+    io::copy(&mut File::open(temporary)?, &mut out)?;
+    out.sync_all()?;
+    std::fs::remove_file(temporary)
+}
+
+/// Whether renaming `temporary` over a file with `existing` metadata keeps its links and owner.
+#[cfg(unix)]
+fn carries_over(existing: &std::fs::Metadata, temporary: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(staged) = std::fs::metadata(temporary) else {
+        return false;
+    };
+    existing.nlink() == 1
+        && existing.uid() == staged.uid()
+        && (existing.gid() == staged.gid()
+            || std::os::unix::fs::chown(temporary, None, Some(existing.gid())).is_ok())
+}
+
+#[cfg(not(unix))]
+fn carries_over(_: &std::fs::Metadata, _: &Path) -> bool {
+    true
 }
 
 /// Create an output file, making any missing parent directories first. Shared
@@ -890,6 +941,71 @@ mod tests {
             .collect();
         names.sort();
         assert_eq!(names, ["existing.tsv", "link.tsv", "out"]);
+    }
+
+    /// Stage `path`, write `text` to its temporary file and commit it.
+    fn stage_and_commit(path: &Path, text: &str) {
+        let mut staged = StagedOutputs::default();
+        staged.stage([path.to_path_buf()]);
+        assert_ne!(staged.path(path), path);
+        create_output_file(staged.path(path)).unwrap();
+        std::fs::write(staged.path(path), text).unwrap();
+        staged.commit().unwrap();
+    }
+
+    #[test]
+    fn test_staged_outputs_keep_the_mode_of_the_file_they_replace() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let existing = dir.path().join("existing.sam");
+        std::fs::write(&existing, b"old").unwrap();
+        std::fs::set_permissions(&existing, std::fs::Permissions::from_mode(0o640)).unwrap();
+        stage_and_commit(&existing, "new");
+        assert_eq!(std::fs::read_to_string(&existing).unwrap(), "new");
+        let mode = std::fs::metadata(&existing).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o640);
+    }
+
+    #[test]
+    fn test_staged_outputs_rewrite_a_hard_linked_file_in_place() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let existing = dir.path().join("existing.sam");
+        let link = dir.path().join("link.sam");
+        std::fs::write(&existing, b"old").unwrap();
+        std::fs::hard_link(&existing, &link).unwrap();
+        let inode = std::fs::metadata(&existing).unwrap().ino();
+        stage_and_commit(&existing, "new");
+        assert_eq!(std::fs::read_to_string(&link).unwrap(), "new");
+        assert_eq!(std::fs::metadata(&existing).unwrap().ino(), inode);
+        assert_eq!(std::fs::metadata(&existing).unwrap().nlink(), 2);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn test_staged_outputs_write_through_a_dangling_symbolic_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("link.sam");
+        std::os::unix::fs::symlink("data/target.sam", &link).unwrap();
+        stage_and_commit(&link, "new");
+        assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("data/target.sam")).unwrap(),
+            "new"
+        );
+        assert_eq!(std::fs::read_to_string(&link).unwrap(), "new");
+    }
+
+    #[test]
+    fn test_link_target_follows_a_chain_of_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first");
+        std::os::unix::fs::symlink("second", &first).unwrap();
+        std::os::unix::fs::symlink("sub/third", dir.path().join("second")).unwrap();
+        assert_eq!(link_target(&first), dir.path().join("sub/third"));
+        let looped = dir.path().join("looped");
+        std::os::unix::fs::symlink("looped", &looped).unwrap();
+        assert_eq!(link_target(&looped), looped);
     }
 
     #[test]
