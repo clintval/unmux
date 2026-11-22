@@ -171,6 +171,31 @@ Feature: Split an aligned input by read group, keeping alignments
       | contigs.cram           |
       | contigs.multi-ref.cram |
 
+  Scenario: a CRAM record running past the end of its reference sequence decodes as htslib does
+    Given the test file "past-end.cram"
+    And the test file "contigs.fa"
+    And the test file "contigs.fa.fai"
+    When I run `unmux past-end.cram --reference contigs.fa --group sm=@RG::SM --sample-from-group sm --out out/%sample.sam`
+    Then the exit code is 0
+    And the records of "out/sA.sam" are:
+      """
+      pastEnd	0	ctgB	196	60	10M	*	0	0	TGCGCACGTA	IIIIIIIIII	MD:Z:5	NM:i:0	RG:Z:rg1
+      insBeforeEnd	0	ctgB	193	60	3M2I8M	*	0	0	TTGGGTGCGCCAG	IIIIIIIIIIIII	MD:Z:8	NM:i:2	RG:Z:rg1
+      mismatchThenEnd	0	ctgB	195	60	8M	*	0	0	GAGCGCGG	IIIIIIII	MD:Z:1T4	NM:i:1	RG:Z:rg1
+      skipAcrossEnd	0	ctgB	197	60	2M3N4M	*	0	0	GCACGT	IIIIII	MD:Z:2	NM:i:0	RG:Z:rg1
+      """
+    And the records of "out/sB.sam" are:
+      """
+      clipAcrossEnd	0	ctgB	199	60	2S6M	*	0	0	AAGCTTCA	IIIIIIII	MD:Z:2	NM:i:0	RG:Z:rg2
+      """
+
+  Scenario: a CRAM record running past the end of an embedded reference fails cleanly
+    Given the test file "past-end.embedded-ref.cram"
+    When I run `unmux past-end.embedded-ref.cram --group sm=@RG::SM --sample-from-group sm --out out/%sample.sam`
+    Then the exit code is 1
+    And stderr contains "CRAM record `pastEnd` runs past the end of reference sequence `ctgB`"
+    And a file "out/sA.sam" does not exist
+
   Scenario: a reference-compressed CRAM input needs --reference
     Given the test file "aligned.htslib-3.1.cram"
     When I run `unmux aligned.htslib-3.1.cram --group rg=@RG --sample-from-group rg --out out/%sample.sam`

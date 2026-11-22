@@ -98,6 +98,18 @@ impl fasta::repository::Adapter for LoadingAdapter {
     }
 }
 
+/// Serves padded sequences, and an empty stand-in for any other name.
+struct PaddedAdapter(HashMap<Vec<u8>, fasta::record::Sequence>);
+
+impl fasta::repository::Adapter for PaddedAdapter {
+    fn get(&mut self, name: &[u8]) -> Option<io::Result<fasta::Record>> {
+        Some(Ok(fasta::Record::new(
+            fasta::record::Definition::new(name, None),
+            self.0.remove(name).unwrap_or_default(),
+        )))
+    }
+}
+
 /// Raised by [`ProbeAdapter`] with the first sequence a slice asks for.
 #[derive(Debug)]
 struct Requested(Vec<u8>);
@@ -213,15 +225,60 @@ impl CramDecoder {
                 records => records,
             }
             .context("failed to read CRAM slice records")?;
-            let mut used = HashSet::new();
+            let lengths = self.held()?.clone();
+            let mut padded: HashMap<&[u8], usize> = HashMap::new();
             for record in &records {
-                used.extend(sequence_name(header, record)?);
-                out.push(owned(header, record, &|name| self.held_sequence(name))?);
+                if let Some((name, end)) = aligned_end(header, record)? {
+                    if lengths.get(name).is_some_and(|&length| end > length) {
+                        let length = padded.entry(name).or_default();
+                        *length = (*length).max(end);
+                    }
+                }
             }
-            drop(records);
+            let repadded = if padded.is_empty() {
+                Vec::new()
+            } else {
+                decode(self.padded_repository(&padded)?)
+                    .context("failed to read CRAM slice records")?
+            };
+            let mut used = HashSet::new();
+            for (i, record) in records.iter().enumerate() {
+                let name = sequence_name(header, record)?;
+                used.extend(name);
+                let record = match name.filter(|name| padded.contains_key(name)) {
+                    Some(_) => &repadded[i],
+                    None => record,
+                };
+                let loaded = |name: &[u8]| self.held_sequence(name);
+                let converted = match aligned_end(header, record)? {
+                    Some((name, end))
+                        if end > header_length(header, name) && !padded.contains_key(name) =>
+                    {
+                        convert_past_end(header, record, &loaded, name)
+                    }
+                    _ => owned(header, record, &loaded),
+                };
+                out.push(converted?);
+            }
+            drop((records, repadded));
             self.retain(&used)?;
         }
         Ok(out)
+    }
+
+    /// Held sequences extended with N to the given lengths, and an empty stand-in for any other.
+    fn padded_repository(&self, padded: &HashMap<&[u8], usize>) -> Result<fasta::Repository> {
+        let mut sequences = HashMap::new();
+        for (&name, &length) in padded {
+            let held = self
+                .held_sequence(name)
+                .ok_or_else(|| anyhow!("a padded CRAM reference sequence was not held"))?;
+            let mut bases = Vec::with_capacity(length);
+            bases.extend_from_slice((*held).as_ref());
+            bases.resize(length.max(bases.len()), b'N');
+            sequences.insert(name.to_vec(), fasta::record::Sequence::from(bases));
+        }
+        Ok(fasta::Repository::new(PaddedAdapter(sequences)))
     }
 
     /// Drop the held sequences ahead of `first` in header order, which sorted input never revisits.
@@ -294,6 +351,47 @@ fn sequence_name<'h>(
         .map(|(name, _)| name.as_ref()))
 }
 
+/// The sequence a mapped record is aligned to and its alignment end.
+fn aligned_end<'h>(
+    header: &'h sam::Header,
+    record: &cram::Record<'_>,
+) -> Result<Option<(&'h [u8], usize)>> {
+    let Some(name) = sequence_name(header, record)? else {
+        return Ok(None);
+    };
+    let end = record.alignment_end().transpose()?;
+    Ok(end.map(|end| (name, usize::from(end))))
+}
+
+/// The length the header gives sequence `name`.
+fn header_length(header: &sam::Header, name: &[u8]) -> usize {
+    header
+        .reference_sequences()
+        .get(name)
+        .map_or(usize::MAX, |sequence| sequence.length().get())
+}
+
+/// Convert a record that runs past the end of `name`, failing cleanly where noodles panics.
+fn convert_past_end(
+    header: &sam::Header,
+    record: &cram::Record<'_>,
+    loaded: Loaded<'_>,
+    name: &[u8],
+) -> Result<RecordBuf> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        owned(header, record, loaded)
+    }))
+    .unwrap_or_else(|_| {
+        Err(anyhow!(
+            "CRAM record `{}` runs past the end of reference sequence `{}` in a slice that \
+                 embeds its reference, which unmux cannot decode; convert the input to BAM first \
+                 (e.g. `samtools view -b`)",
+            record.name().map(ToString::to_string).unwrap_or_default(),
+            String::from_utf8_lossy(name)
+        ))
+    })
+}
+
 /// The loaded reference sequence a record decoded against, looked up by name.
 type Loaded<'a> = &'a dyn Fn(&[u8]) -> Option<Arc<fasta::record::Sequence>>;
 
@@ -318,14 +416,15 @@ fn regenerate_md_nm(header: &sam::Header, record: &mut RecordBuf, loaded: Loaded
     if !(want_md || want_nm) || record.flags().is_unmapped() || record.sequence().is_empty() {
         return;
     }
-    let Some(sequence) = record
+    let Some((sequence, length)) = record
         .reference_sequence_id()
         .and_then(|id| header.reference_sequences().get_index(id))
-        .and_then(|(name, _)| loaded(name))
+        .and_then(|(name, map)| Some((loaded(name)?, map.length().get())))
     else {
         return;
     };
-    if let Some((md, nm)) = md_nm(record, (*sequence).as_ref()) {
+    let sequence: &[u8] = (*sequence).as_ref();
+    if let Some((md, nm)) = md_nm(record, &sequence[..length.min(sequence.len())]) {
         add_md_nm(header, record, want_md.then_some(md), want_nm.then_some(nm));
     }
 }
@@ -339,7 +438,8 @@ fn take_cram_flags(record: &mut RecordBuf) -> i64 {
         .unwrap_or(0)
 }
 
-/// The MD string and edit distance htslib derives from a record's CIGAR, SEQ and reference.
+/// The MD string and edit distance htslib derives from a record's CIGAR, SEQ and reference; like
+/// htslib, the MD string stops at the first base past the end of the reference.
 fn md_nm(record: &RecordBuf, reference: &[u8]) -> Option<(Vec<u8>, u32)> {
     let read = record.sequence().as_ref();
     let mut ref_pos = usize::from(record.alignment_start()?) - 1;
@@ -347,31 +447,50 @@ fn md_nm(record: &RecordBuf, reference: &[u8]) -> Option<(Vec<u8>, u32)> {
     let mut md = Vec::new();
     let mut nm = 0u32;
     let mut run = 0u32;
+    let mut past_end = false;
+    let end_run = |md: &mut Vec<u8>, run: &mut u32| {
+        md.extend_from_slice(run.to_string().as_bytes());
+        *run = 0;
+    };
     for op in record.cigar().as_ref() {
         let len = op.len();
         match op.kind() {
             Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch => {
                 for _ in 0..len {
-                    let base = reference.get(ref_pos)?.to_ascii_uppercase();
-                    if read.get(read_pos)?.to_ascii_uppercase() != base || base == b'N' {
-                        md.extend_from_slice(run.to_string().as_bytes());
-                        md.push(base);
-                        run = 0;
-                        nm += 1;
-                    } else {
-                        run += 1;
+                    let read_base = read.get(read_pos)?.to_ascii_uppercase();
+                    match reference.get(ref_pos).map(u8::to_ascii_uppercase) {
+                        _ if past_end => {}
+                        None => {
+                            end_run(&mut md, &mut run);
+                            past_end = true;
+                        }
+                        Some(base) if read_base != base || base == b'N' => {
+                            end_run(&mut md, &mut run);
+                            md.push(base);
+                            nm += 1;
+                        }
+                        Some(_) => run += 1,
                     }
                     ref_pos += 1;
                     read_pos += 1;
                 }
             }
             Kind::Deletion => {
-                let bases = reference.get(ref_pos..ref_pos + len)?;
-                md.extend_from_slice(run.to_string().as_bytes());
-                md.push(b'^');
-                md.extend(bases.iter().map(u8::to_ascii_uppercase));
-                run = 0;
-                nm += u32::try_from(len).ok()?;
+                if !past_end {
+                    end_run(&mut md, &mut run);
+                    if let Some(bases) = reference.get(ref_pos..reference.len().min(ref_pos + len))
+                    {
+                        md.push(b'^');
+                        md.extend(bases.iter().map(u8::to_ascii_uppercase));
+                        nm += u32::try_from(bases.len()).ok()?;
+                        past_end = bases.len() < len;
+                        if past_end {
+                            md.push(b'0');
+                        }
+                    } else {
+                        past_end = true;
+                    }
+                }
                 ref_pos += len;
             }
             Kind::Insertion => {
@@ -383,7 +502,9 @@ fn md_nm(record: &RecordBuf, reference: &[u8]) -> Option<(Vec<u8>, u32)> {
             Kind::HardClip | Kind::Pad => {}
         }
     }
-    md.extend_from_slice(run.to_string().as_bytes());
+    if !past_end {
+        end_run(&mut md, &mut run);
+    }
     Some((md, nm))
 }
 
@@ -548,6 +669,26 @@ mod tests {
         assert_eq!(
             regenerated("r\t0\tc\t10\t60\t3D2M\t*\t0\t0\tGT\t*"),
             "MD:Z:0^TAC2 NM:i:3"
+        );
+    }
+
+    #[test]
+    fn test_md_nm_stop_at_the_end_of_the_reference_like_htslib() {
+        assert_eq!(
+            regenerated("r\t0\tc\t27\t60\t6M\t*\t0\t0\tACGTAA\t*"),
+            "MD:Z:4 NM:i:0"
+        );
+        assert_eq!(
+            regenerated("r\t0\tc\t27\t60\t6M\t*\t0\t0\tAGGTAA\t*"),
+            "MD:Z:1C2 NM:i:1"
+        );
+        assert_eq!(
+            regenerated("r\t0\tc\t29\t60\t2M2I3M\t*\t0\t0\tGTAAACG\t*"),
+            "MD:Z:2 NM:i:2"
+        );
+        assert_eq!(
+            regenerated("r\t0\tc\t28\t60\t2M3D1M\t*\t0\t0\tCGA\t*"),
+            "MD:Z:2^T0 NM:i:1"
         );
     }
 
