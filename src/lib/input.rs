@@ -524,7 +524,7 @@ enum CramContainers {
         /// The header, for decoding.
         header: Box<sam::Header>,
         /// Decodes each container, against the `--reference` FASTA when given.
-        decoder: Box<CramDecoder>,
+        decoder: CramDecoder,
         /// Set at the EOF container, whose unread body would misparse as another.
         eof: bool,
     },
@@ -541,8 +541,7 @@ impl CramContainers {
     fn pooled(
         mut reader: cram::io::Reader<Recorder<Box<dyn BufRead + Send>>>,
         header: sam::Header,
-        reference: Option<&Reference>,
-        path: &Path,
+        decoder: &CramDecoder,
         workers: NonZero<usize>,
     ) -> Result<Self> {
         type Job = (
@@ -556,7 +555,7 @@ impl CramContainers {
         for _ in 0..workers.get() {
             let job_rx = job_rx.clone();
             let header = std::sync::Arc::clone(&header);
-            let mut decoder = CramDecoder::new(reference.cloned(), path, &header);
+            let decoder = decoder.clone();
             std::thread::Builder::new()
                 .stack_size(CRAM_DECODE_STACK)
                 .spawn(move || {
@@ -963,15 +962,14 @@ fn open_format_reader(
             let header = quietly(|| reader.read_header())
                 .ok_or_else(|| anyhow!("failed to read CRAM header: it is malformed"))?
                 .context("failed to read CRAM header")?;
+            let decoder = CramDecoder::new(reference.cloned(), path, &header);
             let containers = match decode_threads {
-                Some(workers) => {
-                    CramContainers::pooled(reader, header.clone(), reference, path, workers)?
-                }
+                Some(workers) => CramContainers::pooled(reader, header.clone(), &decoder, workers)?,
                 None => CramContainers::Inline {
                     reader,
                     container: cram::io::reader::Container::default(),
-                    decoder: Box::new(CramDecoder::new(reference.cloned(), path, &header)),
                     header: Box::new(header.clone()),
+                    decoder,
                     eof: false,
                 },
             };
