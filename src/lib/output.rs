@@ -473,6 +473,8 @@ pub struct MultiWriter {
     /// the raw `--unassigned`/`--remove` bins): `@PG` provenance plus the
     /// default pool `@RG`.
     default_header: sam::Header,
+    /// The file each destination path is written to, when that differs from the path.
+    files: HashMap<PathBuf, PathBuf>,
 }
 
 impl MultiWriter {
@@ -499,7 +501,13 @@ impl MultiWriter {
             input_formats,
             compression,
             default_header,
+            files: HashMap::new(),
         }
+    }
+
+    /// Write each destination path in `files` to the file it maps to instead.
+    pub fn write_files_to(&mut self, files: HashMap<PathBuf, PathBuf>) {
+        self.files = files;
     }
 
     /// Install the pre-exchanged BGZF pool writers, keyed by destination path.
@@ -570,7 +578,8 @@ impl MultiWriter {
             // writers ignore it.
             return OutputWriter::from_pooled(pooled, format, header);
         }
-        OutputWriter::create_with_header(path, format, self.compression, header)
+        let file = path.map(|path| self.files.get(path).map_or(path, PathBuf::as_path));
+        OutputWriter::create_with_header(file, format, self.compression, header)
     }
 
     /// Finalize every opened writer (flush, gzip trailers, BGZF EOF), returning

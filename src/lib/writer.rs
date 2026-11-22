@@ -17,6 +17,7 @@
 //! the pooled BAM writer is built via `From` so it carries no inner BGZF (the
 //! pool is the sole stage).
 
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -486,22 +487,45 @@ fn bgzf_writer<W: Write>(inner: W, compression: u8) -> Result<bgzf::io::Writer<W
         .build_from_writer(inner))
 }
 
-/// Files and directories a run creates, removed on drop unless kept; existing paths are untracked.
+/// Output files written beside their destinations under temporary names, renamed into place by
+/// [`StagedOutputs::commit`]. Dropped uncommitted, it removes the temporary files and the
+/// directories it created, so a failed run never changes a file that was already there.
 #[derive(Debug, Default)]
-pub(crate) struct CreatedOutputs {
-    files: Vec<PathBuf>,
+pub(crate) struct StagedOutputs {
+    files: HashMap<PathBuf, StagedFile>,
     dirs: Vec<PathBuf>,
-    kept: bool,
+    committed: bool,
 }
 
-impl CreatedOutputs {
-    /// Track every path in `paths` that does not exist yet, with its missing parent directories.
-    pub(crate) fn track(&mut self, paths: impl IntoIterator<Item = PathBuf>) {
+/// Where one staged output is written, and the file it replaces on commit.
+#[derive(Debug)]
+struct StagedFile {
+    destination: PathBuf,
+    temporary: PathBuf,
+}
+
+impl StagedOutputs {
+    /// Stage every path in `paths`, noting its missing parent directories. A path that exists but
+    /// is not a regular file, such as a device or a FIFO, is written in place.
+    pub(crate) fn stage(&mut self, paths: impl IntoIterator<Item = PathBuf>) {
         for path in paths {
-            if path.symlink_metadata().is_ok() {
+            if self.files.contains_key(&path) {
                 continue;
             }
-            for dir in path.ancestors().skip(1) {
+            let destination = match std::fs::metadata(&path) {
+                Ok(metadata) if !metadata.is_file() => continue,
+                Ok(_) => std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone()),
+                Err(_) => path.clone(),
+            };
+            let Some(name) = destination.file_name() else {
+                continue;
+            };
+            let temporary = destination.with_file_name(format!(
+                ".{}.unmux-{}.tmp",
+                name.to_string_lossy(),
+                std::process::id()
+            ));
+            for dir in destination.ancestors().skip(1) {
                 if dir.as_os_str().is_empty() || dir.symlink_metadata().is_ok() {
                     break;
                 }
@@ -509,23 +533,54 @@ impl CreatedOutputs {
                     self.dirs.push(dir.to_path_buf());
                 }
             }
-            self.files.push(path);
+            let file = StagedFile {
+                destination,
+                temporary,
+            };
+            self.files.insert(path, file);
         }
     }
 
-    /// Keep everything the run created.
-    pub(crate) fn keep(&mut self) {
-        self.kept = true;
+    /// The file to write for output `path`: its temporary file when staged, else `path` itself.
+    pub(crate) fn path<'a>(&'a self, path: &'a Path) -> &'a Path {
+        self.files
+            .get(path)
+            .map_or(path, |file| file.temporary.as_path())
+    }
+
+    /// The temporary file of every staged output, by output path.
+    pub(crate) fn temporaries(&self) -> HashMap<PathBuf, PathBuf> {
+        self.files
+            .iter()
+            .map(|(path, file)| (path.clone(), file.temporary.clone()))
+            .collect()
+    }
+
+    /// Rename every written temporary file over its destination.
+    pub(crate) fn commit(&mut self) -> Result<()> {
+        for file in self.files.values() {
+            if file.temporary.symlink_metadata().is_err() {
+                continue;
+            }
+            std::fs::rename(&file.temporary, &file.destination).with_context(|| {
+                format!(
+                    "failed to move the finished output into place: {}",
+                    file.destination.display()
+                )
+            })?;
+        }
+        self.committed = true;
+        Ok(())
     }
 }
 
-impl Drop for CreatedOutputs {
+impl Drop for StagedOutputs {
     fn drop(&mut self) {
-        if self.kept {
+        if self.committed {
             return;
         }
-        for file in &self.files {
-            let _ = std::fs::remove_file(file);
+        for file in self.files.values() {
+            let _ = std::fs::remove_file(&file.temporary);
         }
         self.dirs
             .sort_by_key(|dir| std::cmp::Reverse(dir.components().count()));
@@ -787,30 +842,62 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_created_outputs_removes_only_what_the_run_created() {
+    fn test_staged_outputs_leave_existing_files_untouched_on_failure() {
         let dir = tempfile::tempdir().unwrap();
         let existing = dir.path().join("existing.bam");
         std::fs::write(&existing, b"keep").unwrap();
-        let created_file = dir.path().join("new/nested/out.bam");
-        let mut created = CreatedOutputs::default();
-        created.track([existing.clone(), created_file.clone()]);
-        create_output_file(&created_file).unwrap();
-        drop(created);
+        let created = dir.path().join("new/nested/out.bam");
+        let mut staged = StagedOutputs::default();
+        staged.stage([existing.clone(), created.clone()]);
+        for path in [&existing, &created] {
+            assert_ne!(staged.path(path), path.as_path());
+            create_output_file(staged.path(path)).unwrap();
+            std::fs::write(staged.path(path), b"partial").unwrap();
+        }
+        let temporaries = staged.temporaries();
+        drop(staged);
         assert_eq!(std::fs::read(&existing).unwrap(), b"keep");
-        assert!(!created_file.exists());
+        assert!(!created.exists());
         assert!(!dir.path().join("new").exists());
+        assert!(temporaries.values().all(|temporary| !temporary.exists()));
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 
     #[test]
-    fn test_created_outputs_keeps_everything_once_kept() {
+    fn test_staged_outputs_replace_their_destinations_on_commit() {
         let dir = tempfile::tempdir().unwrap();
-        let created_file = dir.path().join("out/out.bam");
-        let mut created = CreatedOutputs::default();
-        created.track([created_file.clone()]);
-        create_output_file(&created_file).unwrap();
-        created.keep();
-        drop(created);
-        assert!(created_file.exists());
+        let existing = dir.path().join("existing.tsv");
+        std::fs::write(&existing, b"old").unwrap();
+        let link = dir.path().join("link.tsv");
+        std::os::unix::fs::symlink(&existing, &link).unwrap();
+        let created = dir.path().join("out/out.tsv");
+        let unwritten = dir.path().join("unwritten.tsv");
+        let mut staged = StagedOutputs::default();
+        staged.stage([link.clone(), created.clone(), unwritten.clone()]);
+        for (path, text) in [(&link, "new"), (&created, "created")] {
+            create_output_file(staged.path(path)).unwrap();
+            std::fs::write(staged.path(path), text).unwrap();
+        }
+        staged.commit().unwrap();
+        drop(staged);
+        assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read_to_string(&existing).unwrap(), "new");
+        assert_eq!(std::fs::read_to_string(&created).unwrap(), "created");
+        assert!(!unwritten.exists());
+        let mut names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["existing.tsv", "link.tsv", "out"]);
+    }
+
+    #[test]
+    fn test_staged_outputs_write_devices_in_place() {
+        let mut staged = StagedOutputs::default();
+        staged.stage([PathBuf::from("/dev/null")]);
+        assert_eq!(staged.path(Path::new("/dev/null")), Path::new("/dev/null"));
+        staged.commit().unwrap();
     }
 
     #[test]

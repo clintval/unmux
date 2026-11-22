@@ -205,7 +205,7 @@ Feature: Split an aligned input by read group, keeping alignments
     And a file "out/rg1.sam" does not exist
     And a file "out/rg2.sam" does not exist
 
-  Scenario: a failed run removes the outputs it created and keeps files that were already there
+  Scenario: a failed run removes the outputs it created and leaves files that were already there unchanged
     Given the test file "aligned.htslib-3.0.cram"
     And a file "out/rg1.sam" containing:
       """
@@ -213,10 +213,11 @@ Feature: Split an aligned input by read group, keeping alignments
       """
     When I run `unmux aligned.htslib-3.0.cram --group rg=@RG --sample-from-group rg --out out/%sample.sam --unassigned out/unassigned.sam --metrics-summary out/summary.tsv`
     Then the exit code is 1
-    And a file "out/rg1.sam" exists
-    And a file "out/rg2.sam" does not exist
-    And a file "out/unassigned.sam" does not exist
-    And a file "out/summary.tsv" does not exist
+    And the file "out/rg1.sam" is:
+      """
+      existing
+      """
+    And the directory "out" holds exactly "rg1.sam"
 
   Scenario: a CRAM with an embedded reference splits without --reference
     Given the test file "contigs.embedded-ref.cram"

@@ -57,7 +57,7 @@ use crate::output::{
 };
 use crate::qc::{removed_slug, routed_slug, unassigned_slug, Unassigned};
 use crate::tags::{load_tag_file, TagSet};
-use crate::writer::{encode_fragment, output_format, CreatedOutputs, OutputFormat, OutputRead};
+use crate::writer::{encode_fragment, output_format, OutputFormat, OutputRead, StagedOutputs};
 
 /// Resolved arguments for the `unmux` demux command.
 #[derive(Debug, Clone)]
@@ -1196,8 +1196,8 @@ fn run_engine(plan: &DemuxPlan, command_line: Option<&str>) -> Result<()> {
         Some(input) => alignment_header(input, None, command_line)?,
         None => default_read_group_header(&pool, &plan.rg_tags, command_line)?,
     };
-    // Declared first so it drops after every writer, removing what a failed run created.
-    let mut created = CreatedOutputs::default();
+    // Declared first so it drops after every writer, removing what a failed run wrote.
+    let mut staged = StagedOutputs::default();
     // Declared before `writer` so that, on any unwind, `writer` (and its
     // PooledWriters) drops before the pool: a PooledWriter dropped after the
     // pool is stopped would panic. The explicit shutdown below also enforces
@@ -1219,7 +1219,7 @@ fn run_engine(plan: &DemuxPlan, command_line: Option<&str>) -> Result<()> {
         reader.fragment_width(),
     )?;
     log_run_shape(plan, &input_formats, &dests);
-    created.track(
+    staged.stage(
         dests.iter().cloned().chain(
             [
                 &plan.metrics_per_sample,
@@ -1231,6 +1231,7 @@ fn run_engine(plan: &DemuxPlan, command_line: Option<&str>) -> Result<()> {
             .map(|pattern| resolve_metrics_path(pattern, &pool)),
         ),
     );
+    writer.write_files_to(staged.temporaries());
 
     // Route poolable destinations (gzipped FASTX and BAM) through a shared BGZF
     // compressor pool, so compression runs off the consumer thread (the
@@ -1282,7 +1283,7 @@ fn run_engine(plan: &DemuxPlan, command_line: Option<&str>) -> Result<()> {
             .map_err(|e| anyhow!("invalid --compression {} for BGZF: {e}", plan.compression))?;
         let mut exchanged: HashMap<PathBuf, PooledWriter> = HashMap::new();
         for path in &poolable {
-            let file = crate::writer::create_output_file(path)?;
+            let file = crate::writer::create_output_file(staged.path(path))?;
             exchanged.insert(path.clone(), builder.exchange(BufWriter::new(file)));
         }
         writer_pool = Some(
@@ -1374,16 +1375,16 @@ fn run_engine(plan: &DemuxPlan, command_line: Option<&str>) -> Result<()> {
         );
     }
     if let Some(pattern) = &plan.metrics_per_sample {
-        metrics.write_per_sample_tsv(&resolve_metrics_path(pattern, &pool))?;
+        metrics.write_per_sample_tsv(staged.path(&resolve_metrics_path(pattern, &pool)))?;
     }
     if let Some(pattern) = &plan.metrics_summary {
-        metrics.write_summary_tsv(&resolve_metrics_path(pattern, &pool))?;
+        metrics.write_summary_tsv(staged.path(&resolve_metrics_path(pattern, &pool)))?;
     }
     if let Some(pattern) = &plan.metrics_unassigned {
-        metrics.write_unassigned_tsv(&resolve_metrics_path(pattern, &pool), &groups)?;
+        metrics
+            .write_unassigned_tsv(staged.path(&resolve_metrics_path(pattern, &pool)), &groups)?;
     }
-    created.keep();
-    Ok(())
+    staged.commit()
 }
 
 /// The result of matching every group against one record: either a

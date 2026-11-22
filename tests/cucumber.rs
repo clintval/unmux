@@ -305,6 +305,19 @@ async fn file_absent(world: &mut SassWorld, name: String) {
     assert!(!path.exists(), "file {name:?} unexpectedly exists");
 }
 
+#[then(regex = r#"^the directory "([^"]+)" holds exactly "([^"]*)"$"#)]
+async fn directory_holds(world: &mut SassWorld, name: String, entries: String) {
+    let dir = world.work_dir().join(&name);
+    let mut actual: Vec<String> = fs::read_dir(&dir)
+        .unwrap_or_else(|_| panic!("read directory {name:?}"))
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    actual.sort();
+    let mut expected: Vec<String> = entries.split(", ").map(str::to_string).collect();
+    expected.sort();
+    assert_eq!(actual, expected, "the entries of directory {name:?} differ");
+}
+
 #[then(regex = r#"^the file "([^"]+)" is larger than the file "([^"]+)"$"#)]
 async fn file_larger_than(world: &mut SassWorld, bigger: String, smaller: String) {
     let dir = world.work_dir();
