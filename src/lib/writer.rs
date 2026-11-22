@@ -17,10 +17,12 @@
 //! the pooled BAM writer is built via `From` so it carries no inner BGZF (the
 //! pool is the sole stage).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use anyhow::{anyhow, bail, Context, Result};
 use noodles::sam::alignment::io::Write as AlignmentWrite;
@@ -490,11 +492,68 @@ fn bgzf_writer<W: Write>(inner: W, compression: u8) -> Result<bgzf::io::Writer<W
 /// Output files written beside their destinations under temporary names, renamed into place by
 /// [`StagedOutputs::commit`]. Dropped uncommitted, it removes the temporary files and the
 /// directories it created, so a failed run never changes a file that was already there.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct StagedOutputs {
+    id: u64,
     files: HashMap<PathBuf, StagedFile>,
     dirs: Vec<PathBuf>,
     committed: bool,
+}
+
+impl Default for StagedOutputs {
+    fn default() -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        Self {
+            id: NEXT.fetch_add(1, Ordering::Relaxed),
+            files: HashMap::new(),
+            dirs: Vec::new(),
+            committed: false,
+        }
+    }
+}
+
+/// The temporary files and created directories of every live [`StagedOutputs`], by its id.
+type Registry = BTreeMap<u64, (Vec<PathBuf>, Vec<PathBuf>)>;
+
+static REGISTRY: Mutex<Registry> = Mutex::new(BTreeMap::new());
+
+fn registry() -> MutexGuard<'static, Registry> {
+    REGISTRY.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Remove `files`, then the directories in `dirs` that are left empty, deepest first.
+fn remove_staged(files: &[PathBuf], dirs: &[PathBuf]) {
+    for file in files {
+        let _ = std::fs::remove_file(file);
+    }
+    let mut dirs = dirs.to_vec();
+    dirs.sort_by_key(|dir| std::cmp::Reverse(dir.components().count()));
+    for dir in &dirs {
+        let _ = std::fs::remove_dir(dir);
+    }
+}
+
+/// On SIGINT, SIGTERM or SIGHUP, remove staged outputs and exit 128 plus the signal number.
+pub fn clean_up_on_termination() -> io::Result<()> {
+    use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
+    let armed = Arc::new(AtomicBool::new(false));
+    for signal in [SIGINT, SIGTERM, SIGHUP] {
+        signal_hook::flag::register_conditional_shutdown(signal, 128 + signal, Arc::clone(&armed))?;
+        signal_hook::flag::register(signal, Arc::clone(&armed))?;
+    }
+    let mut signals = signal_hook::iterator::Signals::new([SIGINT, SIGTERM, SIGHUP])?;
+    std::thread::Builder::new()
+        .name("unmux-signals".to_string())
+        .spawn(move || {
+            if let Some(signal) = signals.forever().next() {
+                let registry = registry();
+                for (files, dirs) in registry.values() {
+                    remove_staged(files, dirs);
+                }
+                std::process::exit(128 + signal);
+            }
+        })?;
+    Ok(())
 }
 
 /// Where one staged output is written, and the file it replaces on commit.
@@ -541,6 +600,8 @@ impl StagedOutputs {
             };
             self.files.insert(path, file);
         }
+        let temporaries = self.files.values().map(|file| file.temporary.clone());
+        registry().insert(self.id, (temporaries.collect(), self.dirs.clone()));
     }
 
     /// The file to write for output `path`: its temporary file when staged, else `path` itself.
@@ -560,6 +621,7 @@ impl StagedOutputs {
 
     /// Rename every written temporary file over its destination.
     pub(crate) fn commit(&mut self) -> Result<()> {
+        let mut registry = registry();
         for file in self.files.values() {
             if file.temporary.symlink_metadata().is_err() {
                 continue;
@@ -572,23 +634,23 @@ impl StagedOutputs {
             })?;
         }
         self.committed = true;
+        registry.remove(&self.id);
         Ok(())
     }
 }
 
 impl Drop for StagedOutputs {
     fn drop(&mut self) {
-        if self.committed {
-            return;
+        let mut registry = registry();
+        if !self.committed {
+            let temporaries: Vec<PathBuf> = self
+                .files
+                .values()
+                .map(|file| file.temporary.clone())
+                .collect();
+            remove_staged(&temporaries, &self.dirs);
         }
-        for file in self.files.values() {
-            let _ = std::fs::remove_file(&file.temporary);
-        }
-        self.dirs
-            .sort_by_key(|dir| std::cmp::Reverse(dir.components().count()));
-        for dir in &self.dirs {
-            let _ = std::fs::remove_dir(dir);
-        }
+        registry.remove(&self.id);
     }
 }
 

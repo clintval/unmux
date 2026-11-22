@@ -674,6 +674,10 @@ fn main() -> Result<(), Error> {
         .write_style(write_style)
         .init();
 
+    if let Err(error) = unmux::writer::clean_up_on_termination() {
+        warn!("cannot remove unfinished outputs on a termination signal: {error}");
+    }
+
     // Our doc comments are hand-wrapped to fit 80 columns (that is what
     // `verbatim_doc_comment` is for), and `decorate_help` injects ANSI color
     // into them. clap's own help wrapping would count those escape bytes as
