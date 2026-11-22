@@ -128,6 +128,16 @@ Feature: --reference is checked against the CRAM @SQ lines
     And stderr contains "@SQ LN:3000"
     And a file "out" does not exist
 
+  Scenario: a CRAM without M5 still fails on a stale .fai before decoding
+    Given the test file "aligned.htslib-3.0.no-m5.cram"
+    And a copy of the test file "ref.fa" named "edited.fa" with ">chr1" replaced by ">chr1 assembled"
+    And a copy of the test file "ref.fa.fai" named "edited.fa.fai"
+    When I run `unmux aligned.htslib-3.0.no-m5.cram --reference edited.fa --group rg=@RG --sample-from-group rg --out out/%sample.sam`
+    Then the exit code is 1
+    And stderr contains "the .fai index edited.fa.fai is stale: contig `chr1` does not start at its indexed offset 6 in edited.fa"
+    And stderr does not contain "checksum mismatch"
+    And a file "out" does not exist
+
   Scenario: a SAM input ignores --reference
     Given the test file "aligned.sam"
     And a copy of the test file "ref.fa" named "renamed.fa" with ">chr1" replaced by ">chrX"
