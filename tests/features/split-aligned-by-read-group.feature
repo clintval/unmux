@@ -241,6 +241,20 @@ Feature: Split an aligned input by read group, keeping alignments
     And the records of "out/sA.sam" are the "RG:Z:rg1" records of the test file "contigs.sam"
     And the records of "out/sB.sam" are the "RG:Z:rg2" records of the test file "contigs.sam"
 
+  Scenario Outline: a CRAM written without a reference in multi-reference slices splits <how>
+    Given the test file "contigs.no-ref.multi-ref.cram"
+    And the test file "contigs.fa"
+    And the test file "contigs.fa.fai"
+    When I run `unmux contigs.no-ref.multi-ref.cram <args> --group sm=@RG::SM --sample-from-group sm --out out/%sample.sam`
+    Then the exit code is 0
+    And the records of "out/sA.sam" are the "RG:Z:rg1" records of the test file "contigs.sam"
+    And the records of "out/sB.sam" are the "RG:Z:rg2" records of the test file "contigs.sam"
+
+    Examples:
+      | how                  | args                   |
+      | without --reference  | --threads 1            |
+      | with --reference     | --reference contigs.fa |
+
   Scenario: --reference without a CRAM input is unused and says so
     Given the test file "ref.fa"
     And the test file "ref.fa.fai"

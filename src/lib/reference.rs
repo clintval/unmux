@@ -110,6 +110,20 @@ impl fasta::repository::Adapter for PaddedAdapter {
     }
 }
 
+/// Serves zeroed stand-ins of the given lengths for slices that need no reference: noodles still
+/// asks for the sequence of every record in a multi-reference slice and indexes it by position.
+struct BlankAdapter(HashMap<Vec<u8>, usize>);
+
+impl fasta::repository::Adapter for BlankAdapter {
+    fn get(&mut self, name: &[u8]) -> Option<io::Result<fasta::Record>> {
+        let length = self.0.get(name).copied().unwrap_or(0);
+        Some(Ok(fasta::Record::new(
+            fasta::record::Definition::new(name, None),
+            fasta::record::Sequence::from(vec![0; length]),
+        )))
+    }
+}
+
 /// Raised by [`ProbeAdapter`] with the first sequence a slice asks for.
 #[derive(Debug)]
 struct Requested(Vec<u8>);
@@ -145,6 +159,8 @@ pub(crate) struct CramDecoder {
     path: PathBuf,
     repository: fasta::Repository,
     held: Held,
+    blank: Option<fasta::Repository>,
+    blank_lengths: HashMap<Vec<u8>, usize>,
 }
 
 impl CramDecoder {
@@ -155,6 +171,8 @@ impl CramDecoder {
             path: path.to_path_buf(),
             repository: fasta::Repository::default(),
             held: Held::default(),
+            blank: None,
+            blank_lengths: HashMap::new(),
         };
         decoder.repository = decoder.loading_repository(HashMap::new());
         decoder
@@ -191,6 +209,7 @@ impl CramDecoder {
     /// Each slice decodes once against every sequence it references. A probe with no sequences
     /// first finds the first one it needs, so a single-reference container, or sorted input, drops
     /// what the slice cannot use before loading more; afterwards the unused sequences are dropped.
+    /// A container written without the reference never loads one.
     pub(crate) fn decode(
         &mut self,
         container: &cram::io::reader::Container,
@@ -211,19 +230,41 @@ impl CramDecoder {
             let decode = |repository: fasta::Repository| {
                 slice.records(repository, header, &compression_header, &core, &external)
             };
-            let records = match decode(fasta::Repository::new(ProbeAdapter)) {
-                Err(error) => match requested(&error) {
-                    Some(name) => {
-                        if single_reference {
-                            self.retain(&HashSet::from([name]))?;
-                        } else if sorted {
-                            self.retain_from(header, name)?;
+            let records = if !regenerate {
+                let records = decode(self.blank_repository(header, &[]))
+                    .context("failed to read CRAM slice records")?;
+                let ends: Vec<(&[u8], usize)> = records
+                    .iter()
+                    .map(|record| aligned_end(header, record))
+                    .filter_map(Result::transpose)
+                    .collect::<Result<_>>()?;
+                if sorted {
+                    self.blank = None;
+                }
+                if ends
+                    .iter()
+                    .all(|(name, end)| self.blank_lengths.get(*name) >= Some(end))
+                {
+                    Ok(records)
+                } else {
+                    drop(records);
+                    decode(self.blank_repository(header, &ends))
+                }
+            } else {
+                match decode(fasta::Repository::new(ProbeAdapter)) {
+                    Err(error) => match requested(&error) {
+                        Some(name) => {
+                            if single_reference {
+                                self.retain(&HashSet::from([name]))?;
+                            } else if sorted {
+                                self.retain_from(header, name)?;
+                            }
+                            decode(self.repository.clone())
                         }
-                        decode(self.repository.clone())
-                    }
-                    None => Err(error),
-                },
-                records => records,
+                        None => Err(error),
+                    },
+                    records => records,
+                }
             }
             .context("failed to read CRAM slice records")?;
             let lengths = self.held()?.clone();
@@ -255,16 +296,57 @@ impl CramDecoder {
                     Some((name, end))
                         if end > header_length(header, name) && !padded.contains_key(name) =>
                     {
-                        convert_past_end(header, record, &loaded, name)
+                        convert_guarded(header, record, &loaded, || past_end(record, name))
+                    }
+                    _ if !regenerate => {
+                        convert_guarded(header, record, &loaded, || self.unreferenced(record))
                     }
                     _ => owned(header, record, &loaded),
-                };
-                out.push(converted?);
+                }?;
+                // A zeroed stand-in base means the record needed reference bases its slice lacks.
+                if !regenerate && converted.sequence().as_ref().contains(&0) {
+                    return Err(self.unreferenced(record));
+                }
+                out.push(converted);
             }
             drop((records, repadded));
             self.retain(&used)?;
         }
         Ok(out)
+    }
+
+    /// The error for a record that needs reference bases its slice does not carry.
+    fn unreferenced(&self, record: &cram::Record<'_>) -> anyhow::Error {
+        anyhow!(
+            "CRAM record `{}` in {} needs reference bases its slice does not carry",
+            record_name(record),
+            self.path.display()
+        )
+    }
+
+    /// The zeroed stand-ins for slices that need no reference, each as long as its header length
+    /// or the farthest of `ends` on it.
+    fn blank_repository(
+        &mut self,
+        header: &sam::Header,
+        ends: &[(&[u8], usize)],
+    ) -> fasta::Repository {
+        if self.blank_lengths.is_empty() {
+            for (name, sequence) in header.reference_sequences() {
+                self.blank_lengths
+                    .insert(name.to_vec(), sequence.length().get());
+            }
+        }
+        for &(name, end) in ends {
+            let length = self.blank_lengths.entry(name.to_vec()).or_default();
+            if end > *length {
+                *length = end;
+                self.blank = None;
+            }
+        }
+        self.blank
+            .get_or_insert_with(|| fasta::Repository::new(BlankAdapter(self.blank_lengths.clone())))
+            .clone()
     }
 
     /// Held sequences extended with N to the given lengths, and an empty stand-in for any other.
@@ -385,25 +467,33 @@ fn header_length(header: &sam::Header, name: &[u8]) -> usize {
         .map_or(usize::MAX, |sequence| sequence.length().get())
 }
 
-/// Convert a record that runs past the end of `name`, failing cleanly where noodles panics.
-fn convert_past_end(
+/// Convert a record whose decode can panic inside noodles, failing with `error` instead.
+fn convert_guarded(
     header: &sam::Header,
     record: &cram::Record<'_>,
     loaded: Loaded<'_>,
-    name: &[u8],
+    error: impl FnOnce() -> anyhow::Error,
 ) -> Result<RecordBuf> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         owned(header, record, loaded)
     }))
-    .unwrap_or_else(|_| {
-        Err(anyhow!(
-            "CRAM record `{}` runs past the end of reference sequence `{}` in a slice that \
-                 embeds its reference, which unmux cannot decode; convert the input to BAM first \
-                 (e.g. `samtools view -b`)",
-            record.name().map(ToString::to_string).unwrap_or_default(),
-            String::from_utf8_lossy(name)
-        ))
-    })
+    .unwrap_or_else(|_| Err(error()))
+}
+
+/// The error for a record that runs past the end of `name` in a slice that embeds its reference.
+fn past_end(record: &cram::Record<'_>, name: &[u8]) -> anyhow::Error {
+    anyhow!(
+        "CRAM record `{}` runs past the end of reference sequence `{}` in a slice that embeds its \
+         reference, which unmux cannot decode; convert the input to BAM first (e.g. `samtools \
+         view -b`)",
+        record_name(record),
+        String::from_utf8_lossy(name)
+    )
+}
+
+/// A record's name, for messages.
+fn record_name(record: &cram::Record<'_>) -> String {
+    record.name().map(ToString::to_string).unwrap_or_default()
 }
 
 /// The loaded reference sequence a record decoded against, looked up by name.
@@ -611,6 +701,29 @@ mod tests {
         let parts: Vec<&[RecordBuf]> = records.chunks(29).collect();
         let md: Vec<usize> = parts.iter().map(|part| with_md(part)).collect();
         assert_eq!(md, [26, 1, 26, 1]);
+    }
+
+    #[test]
+    fn test_multi_reference_slice_written_without_a_reference_never_loads_one() {
+        let path = test_data("contigs.no-ref.multi-ref.cram");
+        for reference in [
+            None,
+            Some(Reference::load(&test_data("contigs.fa")).unwrap()),
+        ] {
+            let mut reader = cram::io::Reader::new(File::open(&path).unwrap());
+            let header = reader.read_header().unwrap();
+            let mut decoder = CramDecoder::new(reference, &path);
+            let mut container = cram::io::reader::Container::default();
+            let mut records = Vec::new();
+            while reader.read_container(&mut container).unwrap() != 0 {
+                records.extend(decoder.decode(&container, &header).unwrap());
+            }
+            assert_eq!(records.len(), 29);
+            assert!(decoder.repository.is_empty());
+            assert!(records
+                .iter()
+                .all(|record| !record.sequence().as_ref().contains(&0)));
+        }
     }
 
     #[test]
