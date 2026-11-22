@@ -15,6 +15,8 @@ use noodles::sam::alignment::record_buf::data::field::Value;
 use noodles::sam::alignment::{Record as _, RecordBuf};
 use noodles::{cram, fasta, sam};
 
+use crate::cram_raw::{self, EmbeddedReference, Recorder};
+
 /// An indexed FASTA (with a `.fai`) that CRAM inputs decode against; clones share one reader.
 #[derive(Clone)]
 pub struct Reference {
@@ -233,13 +235,15 @@ impl CramDecoder {
     /// Each slice decodes once against every sequence it references. A probe with no sequences
     /// first finds the first one it needs, so a single-reference container, or sorted input, drops
     /// what the slice cannot use before loading more; afterwards the unused sequences are dropped.
-    /// A container written without the reference never loads one.
+    /// A container written without the reference never loads one, and a slice that embeds its
+    /// reference regenerates MD and NM from it, as htslib does.
     pub(crate) fn decode(
         &mut self,
         container: &cram::io::reader::Container,
         header: &sam::Header,
+        raw: &[u8],
     ) -> Result<Vec<RecordBuf>> {
-        quietly(|| self.decode_container(container, header)).unwrap_or_else(|| {
+        quietly(|| self.decode_container(container, header, raw)).unwrap_or_else(|| {
             Err(anyhow!(
                 "failed to decode a CRAM container of {}: it is malformed or uses a CRAM feature \
                  unmux cannot decode",
@@ -252,6 +256,7 @@ impl CramDecoder {
         &mut self,
         container: &cram::io::reader::Container,
         header: &sam::Header,
+        raw: &[u8],
     ) -> Result<Vec<RecordBuf>> {
         let compression_header = container
             .compression_header()
@@ -260,11 +265,13 @@ impl CramDecoder {
         let single_reference = !container.header().reference_sequence_context().is_many();
         let sorted = is_coordinate_sorted(header);
         let mut out = Vec::new();
-        for slice in container.slices() {
+        let landmarks = container.header().landmarks();
+        for (index, slice) in container.slices().enumerate() {
             let slice = slice.context("failed to read CRAM slice")?;
             let (core, external) = slice
                 .decode_blocks()
                 .context("failed to decode CRAM slice blocks")?;
+            let embedded = embedded_bases(raw, landmarks, index, &external)?;
             let decode = |repository: fasta::Repository| {
                 slice.records(repository, header, &compression_header, &core, &external)
             };
@@ -278,6 +285,20 @@ impl CramDecoder {
                     .collect::<Result<_>>()?;
                 if sorted {
                     self.blank = None;
+                }
+                if let Some((embedded, bases)) = embedded {
+                    let end = ends.iter().map(|&(_, end)| end).max().unwrap_or(0);
+                    if end >= embedded.start + bases.len() {
+                        drop(records);
+                        out.extend(self.decode_past_embedded(
+                            (raw, landmarks),
+                            (header, &compression_header),
+                            index,
+                            (embedded, bases),
+                            end,
+                        )?);
+                        continue;
+                    }
                 }
                 if ends
                     .iter()
@@ -329,17 +350,19 @@ impl CramDecoder {
                     Some(_) => &repadded[i],
                     None => record,
                 };
-                let loaded = |name: &[u8]| self.held_sequence(name).filter(|_| regenerate);
-                let converted = match aligned_end(header, record)? {
-                    Some((name, end))
-                        if end > header_length(header, name) && !padded.contains_key(name) =>
-                    {
-                        convert_guarded(header, record, &loaded, || past_end(record, name))
-                    }
-                    _ if !regenerate => {
-                        convert_guarded(header, record, &loaded, || self.unreferenced(record))
-                    }
-                    _ => owned(header, record, &loaded),
+                let held = name
+                    .filter(|_| regenerate && embedded.is_none())
+                    .and_then(|name| self.held_sequence(name));
+                let reference = match (embedded, &held) {
+                    (Some((embedded, bases)), _) => Some((bases, embedded.start)),
+                    (None, Some(sequence)) => Some(((**sequence).as_ref(), 1)),
+                    (None, None) => None,
+                };
+                let converted = if regenerate {
+                    owned(header, record, reference)
+                } else {
+                    quietly(|| owned(header, record, reference))
+                        .unwrap_or_else(|| Err(self.unreferenced(record)))
                 }?;
                 // A zeroed stand-in base means the record needed reference bases its slice lacks.
                 if !regenerate && converted.sequence().as_ref().contains(&0) {
@@ -351,6 +374,44 @@ impl CramDecoder {
             self.retain(&used)?;
         }
         Ok(out)
+    }
+
+    /// Decode slice `index` of container `raw` with its embedded reference padded with N to `end`.
+    fn decode_past_embedded(
+        &self,
+        (raw, landmarks): (&[u8], &[usize]),
+        (header, compression_header): (&sam::Header, &cram::container::CompressionHeader),
+        index: usize,
+        (embedded, bases): (EmbeddedReference, &[u8]),
+        end: usize,
+    ) -> Result<Vec<RecordBuf>> {
+        let mut padded = bases.to_vec();
+        padded.resize(end + 1 - embedded.start, b'N');
+        let rebuilt = cram_raw::with_embedded_bases(raw, landmarks, index, embedded, &padded)
+            .context("failed to lengthen an embedded CRAM reference")?;
+        let mut container = cram::io::reader::Container::default();
+        cram::io::Reader::new(&rebuilt[..])
+            .read_container(&mut container)
+            .context("failed to lengthen an embedded CRAM reference")?;
+        let slice = container
+            .slices()
+            .nth(index)
+            .ok_or_else(|| anyhow!("failed to lengthen an embedded CRAM reference"))?
+            .context("failed to read CRAM slice")?;
+        let (core, external) = slice
+            .decode_blocks()
+            .context("failed to decode CRAM slice blocks")?;
+        let repository = fasta::Repository::default();
+        let records = slice
+            .records(repository, header, compression_header, &core, &external)
+            .context("failed to read CRAM slice records")?;
+        records
+            .iter()
+            .map(|record| {
+                quietly(|| owned(header, record, Some((bases, embedded.start))))
+                    .unwrap_or_else(|| Err(self.unreferenced(record)))
+            })
+            .collect()
     }
 
     /// The error for a record that needs reference bases its slice does not carry.
@@ -435,6 +496,35 @@ impl CramDecoder {
     }
 }
 
+/// Read the next container of `reader` into `container`, keeping its raw bytes in the reader's
+/// [`Recorder`]; `false` at the end of the input.
+pub(crate) fn read_container<R: io::Read>(
+    reader: &mut cram::io::Reader<Recorder<R>>,
+    container: &mut cram::io::reader::Container,
+) -> io::Result<bool> {
+    reader.get_mut().clear();
+    Ok(reader.read_container(container)? != 0)
+}
+
+/// The reference the slice at `index` of container `raw` embeds, with its bases from `external`.
+fn embedded_bases<'a>(
+    raw: &[u8],
+    landmarks: &[usize],
+    index: usize,
+    external: &'a [(i32, std::borrow::Cow<'a, [u8]>)],
+) -> Result<Option<(EmbeddedReference, &'a [u8])>> {
+    let slice = cram_raw::slice(raw, landmarks, index).context("failed to read a CRAM slice")?;
+    let Some(embedded) =
+        cram_raw::embedded_reference(slice).context("failed to read a CRAM slice header")?
+    else {
+        return Ok(None);
+    };
+    Ok(external
+        .iter()
+        .find(|(id, _)| *id == embedded.content_id)
+        .map(|(_, bases)| (embedded, bases.as_ref())))
+}
+
 /// Whether a container's slices decode against the external reference: the compression header's
 /// `RR` flag, which noodles parses but keeps private, so it is read from the header's debug form.
 fn uses_external_reference(
@@ -486,22 +576,9 @@ fn aligned_end<'h>(
     Ok(end.map(|end| (name, usize::from(end))))
 }
 
-/// The length the header gives sequence `name`.
-fn header_length(header: &sam::Header, name: &[u8]) -> usize {
-    header
-        .reference_sequences()
-        .get(name)
-        .map_or(usize::MAX, |sequence| sequence.length().get())
-}
-
-/// Convert a record whose decode can panic inside noodles, failing with `error` instead.
-fn convert_guarded(
-    header: &sam::Header,
-    record: &cram::Record<'_>,
-    loaded: Loaded<'_>,
-    error: impl FnOnce() -> anyhow::Error,
-) -> Result<RecordBuf> {
-    quietly(|| owned(header, record, loaded)).unwrap_or_else(|| Err(error()))
+/// A record's name, for messages.
+fn record_name(record: &cram::Record<'_>) -> String {
+    record.name().map(ToString::to_string).unwrap_or_default()
 }
 
 thread_local! {
@@ -525,27 +602,15 @@ pub(crate) fn quietly<T>(f: impl FnOnce() -> T) -> Option<T> {
     result.ok()
 }
 
-/// The error for a record that runs past the end of `name` in a slice that embeds its reference.
-fn past_end(record: &cram::Record<'_>, name: &[u8]) -> anyhow::Error {
-    anyhow!(
-        "CRAM record `{}` runs past the end of reference sequence `{}` in a slice that embeds its \
-         reference, which unmux cannot decode; convert the input to BAM first (e.g. `samtools \
-         view -b`)",
-        record_name(record),
-        String::from_utf8_lossy(name)
-    )
-}
-
-/// A record's name, for messages.
-fn record_name(record: &cram::Record<'_>) -> String {
-    record.name().map(ToString::to_string).unwrap_or_default()
-}
-
-/// The loaded reference sequence a record decoded against, looked up by name.
-type Loaded<'a> = &'a dyn Fn(&[u8]) -> Option<Arc<fasta::record::Sequence>>;
+/// The reference bases a record decoded against and the position of the first.
+type Bases<'a> = Option<(&'a [u8], usize)>;
 
 /// Convert a decoded CRAM record into an owned record, as htslib would decode it.
-fn owned(header: &sam::Header, record: &cram::Record<'_>, loaded: Loaded<'_>) -> Result<RecordBuf> {
+fn owned(
+    header: &sam::Header,
+    record: &cram::Record<'_>,
+    reference: Bases<'_>,
+) -> Result<RecordBuf> {
     let mut record = RecordBuf::try_from_alignment_record(header, record)
         .context("failed to convert CRAM record")?;
     // CRAM stores no MAPQ for an unmapped record; noodles reports 255, htslib 0.
@@ -553,28 +618,29 @@ fn owned(header: &sam::Header, record: &cram::Record<'_>, loaded: Loaded<'_>) ->
         *record.mapping_quality_mut() = MappingQuality::new(0);
     }
     record.sequence_mut().as_mut().make_ascii_uppercase();
-    regenerate_md_nm(header, &mut record, loaded);
+    regenerate_md_nm(header, &mut record, reference);
     Ok(record)
 }
 
-/// Add the MD and NM tags htslib regenerates when it decodes a mapped record against the external
-/// reference, which `loaded` holds.
-fn regenerate_md_nm(header: &sam::Header, record: &mut RecordBuf, loaded: Loaded<'_>) {
+/// Add the MD and NM tags htslib regenerates when it decodes a mapped record against `reference`.
+fn regenerate_md_nm(header: &sam::Header, record: &mut RecordBuf, reference: Bases<'_>) {
     let skip = take_cram_flags(record);
     let want_md = skip & 1 == 0 && record.data().get(&Tag::MISMATCHED_POSITIONS).is_none();
     let want_nm = skip & 2 == 0 && record.data().get(&Tag::EDIT_DISTANCE).is_none();
     if !(want_md || want_nm) || record.flags().is_unmapped() || record.sequence().is_empty() {
         return;
     }
-    let Some((sequence, length)) = record
-        .reference_sequence_id()
-        .and_then(|id| header.reference_sequences().get_index(id))
-        .and_then(|(name, map)| Some((loaded(name)?, map.length().get())))
-    else {
+    let (Some((bases, start)), Some(length)) = (
+        reference,
+        record
+            .reference_sequence_id()
+            .and_then(|id| header.reference_sequences().get_index(id))
+            .map(|(_, map)| map.length().get()),
+    ) else {
         return;
     };
-    let sequence: &[u8] = (*sequence).as_ref();
-    if let Some((md, nm)) = md_nm(record, &sequence[..length.min(sequence.len())]) {
+    let within = length.saturating_sub(start - 1).min(bases.len());
+    if let Some((md, nm)) = md_nm(record, &bases[..within], start - 1) {
         add_md_nm(header, record, want_md.then_some(md), want_nm.then_some(nm));
     }
 }
@@ -588,9 +654,9 @@ fn take_cram_flags(record: &mut RecordBuf) -> i64 {
         .unwrap_or(0)
 }
 
-/// The MD string and edit distance htslib derives from a record's CIGAR, SEQ and reference; like
-/// htslib, the MD string stops at the first base past the end of the reference.
-fn md_nm(record: &RecordBuf, reference: &[u8]) -> Option<(Vec<u8>, u32)> {
+/// The MD string and edit distance htslib derives from a record's CIGAR, SEQ and the reference
+/// bases after `offset`; like htslib, the MD string stops at the first base past their end.
+fn md_nm(record: &RecordBuf, reference: &[u8], offset: usize) -> Option<(Vec<u8>, u32)> {
     let read = record.sequence().as_ref();
     let mut ref_pos = usize::from(record.alignment_start()?) - 1;
     let mut read_pos = 0;
@@ -608,7 +674,8 @@ fn md_nm(record: &RecordBuf, reference: &[u8]) -> Option<(Vec<u8>, u32)> {
             Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch => {
                 for _ in 0..len {
                     let read_base = read.get(read_pos)?.to_ascii_uppercase();
-                    match reference.get(ref_pos).map(u8::to_ascii_uppercase) {
+                    let base = ref_pos.checked_sub(offset).and_then(|i| reference.get(i));
+                    match base.map(u8::to_ascii_uppercase) {
                         _ if past_end => {}
                         None => {
                             end_run(&mut md, &mut run);
@@ -628,7 +695,9 @@ fn md_nm(record: &RecordBuf, reference: &[u8]) -> Option<(Vec<u8>, u32)> {
             Kind::Deletion => {
                 if !past_end {
                     end_run(&mut md, &mut run);
-                    if let Some(bases) = reference.get(ref_pos..reference.len().min(ref_pos + len))
+                    let at = ref_pos.checked_sub(offset);
+                    if let Some(bases) =
+                        at.and_then(|at| reference.get(at..reference.len().min(at + len)))
                     {
                         md.push(b'^');
                         md.extend(bases.iter().map(u8::to_ascii_uppercase));
@@ -699,15 +768,26 @@ mod tests {
 
     /// Decode a test CRAM, returning its records and the most sequences held after any container.
     fn decode_all(name: &str) -> (Vec<RecordBuf>, usize) {
-        let reference = Reference::load(&test_data("contigs.fa")).unwrap();
-        let mut reader = cram::io::Reader::new(File::open(test_data(name)).unwrap());
+        decode_with(
+            name,
+            Some(Reference::load(&test_data("contigs.fa")).unwrap()),
+        )
+    }
+
+    /// Decode a test CRAM against `reference`, as [`decode_all`] does.
+    fn decode_with(name: &str, reference: Option<Reference>) -> (Vec<RecordBuf>, usize) {
+        let mut reader = cram::io::Reader::new(Recorder::new(File::open(test_data(name)).unwrap()));
         let header = reader.read_header().unwrap();
-        let mut decoder = CramDecoder::new(Some(reference), &test_data(name), &header);
+        let mut decoder = CramDecoder::new(reference, &test_data(name), &header);
         let mut container = cram::io::reader::Container::default();
         let mut records = Vec::new();
         let mut most = 0;
-        while reader.read_container(&mut container).unwrap() != 0 {
-            records.extend(decoder.decode(&container, &header).unwrap());
+        while read_container(&mut reader, &mut container).unwrap() {
+            records.extend(
+                decoder
+                    .decode(&container, &header, reader.get_ref().bytes())
+                    .unwrap(),
+            );
             most = most.max(decoder.repository.len());
         }
         (records, most)
@@ -721,10 +801,11 @@ mod tests {
             ("contigs.no-ref.cram", false),
             ("contigs.embedded-ref.cram", false),
         ] {
-            let mut reader = cram::io::Reader::new(File::open(test_data(name)).unwrap());
+            let mut reader =
+                cram::io::Reader::new(Recorder::new(File::open(test_data(name)).unwrap()));
             reader.read_header().unwrap();
             let mut container = cram::io::reader::Container::default();
-            reader.read_container(&mut container).unwrap();
+            read_container(&mut reader, &mut container).unwrap();
             let compression_header = container.compression_header().unwrap();
             assert_eq!(
                 uses_external_reference(&compression_header).unwrap(),
@@ -755,13 +836,17 @@ mod tests {
             None,
             Some(Reference::load(&test_data("contigs.fa")).unwrap()),
         ] {
-            let mut reader = cram::io::Reader::new(File::open(&path).unwrap());
+            let mut reader = cram::io::Reader::new(Recorder::new(File::open(&path).unwrap()));
             let header = reader.read_header().unwrap();
             let mut decoder = CramDecoder::new(reference, &path, &header);
             let mut container = cram::io::reader::Container::default();
             let mut records = Vec::new();
-            while reader.read_container(&mut container).unwrap() != 0 {
-                records.extend(decoder.decode(&container, &header).unwrap());
+            while read_container(&mut reader, &mut container).unwrap() {
+                records.extend(
+                    decoder
+                        .decode(&container, &header, reader.get_ref().bytes())
+                        .unwrap(),
+                );
             }
             assert_eq!(records.len(), 29);
             assert!(decoder.repository.is_empty());
@@ -769,6 +854,105 @@ mod tests {
                 .iter()
                 .all(|record| !record.sequence().as_ref().contains(&0)));
         }
+    }
+
+    fn tagged(records: &[RecordBuf], tag: Tag) -> usize {
+        records
+            .iter()
+            .filter(|record| record.data().get(&tag).is_some())
+            .count()
+    }
+
+    #[test]
+    fn test_embedded_reference_slices_get_md_and_nm_like_htslib() {
+        let (embedded, _) = decode_with("contigs.embedded-ref.cram", None);
+        let (external, _) = decode_all("contigs.cram");
+        assert_eq!(tagged(&embedded, Tag::MISMATCHED_POSITIONS), 26);
+        assert_eq!(embedded, external);
+    }
+
+    #[test]
+    fn test_embedded_consensus_reference_slices_keep_md_and_nm_absent() {
+        let (records, _) = decode_with("contigs.embedded-ref-2.cram", None);
+        assert_eq!(records.len(), 29);
+        assert_eq!(tagged(&records, Tag::MISMATCHED_POSITIONS), 1);
+        assert_eq!(tagged(&records, Tag::new(b'c', b'F')), 0);
+    }
+
+    #[test]
+    fn test_records_past_the_end_of_an_embedded_reference_decode_like_htslib() {
+        let (embedded, _) = decode_with("past-end.embedded-ref.cram", None);
+        let (external, _) = decode_all("past-end.cram");
+        assert_eq!(embedded.len(), 5);
+        assert_eq!(embedded, external);
+    }
+
+    #[test]
+    fn test_embedded_reference_is_read_from_the_slice_header() {
+        let path = test_data("contigs.embedded-ref.slices.cram");
+        let mut reader = cram::io::Reader::new(Recorder::new(File::open(path).unwrap()));
+        reader.read_header().unwrap();
+        let mut container = cram::io::reader::Container::default();
+        read_container(&mut reader, &mut container).unwrap();
+        let raw = reader.get_ref().bytes();
+        let landmarks = container.header().landmarks();
+        let starts: Vec<usize> = (0..landmarks.len())
+            .map(|i| {
+                let slice = cram_raw::slice(raw, landmarks, i).unwrap();
+                cram_raw::embedded_reference(slice).unwrap().unwrap().start
+            })
+            .collect();
+        assert_eq!(starts, [11, 51, 91, 121]);
+    }
+
+    #[test]
+    fn test_a_container_rebuilt_with_longer_embedded_bases_keeps_every_slice() {
+        let path = test_data("contigs.embedded-ref.slices.cram");
+        let mut reader = cram::io::Reader::new(Recorder::new(File::open(path).unwrap()));
+        let header = reader.read_header().unwrap();
+        let mut container = cram::io::reader::Container::default();
+        read_container(&mut reader, &mut container).unwrap();
+        let raw = reader.get_ref().bytes().to_vec();
+        let landmarks = container.header().landmarks().to_vec();
+        let decode = |container: &cram::io::reader::Container| {
+            let compression_header = container.compression_header().unwrap();
+            let mut names = Vec::new();
+            let mut embedded = Vec::new();
+            for slice in container.slices() {
+                let slice = slice.unwrap();
+                let (core, external) = slice.decode_blocks().unwrap();
+                let records = slice
+                    .records(
+                        fasta::Repository::default(),
+                        &header,
+                        &compression_header,
+                        &core,
+                        &external,
+                    )
+                    .unwrap();
+                names.extend(records.iter().map(record_name));
+                embedded.push(
+                    external
+                        .iter()
+                        .find(|(id, _)| *id == 10)
+                        .unwrap()
+                        .1
+                        .to_vec(),
+                );
+            }
+            (names, embedded)
+        };
+        let (names, mut embedded) = decode(&container);
+        let slice = cram_raw::slice(&raw, &landmarks, 1).unwrap();
+        let reference = cram_raw::embedded_reference(slice).unwrap().unwrap();
+        embedded[1].extend_from_slice(b"NNNNNNN");
+        let rebuilt =
+            cram_raw::with_embedded_bases(&raw, &landmarks, 1, reference, &embedded[1]).unwrap();
+        let mut container = cram::io::reader::Container::default();
+        cram::io::Reader::new(&rebuilt[..])
+            .read_container(&mut container)
+            .unwrap();
+        assert_eq!(decode(&container), (names, embedded));
     }
 
     #[test]
@@ -790,7 +974,7 @@ mod tests {
     fn test_retain_drops_unneeded_sequences_unless_keeping_the_rest_costs_more() {
         let reference = Reference::load(&test_data("contigs.fa")).unwrap();
         let path = test_data("contigs.cram");
-        let header = cram::io::Reader::new(File::open(&path).unwrap())
+        let header = cram::io::Reader::new(Recorder::new(File::open(&path).unwrap()))
             .read_header()
             .unwrap();
         let mut decoder = CramDecoder::new(Some(reference), &path, &header);
@@ -834,8 +1018,7 @@ mod tests {
     fn regenerated(line: &str) -> String {
         use noodles::sam::alignment::io::Write as _;
         let (header, mut record) = parse(line);
-        let contig = Arc::new(fasta::record::Sequence::from(CONTIG.to_vec()));
-        regenerate_md_nm(&header, &mut record, &|_: &[u8]| Some(Arc::clone(&contig)));
+        regenerate_md_nm(&header, &mut record, Some((CONTIG, 1)));
         let mut out = Vec::new();
         sam::io::Writer::new(&mut out)
             .write_alignment_record(&header, &record)
@@ -846,6 +1029,16 @@ mod tests {
             .skip(11)
             .collect::<Vec<_>>()
             .join(" ")
+    }
+
+    #[test]
+    fn test_md_nm_read_reference_bases_that_start_past_position_one() {
+        let (header, mut record) = parse("r\t0\tc\t9\t60\t6M\t*\t0\t0\tGTACTA\t*");
+        regenerate_md_nm(&header, &mut record, Some((&CONTIG[6..], 7)));
+        assert_eq!(
+            record.data().get(&Tag::MISMATCHED_POSITIONS),
+            Some(&Value::String(b"4G0T0".into()))
+        );
     }
 
     #[test]
@@ -955,13 +1148,15 @@ mod tests {
     #[test]
     fn test_a_reference_shorter_than_the_header_length_fails_cleanly() {
         let path = test_data("contigs.cram");
-        let mut reader = cram::io::Reader::new(File::open(&path).unwrap());
+        let mut reader = cram::io::Reader::new(Recorder::new(File::open(&path).unwrap()));
         let header = reader.read_header().unwrap();
         let reference = Reference::load(&test_data("contigs.short.fa")).unwrap();
         let mut decoder = CramDecoder::new(Some(reference), &path, &header);
         let mut container = cram::io::reader::Container::default();
-        reader.read_container(&mut container).unwrap();
-        let error = decoder.decode(&container, &header).unwrap_err();
+        read_container(&mut reader, &mut container).unwrap();
+        let error = decoder
+            .decode(&container, &header, reader.get_ref().bytes())
+            .unwrap_err();
         assert!(format!("{error:#}").contains(
             "reference sequence `ctgA` is 300 bases in the --reference FASTA but 400 in the @SQ \
              header"
@@ -971,13 +1166,15 @@ mod tests {
     #[test]
     fn test_a_panic_inside_noodles_becomes_an_error() {
         let path = test_data("contigs.cram");
-        let mut reader = cram::io::Reader::new(File::open(&path).unwrap());
+        let mut reader = cram::io::Reader::new(Recorder::new(File::open(&path).unwrap()));
         let header = reader.read_header().unwrap();
         let reference = Reference::load(&test_data("contigs.short.fa")).unwrap();
         let mut decoder = CramDecoder::new(Some(reference), &path, &sam::Header::default());
         let mut container = cram::io::reader::Container::default();
-        reader.read_container(&mut container).unwrap();
-        let error = decoder.decode(&container, &header).unwrap_err();
+        read_container(&mut reader, &mut container).unwrap();
+        let error = decoder
+            .decode(&container, &header, reader.get_ref().bytes())
+            .unwrap_err();
         assert!(error
             .to_string()
             .starts_with("failed to decode a CRAM container of"));

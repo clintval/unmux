@@ -31,7 +31,8 @@ use noodles::sam::header::record::value::Map;
 use noodles::{bam, bgzf, cram, fasta, fastq, sam};
 use smallvec::SmallVec;
 
-use crate::reference::{quietly, CramDecoder, Reference};
+use crate::cram_raw::Recorder;
+use crate::reference::{quietly, read_container, CramDecoder, Reference};
 
 /// A format identified by sniffing the start of an input stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -317,7 +318,7 @@ enum FormatReader {
     /// `cram::io::reader::Slice::records`'s documented public loop.
     Cram {
         /// The record reader.
-        reader: cram::io::Reader<Box<dyn BufRead + Send>>,
+        reader: cram::io::Reader<Recorder<Box<dyn BufRead + Send>>>,
         /// The header, needed to decode each record.
         header: Box<sam::Header>,
         /// The reusable container buffer (one container of slices is decoded at
@@ -341,17 +342,19 @@ enum FormatReader {
 /// input. Buffers one container at a time (bounded by container size, not the
 /// whole file).
 fn read_cram_container(
-    reader: &mut cram::io::Reader<Box<dyn BufRead + Send>>,
+    reader: &mut cram::io::Reader<Recorder<Box<dyn BufRead + Send>>>,
     container: &mut cram::io::reader::Container,
     header: &sam::Header,
     decoder: &mut CramDecoder,
 ) -> Result<Option<Vec<RecordBuf>>> {
-    let read = quietly(|| reader.read_container(container))
+    let read = quietly(|| read_container(reader, container))
         .ok_or_else(|| anyhow!("failed to read CRAM container: it is malformed"))?;
-    if read.context("failed to read CRAM container")? == 0 {
+    if !read.context("failed to read CRAM container")? {
         return Ok(None);
     }
-    decoder.decode(container, header).map(Some)
+    decoder
+        .decode(container, header, reader.get_ref().bytes())
+        .map(Some)
 }
 
 impl FormatReader {
@@ -692,7 +695,7 @@ fn open_format_reader(
         SniffedFormat::Cram => {
             // CRAM takes a plain Read (no BGZF/gzip wrapper; gzipped CRAM is
             // already rejected).
-            let mut reader = cram::io::Reader::new(reader);
+            let mut reader = cram::io::Reader::new(Recorder::new(reader));
             let header = quietly(|| reader.read_header())
                 .ok_or_else(|| anyhow!("failed to read CRAM header: it is malformed"))?
                 .context("failed to read CRAM header")?;
