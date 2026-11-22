@@ -146,9 +146,16 @@ Options:
           An @RG source reads the input header's read groups instead of
           matching sequences (SAM/BAM/CRAM only; no barcode attributes, no
           @-span). Pair with --sample-from-group to write one file per
-          read group, sample, or library. Output is UNMAPPED, so aligned
-          inputs lose alignments (a warning is printed); carrying mapped
-          data through a split is planned for later.
+          read group, sample, or library.
+          
+          An aligned input (@SQ present) split into SAM/BAM keeps every
+          record whole, secondary and supplementary included: flags, position,
+          CIGAR, MAPQ, mate fields, and tags. Each file gets the input @HD,
+          @SQ, @PG, and @CO lines, only its own @RG lines, and an unmux
+          @PG; records keep input order. --rg-tag has no effect there, and
+          --template, --tag, sequence-matching groups, aligned CRAM output,
+          and several inputs are errors.
+          For unmapped records, run samtools reset on the outputs.
 
       --extract <SPEC>
           Make a named record segment into a stream NAME=[SPEC] (repeatable).
@@ -345,6 +352,25 @@ Options:
           Disable auto pair-detection. Treat each record as single-end, even
           when one input looks interleaved (mate-name pairing). Interleaving is
           otherwise auto-detected.
+
+      --reference <FASTA>
+          Indexed FASTA (with a .fai) to read a reference-compressed CRAM.
+          
+          Records decode as samtools decodes them, including the MD and NM
+          tags the CRAM left out for the reference to restore.
+          Before any output is written, every CRAM @SQ contig must be in the
+          FASTA (matched by SN) with the same LN and, where @SQ has
+          one, the same M5. Other @SQ fields such as UR are not used.
+          SAM/BAM/FASTX inputs ignore it, and a run with no CRAM input warns
+          that it is unused.
+          
+            --reference ref.fa   decode CRAM input against ref.fa
+
+      --skip-reference-check
+          Skip the --reference check against CRAM @SQ lines.
+          
+          For a CRAM whose header lists contigs the FASTA lacks and no record
+          uses. A record on a missing contig still fails as it is decoded.
 
       --compression <LEVEL>
           Compression level 0-9 for BGZF (BAM) and gzip (FASTX.gz).
