@@ -23,6 +23,10 @@ impl<R> Recorder<R> {
     pub(crate) fn bytes(&self) -> &[u8] {
         &self.bytes
     }
+
+    pub(crate) fn take(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.bytes)
+    }
 }
 
 impl<R: Read> Read for Recorder<R> {

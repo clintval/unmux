@@ -5,7 +5,8 @@ use std::ffi::OsString;
 use std::fs::File;
 use std::io::{self, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard};
 
 use anyhow::{anyhow, bail, Context, Result};
 use noodles::core::Region;
@@ -221,15 +222,50 @@ fn requested(error: &io::Error) -> Option<&[u8]> {
         .map(|requested| requested.0.as_slice())
 }
 
-/// Decodes one CRAM input's containers into owned records.
+/// Decodes one CRAM input's containers into owned records. Clones share one set of held sequences,
+/// so decode workers never copy a sequence another worker already holds.
+#[derive(Clone)]
 pub(crate) struct CramDecoder {
+    shared: Arc<Shared>,
+}
+
+/// The state [`CramDecoder`] clones share. Slices decode under a read lock on the repository, and
+/// dropping held sequences takes the write lock, so it waits for the slices in flight.
+struct Shared {
     reference: Option<Reference>,
     path: PathBuf,
     lengths: Arc<HashMap<Vec<u8>, usize>>,
-    repository: fasta::Repository,
+    repository: RwLock<fasta::Repository>,
     held: Held,
-    blank: Option<fasta::Repository>,
-    blank_lengths: HashMap<Vec<u8>, usize>,
+    pinned: Mutex<HashMap<Vec<u8>, usize>>,
+    newest: Mutex<HashMap<Vec<u8>, usize>>,
+    tickets: AtomicUsize,
+    blank: Mutex<Blank>,
+}
+
+/// The zeroed stand-ins slices written without the reference decode against, and their lengths.
+struct Blank {
+    repository: Option<fasta::Repository>,
+    lengths: HashMap<Vec<u8>, usize>,
+}
+
+/// Marks a sequence as wanted by a slice in flight until dropped, so other workers keep it.
+struct Pin<'a> {
+    pinned: &'a Mutex<HashMap<Vec<u8>, usize>>,
+    name: Vec<u8>,
+}
+
+impl Drop for Pin<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut pinned) = self.pinned.lock() {
+            if let Some(count) = pinned.get_mut(&self.name) {
+                *count -= 1;
+                if *count == 0 {
+                    pinned.remove(&self.name);
+                }
+            }
+        }
+    }
 }
 
 impl CramDecoder {
@@ -240,44 +276,77 @@ impl CramDecoder {
             .iter()
             .map(|(name, sequence)| (name.to_vec(), sequence.length().get()))
             .collect();
-        let mut decoder = Self {
-            reference,
-            path: path.to_path_buf(),
-            lengths: Arc::new(lengths.clone()),
-            repository: fasta::Repository::default(),
-            held: Held::default(),
-            blank: None,
-            blank_lengths: lengths,
-        };
-        decoder.repository = decoder.loading_repository(HashMap::new());
-        decoder
-    }
-
-    fn loading_repository(
-        &self,
-        carried: HashMap<Vec<u8>, Arc<fasta::record::Sequence>>,
-    ) -> fasta::Repository {
-        fasta::Repository::new(LoadingAdapter {
-            reference: self.reference.clone(),
-            path: self.path.clone(),
-            lengths: Arc::clone(&self.lengths),
-            carried,
-            held: Arc::clone(&self.held),
-        })
+        let lengths = Arc::new(lengths);
+        let held = Held::default();
+        let repository = loading_repository(&reference, path, &lengths, &held, HashMap::new());
+        Self {
+            shared: Arc::new(Shared {
+                reference,
+                path: path.to_path_buf(),
+                lengths: Arc::clone(&lengths),
+                repository: RwLock::new(repository),
+                held,
+                pinned: Mutex::default(),
+                newest: Mutex::default(),
+                tickets: AtomicUsize::new(0),
+                blank: Mutex::new(Blank {
+                    repository: None,
+                    lengths: (*lengths).clone(),
+                }),
+            }),
+        }
     }
 
     fn held(&self) -> Result<std::sync::MutexGuard<'_, HashMap<Vec<u8>, usize>>> {
-        self.held
+        self.shared
+            .held
             .lock()
             .map_err(|_| anyhow!("the CRAM reference bookkeeping was poisoned"))
     }
 
+    fn pinned(&self) -> Result<std::sync::MutexGuard<'_, HashMap<Vec<u8>, usize>>> {
+        self.shared
+            .pinned
+            .lock()
+            .map_err(|_| anyhow!("the CRAM reference bookkeeping was poisoned"))
+    }
+
+    fn blank(&self) -> Result<std::sync::MutexGuard<'_, Blank>> {
+        self.shared.blank.lock().map_err(|_| poisoned())
+    }
+
+    /// Record that container `order` uses `names`, so no earlier container drops them.
+    fn mark<'a>(&self, names: impl IntoIterator<Item = &'a [u8]>, order: usize) -> Result<()> {
+        let mut newest = self.shared.newest.lock().map_err(|_| poisoned())?;
+        for name in names {
+            let last = newest.entry(name.to_vec()).or_default();
+            *last = (*last).max(order);
+        }
+        Ok(())
+    }
+
+    fn pin(&self, name: &[u8]) -> Result<Pin<'_>> {
+        *self.pinned()?.entry(name.to_vec()).or_default() += 1;
+        Ok(Pin {
+            pinned: &self.shared.pinned,
+            name: name.to_vec(),
+        })
+    }
+
+    fn read(&self) -> Result<RwLockReadGuard<'_, fasta::Repository>> {
+        self.shared.repository.read().map_err(|_| poisoned())
+    }
+
     /// A held sequence, never loading one.
-    fn held_sequence(&self, name: &[u8]) -> Option<Arc<fasta::record::Sequence>> {
+    fn held_sequence(
+        &self,
+        repository: &fasta::Repository,
+        name: &[u8],
+    ) -> Option<Arc<fasta::record::Sequence>> {
         if !self.held().ok()?.contains_key(name) {
             return None;
         }
-        self.repository.get(name).and_then(Result::ok)
+        repository.get(name).and_then(Result::ok)
     }
 
     /// Decode every slice of `container` into owned records, in file order.
@@ -285,25 +354,43 @@ impl CramDecoder {
     /// Each slice decodes once against every sequence it references. A probe with no sequences
     /// first finds the first one it needs, so a single-reference container, or sorted input, drops
     /// what the slice cannot use before loading more; afterwards the unused sequences are dropped.
-    /// A container written without the reference never loads one, and a slice that embeds its
+    /// A sequence another clone's slice still needs, or a later container already used, is kept. A
+    /// container written without the reference never loads one, and a slice that embeds its
     /// reference regenerates MD and NM from it, as htslib does.
     pub(crate) fn decode(
-        &mut self,
+        &self,
         container: &cram::io::reader::Container,
         header: &sam::Header,
         raw: &[u8],
     ) -> Result<Vec<RecordBuf>> {
-        quietly(|| self.decode_container(container, header, raw)).unwrap_or_else(|| {
+        self.decode_in_order(self.ticket(), container, header, raw)
+    }
+
+    /// The place in file order of the next container read, for [`Self::decode_in_order`].
+    pub(crate) fn ticket(&self) -> usize {
+        self.shared.tickets.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Decode `container`, the one at place `order` in file order, as [`Self::decode`] does.
+    pub(crate) fn decode_in_order(
+        &self,
+        order: usize,
+        container: &cram::io::reader::Container,
+        header: &sam::Header,
+        raw: &[u8],
+    ) -> Result<Vec<RecordBuf>> {
+        quietly(|| self.decode_container(order, container, header, raw)).unwrap_or_else(|| {
             Err(anyhow!(
                 "failed to decode a CRAM container of {}: it is malformed or uses a CRAM feature \
                  unmux cannot decode",
-                self.path.display()
+                self.shared.path.display()
             ))
         })
     }
 
     fn decode_container(
-        &mut self,
+        &self,
+        order: usize,
         container: &cram::io::reader::Container,
         header: &sam::Header,
         raw: &[u8],
@@ -325,54 +412,61 @@ impl CramDecoder {
             let decode = |repository: fasta::Repository| {
                 slice.records(repository, header, &compression_header, &core, &external)
             };
-            let records = if !regenerate {
-                let records = decode(self.blank_repository(&[]))
-                    .context("failed to read CRAM slice records")?;
-                let ends: Vec<(&[u8], usize)> = records
-                    .iter()
-                    .map(|record| aligned_end(header, record))
-                    .filter_map(Result::transpose)
-                    .collect::<Result<_>>()?;
-                if sorted {
-                    self.blank = None;
-                }
-                if let Some((embedded, bases)) = embedded {
-                    let end = ends.iter().map(|&(_, end)| end).max().unwrap_or(0);
-                    if end >= embedded.start + bases.len() {
-                        drop(records);
-                        out.extend(self.decode_past_embedded(
-                            (raw, landmarks),
-                            (header, &compression_header),
-                            index,
-                            (embedded, bases),
-                            end,
-                        )?);
-                        continue;
+            let mut pin = None;
+            let mut probed = None;
+            if regenerate {
+                let result = decode(fasta::Repository::new(ProbeAdapter));
+                if let Some(name) = result.as_ref().err().and_then(requested) {
+                    self.mark([name], order)?;
+                    pin = Some(self.pin(name)?);
+                    if single_reference {
+                        self.retain(&HashSet::from([name]), order)?;
+                    } else if sorted {
+                        self.retain_from(header, name, order)?;
                     }
                 }
-                if ends
-                    .iter()
-                    .all(|(name, end)| self.blank_lengths.get(*name) >= Some(end))
-                {
-                    Ok(records)
-                } else {
-                    drop(records);
-                    decode(self.blank_repository(&ends))
-                }
-            } else {
-                match decode(fasta::Repository::new(ProbeAdapter)) {
-                    Err(error) => match requested(&error) {
-                        Some(name) => {
-                            if single_reference {
-                                self.retain(&HashSet::from([name]))?;
-                            } else if sorted {
-                                self.retain_from(header, name)?;
-                            }
-                            decode(self.repository.clone())
+                probed = Some(result);
+            }
+            let repository = self.read()?;
+            let records = match probed {
+                Some(Err(error)) if requested(&error).is_some() => decode(repository.clone()),
+                Some(probed) => probed,
+                None => {
+                    let records = decode(self.blank_repository(&[])?)
+                        .context("failed to read CRAM slice records")?;
+                    let ends: Vec<(&[u8], usize)> = records
+                        .iter()
+                        .map(|record| aligned_end(header, record))
+                        .filter_map(Result::transpose)
+                        .collect::<Result<_>>()?;
+                    if sorted {
+                        self.blank()?.repository = None;
+                    }
+                    if let Some((embedded, bases)) = embedded {
+                        let end = ends.iter().map(|&(_, end)| end).max().unwrap_or(0);
+                        if end >= embedded.start + bases.len() {
+                            drop(records);
+                            out.extend(self.decode_past_embedded(
+                                (raw, landmarks),
+                                (header, &compression_header),
+                                index,
+                                (embedded, bases),
+                                end,
+                            )?);
+                            continue;
                         }
-                        None => Err(error),
-                    },
-                    records => records,
+                    }
+                    let covered = {
+                        let blank = self.blank()?;
+                        ends.iter()
+                            .all(|(name, end)| blank.lengths.get(*name) >= Some(end))
+                    };
+                    if covered {
+                        Ok(records)
+                    } else {
+                        drop(records);
+                        decode(self.blank_repository(&ends)?)
+                    }
                 }
             }
             .context("failed to read CRAM slice records")?;
@@ -389,20 +483,23 @@ impl CramDecoder {
             let repadded = if padded.is_empty() {
                 Vec::new()
             } else {
-                decode(self.padded_repository(&padded)?)
+                decode(self.padded_repository(&repository, &padded)?)
                     .context("failed to read CRAM slice records")?
             };
-            let mut used = HashSet::new();
+            let used = records
+                .iter()
+                .filter_map(|record| sequence_name(header, record).transpose())
+                .collect::<Result<HashSet<_>>>()?;
+            self.mark(used.iter().copied(), order)?;
             for (i, record) in records.iter().enumerate() {
                 let name = sequence_name(header, record)?;
-                used.extend(name);
                 let record = match name.filter(|name| padded.contains_key(name)) {
                     Some(_) => &repadded[i],
                     None => record,
                 };
                 let held = name
                     .filter(|_| regenerate && embedded.is_none())
-                    .and_then(|name| self.held_sequence(name));
+                    .and_then(|name| self.held_sequence(&repository, name));
                 let reference = match (embedded, &held) {
                     (Some((embedded, bases)), _) => Some((bases, embedded.start)),
                     (None, Some(sequence)) => Some(((**sequence).as_ref(), 1)),
@@ -420,8 +517,8 @@ impl CramDecoder {
                 }
                 out.push(converted);
             }
-            drop((records, repadded));
-            self.retain(&used)?;
+            drop((records, repadded, repository, pin));
+            self.retain(&used, order)?;
         }
         Ok(out)
     }
@@ -469,30 +566,37 @@ impl CramDecoder {
         anyhow!(
             "CRAM record `{}` in {} needs reference bases its slice does not carry",
             record_name(record),
-            self.path.display()
+            self.shared.path.display()
         )
     }
 
     /// Zeroed stand-ins as long as each header length, lengthened to reach every one of `ends`.
-    fn blank_repository(&mut self, ends: &[(&[u8], usize)]) -> fasta::Repository {
+    fn blank_repository(&self, ends: &[(&[u8], usize)]) -> Result<fasta::Repository> {
+        let mut blank = self.blank()?;
         for &(name, end) in ends {
-            let length = self.blank_lengths.entry(name.to_vec()).or_default();
+            let length = blank.lengths.entry(name.to_vec()).or_default();
             if end > *length {
                 *length = end;
-                self.blank = None;
+                blank.repository = None;
             }
         }
-        self.blank
-            .get_or_insert_with(|| fasta::Repository::new(BlankAdapter(self.blank_lengths.clone())))
-            .clone()
+        let lengths = blank.lengths.clone();
+        Ok(blank
+            .repository
+            .get_or_insert_with(|| fasta::Repository::new(BlankAdapter(lengths)))
+            .clone())
     }
 
     /// Held sequences extended with N to the given lengths, and an empty stand-in for any other.
-    fn padded_repository(&self, padded: &HashMap<&[u8], usize>) -> Result<fasta::Repository> {
+    fn padded_repository(
+        &self,
+        repository: &fasta::Repository,
+        padded: &HashMap<&[u8], usize>,
+    ) -> Result<fasta::Repository> {
         let mut sequences = HashMap::new();
         for (&name, &length) in padded {
             let held = self
-                .held_sequence(name)
+                .held_sequence(repository, name)
                 .ok_or_else(|| anyhow!("a padded CRAM reference sequence was not held"))?;
             let mut bases = Vec::with_capacity(length);
             bases.extend_from_slice((*held).as_ref());
@@ -503,7 +607,7 @@ impl CramDecoder {
     }
 
     /// Drop the held sequences ahead of `first` in header order, which sorted input never revisits.
-    fn retain_from(&mut self, header: &sam::Header, first: &[u8]) -> Result<()> {
+    fn retain_from(&self, header: &sam::Header, first: &[u8], order: usize) -> Result<()> {
         let sequences = header.reference_sequences();
         let first = sequences.get_index_of(first);
         let needed: Vec<Vec<u8>> = self
@@ -512,38 +616,87 @@ impl CramDecoder {
             .filter(|name| sequences.get_index_of(name.as_slice()) >= first)
             .cloned()
             .collect();
-        self.retain(&needed.iter().map(Vec::as_slice).collect())
+        self.retain(&needed.iter().map(Vec::as_slice).collect(), order)
     }
 
-    /// Drop the held sequences outside `needed`, unless they free less than keeping the rest copies.
-    fn retain(&mut self, needed: &HashSet<&[u8]>) -> Result<()> {
+    /// The held sequences container `order` drops to keep only `needed`, what slices in flight
+    /// pinned and what later containers used, or none when they free less than keeping the rest
+    /// copies.
+    fn droppable(&self, needed: &HashSet<&[u8]>, order: usize) -> Result<Vec<Vec<u8>>> {
         let held = self.held()?.clone();
-        if held.keys().all(|name| needed.contains(name.as_slice())) {
-            return Ok(());
-        }
-        let (kept, dropped): (Vec<_>, Vec<_>) = held
-            .iter()
-            .partition(|(name, _)| needed.contains(name.as_slice()));
+        let pinned = self.pinned()?;
+        let newest = self.shared.newest.lock().map_err(|_| poisoned())?;
+        let keep = |name: &Vec<u8>| {
+            needed.contains(name.as_slice())
+                || pinned.contains_key(name)
+                || newest.get(name).is_some_and(|&last| last > order)
+        };
+        let (kept, dropped): (Vec<_>, Vec<_>) = held.iter().partition(|(name, _)| keep(name));
         let bases = |part: &[(&Vec<u8>, &usize)]| part.iter().map(|(_, len)| **len).sum::<usize>();
-        if bases(&dropped) < bases(&kept) {
+        if dropped.is_empty() || bases(&dropped) < bases(&kept) {
+            return Ok(Vec::new());
+        }
+        Ok(dropped.into_iter().map(|(name, _)| name.clone()).collect())
+    }
+
+    /// Drop the held sequences container `order` does not need, as [`Self::droppable`] picks them.
+    fn retain(&self, needed: &HashSet<&[u8]>, order: usize) -> Result<()> {
+        if self.droppable(needed, order)?.is_empty() {
             return Ok(());
         }
+        let mut repository = self.shared.repository.write().map_err(|_| poisoned())?;
+        let dropped = self.droppable(needed, order)?;
+        if dropped.is_empty() {
+            return Ok(());
+        }
+        let kept: Vec<Vec<u8>> = self
+            .held()?
+            .keys()
+            .filter(|name| !dropped.contains(name))
+            .cloned()
+            .collect();
         let carried: HashMap<Vec<u8>, Arc<fasta::record::Sequence>> = kept
-            .iter()
-            .filter_map(|(name, _)| Some(((*name).clone(), self.repository.get(name)?.ok()?)))
+            .into_iter()
+            .filter_map(|name| Some((name.clone(), repository.get(&name)?.ok()?)))
             .collect();
         let names: Vec<Vec<u8>> = carried.keys().cloned().collect();
         self.held()?.clear();
-        self.repository = fasta::Repository::default();
-        self.repository = self.loading_repository(carried);
+        *repository = fasta::Repository::default();
+        *repository = loading_repository(
+            &self.shared.reference,
+            &self.shared.path,
+            &self.shared.lengths,
+            &self.shared.held,
+            carried,
+        );
         for name in names {
-            self.repository
+            repository
                 .get(&name)
                 .transpose()
                 .context("failed to keep a CRAM reference sequence")?;
         }
         Ok(())
     }
+}
+
+fn loading_repository(
+    reference: &Option<Reference>,
+    path: &Path,
+    lengths: &Arc<HashMap<Vec<u8>, usize>>,
+    held: &Held,
+    carried: HashMap<Vec<u8>, Arc<fasta::record::Sequence>>,
+) -> fasta::Repository {
+    fasta::Repository::new(LoadingAdapter {
+        reference: reference.clone(),
+        path: path.to_path_buf(),
+        lengths: Arc::clone(lengths),
+        carried,
+        held: Arc::clone(held),
+    })
+}
+
+fn poisoned() -> anyhow::Error {
+    anyhow!("a CRAM decode thread panicked")
 }
 
 /// Read the next container of `reader` into `container`, keeping its raw bytes in the reader's
@@ -828,7 +981,7 @@ mod tests {
     fn decode_with(name: &str, reference: Option<Reference>) -> (Vec<RecordBuf>, usize) {
         let mut reader = cram::io::Reader::new(Recorder::new(File::open(test_data(name)).unwrap()));
         let header = reader.read_header().unwrap();
-        let mut decoder = CramDecoder::new(reference, &test_data(name), &header);
+        let decoder = CramDecoder::new(reference, &test_data(name), &header);
         let mut container = cram::io::reader::Container::default();
         let mut records = Vec::new();
         let mut most = 0;
@@ -838,7 +991,7 @@ mod tests {
                     .decode(&container, &header, reader.get_ref().bytes())
                     .unwrap(),
             );
-            most = most.max(decoder.repository.len());
+            most = most.max(decoder.read().unwrap().len());
         }
         (records, most)
     }
@@ -888,7 +1041,7 @@ mod tests {
         ] {
             let mut reader = cram::io::Reader::new(Recorder::new(File::open(&path).unwrap()));
             let header = reader.read_header().unwrap();
-            let mut decoder = CramDecoder::new(reference, &path, &header);
+            let decoder = CramDecoder::new(reference, &path, &header);
             let mut container = cram::io::reader::Container::default();
             let mut records = Vec::new();
             while read_container(&mut reader, &mut container).unwrap() {
@@ -899,7 +1052,7 @@ mod tests {
                 );
             }
             assert_eq!(records.len(), 29);
-            assert!(decoder.repository.is_empty());
+            assert!(decoder.read().unwrap().is_empty());
             assert!(records
                 .iter()
                 .all(|record| !record.sequence().as_ref().contains(&0)));
@@ -1027,9 +1180,9 @@ mod tests {
         let header = cram::io::Reader::new(Recorder::new(File::open(&path).unwrap()))
             .read_header()
             .unwrap();
-        let mut decoder = CramDecoder::new(Some(reference), &path, &header);
+        let decoder = CramDecoder::new(Some(reference), &path, &header);
         let load = |decoder: &CramDecoder, name: &[u8]| {
-            decoder.repository.get(name).unwrap().unwrap();
+            decoder.read().unwrap().get(name).unwrap().unwrap();
         };
         let held = |decoder: &CramDecoder| {
             let mut names: Vec<Vec<u8>> = decoder.held().unwrap().keys().cloned().collect();
@@ -1038,17 +1191,98 @@ mod tests {
         };
         load(&decoder, b"ctgA");
         load(&decoder, b"ctgB");
-        decoder.retain(&HashSet::from([&b"ctgA"[..]])).unwrap();
+        decoder.retain(&HashSet::from([&b"ctgA"[..]]), 0).unwrap();
         assert_eq!(held(&decoder), [b"ctgA".to_vec(), b"ctgB".to_vec()]);
-        decoder.retain(&HashSet::from([&b"ctgB"[..]])).unwrap();
+        decoder.retain(&HashSet::from([&b"ctgB"[..]]), 0).unwrap();
         assert_eq!(held(&decoder), [b"ctgB".to_vec()]);
-        assert_eq!(decoder.repository.len(), 1);
-        assert_eq!(decoder.held_sequence(b"ctgB").unwrap().len(), 200);
-        decoder.retain(&HashSet::new()).unwrap();
+        let repository = decoder.read().unwrap().clone();
+        assert_eq!(repository.len(), 1);
+        assert_eq!(
+            decoder.held_sequence(&repository, b"ctgB").unwrap().len(),
+            200
+        );
+        decoder.retain(&HashSet::new(), 0).unwrap();
+        let repository = decoder.read().unwrap().clone();
         assert!(held(&decoder).is_empty());
-        assert!(decoder.repository.is_empty());
-        assert!(decoder.held_sequence(b"ctgA").is_none());
-        assert!(decoder.repository.is_empty());
+        assert!(repository.is_empty());
+        assert!(decoder.held_sequence(&repository, b"ctgA").is_none());
+        assert!(repository.is_empty());
+    }
+
+    /// A decoder for the test CRAM `name` against the test FASTA.
+    fn test_decoder(name: &str) -> CramDecoder {
+        let path = test_data(name);
+        let header = cram::io::Reader::new(Recorder::new(File::open(&path).unwrap()))
+            .read_header()
+            .unwrap();
+        let reference = Reference::open(&test_data("contigs.fa"), false, 1).unwrap();
+        CramDecoder::new(Some(reference), &path, &header)
+    }
+
+    #[test]
+    fn test_retain_keeps_sequences_pinned_by_slices_in_flight() {
+        let decoder = test_decoder("contigs.cram");
+        for name in [&b"ctgA"[..], b"ctgB"] {
+            decoder.read().unwrap().get(name).unwrap().unwrap();
+        }
+        let pin = decoder.pin(b"ctgA").unwrap();
+        decoder.retain(&HashSet::new(), 0).unwrap();
+        assert_eq!(decoder.held().unwrap().len(), 2);
+        drop(pin);
+        decoder.retain(&HashSet::new(), 0).unwrap();
+        assert!(decoder.held().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_retain_keeps_sequences_a_later_container_used() {
+        let decoder = test_decoder("contigs.cram");
+        for name in [&b"ctgA"[..], b"ctgB"] {
+            decoder.read().unwrap().get(name).unwrap().unwrap();
+        }
+        decoder.mark([&b"ctgB"[..]], 5).unwrap();
+        decoder.retain(&HashSet::new(), 3).unwrap();
+        let held: Vec<Vec<u8>> = decoder.held().unwrap().keys().cloned().collect();
+        assert_eq!(held, [b"ctgB".to_vec()]);
+        decoder.retain(&HashSet::new(), 5).unwrap();
+        assert!(decoder.held().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_decoder_clones_decode_concurrently_like_one_decoder() {
+        for name in [
+            "contigs.cram",
+            "contigs.multi-ref.cram",
+            "contigs.mixed-ref.cram",
+            "past-end.cram",
+            "past-end.embedded-ref.cram",
+            "contigs.embedded-ref.slices.cram",
+            "contigs.no-ref.multi-ref.cram",
+        ] {
+            let (single, _) = decode_all(name);
+            let mut reader =
+                cram::io::Reader::new(Recorder::new(File::open(test_data(name)).unwrap()));
+            let header = reader.read_header().unwrap();
+            let mut containers = Vec::new();
+            let mut container = cram::io::reader::Container::default();
+            while read_container(&mut reader, &mut container).unwrap() {
+                containers.push((std::mem::take(&mut container), reader.get_mut().take()));
+            }
+            let decoder = test_decoder(name);
+            let decoded: Vec<Vec<RecordBuf>> = std::thread::scope(|scope| {
+                let handles: Vec<_> = containers
+                    .iter()
+                    .map(|(container, raw)| {
+                        let decoder = decoder.clone();
+                        let header = &header;
+                        scope.spawn(move || decoder.decode(container, header, raw).unwrap())
+                    })
+                    .collect();
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+            assert_eq!(decoded.concat(), single, "{name}");
+            assert!(decoder.held().unwrap().len() <= 3, "{name}");
+            assert!(decoder.pinned().unwrap().is_empty(), "{name}");
+        }
     }
 
     /// The reference behind the MD/NM tests: an N run at 5-6 and lowercase bases at 11-14.
@@ -1201,7 +1435,7 @@ mod tests {
         let mut reader = cram::io::Reader::new(Recorder::new(File::open(&path).unwrap()));
         let header = reader.read_header().unwrap();
         let reference = Reference::open(&test_data("contigs.short.fa"), false, 1).unwrap();
-        let mut decoder = CramDecoder::new(Some(reference), &path, &header);
+        let decoder = CramDecoder::new(Some(reference), &path, &header);
         let mut container = cram::io::reader::Container::default();
         read_container(&mut reader, &mut container).unwrap();
         let error = decoder
@@ -1219,7 +1453,7 @@ mod tests {
         let mut reader = cram::io::Reader::new(Recorder::new(File::open(&path).unwrap()));
         let header = reader.read_header().unwrap();
         let reference = Reference::open(&test_data("contigs.short.fa"), false, 1).unwrap();
-        let mut decoder = CramDecoder::new(Some(reference), &path, &sam::Header::default());
+        let decoder = CramDecoder::new(Some(reference), &path, &sam::Header::default());
         let mut container = cram::io::reader::Container::default();
         read_container(&mut reader, &mut container).unwrap();
         let error = decoder

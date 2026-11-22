@@ -171,11 +171,11 @@ Feature: Split an aligned input by read group, keeping alignments
       | contigs.cram           |
       | contigs.multi-ref.cram |
 
-  Scenario: a CRAM record running past the end of its reference sequence decodes as htslib does
+  Scenario Outline: a CRAM record running past the end of its reference sequence decodes as htslib does on <threads> threads
     Given the test file "past-end.cram"
     And the test file "contigs.fa"
     And the test file "contigs.fa.fai"
-    When I run `unmux past-end.cram --reference contigs.fa --group sm=@RG::SM --sample-from-group sm --out out/%sample.sam`
+    When I run `unmux past-end.cram --reference contigs.fa --group sm=@RG::SM --sample-from-group sm --out out/%sample.sam --threads <threads>`
     Then the exit code is 0
     And the records of "out/sA.sam" are:
       """
@@ -189,9 +189,15 @@ Feature: Split an aligned input by read group, keeping alignments
       clipAcrossEnd	0	ctgB	199	60	2S6M	*	0	0	AAGCTTCA	IIIIIIII	MD:Z:2	NM:i:0	RG:Z:rg2
       """
 
-  Scenario: a CRAM record running past the end of an embedded reference decodes as htslib does
+    Examples:
+      | threads |
+      | 1       |
+      | 8       |
+      | 32      |
+
+  Scenario Outline: a CRAM record running past the end of an embedded reference decodes as htslib does on <threads> threads
     Given the test file "past-end.embedded-ref.cram"
-    When I run `unmux past-end.embedded-ref.cram --group sm=@RG::SM --sample-from-group sm --out out/%sample.sam`
+    When I run `unmux past-end.embedded-ref.cram --group sm=@RG::SM --sample-from-group sm --out out/%sample.sam --threads <threads>`
     Then the exit code is 0
     And the records of "out/sA.sam" are:
       """
@@ -206,14 +212,29 @@ Feature: Split an aligned input by read group, keeping alignments
       """
     And stderr does not contain "panicked"
 
-  Scenario: MD and NM are regenerated only for slices that use the external reference
+    Examples:
+      | threads |
+      | 1       |
+      | 5       |
+      | 8       |
+      | 32      |
+
+  Scenario Outline: MD and NM are regenerated only for slices that use the external reference on <threads> threads
     Given the test file "contigs.mixed-ref.cram"
     And the test file "contigs.fa"
     And the test file "contigs.fa.fai"
-    When I run `unmux contigs.mixed-ref.cram --reference contigs.fa --group sm=@RG::SM --sample-from-group sm --out out/%sample.sam --unassigned out/unassigned.sam`
+    When I run `unmux contigs.mixed-ref.cram --reference contigs.fa --group sm=@RG::SM --sample-from-group sm --out out/%sample.sam --unassigned out/unassigned.sam --threads <threads>`
     Then the exit code is 0
     And the records of "out/sA.sam" are the "RG:Z:rg1" records of the test file "contigs.mixed-ref.htslib.sam"
     And the records of "out/sB.sam" are the "RG:Z:rg2" records of the test file "contigs.mixed-ref.htslib.sam"
+
+    Examples:
+      | threads |
+      | 1       |
+      | 5       |
+      | 8       |
+      | 16      |
+      | 32      |
 
   Scenario: a --reference sequence shorter than its @SQ length fails cleanly without the check
     Given the test file "contigs.cram"

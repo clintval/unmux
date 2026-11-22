@@ -1361,6 +1361,7 @@ dependencies = [
  "bytes",
  "crossbeam-channel",
  "flate2",
+ "libdeflater",
 ]
 
 [[package]]
@@ -2313,6 +2314,7 @@ dependencies = [
  "assert_cmd",
  "bolero",
  "clap",
+ "crossbeam-channel",
  "csv",
  "cucumber",
  "env_logger",
@@ -2323,6 +2325,7 @@ dependencies = [
  "memchr",
  "mimalloc",
  "noodles",
+ "noodles-bgzf",
  "pa-types",
  "pooled-writer",
  "predicates",
