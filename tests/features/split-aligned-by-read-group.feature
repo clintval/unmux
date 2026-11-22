@@ -194,6 +194,7 @@ Feature: Split an aligned input by read group, keeping alignments
     When I run `unmux past-end.embedded-ref.cram --group sm=@RG::SM --sample-from-group sm --out out/%sample.sam`
     Then the exit code is 1
     And stderr contains "CRAM record `pastEnd` runs past the end of reference sequence `ctgB`"
+    And stderr does not contain "panicked"
     And a file "out/sA.sam" does not exist
 
   Scenario: MD and NM are regenerated only for slices that use the external reference

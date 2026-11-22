@@ -31,7 +31,7 @@ use noodles::sam::header::record::value::Map;
 use noodles::{bam, bgzf, cram, fasta, fastq, sam};
 use smallvec::SmallVec;
 
-use crate::reference::{CramDecoder, Reference};
+use crate::reference::{quietly, CramDecoder, Reference};
 
 /// A format identified by sniffing the start of an input stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -346,11 +346,9 @@ fn read_cram_container(
     header: &sam::Header,
     decoder: &mut CramDecoder,
 ) -> Result<Option<Vec<RecordBuf>>> {
-    if reader
-        .read_container(container)
-        .context("failed to read CRAM container")?
-        == 0
-    {
+    let read = quietly(|| reader.read_container(container))
+        .ok_or_else(|| anyhow!("failed to read CRAM container: it is malformed"))?;
+    if read.context("failed to read CRAM container")? == 0 {
         return Ok(None);
     }
     decoder.decode(container, header).map(Some)
@@ -695,7 +693,9 @@ fn open_format_reader(
             // CRAM takes a plain Read (no BGZF/gzip wrapper; gzipped CRAM is
             // already rejected).
             let mut reader = cram::io::Reader::new(reader);
-            let header = reader.read_header().context("failed to read CRAM header")?;
+            let header = quietly(|| reader.read_header())
+                .ok_or_else(|| anyhow!("failed to read CRAM header: it is malformed"))?
+                .context("failed to read CRAM header")?;
             FormatReader::Cram {
                 reader,
                 decoder: CramDecoder::new(reference.cloned(), path, &header),

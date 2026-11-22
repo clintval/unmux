@@ -127,8 +127,7 @@ impl fasta::repository::Adapter for PaddedAdapter {
     }
 }
 
-/// Serves zeroed stand-ins of the given lengths for slices that need no reference: noodles still
-/// asks for the sequence of every record in a multi-reference slice and indexes it by position.
+/// Serves zeroed stand-ins that noodles indexes by position in a slice that needs no reference.
 struct BlankAdapter(HashMap<Vec<u8>, usize>);
 
 impl fasta::repository::Adapter for BlankAdapter {
@@ -182,8 +181,7 @@ pub(crate) struct CramDecoder {
 }
 
 impl CramDecoder {
-    /// A decoder for the CRAM at `path` with `header`, reading sequences from `reference` when
-    /// given.
+    /// A decoder for the CRAM at `path` with `header`, reading `reference` sequences when given.
     pub(crate) fn new(reference: Option<Reference>, path: &Path, header: &sam::Header) -> Self {
         let lengths: HashMap<Vec<u8>, usize> = header
             .reference_sequences()
@@ -237,6 +235,20 @@ impl CramDecoder {
     /// what the slice cannot use before loading more; afterwards the unused sequences are dropped.
     /// A container written without the reference never loads one.
     pub(crate) fn decode(
+        &mut self,
+        container: &cram::io::reader::Container,
+        header: &sam::Header,
+    ) -> Result<Vec<RecordBuf>> {
+        quietly(|| self.decode_container(container, header)).unwrap_or_else(|| {
+            Err(anyhow!(
+                "failed to decode a CRAM container of {}: it is malformed or uses a CRAM feature \
+                 unmux cannot decode",
+                self.path.display()
+            ))
+        })
+    }
+
+    fn decode_container(
         &mut self,
         container: &cram::io::reader::Container,
         header: &sam::Header,
@@ -350,8 +362,7 @@ impl CramDecoder {
         )
     }
 
-    /// The zeroed stand-ins for slices that need no reference, each as long as its header length
-    /// or the farthest of `ends` on it.
+    /// Zeroed stand-ins as long as each header length, lengthened to reach every one of `ends`.
     fn blank_repository(&mut self, ends: &[(&[u8], usize)]) -> fasta::Repository {
         for &(name, end) in ends {
             let length = self.blank_lengths.entry(name.to_vec()).or_default();
@@ -490,10 +501,28 @@ fn convert_guarded(
     loaded: Loaded<'_>,
     error: impl FnOnce() -> anyhow::Error,
 ) -> Result<RecordBuf> {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        owned(header, record, loaded)
-    }))
-    .unwrap_or_else(|_| Err(error()))
+    quietly(|| owned(header, record, loaded)).unwrap_or_else(|| Err(error()))
+}
+
+thread_local! {
+    static QUIET: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `f`, returning `None` without printing the panic if noodles panics on input it cannot decode.
+pub(crate) fn quietly<T>(f: impl FnOnce() -> T) -> Option<T> {
+    static HOOK: std::sync::Once = std::sync::Once::new();
+    HOOK.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if !QUIET.with(std::cell::Cell::get) {
+                previous(info);
+            }
+        }));
+    });
+    let quiet = QUIET.with(|quiet| quiet.replace(true));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+    QUIET.with(|cell| cell.set(quiet));
+    result.ok()
 }
 
 /// The error for a record that runs past the end of `name` in a slice that embeds its reference.
@@ -937,6 +966,28 @@ mod tests {
             "reference sequence `ctgA` is 300 bases in the --reference FASTA but 400 in the @SQ \
              header"
         ));
+    }
+
+    #[test]
+    fn test_a_panic_inside_noodles_becomes_an_error() {
+        let path = test_data("contigs.cram");
+        let mut reader = cram::io::Reader::new(File::open(&path).unwrap());
+        let header = reader.read_header().unwrap();
+        let reference = Reference::load(&test_data("contigs.short.fa")).unwrap();
+        let mut decoder = CramDecoder::new(Some(reference), &path, &sam::Header::default());
+        let mut container = cram::io::reader::Container::default();
+        reader.read_container(&mut container).unwrap();
+        let error = decoder.decode(&container, &header).unwrap_err();
+        assert!(error
+            .to_string()
+            .starts_with("failed to decode a CRAM container of"));
+    }
+
+    #[test]
+    fn test_quietly_returns_the_value_or_none_on_a_panic() {
+        assert_eq!(quietly(|| 7), Some(7));
+        assert_eq!(quietly(|| -> u8 { panic!("noodles") }), None);
+        assert!(!QUIET.with(std::cell::Cell::get));
     }
 
     #[test]
