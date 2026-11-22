@@ -958,17 +958,35 @@ fn text_bufread(reader: Box<dyn BufRead + Send>, gzipped: bool) -> Box<dyn BufRe
     }
 }
 
-/// Open one input by sniffing its format and dispatching to the matching
-/// noodles reader, returning the sniffed format alongside (so the caller can
-/// validate the input family and mirror the format to stdout output). With
+/// Split `decode_threads` workers across the BAM and CRAM inputs among
+/// `formats`, the earlier inputs taking any remainder; other inputs get none.
+fn decode_shares(formats: &[SniffedFormat], decode_threads: usize) -> Vec<usize> {
+    let decoding = formats
+        .iter()
+        .filter(|format| matches!(format, SniffedFormat::Bam | SniffedFormat::Cram))
+        .count();
+    let mut nth = 0;
+    formats
+        .iter()
+        .map(|format| {
+            if !matches!(format, SniffedFormat::Bam | SniffedFormat::Cram) {
+                return 0;
+            }
+            let share = decode_threads / decoding + usize::from(nth < decode_threads % decoding);
+            nth += 1;
+            share
+        })
+        .collect()
+}
+
+/// Open one sniffed input with the matching noodles reader. With
 /// `decode_threads`, BAM inflates and CRAM decodes on that many workers.
 fn open_format_reader(
     path: &Path,
+    (format, gzipped, reader): (SniffedFormat, bool, Box<dyn BufRead + Send>),
     reference: Option<&Reference>,
     decode_threads: Option<NonZero<usize>>,
-) -> Result<(SniffedFormat, FormatReader)> {
-    let (format, gzipped, reader) =
-        sniff_input(path).with_context(|| format!("failed to read: {}", path.display()))?;
+) -> Result<FormatReader> {
     let format_reader = match format {
         SniffedFormat::Fastq => FormatReader::Fastq {
             reader: fastq::io::Reader::new(text_bufread(reader, gzipped)),
@@ -1028,7 +1046,7 @@ fn open_format_reader(
             bail!("could not identify the input format of {}", path.display())
         }
     };
-    Ok((format, format_reader))
+    Ok(format_reader)
 }
 
 /// Reject inputs that mix formats with and without per-base qualities: FASTA
@@ -1102,6 +1120,8 @@ pub struct FragmentReader {
     buffered: Vec<InputRecord>,
     /// Pass SAM/BAM/CRAM records through whole (see [`Self::keep_alignments`]).
     keep_alignments: bool,
+    /// The BAM inflate and CRAM decode workers started across all inputs.
+    decode_threads: usize,
 }
 
 impl FragmentReader {
@@ -1119,30 +1139,38 @@ impl FragmentReader {
         per_record: bool,
         reference: Option<&Reference>,
     ) -> Result<Self> {
-        Self::open_with_threads(paths, per_record, reference, 0)
+        Self::open_with_threads(paths, per_record, reference, |_| 0)
     }
 
     /// [`Self::open_with_reference`], inflating BAM and decoding CRAM input on
-    /// `decode_threads` workers per input (zero decodes inline).
+    /// the workers `decode_threads` allots for the sniffed formats, shared out
+    /// across those inputs; an input left without one decodes inline.
     pub fn open_with_threads(
         paths: &[PathBuf],
         per_record: bool,
         reference: Option<&Reference>,
-        decode_threads: usize,
+        decode_threads: impl FnOnce(&[SniffedFormat]) -> usize,
     ) -> Result<Self> {
-        let decode_threads = NonZero::new(decode_threads);
-        let opened = paths
+        let open_error =
+            |i: usize, path: &Path| format!("failed to open input file {i} ({})", path.display());
+        let sniffed = paths
             .iter()
             .enumerate()
             .map(|(i, path)| {
-                open_format_reader(path, reference, decode_threads)
-                    .with_context(|| format!("failed to open input file {i} ({})", path.display()))
+                sniff_input(path)
+                    .with_context(|| format!("failed to read: {}", path.display()))
+                    .with_context(|| open_error(i, path))
             })
-            .collect::<Result<Vec<(SniffedFormat, FormatReader)>>>()?;
-
-        let formats: Vec<SniffedFormat> = opened.iter().map(|(format, _)| *format).collect();
+            .collect::<Result<Vec<_>>>()?;
+        let formats: Vec<SniffedFormat> = sniffed.iter().map(|(format, _, _)| *format).collect();
+        let shares = decode_shares(&formats, decode_threads(&formats));
+        let mut readers = Vec::with_capacity(paths.len());
+        for (i, (path, sniffed)) in paths.iter().zip(sniffed).enumerate() {
+            let reader = open_format_reader(path, sniffed, reference, NonZero::new(shares[i]))
+                .with_context(|| open_error(i, path))?;
+            readers.push(reader);
+        }
         ensure_compatible_quality(&formats)?;
-        let mut readers: Vec<FormatReader> = opened.into_iter().map(|(_, reader)| reader).collect();
 
         let mut buffered = Vec::new();
         let mut interleaved = false;
@@ -1179,6 +1207,7 @@ impl FragmentReader {
             interleaved,
             buffered,
             keep_alignments: false,
+            decode_threads: shares.iter().sum(),
         })
     }
 
@@ -1199,6 +1228,11 @@ impl FragmentReader {
     /// uncompressed BAM.
     pub fn formats(&self) -> &[SniffedFormat] {
         &self.formats
+    }
+
+    /// The BAM inflate and CRAM decode workers started across all inputs.
+    pub fn decode_threads(&self) -> usize {
+        self.decode_threads
     }
 
     /// The read groups declared by the input headers, in first-seen order, plus
@@ -1968,6 +2002,16 @@ mod tests {
     }
 
     #[test]
+    fn test_decode_shares_split_workers_across_bam_and_cram_inputs() {
+        use SniffedFormat::{Bam, Cram, Fastq};
+        assert_eq!(decode_shares(&[Bam], 2), vec![2]);
+        assert_eq!(decode_shares(&[Bam, Cram], 3), vec![2, 1]);
+        assert_eq!(decode_shares(&[Fastq, Bam, Bam], 1), vec![0, 1, 0]);
+        assert_eq!(decode_shares(&[Fastq], 4), vec![0]);
+        assert_eq!(decode_shares(&[Bam, Bam], 0), vec![0, 0]);
+    }
+
+    #[test]
     fn test_pooled_cram_and_bam_decode_match_inline() {
         use noodles::sam::alignment::io::Write as _;
         use noodles::sam::alignment::record::Flags;
@@ -2012,7 +2056,7 @@ mod tests {
             let read = |threads: usize, keep: bool| {
                 let path = file.path().to_path_buf();
                 let mut reader =
-                    FragmentReader::open_with_threads(&[path], true, None, threads).unwrap();
+                    FragmentReader::open_with_threads(&[path], true, None, |_| threads).unwrap();
                 if keep {
                     reader.keep_alignments();
                 }

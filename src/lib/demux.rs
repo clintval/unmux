@@ -1044,20 +1044,27 @@ fn writer_pool_size(threads: usize, has_poolable: bool) -> usize {
 /// The most threads that inflate BAM or decode CRAM input.
 pub const MAX_DECODE_THREADS: usize = 4;
 
-/// The BAM inflate / CRAM decode pool size for `threads` total threads: none
-/// below 4 threads, where the read-ahead thread decodes inline, else an eighth
-/// of the threads, capped at [`MAX_DECODE_THREADS`].
-pub fn decode_pool_size(threads: usize) -> usize {
-    if threads < 4 {
-        return 0;
-    }
-    (threads / 8).clamp(1, MAX_DECODE_THREADS)
+/// The BAM inflate / CRAM decode workers for `threads` total threads, shared
+/// across the inputs of `formats`: none below 5 threads, where the read-ahead
+/// thread decodes inline, else a quarter of the threads for CRAM, whose decode is
+/// the heaviest stage, or an eighth from 16 threads for BAM, whose inflate the
+/// read-ahead thread keeps up with below that; at most [`MAX_DECODE_THREADS`].
+pub fn decode_pool_size(threads: usize, formats: &[SniffedFormat]) -> usize {
+    let workers = if threads < 5 {
+        0
+    } else if formats.contains(&SniffedFormat::Cram) {
+        threads / 4
+    } else if formats.contains(&SniffedFormat::Bam) && threads >= 16 {
+        threads / 8
+    } else {
+        0
+    };
+    workers.min(MAX_DECODE_THREADS)
 }
 
 /// Partition `--threads N` into the engine's [`ThreadBudget`] after reserving
 /// `writer_threads` for the BGZF pool and `decode_threads` for input decoding.
-/// The read-ahead thread only frames records once a decode pool inflates for it,
-/// so the pool shares its slot. The `max(1)` keeps at least one matcher.
+/// The `max(1)` keeps at least one matcher.
 pub fn partition_threads(
     threads: usize,
     writer_threads: usize,
@@ -1066,7 +1073,7 @@ pub fn partition_threads(
     let reader = 1;
     let main = 1;
     let matchers = threads
-        .saturating_sub(reader.max(decode_threads) + main + writer_threads)
+        .saturating_sub(reader + decode_threads + main + writer_threads)
         .max(1);
     ThreadBudget {
         reader,
@@ -1129,25 +1136,17 @@ fn run_engine(plan: &DemuxPlan, command_line: Option<&str>) -> Result<()> {
             crate::reference::Reference::open(path, !plan.skip_reference_check, plan.threads)
         })
         .transpose()?;
-    let decode_threads = decode_pool_size(plan.threads.max(1));
     let mut reader = FragmentReader::open_with_threads(
         &plan.inputs,
         plan.per_record,
         reference.as_ref(),
-        decode_threads,
+        |formats| decode_pool_size(plan.threads.max(1), formats),
     )?;
     let input_formats = reader.formats().to_vec();
     if plan.reference.is_some() && !input_formats.contains(&SniffedFormat::Cram) {
         log::warn!("--reference is unused: no input is CRAM");
     }
-    let decode_threads = if input_formats
-        .iter()
-        .any(|format| matches!(format, SniffedFormat::Bam | SniffedFormat::Cram))
-    {
-        decode_threads
-    } else {
-        0
-    };
+    let decode_threads = reader.decode_threads();
     // Only read (and conflict-check) the input `@RG` header when an `@RG`
     // group is actually present: `input_read_groups` bails on a repeated RG id
     // with conflicting SM/LB across inputs, which is a legitimate outcome for
@@ -1309,7 +1308,8 @@ fn run_engine(plan: &DemuxPlan, command_line: Option<&str>) -> Result<()> {
     // Defensive max(1): clap already guarantees --threads >= 1, but guard for
     // library callers.
     let threads = plan.threads.max(1);
-    let writer_threads = writer_pool_size(threads, !poolable.is_empty());
+    let writer_threads =
+        writer_pool_size(threads.saturating_sub(decode_threads), !poolable.is_empty());
     let budget = partition_threads(threads, writer_threads, decode_threads);
     match threads {
         1 => log::info!("threads=1: serial (read + match + write inline, no pools)"),
@@ -2052,10 +2052,10 @@ fn drive_pipelined(
 }
 
 /// Drive the engine in parallel as three overlapped stages: a read-ahead thread
-/// streams bounded chunks of raw fragments; a process thread hands each chunk to
-/// the rayon pool, which decodes and fully prepares every record
-/// ([`process_pending`]); and the consumer (main) thread applies each prepared
-/// chunk to the single writer in input order while the pool works on the next.
+/// streams bounded chunks of raw fragments; a task on the rayon pool decodes and
+/// fully prepares every record of each chunk ([`process_pending`]); and the
+/// consumer (main) thread applies each prepared chunk to the single writer in
+/// input order while the pool works on the next.
 /// Output stays in input order, so runs are deterministic regardless of
 /// `--threads`.
 fn drive_parallel(
@@ -2076,21 +2076,19 @@ fn drive_parallel(
     let reader_handle = spawn_reader(reader, tx)?;
 
     let (prepared_tx, prepared_rx) = std::sync::mpsc::sync_channel::<Vec<Result<Prepared>>>(1);
-    let outcome = std::thread::scope(|scope| {
-        scope.spawn(move || {
+    let outcome = pool.in_place_scope(|scope| {
+        scope.spawn(move |_| {
             for chunk in rx {
-                let prepared: Vec<Result<Prepared>> = pool.install(|| {
-                    chunk
-                        .into_par_iter()
-                        .with_min_len(MATCHER_MIN_JOB)
-                        .map_init(
-                            || (Scratch::new(), RecordBuf::default()),
-                            |(scratch, record), pending| {
-                                process_pending(engine, scratch, record, pending)
-                            },
-                        )
-                        .collect()
-                });
+                let prepared: Vec<Result<Prepared>> = chunk
+                    .into_par_iter()
+                    .with_min_len(MATCHER_MIN_JOB)
+                    .map_init(
+                        || (Scratch::new(), RecordBuf::default()),
+                        |(scratch, record), pending| {
+                            process_pending(engine, scratch, record, pending)
+                        },
+                    )
+                    .collect();
                 if prepared_tx.send(prepared).is_err() {
                     return;
                 }
@@ -2103,7 +2101,7 @@ fn drive_parallel(
                 break;
             }
         }
-        // Closing the channel stops the process thread, which closes the reader's.
+        // Closing the channel stops the process task, which closes the reader's.
         drop(prepared_rx);
         outcome
     });
@@ -2869,6 +2867,29 @@ mod tests {
             skip_reference_check: false,
             command_line: None,
         }
+    }
+
+    #[test]
+    fn test_decode_workers_fit_inside_the_thread_budget() {
+        use SniffedFormat::{Bam, Cram, Fastq};
+        for formats in [&[Bam][..], &[Bam, Bam], &[Cram], &[Fastq, Bam], &[Fastq]] {
+            for threads in 3..=40 {
+                let decode = decode_pool_size(threads, formats);
+                let writer = writer_pool_size(threads - decode, true);
+                let budget = partition_threads(threads, writer, decode);
+                assert!(budget.matchers >= 1);
+                assert_eq!(
+                    budget.reader + budget.decode + budget.main + budget.writer + budget.matchers,
+                    threads,
+                    "{formats:?} at {threads} threads: {budget:?}"
+                );
+            }
+        }
+        assert_eq!(decode_pool_size(8, &[Bam]), 0);
+        assert_eq!(decode_pool_size(16, &[Bam]), 2);
+        assert_eq!(decode_pool_size(8, &[Cram]), 2);
+        assert_eq!(decode_pool_size(4, &[Cram]), 0);
+        assert_eq!(decode_pool_size(64, &[Fastq]), 0);
     }
 
     #[test]
