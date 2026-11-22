@@ -11,9 +11,9 @@
 //! and extraction consume. SAM/BAM/CRAM inputs carry their record tags through
 //! for the writer to re-emit. A single FASTX input is auto-detected as
 //! interleaved (two mates per fragment). An input path of `-` reads stdin (at
-//! most one). CRAM input decodes against a `--reference` FASTA when given; a
-//! CRAM that needs one and has none fails at its first reference-compressed
-//! slice.
+//! most one). CRAM input decodes against a `--reference` FASTA when given,
+//! which must match the CRAM's `@SQ` lines; a CRAM that needs one and has none
+//! fails at its first reference-compressed slice.
 
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read};
@@ -798,7 +798,7 @@ impl FragmentReader {
         Self::open_with_reference(paths, per_record, None)
     }
 
-    /// [`Self::open`], decoding CRAM input against `reference` when given.
+    /// [`Self::open`], decoding CRAM input against `reference` when given; see [`Self::check_reference`].
     pub fn open_with_reference(
         paths: &[PathBuf],
         per_record: bool,
@@ -914,6 +914,21 @@ impl FragmentReader {
             }
         }
         Ok(info)
+    }
+
+    /// Check each CRAM input's `@SQ` lines against `reference`, `paths` being the inputs in `--in` order.
+    pub fn check_reference(&self, paths: &[PathBuf], reference: &Reference) -> Result<()> {
+        for (i, (reader, path)) in self.readers.iter().zip(paths).enumerate() {
+            if let FormatReader::Cram { header, .. } = reader {
+                reference.check_header(header, path).with_context(|| {
+                    format!(
+                        "failed to check input file {i} ({}) against --reference",
+                        path.display()
+                    )
+                })?;
+            }
+        }
+        Ok(())
     }
 
     /// The number of records every fragment carries: two for a single

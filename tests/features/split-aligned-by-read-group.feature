@@ -215,11 +215,11 @@ Feature: Split an aligned input by read group, keeping alignments
     And the records of "out/sA.sam" are the "RG:Z:rg1" records of the test file "contigs.mixed-ref.htslib.sam"
     And the records of "out/sB.sam" are the "RG:Z:rg2" records of the test file "contigs.mixed-ref.htslib.sam"
 
-  Scenario: a --reference sequence shorter than its @SQ length fails cleanly
+  Scenario: a --reference sequence shorter than its @SQ length fails cleanly without the check
     Given the test file "contigs.cram"
     And the test file "contigs.short.fa"
     And the test file "contigs.short.fa.fai"
-    When I run `unmux contigs.cram --reference contigs.short.fa --group sm=@RG::SM --sample-from-group sm --out out/%sample.sam`
+    When I run `unmux contigs.cram --reference contigs.short.fa --skip-reference-check --group sm=@RG::SM --sample-from-group sm --out out/%sample.sam`
     Then the exit code is 1
     And stderr contains "reference sequence `ctgA` is 300 bases in the --reference FASTA but 400 in the @SQ header of CRAM input contigs.cram"
     And stderr does not contain "panicked"
