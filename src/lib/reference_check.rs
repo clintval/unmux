@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use anyhow::{anyhow, bail, Context, Result};
 use md5::{Digest, Md5};
@@ -18,10 +19,11 @@ type Md5Digest = [u8; 16];
 /// Small reads contend in the kernel when many contigs are hashed at once.
 const READ_BUFFER: usize = 1 << 20;
 
-/// Checks CRAM headers against an indexed FASTA, hashing contigs on `threads` threads.
+/// Checks CRAM headers against an indexed FASTA, hashing each contig at most once on `threads` threads.
 pub(crate) struct HeaderCheck {
     path: PathBuf,
     index: fai::Index,
+    digests: Vec<OnceLock<Md5Digest>>,
     threads: usize,
 }
 
@@ -30,6 +32,7 @@ impl HeaderCheck {
     pub(crate) fn new(path: &Path, index: fai::Index, threads: usize) -> Self {
         Self {
             path: path.to_path_buf(),
+            digests: index.as_ref().iter().map(|_| OnceLock::new()).collect(),
             index,
             threads: threads.max(1),
         }
@@ -38,12 +41,11 @@ impl HeaderCheck {
     /// Fail unless every `@SQ` contig is in this FASTA with the same `LN` and any `M5`.
     pub(crate) fn check(&self, header: &sam::Header, input: &Path) -> Result<()> {
         let expected = expected_contigs(header, input)?;
-        let records = self.records_for(&expected, input)?;
-        let hashed: Vec<(&ExpectedContig, &fai::Record)> = expected
+        let positions = self.positions_for(&expected, input)?;
+        let hashed: Vec<(&ExpectedContig, usize)> = expected
             .iter()
-            .zip(&records)
+            .zip(positions)
             .filter(|(contig, _)| contig.md5.is_some())
-            .map(|(contig, record)| (contig, *record))
             .collect();
         let unhashed = expected.len() - hashed.len();
         if unhashed > 0 {
@@ -61,7 +63,7 @@ impl HeaderCheck {
             hashed
                 .par_iter()
                 .with_max_len(1)
-                .map(|(_, record)| self.digest(record))
+                .map(|&(_, i)| self.cached_digest(i))
                 .collect::<Result<Vec<Md5Digest>>>()
         })?;
         for ((contig, _), actual) in hashed.iter().zip(&digests) {
@@ -79,18 +81,28 @@ impl HeaderCheck {
         Ok(())
     }
 
-    /// The `.fai` record of each contig, failing on one missing or of another length.
-    fn records_for(&self, expected: &[ExpectedContig], input: &Path) -> Result<Vec<&fai::Record>> {
-        let by_name: HashMap<&[u8], &fai::Record> = self
+    /// The digest of the `i`th `.fai` record, hashing it only on first use.
+    fn cached_digest(&self, i: usize) -> Result<Md5Digest> {
+        if let Some(digest) = self.digests[i].get() {
+            return Ok(*digest);
+        }
+        let digest = self.digest(&self.index.as_ref()[i])?;
+        Ok(*self.digests[i].get_or_init(|| digest))
+    }
+
+    /// The `.fai` position of each contig, failing on one missing or of another length.
+    fn positions_for(&self, expected: &[ExpectedContig], input: &Path) -> Result<Vec<usize>> {
+        let by_name: HashMap<&[u8], (usize, &fai::Record)> = self
             .index
             .as_ref()
             .iter()
-            .map(|record| (record.name().as_ref(), record))
+            .enumerate()
+            .map(|(i, record)| (record.name().as_ref(), (i, record)))
             .collect();
         expected
             .iter()
             .map(|contig| {
-                let record = by_name.get(contig.name.as_bytes()).ok_or_else(|| {
+                let &(i, record) = by_name.get(contig.name.as_bytes()).ok_or_else(|| {
                     anyhow!(
                         "contig `{}` (@SQ in {}) is missing from the --reference FASTA {}; pass the FASTA the CRAM was written against, or --skip-reference-check if no record is on that contig",
                         contig.name,
@@ -108,7 +120,7 @@ impl HeaderCheck {
                         input.display()
                     );
                 }
-                Ok(*record)
+                Ok(i)
             })
             .collect()
     }
@@ -327,6 +339,20 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("ends 2 bp early"), "{err}");
+    }
+
+    #[test]
+    fn test_each_contig_is_hashed_once_across_checks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_fasta(dir.path(), ">a\nACGT\n>b\nTT\n");
+        let check = open(&path, 2);
+        let md5 = to_hex(&Md5::digest(b"ACGT").into());
+        let header = header(&[("a", 4, Some(&md5)), ("b", 2, None)]);
+        check.check(&header, Path::new("1.cram")).unwrap();
+        assert!(check.digests[0].get().is_some());
+        assert!(check.digests[1].get().is_none());
+        std::fs::remove_file(&path).unwrap();
+        check.check(&header, Path::new("2.cram")).unwrap();
     }
 
     #[test]
