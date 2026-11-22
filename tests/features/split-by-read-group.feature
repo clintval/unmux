@@ -2,8 +2,8 @@ Feature: Split an existing multi-read-group input by its @RG header
   A `--group NAME=@RG[::SM[::LB]]` source reads the input's read groups and,
   paired with --sample-from-group, fans records out into one file per read
   group, sample, or library, keyed on the record's own RG:Z and the
-  header's @RG lines. Output is unmapped, and aligned inputs are warned
-  about but processed.
+  header's @RG lines. Aligned inputs keep their alignments (see
+  split-aligned-by-read-group.feature).
 
   Scenario: @RG splits by read-group ID, one file per read group
     Given a file "in.sam" containing:
@@ -72,7 +72,7 @@ Feature: Split an existing multi-read-group input by its @RG header
     And the BAM header of "out/sampleA.bam" contains "ID:rg1"
     And the BAM header of "out/sampleA.bam" contains "ID:rg2"
 
-  Scenario: an aligned input is split but warns that output is unmapped
+  Scenario: an aligned input is split with its alignments and @SQ kept
     Given a file "in.sam" containing:
       """
       @HD	VN:1.6	SO:coordinate
@@ -83,8 +83,11 @@ Feature: Split an existing multi-read-group input by its @RG header
     When I run `unmux in.sam --group rg=@RG --sample-from-group rg --out out/%sample.bam`
     Then the exit code is 0
     And a file "out/rg1.bam" exists
-    And stderr contains "UNMAPPED"
-    And the BAM header of "out/rg1.bam" does not contain "@SQ"
+    And the BAM header of "out/rg1.bam" contains "@SQ"
+    And the records of "out/rg1.bam" are:
+      """
+      r1	0	chr1	100	60	8M	*	0	0	AAAAAAAA	IIIIIIII	RG:Z:rg1
+      """
 
   Scenario: a record with no RG:Z lands in the unassigned bin
     Given a file "in.sam" containing:

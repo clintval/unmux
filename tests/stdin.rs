@@ -126,3 +126,57 @@ fn stdin_short_first_write_is_still_sniffed_as_sam() {
         "the SAM record round-trips"
     );
 }
+
+#[test]
+fn stdin_aligned_bam_splits_by_read_group_keeping_alignments() {
+    use noodles::sam::alignment::io::Write as _;
+    use noodles::{bam, sam};
+
+    let text = b"@HD\tVN:1.6\tSO:coordinate\n@SQ\tSN:chr1\tLN:1000\n\
+                 @RG\tID:rg1\tSM:sA\n@RG\tID:rg2\tSM:sB\n\
+                 q1\t99\tchr1\t100\t60\t8M\t=\t150\t58\tACGTACGT\tIIIIIIII\tMC:Z:8M\tRG:Z:rg1\n\
+                 q2\t0\tchr1\t120\t30\t8M\t*\t0\t0\tCCCCAAAA\tIIIIIIII\tRG:Z:rg2\n\
+                 q1\t147\tchr1\t150\t60\t8M\t=\t100\t-58\tGGGGTTTT\tIIIIIIII\tMC:Z:8M\tRG:Z:rg1\n";
+    let mut reader = sam::io::Reader::new(&text[..]);
+    let header = reader.read_header().unwrap();
+    let records: Vec<_> = reader
+        .record_bufs(&header)
+        .collect::<Result<_, _>>()
+        .unwrap();
+    let mut bam_bytes = Vec::new();
+    {
+        let mut writer = bam::io::Writer::new(&mut bam_bytes);
+        writer.write_header(&header).unwrap();
+        for record in &records {
+            writer.write_alignment_record(&header, record).unwrap();
+        }
+        writer.try_finish().unwrap();
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let pattern = dir.path().join("%sample.bam");
+    Command::cargo_bin("unmux")
+        .unwrap()
+        .args([
+            "-",
+            "--group",
+            "rg=@RG",
+            "--sample-from-group",
+            "rg",
+            "--out",
+            pattern.to_str().unwrap(),
+        ])
+        .write_stdin(bam_bytes)
+        .assert()
+        .success();
+
+    let mut reader = bam::io::Reader::new(std::fs::File::open(dir.path().join("rg1.bam")).unwrap());
+    let out_header = reader.read_header().unwrap();
+    assert_eq!(out_header.reference_sequences().len(), 1);
+    assert_eq!(out_header.read_groups().len(), 1);
+    let kept: Vec<_> = reader
+        .record_bufs(&out_header)
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(kept, vec![records[0].clone(), records[2].clone()]);
+}

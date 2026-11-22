@@ -17,9 +17,12 @@
 //! the pooled BAM writer is built via `From` so it carries no inner BGZF (the
 //! pool is the sole stage).
 
+use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use anyhow::{anyhow, bail, Context, Result};
 use noodles::sam::alignment::io::Write as AlignmentWrite;
@@ -51,6 +54,9 @@ pub struct OutputRead<'a> {
     /// assigned record on SAM/BAM output (an `RG:Z` data field, matching an
     /// `@RG` header line). FASTX has no read groups, so it is ignored there.
     pub read_group: Option<&'a str>,
+    /// A source alignment to write verbatim on SAM/BAM, in place of a record
+    /// built from the fields above. FASTX ignores it.
+    pub alignment: Option<&'a RecordBuf>,
 }
 
 /// A resolved output format. FASTX variants carry whether the sink is
@@ -483,6 +489,220 @@ fn bgzf_writer<W: Write>(inner: W, compression: u8) -> Result<bgzf::io::Writer<W
         .build_from_writer(inner))
 }
 
+/// Output files written beside their destinations under temporary names, renamed into place by
+/// [`StagedOutputs::commit`]. Dropped uncommitted, it removes the temporary files and the
+/// directories it created, so a failed run never changes a file that was already there.
+#[derive(Debug)]
+pub(crate) struct StagedOutputs {
+    id: u64,
+    files: HashMap<PathBuf, StagedFile>,
+    dirs: Vec<PathBuf>,
+    committed: bool,
+}
+
+impl Default for StagedOutputs {
+    fn default() -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        Self {
+            id: NEXT.fetch_add(1, Ordering::Relaxed),
+            files: HashMap::new(),
+            dirs: Vec::new(),
+            committed: false,
+        }
+    }
+}
+
+/// The temporary files and created directories of every live [`StagedOutputs`], by its id.
+type Registry = BTreeMap<u64, (Vec<PathBuf>, Vec<PathBuf>)>;
+
+static REGISTRY: Mutex<Registry> = Mutex::new(BTreeMap::new());
+
+fn registry() -> MutexGuard<'static, Registry> {
+    REGISTRY.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Remove `files`, then the directories in `dirs` that are left empty, deepest first.
+fn remove_staged(files: &[PathBuf], dirs: &[PathBuf]) {
+    for file in files {
+        let _ = std::fs::remove_file(file);
+    }
+    let mut dirs = dirs.to_vec();
+    dirs.sort_by_key(|dir| std::cmp::Reverse(dir.components().count()));
+    for dir in &dirs {
+        let _ = std::fs::remove_dir(dir);
+    }
+}
+
+/// On SIGINT, SIGTERM or SIGHUP, remove staged outputs and exit 128 plus the signal number.
+pub fn clean_up_on_termination() -> io::Result<()> {
+    use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
+    let armed = Arc::new(AtomicBool::new(false));
+    for signal in [SIGINT, SIGTERM, SIGHUP] {
+        signal_hook::flag::register_conditional_shutdown(signal, 128 + signal, Arc::clone(&armed))?;
+        signal_hook::flag::register(signal, Arc::clone(&armed))?;
+    }
+    let mut signals = signal_hook::iterator::Signals::new([SIGINT, SIGTERM, SIGHUP])?;
+    std::thread::Builder::new()
+        .name("unmux-signals".to_string())
+        .spawn(move || {
+            if let Some(signal) = signals.forever().next() {
+                let registry = registry();
+                for (files, dirs) in registry.values() {
+                    remove_staged(files, dirs);
+                }
+                std::process::exit(128 + signal);
+            }
+        })?;
+    Ok(())
+}
+
+/// Where one staged output is written, and the file it replaces on commit.
+#[derive(Debug)]
+struct StagedFile {
+    destination: PathBuf,
+    temporary: PathBuf,
+}
+
+impl StagedOutputs {
+    /// Stage every path in `paths`, noting its missing parent directories. A path that exists but
+    /// is not a regular file, such as a device or a FIFO, is written in place; a symbolic link,
+    /// dangling or not, is staged beside the file it points to.
+    pub(crate) fn stage(&mut self, paths: impl IntoIterator<Item = PathBuf>) {
+        for path in paths {
+            if self.files.contains_key(&path) {
+                continue;
+            }
+            let target = link_target(&path);
+            let destination = match std::fs::metadata(&target) {
+                Ok(metadata) if !metadata.is_file() => continue,
+                Ok(_) => std::fs::canonicalize(&target).unwrap_or(target),
+                Err(_) => target,
+            };
+            let Some(name) = destination.file_name() else {
+                continue;
+            };
+            let temporary = destination.with_file_name(format!(
+                ".{}.unmux-{}.tmp",
+                name.to_string_lossy(),
+                std::process::id()
+            ));
+            for dir in destination.ancestors().skip(1) {
+                if dir.as_os_str().is_empty() || dir.symlink_metadata().is_ok() {
+                    break;
+                }
+                if !self.dirs.iter().any(|known| known == dir) {
+                    self.dirs.push(dir.to_path_buf());
+                }
+            }
+            let file = StagedFile {
+                destination,
+                temporary,
+            };
+            self.files.insert(path, file);
+        }
+        let temporaries = self.files.values().map(|file| file.temporary.clone());
+        registry().insert(self.id, (temporaries.collect(), self.dirs.clone()));
+    }
+
+    /// The file to write for output `path`: its temporary file when staged, else `path` itself.
+    pub(crate) fn path<'a>(&'a self, path: &'a Path) -> &'a Path {
+        self.files
+            .get(path)
+            .map_or(path, |file| file.temporary.as_path())
+    }
+
+    /// The temporary file of every staged output, by output path.
+    pub(crate) fn temporaries(&self) -> HashMap<PathBuf, PathBuf> {
+        self.files
+            .iter()
+            .map(|(path, file)| (path.clone(), file.temporary.clone()))
+            .collect()
+    }
+
+    /// Rename every written temporary file over its destination.
+    pub(crate) fn commit(&mut self) -> Result<()> {
+        let mut registry = registry();
+        for file in self.files.values() {
+            if file.temporary.symlink_metadata().is_err() {
+                continue;
+            }
+            replace(&file.temporary, &file.destination).with_context(|| {
+                format!(
+                    "failed to move the finished output into place: {}",
+                    file.destination.display()
+                )
+            })?;
+        }
+        self.committed = true;
+        registry.remove(&self.id);
+        Ok(())
+    }
+}
+
+impl Drop for StagedOutputs {
+    fn drop(&mut self) {
+        let mut registry = registry();
+        if !self.committed {
+            let temporaries: Vec<PathBuf> = self
+                .files
+                .values()
+                .map(|file| file.temporary.clone())
+                .collect();
+            remove_staged(&temporaries, &self.dirs);
+        }
+        registry.remove(&self.id);
+    }
+}
+
+/// The file `path` finally points to, following symbolic links even when the last one dangles.
+fn link_target(path: &Path) -> PathBuf {
+    let mut target = path.to_path_buf();
+    for _ in 0..40 {
+        match std::fs::read_link(&target) {
+            Ok(next) => target = target.parent().unwrap_or(Path::new("")).join(next),
+            Err(_) => return target,
+        }
+    }
+    path.to_path_buf()
+}
+
+/// Move finished file `temporary` onto `destination`, keeping an existing destination's mode,
+/// owner and hard links: renamed when they carry over, else copied into the destination in place.
+fn replace(temporary: &Path, destination: &Path) -> io::Result<()> {
+    let Ok(existing) = std::fs::metadata(destination) else {
+        return std::fs::rename(temporary, destination);
+    };
+    if carries_over(&existing, temporary) {
+        std::fs::set_permissions(temporary, existing.permissions())?;
+        return std::fs::rename(temporary, destination);
+    }
+    let mut out = std::fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(destination)?;
+    io::copy(&mut File::open(temporary)?, &mut out)?;
+    out.sync_all()?;
+    std::fs::remove_file(temporary)
+}
+
+/// Whether renaming `temporary` over a file with `existing` metadata keeps its links and owner.
+#[cfg(unix)]
+fn carries_over(existing: &std::fs::Metadata, temporary: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(staged) = std::fs::metadata(temporary) else {
+        return false;
+    };
+    existing.nlink() == 1
+        && existing.uid() == staged.uid()
+        && (existing.gid() == staged.gid()
+            || std::os::unix::fs::chown(temporary, None, Some(existing.gid())).is_ok())
+}
+
+#[cfg(not(unix))]
+fn carries_over(_: &std::fs::Metadata, _: &Path) -> bool {
+    true
+}
+
 /// Create an output file, making any missing parent directories first. Shared
 /// by the inline writers and the pooled-writer exchange so both create files
 /// (and dirs) identically.
@@ -627,10 +847,14 @@ fn write_alignments<W: AlignmentWrite>(
         );
     }
     for (index, read) in reads.iter().enumerate() {
-        let record = build_record(read, segment_flags(index, reads.len()));
-        writer
-            .write_alignment_record(header, &record)
-            .context("failed to write SAM/BAM/CRAM record")?;
+        let written = match read.alignment {
+            Some(record) => writer.write_alignment_record(header, record),
+            None => {
+                let record = build_record(read, segment_flags(index, reads.len()));
+                writer.write_alignment_record(header, &record)
+            }
+        };
+        written.context("failed to write SAM/BAM/CRAM record")?;
     }
     Ok(())
 }
@@ -729,6 +953,130 @@ fn segment_flags(index: usize, total: usize) -> Flags {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_staged_outputs_leave_existing_files_untouched_on_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let existing = dir.path().join("existing.bam");
+        std::fs::write(&existing, b"keep").unwrap();
+        let created = dir.path().join("new/nested/out.bam");
+        let mut staged = StagedOutputs::default();
+        staged.stage([existing.clone(), created.clone()]);
+        for path in [&existing, &created] {
+            assert_ne!(staged.path(path), path.as_path());
+            create_output_file(staged.path(path)).unwrap();
+            std::fs::write(staged.path(path), b"partial").unwrap();
+        }
+        let temporaries = staged.temporaries();
+        drop(staged);
+        assert_eq!(std::fs::read(&existing).unwrap(), b"keep");
+        assert!(!created.exists());
+        assert!(!dir.path().join("new").exists());
+        assert!(temporaries.values().all(|temporary| !temporary.exists()));
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn test_staged_outputs_replace_their_destinations_on_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let existing = dir.path().join("existing.tsv");
+        std::fs::write(&existing, b"old").unwrap();
+        let link = dir.path().join("link.tsv");
+        std::os::unix::fs::symlink(&existing, &link).unwrap();
+        let created = dir.path().join("out/out.tsv");
+        let unwritten = dir.path().join("unwritten.tsv");
+        let mut staged = StagedOutputs::default();
+        staged.stage([link.clone(), created.clone(), unwritten.clone()]);
+        for (path, text) in [(&link, "new"), (&created, "created")] {
+            create_output_file(staged.path(path)).unwrap();
+            std::fs::write(staged.path(path), text).unwrap();
+        }
+        staged.commit().unwrap();
+        drop(staged);
+        assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read_to_string(&existing).unwrap(), "new");
+        assert_eq!(std::fs::read_to_string(&created).unwrap(), "created");
+        assert!(!unwritten.exists());
+        let mut names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["existing.tsv", "link.tsv", "out"]);
+    }
+
+    /// Stage `path`, write `text` to its temporary file and commit it.
+    fn stage_and_commit(path: &Path, text: &str) {
+        let mut staged = StagedOutputs::default();
+        staged.stage([path.to_path_buf()]);
+        assert_ne!(staged.path(path), path);
+        create_output_file(staged.path(path)).unwrap();
+        std::fs::write(staged.path(path), text).unwrap();
+        staged.commit().unwrap();
+    }
+
+    #[test]
+    fn test_staged_outputs_keep_the_mode_of_the_file_they_replace() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let existing = dir.path().join("existing.sam");
+        std::fs::write(&existing, b"old").unwrap();
+        std::fs::set_permissions(&existing, std::fs::Permissions::from_mode(0o640)).unwrap();
+        stage_and_commit(&existing, "new");
+        assert_eq!(std::fs::read_to_string(&existing).unwrap(), "new");
+        let mode = std::fs::metadata(&existing).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o640);
+    }
+
+    #[test]
+    fn test_staged_outputs_rewrite_a_hard_linked_file_in_place() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let existing = dir.path().join("existing.sam");
+        let link = dir.path().join("link.sam");
+        std::fs::write(&existing, b"old").unwrap();
+        std::fs::hard_link(&existing, &link).unwrap();
+        let inode = std::fs::metadata(&existing).unwrap().ino();
+        stage_and_commit(&existing, "new");
+        assert_eq!(std::fs::read_to_string(&link).unwrap(), "new");
+        assert_eq!(std::fs::metadata(&existing).unwrap().ino(), inode);
+        assert_eq!(std::fs::metadata(&existing).unwrap().nlink(), 2);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn test_staged_outputs_write_through_a_dangling_symbolic_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("link.sam");
+        std::os::unix::fs::symlink("data/target.sam", &link).unwrap();
+        stage_and_commit(&link, "new");
+        assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("data/target.sam")).unwrap(),
+            "new"
+        );
+        assert_eq!(std::fs::read_to_string(&link).unwrap(), "new");
+    }
+
+    #[test]
+    fn test_link_target_follows_a_chain_of_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first");
+        std::os::unix::fs::symlink("second", &first).unwrap();
+        std::os::unix::fs::symlink("sub/third", dir.path().join("second")).unwrap();
+        assert_eq!(link_target(&first), dir.path().join("sub/third"));
+        let looped = dir.path().join("looped");
+        std::os::unix::fs::symlink("looped", &looped).unwrap();
+        assert_eq!(link_target(&looped), looped);
+    }
+
+    #[test]
+    fn test_staged_outputs_write_devices_in_place() {
+        let mut staged = StagedOutputs::default();
+        staged.stage([PathBuf::from("/dev/null")]);
+        assert_eq!(staged.path(Path::new("/dev/null")), Path::new("/dev/null"));
+        staged.commit().unwrap();
+    }
 
     #[test]
     fn test_format_from_extension() {
@@ -838,6 +1186,7 @@ mod tests {
                 quals: Some(&[30, 30, 30, 30]),
                 tags: None,
                 read_group: Some("dna01.lib01"),
+                alignment: None,
             }])
             .unwrap();
         writer.finish().unwrap();
@@ -889,6 +1238,7 @@ mod tests {
                 quals: Some(&[30, 31, 32, 33, 34, 35, 36, 37]),
                 tags: None,
                 read_group: Some("dna01"),
+                alignment: None,
             }],
             vec![
                 OutputRead {
@@ -897,6 +1247,7 @@ mod tests {
                     quals: Some(&q),
                     tags: None,
                     read_group: Some("dna01"),
+                    alignment: None,
                 },
                 OutputRead {
                     name: b"r2",
@@ -904,6 +1255,7 @@ mod tests {
                     quals: Some(&q),
                     tags: None,
                     read_group: Some("dna01"),
+                    alignment: None,
                 },
             ],
         ];
@@ -1001,6 +1353,7 @@ mod tests {
             quals: Some(&[30, 30, 30, 30]),
             tags: None,
             read_group: None,
+            alignment: None,
         }])
         .unwrap();
         w.finish().unwrap();
@@ -1049,6 +1402,7 @@ mod tests {
                 quals: Some(&q),
                 tags: None,
                 read_group: None,
+                alignment: None,
             })
             .collect();
         let err = w.write_fragment(&reads).unwrap_err().to_string();
@@ -1073,5 +1427,43 @@ mod tests {
         assert_eq!(gzip.write(b"abc").unwrap(), 3);
         gzip.flush().unwrap();
         gzip.finish().unwrap();
+    }
+
+    #[test]
+    fn test_alignment_is_written_verbatim_to_sam_and_bam() {
+        let text = b"@HD\tVN:1.6\tSO:coordinate\n@SQ\tSN:chr1\tLN:100\n\
+                     r1\t83\tchr1\t10\t60\t2S4M\t=\t40\t-36\tAACCGG\tABCDEF\tMC:Z:6M\tRG:Z:x\n";
+        let mut reader = sam::io::Reader::new(&text[..]);
+        let header = reader.read_header().unwrap();
+        let mut record = RecordBuf::default();
+        reader.read_record_buf(&header, &mut record).unwrap();
+        let read = OutputRead {
+            name: b"ignored",
+            bases: b"T",
+            quals: None,
+            tags: None,
+            read_group: Some("ignored"),
+            alignment: Some(&record),
+        };
+        let sam_bytes =
+            encode_fragment(OutputFormat::Sam, &header, std::slice::from_ref(&read)).unwrap();
+        assert_eq!(
+            String::from_utf8(sam_bytes).unwrap(),
+            "r1\t83\tchr1\t10\t60\t2S4M\t=\t40\t-36\tAACCGG\tABCDEF\tMC:Z:6M\tRG:Z:x\n"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out.bam");
+        let mut w =
+            OutputWriter::create_with_header(Some(&out), OutputFormat::Bam, 5, header.clone())
+                .unwrap();
+        w.write_fragment(&[read]).unwrap();
+        w.finish().unwrap();
+        let mut reader = bam::io::Reader::new(File::open(&out).unwrap());
+        let read_header = reader.read_header().unwrap();
+        assert_eq!(read_header.reference_sequences().len(), 1);
+        let mut back = RecordBuf::default();
+        reader.read_record_buf(&read_header, &mut back).unwrap();
+        assert_eq!(back, record);
     }
 }

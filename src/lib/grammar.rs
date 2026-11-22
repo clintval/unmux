@@ -554,6 +554,8 @@ pub struct DemuxPlan {
     pub compression: u8,
     /// `--threads` worker count.
     pub threads: usize,
+    /// `--reference`: an indexed FASTA for reference-compressed CRAM input.
+    pub reference: Option<PathBuf>,
 }
 
 /// Parse and structurally validate the raw flag surface into a [`DemuxPlan`].
@@ -618,6 +620,7 @@ pub fn parse_demux(args: &DemuxArgs) -> Result<DemuxPlan> {
         per_record: args.per_record,
         compression: args.compression,
         threads: args.threads,
+        reference: args.reference.clone(),
     };
     validate_plan(&plan)?;
     for warning in plan_warnings(&plan) {
@@ -2067,33 +2070,9 @@ fn plan_warnings(plan: &DemuxPlan) -> Vec<String> {
     // any group (resolved later, at load), so suppress the warning entirely
     // under a sheet.
     if !matches!(plan.samples, SampleSpec::Sheet(..)) {
-        let emitted: HashSet<&str> = plan
-            .templates
-            .iter()
-            .flat_map(|t| t.streams.iter())
-            .chain(plan.tags.iter().flat_map(|t| t.streams.iter()))
-            .map(|s| s.name.as_str())
-            .collect();
-        let match_refs: HashSet<&str> = plan
-            .groups
-            .iter()
-            .filter_map(|g| g.attrs.match_streams.as_ref())
-            .flatten()
-            .map(String::as_str)
-            .collect();
-        let mut linked: HashSet<&str> = HashSet::new();
+        let consumers = Consumers::of(plan);
         for group in &plan.groups {
-            if let Some(next) = &group.attrs.next {
-                linked.insert(group.name.as_str());
-                linked.insert(next.group.as_str());
-            }
-            if let Some(prev) = &group.attrs.prev {
-                linked.insert(group.name.as_str());
-                linked.insert(prev.as_str());
-            }
-        }
-        for group in &plan.groups {
-            if group_is_consumed(plan, group, &emitted, &match_refs, &linked) {
+            if consumers.consume(plan, group) {
                 continue;
             }
             warnings.push(format!(
@@ -2200,6 +2179,63 @@ fn plan_warnings(plan: &DemuxPlan) -> Vec<String> {
     warnings
 }
 
+/// Whether `group`'s matches can route or tag a record: something in the plan consumes them, a
+/// `--sample-sheet` may name it, or `--qc-tag` reports them.
+pub(crate) fn group_has_effect(plan: &DemuxPlan, group: &Group) -> bool {
+    matches!(plan.samples, SampleSpec::Sheet(..))
+        || plan.qc_tag.is_some()
+        || Consumers::of(plan).consume(plan, group)
+}
+
+/// The plan's consumers of group matches beyond sample selectors, removal rules and find
+/// constraints: `emitted` is every extract-stream name a `--template`/`--tag` emits, `match_refs`
+/// every stream a `match=` group consumes, and `linked` every group on either end of a
+/// `next=`/`prev=` link.
+struct Consumers<'a> {
+    emitted: HashSet<&'a str>,
+    match_refs: HashSet<&'a str>,
+    linked: HashSet<&'a str>,
+}
+
+impl<'a> Consumers<'a> {
+    fn of(plan: &'a DemuxPlan) -> Self {
+        let emitted = plan
+            .templates
+            .iter()
+            .flat_map(|t| t.streams.iter())
+            .chain(plan.tags.iter().flat_map(|t| t.streams.iter()))
+            .map(|s| s.name.as_str())
+            .collect();
+        let match_refs = plan
+            .groups
+            .iter()
+            .filter_map(|g| g.attrs.match_streams.as_ref())
+            .flatten()
+            .map(String::as_str)
+            .collect();
+        let mut linked = HashSet::new();
+        for group in &plan.groups {
+            if let Some(next) = &group.attrs.next {
+                linked.insert(group.name.as_str());
+                linked.insert(next.group.as_str());
+            }
+            if let Some(prev) = &group.attrs.prev {
+                linked.insert(group.name.as_str());
+                linked.insert(prev.as_str());
+            }
+        }
+        Self {
+            emitted,
+            match_refs,
+            linked,
+        }
+    }
+
+    fn consume(&self, plan: &DemuxPlan, group: &Group) -> bool {
+        group_is_consumed(plan, group, &self.emitted, &self.match_refs, &self.linked)
+    }
+}
+
 /// Whether anything in the plan consumes `group`'s matches (see
 /// [`plan_warnings`] rule 1). `emitted` is every extract-stream name a
 /// `--template`/`--tag` emits, `match_refs` every stream a `match=` group
@@ -2287,6 +2323,7 @@ mod tests {
             per_record: false,
             compression: 5,
             threads: 8,
+            reference: None,
             command_line: None,
         }
     }
@@ -2494,6 +2531,29 @@ mod tests {
             !w.iter().any(|m| m.contains("tag `CR`")),
             "raw on the corrected @grp stream is not flagged: {w:?}"
         );
+    }
+
+    #[test]
+    fn test_group_has_effect_only_when_consumed_or_reported() {
+        let mut a = args();
+        a.groups = vec![
+            "g={ACGT}".to_string(),
+            "g::loc=0:0:4".to_string(),
+            "h={ACGT}".to_string(),
+            "h::loc=0:0:4".to_string(),
+        ];
+        a.samples = vec!["s=h::ACGT".to_string()];
+        a.out = Some("%sample.fq".to_string());
+        let plan = parse_demux(&a).unwrap();
+        let effect = |plan: &DemuxPlan| {
+            plan.groups
+                .iter()
+                .map(|group| group_has_effect(plan, group))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(effect(&plan), [false, true]);
+        a.qc_tag = Some("XQ".to_string());
+        assert_eq!(effect(&parse_demux(&a).unwrap()), [true, true]);
     }
 
     #[test]

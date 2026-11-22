@@ -283,23 +283,7 @@ pub fn read_group_header(
 ) -> Result<sam::Header> {
     let mut builder = provenance_header_builder(command_line);
     if let Some(constituent) = constituent {
-        // An @RG-split run: emit each target's original @RG line(s) verbatim,
-        // deduped by id across targets that share this file, and skip the synth
-        // per-target @RG path entirely. The bucket built by
-        // `build_constituent_rgs` iterates a HashMap, so its order is not
-        // deterministic; sort by id here so the emitted line order is stable
-        // run-to-run regardless of upstream iteration order.
-        let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
-        let mut deduped: Vec<(Vec<u8>, Map<ReadGroup>)> = Vec::new();
-        for target in targets {
-            for (id, map) in constituent.get(target).into_iter().flatten() {
-                if seen.insert(id.clone()) {
-                    deduped.push((id.clone(), map.clone()));
-                }
-            }
-        }
-        deduped.sort_by(|(a, _), (b, _)| a.cmp(b));
-        for (id, map) in deduped {
+        for (id, map) in file_read_groups(targets, constituent) {
             builder = builder.add_read_group(id, map);
         }
         return Ok(builder.build());
@@ -319,6 +303,92 @@ pub fn read_group_header(
         builder = builder.add_read_group(target.label(), map);
     }
     Ok(builder.build())
+}
+
+/// The original `@RG` lines of the targets sharing one file, deduped and sorted by id.
+fn file_read_groups(
+    targets: &[&Target],
+    constituent: &ConstituentReadGroups,
+) -> Vec<(Vec<u8>, Map<ReadGroup>)> {
+    let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+    let mut deduped: Vec<(Vec<u8>, Map<ReadGroup>)> = Vec::new();
+    for target in targets {
+        for (id, map) in constituent.get(target).into_iter().flatten() {
+            if seen.insert(id.clone()) {
+                deduped.push((id.clone(), map.clone()));
+            }
+        }
+    }
+    deduped.sort_by(|(a, _), (b, _)| a.cmp(b));
+    deduped
+}
+
+/// The input header with the unmux `@PG` appended, its `@RG` lines narrowed (in
+/// input order) to the targets sharing this file when `targets` is given.
+pub fn alignment_header(
+    input: &sam::Header,
+    targets: Option<(&[&Target], &ConstituentReadGroups)>,
+    command_line: Option<&str>,
+) -> Result<sam::Header> {
+    let mut header = input.clone();
+    if let Some((targets, constituent)) = targets {
+        let keep: std::collections::HashSet<Vec<u8>> = file_read_groups(targets, constituent)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        header
+            .read_groups_mut()
+            .retain(|id, _| keep.contains(AsRef::<[u8]>::as_ref(id)));
+    }
+    append_program(header.programs_mut(), program_record(command_line));
+    Ok(header)
+}
+
+/// Append the unmux `@PG` under the first free ID of `unmux`, `unmux.1`, ...,
+/// chained by `PP` to the last leaf program unless the existing chains have a
+/// dangling `PP` or a cycle, in which case it is left unchained.
+fn append_program(programs: &mut sam::header::Programs, mut map: Map<Program>) {
+    let inner = programs.as_mut();
+    let previous = |id: &[u8]| {
+        inner
+            .get(id)
+            .and_then(|map| map.other_fields().get(&program_tag::PREVIOUS_PROGRAM_ID))
+            .map(|pp| AsRef::<[u8]>::as_ref(pp).to_vec())
+    };
+    let chains_are_sound = inner.keys().all(|start| {
+        let mut seen = std::collections::HashSet::new();
+        let mut current = AsRef::<[u8]>::as_ref(start).to_vec();
+        while let Some(pp) = previous(&current) {
+            if !inner.contains_key(pp.as_slice()) || !seen.insert(pp.clone()) {
+                return false;
+            }
+            current = pp;
+        }
+        true
+    });
+    if chains_are_sound {
+        let referenced: std::collections::HashSet<Vec<u8>> = inner
+            .keys()
+            .filter_map(|id| previous(id.as_ref()))
+            .collect();
+        let leaf = inner
+            .keys()
+            .rev()
+            .find(|id| !referenced.contains(AsRef::<[u8]>::as_ref(*id)))
+            .cloned();
+        if let Some(leaf) = leaf {
+            map.other_fields_mut()
+                .insert(program_tag::PREVIOUS_PROGRAM_ID, leaf);
+        }
+    }
+    let id = (0..)
+        .map(|n| match n {
+            0 => "unmux".to_string(),
+            n => format!("unmux.{n}"),
+        })
+        .find(|id| !inner.contains_key(id.as_bytes()))
+        .expect("an unused program ID exists");
+    inner.insert(id.into(), map);
 }
 
 /// Build the fallback header for destinations with no per-sample read group:
@@ -403,6 +473,8 @@ pub struct MultiWriter {
     /// the raw `--unassigned`/`--remove` bins): `@PG` provenance plus the
     /// default pool `@RG`.
     default_header: sam::Header,
+    /// The file each destination path is written to, when that differs from the path.
+    files: HashMap<PathBuf, PathBuf>,
 }
 
 impl MultiWriter {
@@ -429,7 +501,13 @@ impl MultiWriter {
             input_formats,
             compression,
             default_header,
+            files: HashMap::new(),
         }
+    }
+
+    /// Write each destination path in `files` to the file it maps to instead.
+    pub fn write_files_to(&mut self, files: HashMap<PathBuf, PathBuf>) {
+        self.files = files;
     }
 
     /// Install the pre-exchanged BGZF pool writers, keyed by destination path.
@@ -500,7 +578,8 @@ impl MultiWriter {
             // writers ignore it.
             return OutputWriter::from_pooled(pooled, format, header);
         }
-        OutputWriter::create_with_header(path, format, self.compression, header)
+        let file = path.map(|path| self.files.get(path).map_or(path, PathBuf::as_path));
+        OutputWriter::create_with_header(file, format, self.compression, header)
     }
 
     /// Finalize every opened writer (flush, gzip trailers, BGZF EOF), returning
@@ -526,6 +605,98 @@ mod tests {
     /// values.
     fn pattern(text: &str, allowed: &[Placeholder]) -> OutputPattern {
         crate::grammar::parse_output_pattern(text, allowed).unwrap()
+    }
+
+    #[test]
+    fn test_alignment_header_keeps_input_and_narrows_read_groups() {
+        let input = sam::io::Reader::new(
+            &b"@HD\tVN:1.6\tSO:coordinate\n@SQ\tSN:chr1\tLN:100\n\
+               @RG\tID:rg1\tSM:sA\n@RG\tID:rg2\tSM:sB\n@PG\tID:bwa\tPN:bwa\n@CO\tnote\n"[..],
+        )
+        .read_header()
+        .unwrap();
+        let target = Target {
+            sample: "sA".to_string(),
+            sub_sample: None,
+        };
+        let rg1 = input.read_groups().get(&b"rg1"[..]).unwrap().clone();
+        let constituent: ConstituentReadGroups =
+            HashMap::from([(target.clone(), vec![(b"rg1".to_vec(), rg1)])]);
+        let render = |header: &sam::Header| {
+            let mut buf = Vec::new();
+            sam::io::Writer::new(&mut buf).write_header(header).unwrap();
+            String::from_utf8(buf).unwrap()
+        };
+
+        let narrowed =
+            alignment_header(&input, Some((&[&target], &constituent)), Some("unmux x")).unwrap();
+        let text = render(&narrowed);
+        assert!(text.starts_with("@HD\tVN:1.6\tSO:coordinate\n@SQ\tSN:chr1\tLN:100\n"));
+        assert!(text.contains("@RG\tID:rg1\tSM:sA\n"));
+        assert!(!text.contains("ID:rg2"));
+        assert!(text.contains("@PG\tID:bwa\tPN:bwa\n"));
+        assert!(text.contains("@PG\tID:unmux\tPN:unmux"));
+        assert!(text.contains("PP:bwa"));
+        assert!(text.contains("@CO\tnote"));
+
+        let full = render(&alignment_header(&input, None, None).unwrap());
+        assert!(full.contains("ID:rg1") && full.contains("ID:rg2"));
+    }
+
+    fn appended(text: &[u8]) -> Vec<(String, Option<String>)> {
+        let input = sam::io::Reader::new(text).read_header().unwrap();
+        let header = alignment_header(&input, None, None).unwrap();
+        header
+            .programs()
+            .as_ref()
+            .iter()
+            .map(|(id, map)| {
+                let pp = map
+                    .other_fields()
+                    .get(&program_tag::PREVIOUS_PROGRAM_ID)
+                    .map(|pp| pp.to_string());
+                (id.to_string(), pp)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_unmux_program_chains_to_the_last_leaf() {
+        let programs =
+            appended(b"@HD\tVN:1.6\n@PG\tID:a\tPN:a\n@PG\tID:b\tPN:b\tPP:a\n@PG\tID:c\tPN:c\n");
+        assert_eq!(
+            programs.last().unwrap(),
+            &("unmux".to_string(), Some("c".to_string()))
+        );
+        assert_eq!(programs.len(), 4, "one unmux @PG even with two leaves");
+    }
+
+    #[test]
+    fn test_unmux_program_is_unchained_after_a_dangling_link_or_cycle() {
+        let dangling = appended(b"@HD\tVN:1.6\n@PG\tID:a\tPN:a\tPP:missing\n");
+        assert_eq!(dangling.last().unwrap(), &("unmux".to_string(), None));
+        let cycle = appended(b"@HD\tVN:1.6\n@PG\tID:a\tPN:a\tPP:b\n@PG\tID:b\tPN:b\tPP:a\n");
+        assert_eq!(cycle.last().unwrap(), &("unmux".to_string(), None));
+    }
+
+    #[test]
+    fn test_unmux_program_id_takes_a_counter_suffix() {
+        let programs = appended(
+            b"@HD\tVN:1.6\n@PG\tID:unmux\tPN:unmux\n@PG\tID:unmux.1\tPN:unmux\tPP:unmux\n",
+        );
+        assert_eq!(
+            programs.last().unwrap(),
+            &("unmux.2".to_string(), Some("unmux.1".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_alignment_header_dedups_a_repeated_unmux_program_id() {
+        let input = sam::io::Reader::new(&b"@HD\tVN:1.6\n@PG\tID:unmux\tPN:unmux\n"[..])
+            .read_header()
+            .unwrap();
+        let header = alignment_header(&input, None, None).unwrap();
+        assert_eq!(header.programs().as_ref().len(), 2);
     }
 
     #[test]
@@ -905,6 +1076,7 @@ mod tests {
             quals: Some(&[30, 30, 30, 30]),
             tags: None,
             read_group: None,
+            alignment: None,
         };
         writer.write(Some(&a), &[read(b"ra")]).unwrap();
         writer.write(Some(&b), &[read(b"rb")]).unwrap();
