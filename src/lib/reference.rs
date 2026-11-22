@@ -64,6 +64,7 @@ type Held = Arc<Mutex<HashMap<Vec<u8>, usize>>>;
 struct LoadingAdapter {
     reference: Option<Reference>,
     path: PathBuf,
+    lengths: Arc<HashMap<Vec<u8>, usize>>,
     carried: HashMap<Vec<u8>, Arc<fasta::record::Sequence>>,
     held: Held,
 }
@@ -73,7 +74,23 @@ impl fasta::repository::Adapter for LoadingAdapter {
         let sequence = match (self.carried.remove(name), &self.reference) {
             (Some(sequence), _) => Arc::unwrap_or_clone(sequence),
             (None, Some(reference)) => match reference.sequence(name) {
-                Ok(sequence) => sequence,
+                Ok(sequence) => match self.lengths.get(name) {
+                    Some(&length) if sequence.len() < length => {
+                        return Some(Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "reference sequence `{}` is {} bases in the --reference FASTA but \
+                                 {} in the @SQ header of CRAM input {}; pass the FASTA it was \
+                                 written against",
+                                String::from_utf8_lossy(name),
+                                sequence.len(),
+                                length,
+                                self.path.display()
+                            ),
+                        )))
+                    }
+                    _ => sequence,
+                },
                 Err(error) => return Some(Err(error)),
             },
             (None, None) => {
@@ -157,6 +174,7 @@ fn requested(error: &io::Error) -> Option<&[u8]> {
 pub(crate) struct CramDecoder {
     reference: Option<Reference>,
     path: PathBuf,
+    lengths: Arc<HashMap<Vec<u8>, usize>>,
     repository: fasta::Repository,
     held: Held,
     blank: Option<fasta::Repository>,
@@ -164,15 +182,22 @@ pub(crate) struct CramDecoder {
 }
 
 impl CramDecoder {
-    /// A decoder for the CRAM at `path`, reading sequences from `reference` when given.
-    pub(crate) fn new(reference: Option<Reference>, path: &Path) -> Self {
+    /// A decoder for the CRAM at `path` with `header`, reading sequences from `reference` when
+    /// given.
+    pub(crate) fn new(reference: Option<Reference>, path: &Path, header: &sam::Header) -> Self {
+        let lengths: HashMap<Vec<u8>, usize> = header
+            .reference_sequences()
+            .iter()
+            .map(|(name, sequence)| (name.to_vec(), sequence.length().get()))
+            .collect();
         let mut decoder = Self {
             reference,
             path: path.to_path_buf(),
+            lengths: Arc::new(lengths.clone()),
             repository: fasta::Repository::default(),
             held: Held::default(),
             blank: None,
-            blank_lengths: HashMap::new(),
+            blank_lengths: lengths,
         };
         decoder.repository = decoder.loading_repository(HashMap::new());
         decoder
@@ -185,6 +210,7 @@ impl CramDecoder {
         fasta::Repository::new(LoadingAdapter {
             reference: self.reference.clone(),
             path: self.path.clone(),
+            lengths: Arc::clone(&self.lengths),
             carried,
             held: Arc::clone(&self.held),
         })
@@ -231,7 +257,7 @@ impl CramDecoder {
                 slice.records(repository, header, &compression_header, &core, &external)
             };
             let records = if !regenerate {
-                let records = decode(self.blank_repository(header, &[]))
+                let records = decode(self.blank_repository(&[]))
                     .context("failed to read CRAM slice records")?;
                 let ends: Vec<(&[u8], usize)> = records
                     .iter()
@@ -248,7 +274,7 @@ impl CramDecoder {
                     Ok(records)
                 } else {
                     drop(records);
-                    decode(self.blank_repository(header, &ends))
+                    decode(self.blank_repository(&ends))
                 }
             } else {
                 match decode(fasta::Repository::new(ProbeAdapter)) {
@@ -326,17 +352,7 @@ impl CramDecoder {
 
     /// The zeroed stand-ins for slices that need no reference, each as long as its header length
     /// or the farthest of `ends` on it.
-    fn blank_repository(
-        &mut self,
-        header: &sam::Header,
-        ends: &[(&[u8], usize)],
-    ) -> fasta::Repository {
-        if self.blank_lengths.is_empty() {
-            for (name, sequence) in header.reference_sequences() {
-                self.blank_lengths
-                    .insert(name.to_vec(), sequence.length().get());
-            }
-        }
+    fn blank_repository(&mut self, ends: &[(&[u8], usize)]) -> fasta::Repository {
         for &(name, end) in ends {
             let length = self.blank_lengths.entry(name.to_vec()).or_default();
             if end > *length {
@@ -657,7 +673,7 @@ mod tests {
         let reference = Reference::load(&test_data("contigs.fa")).unwrap();
         let mut reader = cram::io::Reader::new(File::open(test_data(name)).unwrap());
         let header = reader.read_header().unwrap();
-        let mut decoder = CramDecoder::new(Some(reference), &test_data(name));
+        let mut decoder = CramDecoder::new(Some(reference), &test_data(name), &header);
         let mut container = cram::io::reader::Container::default();
         let mut records = Vec::new();
         let mut most = 0;
@@ -712,7 +728,7 @@ mod tests {
         ] {
             let mut reader = cram::io::Reader::new(File::open(&path).unwrap());
             let header = reader.read_header().unwrap();
-            let mut decoder = CramDecoder::new(reference, &path);
+            let mut decoder = CramDecoder::new(reference, &path, &header);
             let mut container = cram::io::reader::Container::default();
             let mut records = Vec::new();
             while reader.read_container(&mut container).unwrap() != 0 {
@@ -744,7 +760,11 @@ mod tests {
     #[test]
     fn test_retain_drops_unneeded_sequences_unless_keeping_the_rest_costs_more() {
         let reference = Reference::load(&test_data("contigs.fa")).unwrap();
-        let mut decoder = CramDecoder::new(Some(reference), &test_data("contigs.cram"));
+        let path = test_data("contigs.cram");
+        let header = cram::io::Reader::new(File::open(&path).unwrap())
+            .read_header()
+            .unwrap();
+        let mut decoder = CramDecoder::new(Some(reference), &path, &header);
         let load = |decoder: &CramDecoder, name: &[u8]| {
             decoder.repository.get(name).unwrap().unwrap();
         };
@@ -901,6 +921,22 @@ mod tests {
             add_md_nm(&header, &mut record, None, Some(nm));
             assert_eq!(record.data().get(&Tag::EDIT_DISTANCE), Some(&want));
         }
+    }
+
+    #[test]
+    fn test_a_reference_shorter_than_the_header_length_fails_cleanly() {
+        let path = test_data("contigs.cram");
+        let mut reader = cram::io::Reader::new(File::open(&path).unwrap());
+        let header = reader.read_header().unwrap();
+        let reference = Reference::load(&test_data("contigs.short.fa")).unwrap();
+        let mut decoder = CramDecoder::new(Some(reference), &path, &header);
+        let mut container = cram::io::reader::Container::default();
+        reader.read_container(&mut container).unwrap();
+        let error = decoder.decode(&container, &header).unwrap_err();
+        assert!(format!("{error:#}").contains(
+            "reference sequence `ctgA` is 300 bases in the --reference FASTA but 400 in the @SQ \
+             header"
+        ));
     }
 
     #[test]

@@ -698,9 +698,9 @@ fn open_format_reader(
             let header = reader.read_header().context("failed to read CRAM header")?;
             FormatReader::Cram {
                 reader,
+                decoder: CramDecoder::new(reference.cloned(), path, &header),
                 header: Box::new(header),
                 container: cram::io::reader::Container::default(),
-                decoder: CramDecoder::new(reference.cloned(), path),
                 buffered: Vec::new().into_iter(),
                 eof: false,
             }
