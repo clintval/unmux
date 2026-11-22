@@ -48,6 +48,25 @@ Feature: --reference is checked against the CRAM @SQ lines
     And stderr contains "--skip-reference-check"
     And a file "out" does not exist
 
+  Scenario: a .fai that lists a contig twice is rejected before any output exists
+    Given the test file "aligned.htslib-3.1.cram"
+    And a file "dup.fa" containing:
+      """
+      >chr1
+      ACGT
+      >chr1
+      TTTT
+      """
+    And a file "dup.fa.fai" containing:
+      """
+      chr1	4	6	4	5
+      chr1	4	17	4	5
+      """
+    When I run `unmux aligned.htslib-3.1.cram --reference dup.fa --skip-reference-check --group rg=@RG --sample-from-group rg --out out/%sample.sam`
+    Then the exit code is 1
+    And stderr contains "contig `chr1` is listed more than once in the .fai index dup.fa.fai"
+    And a file "out" does not exist
+
   Scenario: a skipped check still fails on a record whose contig is missing
     Given the test file "aligned.htslib-3.1.cram"
     And a copy of the test file "ref.fa" named "renamed.fa" with ">chr1" replaced by ">chrX"

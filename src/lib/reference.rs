@@ -7,7 +7,7 @@ use std::io::{self, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use noodles::core::Region;
 use noodles::fasta::fai;
 use noodles::sam::alignment::record::cigar::op::Kind;
@@ -39,6 +39,7 @@ impl Reference {
         let mut index_path = OsString::from(path);
         index_path.push(".fai");
         let index = fai::fs::read(&index_path).with_context(context)?;
+        reject_duplicate_names(&index, Path::new(&index_path))?;
         let reader = fasta::io::indexed_reader::Builder::default()
             .set_index(index.clone())
             .build_from_path(path)
@@ -75,6 +76,22 @@ impl Reference {
         reader.read_sequence(&mut sequence)?;
         Ok(fasta::record::Sequence::from(sequence))
     }
+}
+
+/// Fail when the `.fai` lists a name twice, since a lookup by name could pick either record.
+fn reject_duplicate_names(index: &fai::Index, path: &Path) -> Result<()> {
+    let mut seen = HashSet::new();
+    for record in index.as_ref() {
+        let name: &[u8] = record.name().as_ref();
+        if !seen.insert(name) {
+            bail!(
+                "contig `{}` is listed more than once in the .fai index {}; give each sequence of the --reference FASTA a unique name",
+                String::from_utf8_lossy(name),
+                path.display()
+            );
+        }
+    }
+    Ok(())
 }
 
 /// The reference sequences a [`CramDecoder`] holds, by name, with their lengths.
@@ -1213,6 +1230,26 @@ mod tests {
             .unwrap()
             .check_header(&header, Path::new("in.cram"))
             .unwrap();
+    }
+
+    #[test]
+    fn test_duplicate_contig_names_are_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dup.fa");
+        std::fs::write(&path, ">a\nACGT\n>a\nTTTT\n").unwrap();
+        std::fs::write(
+            dir.path().join("dup.fa.fai"),
+            "a\t4\t3\t4\t5\na\t4\t11\t4\t5\n",
+        )
+        .unwrap();
+        for check in [true, false] {
+            let err = Reference::open(&path, check, 1).err().unwrap().to_string();
+            assert!(
+                err.contains("contig `a` is listed more than once in the .fai index"),
+                "{err}"
+            );
+            assert!(err.contains("dup.fa.fai"), "{err}");
+        }
     }
 
     #[test]
