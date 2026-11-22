@@ -23,7 +23,7 @@ const READ_BUFFER: usize = 1 << 20;
 pub(crate) struct HeaderCheck {
     path: PathBuf,
     index: fai::Index,
-    digests: Vec<OnceLock<Md5Digest>>,
+    digests: Vec<OnceLock<ContigDigest>>,
     threads: usize,
 }
 
@@ -60,7 +60,7 @@ impl HeaderCheck {
             .num_threads(self.threads)
             .build()
             .context("failed to build the reference check thread pool")?;
-        let digests: Vec<Result<Md5Digest>> = pool.install(|| {
+        let digests: Vec<Result<ContigDigest>> = pool.install(|| {
             hashed
                 .par_iter()
                 .with_max_len(1)
@@ -68,12 +68,12 @@ impl HeaderCheck {
                 .collect()
         });
         for ((contig, _), actual) in hashed.iter().zip(digests) {
-            let actual = &actual?;
-            if let Some(md5) = contig.md5.filter(|md5| md5 != actual) {
+            let actual = actual?;
+            if let Some(md5) = contig.md5.filter(|md5| !actual.matches(md5)) {
                 bail!(
                     "contig `{}` has MD5 {} in the --reference FASTA {} but @SQ M5:{} in {}; the FASTA is not the one the CRAM was written against",
                     contig.name,
-                    to_hex(actual),
+                    to_hex(&actual.spec),
                     self.path.display(),
                     to_hex(&md5),
                     input
@@ -84,7 +84,7 @@ impl HeaderCheck {
     }
 
     /// The digest of the `i`th `.fai` record, hashing it only on first use.
-    fn cached_digest(&self, i: usize) -> Result<Md5Digest> {
+    fn cached_digest(&self, i: usize) -> Result<ContigDigest> {
         if let Some(digest) = self.digests[i].get() {
             return Ok(*digest);
         }
@@ -127,8 +127,8 @@ impl HeaderCheck {
             .collect()
     }
 
-    /// The MD5 of one sequence as htslib computes `M5`: uppercase, bytes outside `!`..=`~` dropped.
-    fn digest(&self, record: &fai::Record) -> Result<Md5Digest> {
+    /// The MD5s of one sequence with bytes outside `!`..=`~` dropped, as [`ContigDigest`] normalizes it.
+    fn digest(&self, record: &fai::Record) -> Result<ContigDigest> {
         let open_context = || format!("failed to open {}", self.path.display());
         let read_context = || format!("failed to read {}", self.path.display());
         let stale = |problem: String| {
@@ -170,7 +170,7 @@ impl HeaderCheck {
         reader.consume(1);
         let length = record.length();
         let mut remaining = length;
-        let mut hasher = Md5::new();
+        let mut hasher = ContigHasher::default();
         let mut normalized = Vec::new();
         while remaining > 0 {
             let buf = reader.fill_buf().with_context(read_context)?;
@@ -203,7 +203,6 @@ impl HeaderCheck {
                     }
                 }
             }
-            normalized.make_ascii_uppercase();
             hasher.update(&normalized);
             reader.consume(consumed);
         }
@@ -219,7 +218,69 @@ impl HeaderCheck {
                 }
             }
         }
-        Ok(hasher.finalize().into())
+        Ok(hasher.finalize())
+    }
+}
+
+/// The MD5s an `@SQ` `M5` may hold: letters uppercased as in the SAM spec, or bit 0x20 cleared as htslib writes CRAM.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ContigDigest {
+    spec: Md5Digest,
+    htslib: Option<Md5Digest>,
+}
+
+impl ContigDigest {
+    /// Whether `md5` is either digest.
+    fn matches(&self, md5: &Md5Digest) -> bool {
+        &self.spec == md5 || self.htslib.as_ref() == Some(md5)
+    }
+}
+
+/// Hashes a sequence both ways, starting the htslib digest only at its first non-letter byte.
+#[derive(Default)]
+struct ContigHasher {
+    spec: Md5,
+    htslib: Option<Md5>,
+    buf: Vec<u8>,
+}
+
+impl ContigHasher {
+    /// Add the graphic bytes `bases` to both digests.
+    fn update(&mut self, mut bases: &[u8]) {
+        if self.htslib.is_none() {
+            let letters = bases
+                .iter()
+                .position(|byte| !byte.is_ascii_alphabetic())
+                .unwrap_or(bases.len());
+            self.update_spec(&bases[..letters]);
+            if letters == bases.len() {
+                return;
+            }
+            self.htslib = Some(self.spec.clone());
+            bases = &bases[letters..];
+        }
+        self.update_spec(bases);
+        if let Some(htslib) = &mut self.htslib {
+            self.buf.clear();
+            self.buf.extend(bases.iter().map(|byte| byte & !0x20));
+            htslib.update(&self.buf);
+        }
+    }
+
+    /// Add `bases` to the SAM spec digest.
+    fn update_spec(&mut self, bases: &[u8]) {
+        self.buf.clear();
+        self.buf.extend_from_slice(bases);
+        self.buf.make_ascii_uppercase();
+        self.spec.update(&self.buf);
+    }
+
+    /// Both digests, the htslib one only when it can differ.
+    fn finalize(self) -> ContigDigest {
+        ContigDigest {
+            spec: self.spec.finalize().into(),
+            htslib: self.htslib.map(|htslib| htslib.finalize().into()),
+        }
     }
 }
 
@@ -383,13 +444,65 @@ mod tests {
         let path = write_fasta(dir.path(), ">a\nacgT\r\nNN\r\n>b desc\nAC\n");
         let check = open(&path, 1);
         let records = check.index.as_ref();
-        let digest = |i: usize| to_hex(&check.digest(&records[i]).unwrap());
+        let digest = |i: usize| to_hex(&check.digest(&records[i]).unwrap().spec);
         assert_eq!(digest(0), to_hex(&Md5::digest(b"ACGTNN").into()));
         assert_eq!(digest(1), to_hex(&Md5::digest(b"AC").into()));
     }
 
+    #[test]
+    fn test_m5_from_htslib_cram_writer_also_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_fasta(dir.path(), &format!(">a\n{}", "ACGT*-.ACG\n".repeat(5)));
+        let check = open(&path, 1);
+        let samtools_dict = "e6b475a6ea3c95c302e8879b292cb6a7";
+        let samtools_view = "c345582aa180e8a916ec7eac268d3e64";
+        for md5 in [samtools_dict, samtools_view] {
+            check
+                .check(&header(&[("a", 50, Some(md5))]), Path::new("in.cram"))
+                .unwrap();
+        }
+        let err = check
+            .check(
+                &header(&[("a", 50, Some(&"0".repeat(32)))]),
+                Path::new("in.cram"),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(&format!("has MD5 {samtools_dict}")), "{err}");
+    }
+
+    #[test]
+    fn test_htslib_digest_is_computed_only_for_non_letter_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_fasta(dir.path(), ">a\nacgTN\n>b\nAC\nG*\n");
+        let check = open(&path, 1);
+        let records = check.index.as_ref();
+        assert!(check.digest(&records[0]).unwrap().htslib.is_none());
+        let digest = check.digest(&records[1]).unwrap();
+        assert_eq!(digest.spec, <[u8; 16]>::from(Md5::digest(b"ACG*")));
+        assert_eq!(digest.htslib, Some(Md5::digest(b"ACG\n").into()));
+    }
+
+    #[test]
+    fn test_contig_hasher_is_independent_of_chunking() {
+        let bases = b"acgTN*-.09{}acgt";
+        let whole = {
+            let mut hasher = ContigHasher::default();
+            hasher.update(bases);
+            hasher.finalize()
+        };
+        for split in 0..=bases.len() {
+            let mut hasher = ContigHasher::default();
+            hasher.update(&bases[..split]);
+            hasher.update(&bases[split..]);
+            assert_eq!(hasher.finalize(), whole, "split at {split}");
+        }
+        let htslib: Vec<u8> = bases.iter().map(|byte| byte & !0x20).collect();
+        assert_eq!(whole.htslib, Some(Md5::digest(&htslib).into()));
+    }
+
     /// Index `before`, then overwrite the FASTA with `after` and digest contig `i` against the old index.
-    fn digest_with_stale_index(before: &str, after: &str, i: usize) -> Result<Md5Digest> {
+    fn digest_with_stale_index(before: &str, after: &str, i: usize) -> Result<ContigDigest> {
         let dir = tempfile::tempdir().unwrap();
         let path = write_fasta(dir.path(), before);
         std::fs::write(&path, after).unwrap();
@@ -445,11 +558,11 @@ mod tests {
     #[test]
     fn test_digest_accepts_line_endings_trailing_blank_lines_and_eof() {
         let fasta = ">a\nACGT\r\n>b\nTT";
-        let digest = |i| to_hex(&digest_with_stale_index(fasta, fasta, i).unwrap());
+        let digest = |i| to_hex(&digest_with_stale_index(fasta, fasta, i).unwrap().spec);
         assert_eq!(digest(0), to_hex(&Md5::digest(b"ACGT").into()));
         assert_eq!(digest(1), to_hex(&Md5::digest(b"TT").into()));
         let blank = digest_with_stale_index(">a\nACGT\n", ">a\nACGT\n\n\n", 0).unwrap();
-        assert_eq!(to_hex(&blank), to_hex(&Md5::digest(b"ACGT").into()));
+        assert_eq!(to_hex(&blank.spec), to_hex(&Md5::digest(b"ACGT").into()));
     }
 
     #[test]

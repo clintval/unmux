@@ -142,3 +142,22 @@ Feature: --reference is checked against the CRAM @SQ lines
     When I run `unmux aligned.htslib-3.1.cram --skip-reference-check --group rg=@RG --sample-from-group rg --out out/%sample.sam`
     Then the exit code is 2
     And stderr contains "--reference"
+
+  Scenario: an M5 that the htslib CRAM writer computed over non-letter bytes passes the check
+    Given the test file "punctuation.cram"
+    And a file "punctuation.fa" containing:
+      """
+      >a
+      ACGT*-.ACG
+      ACGT*-.ACG
+      """
+    And a file "punctuation.fa.fai" containing:
+      """
+      a	20	3	10	11
+      """
+    When I run `unmux punctuation.cram --reference punctuation.fa --group rg=@RG --sample-from-group rg --out out/%sample.sam`
+    Then the exit code is 0
+    And the records of "out/rg1.sam" are:
+      """
+      r1	0	a	1	60	1M	*	0	0	A	I	MD:Z:1	NM:i:0	RG:Z:rg1
+      """
