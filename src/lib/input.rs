@@ -595,6 +595,7 @@ impl CramContainers {
         workers: NonZero<usize>,
     ) -> Result<Self> {
         type Job = (
+            usize,
             cram::io::reader::Container,
             Vec<u8>,
             crossbeam_channel::Sender<Result<Option<Vec<RecordBuf>>>>,
@@ -609,13 +610,14 @@ impl CramContainers {
             std::thread::Builder::new()
                 .stack_size(CRAM_DECODE_STACK)
                 .spawn(move || {
-                    for (container, raw, result_tx) in job_rx {
-                        let decoded = decoder.decode(&container, &header, &raw);
+                    for (order, container, raw, result_tx) in job_rx {
+                        let decoded = decoder.decode_in_order(order, &container, &header, &raw);
                         let _ = result_tx.send(decoded.map(Some));
                     }
                 })
                 .context("failed to start a CRAM decode thread")?;
         }
+        let decoder = decoder.clone();
         std::thread::spawn(move || loop {
             let (result_tx, result_rx) = crossbeam_channel::bounded(1);
             if order_tx.send(result_rx).is_err() {
@@ -628,8 +630,13 @@ impl CramContainers {
                     return;
                 }
                 Ok(true) => {
-                    let raw = reader.get_mut().take();
-                    if job_tx.send((container, raw, result_tx)).is_err() {
+                    let job = (
+                        decoder.ticket(),
+                        container,
+                        reader.get_mut().take(),
+                        result_tx,
+                    );
+                    if job_tx.send(job).is_err() {
                         return;
                     }
                 }

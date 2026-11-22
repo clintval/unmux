@@ -5,6 +5,7 @@ use std::ffi::OsString;
 use std::fs::File;
 use std::io::{self, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -237,6 +238,8 @@ struct Shared {
     repository: RwLock<fasta::Repository>,
     held: Held,
     pinned: Mutex<HashMap<Vec<u8>, usize>>,
+    newest: Mutex<HashMap<Vec<u8>, usize>>,
+    tickets: AtomicUsize,
     blank: Mutex<Blank>,
 }
 
@@ -284,6 +287,8 @@ impl CramDecoder {
                 repository: RwLock::new(repository),
                 held,
                 pinned: Mutex::default(),
+                newest: Mutex::default(),
+                tickets: AtomicUsize::new(0),
                 blank: Mutex::new(Blank {
                     repository: None,
                     lengths: (*lengths).clone(),
@@ -308,6 +313,16 @@ impl CramDecoder {
 
     fn blank(&self) -> Result<std::sync::MutexGuard<'_, Blank>> {
         self.shared.blank.lock().map_err(|_| poisoned())
+    }
+
+    /// Record that container `order` uses `names`, so no earlier container drops them.
+    fn mark<'a>(&self, names: impl IntoIterator<Item = &'a [u8]>, order: usize) -> Result<()> {
+        let mut newest = self.shared.newest.lock().map_err(|_| poisoned())?;
+        for name in names {
+            let last = newest.entry(name.to_vec()).or_default();
+            *last = (*last).max(order);
+        }
+        Ok(())
     }
 
     fn pin(&self, name: &[u8]) -> Result<Pin<'_>> {
@@ -339,16 +354,32 @@ impl CramDecoder {
     /// Each slice decodes once against every sequence it references. A probe with no sequences
     /// first finds the first one it needs, so a single-reference container, or sorted input, drops
     /// what the slice cannot use before loading more; afterwards the unused sequences are dropped.
-    /// A sequence another clone's slice still needs is kept. A container written without the
-    /// reference never loads one, and a slice that embeds its reference regenerates MD and NM from
-    /// it, as htslib does.
+    /// A sequence another clone's slice still needs, or a later container already used, is kept. A
+    /// container written without the reference never loads one, and a slice that embeds its
+    /// reference regenerates MD and NM from it, as htslib does.
     pub(crate) fn decode(
         &self,
         container: &cram::io::reader::Container,
         header: &sam::Header,
         raw: &[u8],
     ) -> Result<Vec<RecordBuf>> {
-        quietly(|| self.decode_container(container, header, raw)).unwrap_or_else(|| {
+        self.decode_in_order(self.ticket(), container, header, raw)
+    }
+
+    /// The place in file order of the next container read, for [`Self::decode_in_order`].
+    pub(crate) fn ticket(&self) -> usize {
+        self.shared.tickets.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Decode `container`, the one at place `order` in file order, as [`Self::decode`] does.
+    pub(crate) fn decode_in_order(
+        &self,
+        order: usize,
+        container: &cram::io::reader::Container,
+        header: &sam::Header,
+        raw: &[u8],
+    ) -> Result<Vec<RecordBuf>> {
+        quietly(|| self.decode_container(order, container, header, raw)).unwrap_or_else(|| {
             Err(anyhow!(
                 "failed to decode a CRAM container of {}: it is malformed or uses a CRAM feature \
                  unmux cannot decode",
@@ -359,6 +390,7 @@ impl CramDecoder {
 
     fn decode_container(
         &self,
+        order: usize,
         container: &cram::io::reader::Container,
         header: &sam::Header,
         raw: &[u8],
@@ -385,11 +417,12 @@ impl CramDecoder {
             if regenerate {
                 let result = decode(fasta::Repository::new(ProbeAdapter));
                 if let Some(name) = result.as_ref().err().and_then(requested) {
+                    self.mark([name], order)?;
                     pin = Some(self.pin(name)?);
                     if single_reference {
-                        self.retain(&HashSet::from([name]))?;
+                        self.retain(&HashSet::from([name]), order)?;
                     } else if sorted {
-                        self.retain_from(header, name)?;
+                        self.retain_from(header, name, order)?;
                     }
                 }
                 probed = Some(result);
@@ -453,10 +486,13 @@ impl CramDecoder {
                 decode(self.padded_repository(&repository, &padded)?)
                     .context("failed to read CRAM slice records")?
             };
-            let mut used = HashSet::new();
+            let used = records
+                .iter()
+                .filter_map(|record| sequence_name(header, record).transpose())
+                .collect::<Result<HashSet<_>>>()?;
+            self.mark(used.iter().copied(), order)?;
             for (i, record) in records.iter().enumerate() {
                 let name = sequence_name(header, record)?;
-                used.extend(name);
                 let record = match name.filter(|name| padded.contains_key(name)) {
                     Some(_) => &repadded[i],
                     None => record,
@@ -482,7 +518,7 @@ impl CramDecoder {
                 out.push(converted);
             }
             drop((records, repadded, repository, pin));
-            self.retain(&used)?;
+            self.retain(&used, order)?;
         }
         Ok(out)
     }
@@ -571,7 +607,7 @@ impl CramDecoder {
     }
 
     /// Drop the held sequences ahead of `first` in header order, which sorted input never revisits.
-    fn retain_from(&self, header: &sam::Header, first: &[u8]) -> Result<()> {
+    fn retain_from(&self, header: &sam::Header, first: &[u8], order: usize) -> Result<()> {
         let sequences = header.reference_sequences();
         let first = sequences.get_index_of(first);
         let needed: Vec<Vec<u8>> = self
@@ -580,15 +616,21 @@ impl CramDecoder {
             .filter(|name| sequences.get_index_of(name.as_slice()) >= first)
             .cloned()
             .collect();
-        self.retain(&needed.iter().map(Vec::as_slice).collect())
+        self.retain(&needed.iter().map(Vec::as_slice).collect(), order)
     }
 
-    /// The held sequences to drop to keep only `needed` and what slices in flight pinned, or none
-    /// when they free less than keeping the rest copies.
-    fn droppable(&self, needed: &HashSet<&[u8]>) -> Result<Vec<Vec<u8>>> {
+    /// The held sequences container `order` drops to keep only `needed`, what slices in flight
+    /// pinned and what later containers used, or none when they free less than keeping the rest
+    /// copies.
+    fn droppable(&self, needed: &HashSet<&[u8]>, order: usize) -> Result<Vec<Vec<u8>>> {
         let held = self.held()?.clone();
         let pinned = self.pinned()?;
-        let keep = |name: &Vec<u8>| needed.contains(name.as_slice()) || pinned.contains_key(name);
+        let newest = self.shared.newest.lock().map_err(|_| poisoned())?;
+        let keep = |name: &Vec<u8>| {
+            needed.contains(name.as_slice())
+                || pinned.contains_key(name)
+                || newest.get(name).is_some_and(|&last| last > order)
+        };
         let (kept, dropped): (Vec<_>, Vec<_>) = held.iter().partition(|(name, _)| keep(name));
         let bases = |part: &[(&Vec<u8>, &usize)]| part.iter().map(|(_, len)| **len).sum::<usize>();
         if dropped.is_empty() || bases(&dropped) < bases(&kept) {
@@ -597,13 +639,13 @@ impl CramDecoder {
         Ok(dropped.into_iter().map(|(name, _)| name.clone()).collect())
     }
 
-    /// Drop the held sequences outside `needed`, unless they free less than keeping the rest copies.
-    fn retain(&self, needed: &HashSet<&[u8]>) -> Result<()> {
-        if self.droppable(needed)?.is_empty() {
+    /// Drop the held sequences container `order` does not need, as [`Self::droppable`] picks them.
+    fn retain(&self, needed: &HashSet<&[u8]>, order: usize) -> Result<()> {
+        if self.droppable(needed, order)?.is_empty() {
             return Ok(());
         }
         let mut repository = self.shared.repository.write().map_err(|_| poisoned())?;
-        let dropped = self.droppable(needed)?;
+        let dropped = self.droppable(needed, order)?;
         if dropped.is_empty() {
             return Ok(());
         }
@@ -1149,9 +1191,9 @@ mod tests {
         };
         load(&decoder, b"ctgA");
         load(&decoder, b"ctgB");
-        decoder.retain(&HashSet::from([&b"ctgA"[..]])).unwrap();
+        decoder.retain(&HashSet::from([&b"ctgA"[..]]), 0).unwrap();
         assert_eq!(held(&decoder), [b"ctgA".to_vec(), b"ctgB".to_vec()]);
-        decoder.retain(&HashSet::from([&b"ctgB"[..]])).unwrap();
+        decoder.retain(&HashSet::from([&b"ctgB"[..]]), 0).unwrap();
         assert_eq!(held(&decoder), [b"ctgB".to_vec()]);
         let repository = decoder.read().unwrap().clone();
         assert_eq!(repository.len(), 1);
@@ -1159,7 +1201,7 @@ mod tests {
             decoder.held_sequence(&repository, b"ctgB").unwrap().len(),
             200
         );
-        decoder.retain(&HashSet::new()).unwrap();
+        decoder.retain(&HashSet::new(), 0).unwrap();
         let repository = decoder.read().unwrap().clone();
         assert!(held(&decoder).is_empty());
         assert!(repository.is_empty());
@@ -1184,10 +1226,24 @@ mod tests {
             decoder.read().unwrap().get(name).unwrap().unwrap();
         }
         let pin = decoder.pin(b"ctgA").unwrap();
-        decoder.retain(&HashSet::new()).unwrap();
+        decoder.retain(&HashSet::new(), 0).unwrap();
         assert_eq!(decoder.held().unwrap().len(), 2);
         drop(pin);
-        decoder.retain(&HashSet::new()).unwrap();
+        decoder.retain(&HashSet::new(), 0).unwrap();
+        assert!(decoder.held().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_retain_keeps_sequences_a_later_container_used() {
+        let decoder = test_decoder("contigs.cram");
+        for name in [&b"ctgA"[..], b"ctgB"] {
+            decoder.read().unwrap().get(name).unwrap().unwrap();
+        }
+        decoder.mark([&b"ctgB"[..]], 5).unwrap();
+        decoder.retain(&HashSet::new(), 3).unwrap();
+        let held: Vec<Vec<u8>> = decoder.held().unwrap().keys().cloned().collect();
+        assert_eq!(held, [b"ctgB".to_vec()]);
+        decoder.retain(&HashSet::new(), 5).unwrap();
         assert!(decoder.held().unwrap().is_empty());
     }
 
