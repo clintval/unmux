@@ -199,6 +199,7 @@ impl CramDecoder {
         let compression_header = container
             .compression_header()
             .context("failed to read CRAM compression header")?;
+        let regenerate = uses_external_reference(&compression_header)?;
         let single_reference = !container.header().reference_sequence_context().is_many();
         let sorted = is_coordinate_sorted(header);
         let mut out = Vec::new();
@@ -249,7 +250,7 @@ impl CramDecoder {
                     Some(_) => &repadded[i],
                     None => record,
                 };
-                let loaded = |name: &[u8]| self.held_sequence(name);
+                let loaded = |name: &[u8]| self.held_sequence(name).filter(|_| regenerate);
                 let converted = match aligned_end(header, record)? {
                     Some((name, end))
                         if end > header_length(header, name) && !padded.contains_key(name) =>
@@ -323,6 +324,19 @@ impl CramDecoder {
         }
         Ok(())
     }
+}
+
+/// Whether a container's slices decode against the external reference: the compression header's
+/// `RR` flag, which noodles parses but keeps private, so it is read from the header's debug form.
+fn uses_external_reference(
+    compression_header: &cram::container::CompressionHeader,
+) -> Result<bool> {
+    const FLAG: &str = "external_reference_sequence_is_required: ";
+    let debug = format!("{compression_header:?}");
+    let at = debug
+        .find(FLAG)
+        .ok_or_else(|| anyhow!("failed to read the reference flag of a CRAM compression header"))?;
+    Ok(debug[at + FLAG.len()..].starts_with("true"))
 }
 
 /// Whether the header declares the records sorted by coordinate.
@@ -408,7 +422,8 @@ fn owned(header: &sam::Header, record: &cram::Record<'_>, loaded: Loaded<'_>) ->
     Ok(record)
 }
 
-/// Add the MD and NM tags htslib regenerates when it decodes a mapped record against its reference.
+/// Add the MD and NM tags htslib regenerates when it decodes a mapped record against the external
+/// reference, which `loaded` holds.
 fn regenerate_md_nm(header: &sam::Header, record: &mut RecordBuf, loaded: Loaded<'_>) {
     let skip = take_cram_flags(record);
     let want_md = skip & 1 == 0 && record.data().get(&Tag::MISMATCHED_POSITIONS).is_none();
@@ -561,6 +576,41 @@ mod tests {
             most = most.max(decoder.repository.len());
         }
         (records, most)
+    }
+
+    #[test]
+    fn test_the_reference_flag_is_read_from_the_compression_header() {
+        for (name, external) in [
+            ("contigs.cram", true),
+            ("contigs.multi-ref.cram", true),
+            ("contigs.no-ref.cram", false),
+            ("contigs.embedded-ref.cram", false),
+        ] {
+            let mut reader = cram::io::Reader::new(File::open(test_data(name)).unwrap());
+            reader.read_header().unwrap();
+            let mut container = cram::io::reader::Container::default();
+            reader.read_container(&mut container).unwrap();
+            let compression_header = container.compression_header().unwrap();
+            assert_eq!(
+                uses_external_reference(&compression_header).unwrap(),
+                external,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_slices_without_the_external_reference_get_no_md_or_nm() {
+        let (records, _) = decode_all("contigs.mixed-ref.cram");
+        let with_md = |records: &[RecordBuf]| {
+            records
+                .iter()
+                .filter(|record| record.data().get(&Tag::MISMATCHED_POSITIONS).is_some())
+                .count()
+        };
+        let parts: Vec<&[RecordBuf]> = records.chunks(29).collect();
+        let md: Vec<usize> = parts.iter().map(|part| with_md(part)).collect();
+        assert_eq!(md, [26, 1, 26, 1]);
     }
 
     #[test]

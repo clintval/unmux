@@ -196,6 +196,15 @@ Feature: Split an aligned input by read group, keeping alignments
     And stderr contains "CRAM record `pastEnd` runs past the end of reference sequence `ctgB`"
     And a file "out/sA.sam" does not exist
 
+  Scenario: MD and NM are regenerated only for slices that use the external reference
+    Given the test file "contigs.mixed-ref.cram"
+    And the test file "contigs.fa"
+    And the test file "contigs.fa.fai"
+    When I run `unmux contigs.mixed-ref.cram --reference contigs.fa --group sm=@RG::SM --sample-from-group sm --out out/%sample.sam --unassigned out/unassigned.sam`
+    Then the exit code is 0
+    And the records of "out/sA.sam" are the "RG:Z:rg1" records of the test file "contigs.mixed-ref.htslib.sam"
+    And the records of "out/sB.sam" are the "RG:Z:rg2" records of the test file "contigs.mixed-ref.htslib.sam"
+
   Scenario: a reference-compressed CRAM input needs --reference
     Given the test file "aligned.htslib-3.1.cram"
     When I run `unmux aligned.htslib-3.1.cram --group rg=@RG --sample-from-group rg --out out/%sample.sam`
