@@ -960,7 +960,10 @@ fn passes_alignments_through(
     let by_sequence = plan
         .groups
         .iter()
-        .find(|group| !matches!(group.source, GroupSource::ReadGroup(_)))
+        .find(|group| {
+            !matches!(group.source, GroupSource::ReadGroup(_))
+                && crate::grammar::group_has_effect(plan, group)
+        })
         .map(|group| format!("group `{}` matches", group.name))
         .or_else(|| {
             plan.tags

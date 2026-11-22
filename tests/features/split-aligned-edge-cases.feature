@@ -109,6 +109,36 @@ Feature: Edge cases of an aligned read-group split
     And a file "out/sA.sam" does not exist
     And a file "out/removed.sam" does not exist
 
+  Scenario: a sequence-matching group nothing consumes is allowed, with its no-effect warning
+    Given a file "in.sam" containing:
+      """
+      @HD	VN:1.6	SO:coordinate
+      @SQ	SN:chr1	LN:1000
+      @RG	ID:rg1	SM:sA
+      p1	0	chr1	100	60	12M	*	0	0	AACCGGTTACGT	IIIIIIIIIIII	RG:Z:rg1
+      p1	256	chr1	300	0	12M	*	0	0	*	*	RG:Z:rg1
+      """
+    When I run `unmux in.sam --group rg=@RG --group bc={x=ACGT} --group bc::loc=0:0:4 --sample-from-group rg --out out/%sample.sam`
+    Then the exit code is 0
+    And stderr contains "group `bc` is defined but nothing consumes its matches"
+    And the records of "out/rg1.sam" are:
+      """
+      p1	0	chr1	100	60	12M	*	0	0	AACCGGTTACGT	IIIIIIIIIIII	RG:Z:rg1
+      p1	256	chr1	300	0	12M	*	0	0	*	*	RG:Z:rg1
+      """
+
+  Scenario: a sequence-matching group reported by --qc-tag is refused
+    Given a file "in.sam" containing:
+      """
+      @HD	VN:1.6	SO:coordinate
+      @SQ	SN:chr1	LN:1000
+      @RG	ID:rg1	SM:sA
+      p1	0	chr1	100	60	12M	*	0	0	AACCGGTTACGT	IIIIIIIIIIII	RG:Z:rg1
+      """
+    When I run `unmux in.sam --group rg=@RG --group bc={x=ACGT} --group bc::loc=0:0:4 --sample-from-group rg --qc-tag XQ --out out/%sample.sam`
+    Then the exit code is 1
+    And stderr contains "group `bc` matches record sequences"
+
   Scenario: a --tag drawn from record sequences is refused
     Given a file "in.sam" containing:
       """
