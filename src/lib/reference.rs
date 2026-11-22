@@ -15,7 +15,7 @@ use noodles::sam::alignment::record::data::field::Tag;
 use noodles::sam::alignment::record::MappingQuality;
 use noodles::sam::alignment::record_buf::data::field::Value;
 use noodles::sam::alignment::{Record as _, RecordBuf};
-use noodles::{cram, fasta, sam};
+use noodles::{bgzf, cram, fasta, sam};
 
 use crate::cram_raw::{self, EmbeddedReference, Recorder};
 use crate::reference_check::HeaderCheck;
@@ -43,6 +43,18 @@ impl Reference {
             )
         })?;
         reject_duplicate_names(&index, &index_path)?;
+        if let Some("gz" | "bgz") = path.extension().and_then(|ext| ext.to_str()) {
+            let mut gzi_path = OsString::from(path);
+            gzi_path.push(".gzi");
+            let gzi_path = PathBuf::from(gzi_path);
+            bgzf::gzi::fs::read(&gzi_path).with_context(|| {
+                format!(
+                    "failed to read the .gzi index {} of the bgzipped --reference FASTA {}; create it with bgzip -r",
+                    gzi_path.display(),
+                    path.display()
+                )
+            })?;
+        }
         let reader = fasta::io::indexed_reader::Builder::default()
             .set_index(index.clone())
             .build_from_path(path)
@@ -1250,6 +1262,30 @@ mod tests {
         assert!(err.starts_with("failed to read the .fai index"), "{err}");
         assert!(err.contains("ref.fa.fai of the --reference FASTA"), "{err}");
         assert!(err.contains("samtools faidx"), "{err}");
+    }
+
+    #[test]
+    fn test_a_missing_gzi_is_named() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ref.fa.gz");
+        let mut writer = bgzf::io::Writer::new(File::create(&path).unwrap());
+        io::Write::write_all(&mut writer, b">a\nACGT\n").unwrap();
+        writer.finish().unwrap();
+        std::fs::write(dir.path().join("ref.fa.gz.fai"), "a\t4\t3\t4\t5\n").unwrap();
+        let err = format!("{:#}", Reference::open(&path, true, 1).err().unwrap());
+        assert!(err.starts_with("failed to read the .gzi index"), "{err}");
+        assert!(
+            err.contains("ref.fa.gz.gzi of the bgzipped --reference FASTA"),
+            "{err}"
+        );
+        assert!(err.contains("bgzip -r"), "{err}");
+        bgzf::gzi::fs::write(
+            dir.path().join("ref.fa.gz.gzi"),
+            &bgzf::gzi::Index::default(),
+        )
+        .unwrap();
+        let reference = Reference::open(&path, true, 1).unwrap();
+        assert_eq!(&reference.sequence(b"a").unwrap()[..], b"ACGT");
     }
 
     #[test]
