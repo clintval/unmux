@@ -48,6 +48,25 @@ Feature: --reference is checked against the CRAM @SQ lines
     And stderr contains "--skip-reference-check"
     And a file "out" does not exist
 
+  Scenario: a FASTA whose header line changed after indexing fails as a stale .fai
+    Given the test file "aligned.htslib-3.1.cram"
+    And a copy of the test file "ref.fa" named "edited.fa" with ">chr1" replaced by ">chr1 assembled"
+    And a copy of the test file "ref.fa.fai" named "edited.fa.fai"
+    When I run `unmux aligned.htslib-3.1.cram --reference edited.fa --group rg=@RG --sample-from-group rg --out out/%sample.sam`
+    Then the exit code is 1
+    And stderr contains "the .fai index edited.fa.fai is stale: contig `chr1` does not start at its indexed offset 6 in edited.fa"
+    And stderr does not contain "has MD5"
+    And a file "out" does not exist
+
+  Scenario: a contig truncated after indexing fails as a stale .fai naming that contig
+    Given the test file "contigs.cram"
+    And a copy of the test file "contigs.fa" named "edited.fa" with "TTTCCTCATGCAATTCAAAACCATG" replaced by ""
+    And a copy of the test file "contigs.fa.fai" named "edited.fa.fai"
+    When I run `unmux contigs.cram --reference edited.fa --threads 4 --group sm=@RG::SM --sample-from-group sm --out out/%sample.sam`
+    Then the exit code is 1
+    And stderr contains "the .fai index edited.fa.fai is stale: contig `ctgA` has 375 bp, not its indexed 400"
+    And a file "out" does not exist
+
   Scenario: a .fai that lists a contig twice is rejected before any output exists
     Given the test file "aligned.htslib-3.1.cram"
     And a file "dup.fa" containing:

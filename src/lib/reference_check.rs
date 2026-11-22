@@ -59,14 +59,15 @@ impl HeaderCheck {
             .num_threads(self.threads)
             .build()
             .context("failed to build the reference check thread pool")?;
-        let digests = pool.install(|| {
+        let digests: Vec<Result<Md5Digest>> = pool.install(|| {
             hashed
                 .par_iter()
                 .with_max_len(1)
                 .map(|&(_, i)| self.cached_digest(i))
-                .collect::<Result<Vec<Md5Digest>>>()
-        })?;
-        for ((contig, _), actual) in hashed.iter().zip(&digests) {
+                .collect()
+        });
+        for ((contig, _), actual) in hashed.iter().zip(digests) {
+            let actual = &actual?;
             if let Some(md5) = contig.md5.filter(|md5| md5 != actual) {
                 bail!(
                     "contig `{}` has MD5 {} in the --reference FASTA {} but @SQ M5:{} in {}; the FASTA is not the one the CRAM was written against",
@@ -128,6 +129,17 @@ impl HeaderCheck {
     /// The MD5 of one sequence as htslib computes `M5`: uppercase, bytes outside `!`..=`~` dropped.
     fn digest(&self, record: &fai::Record) -> Result<Md5Digest> {
         let open_context = || format!("failed to open {}", self.path.display());
+        let read_context = || format!("failed to read {}", self.path.display());
+        let stale = |problem: String| {
+            let mut index_path = self.path.clone().into_os_string();
+            index_path.push(".fai");
+            anyhow!(
+                "the .fai index {} is stale: contig `{}` {problem} in {}; rebuild it with samtools faidx",
+                Path::new(&index_path).display(),
+                record.name(),
+                self.path.display()
+            )
+        };
         let mut reader = match self.path.extension().and_then(|ext| ext.to_str()) {
             Some("gz" | "bgz") => fasta::io::indexed_reader::Builder::default()
                 .set_index(fai::Index::default())
@@ -139,22 +151,33 @@ impl HeaderCheck {
                 File::open(&self.path).with_context(open_context)?,
             )),
         };
-        reader
-            .seek(SeekFrom::Start(record.offset()))
-            .with_context(|| format!("failed to seek in {}", self.path.display()))?;
-        let mut remaining = record.length();
+        let starts_a_line = match record.offset().checked_sub(1) {
+            Some(before) => {
+                reader
+                    .seek(SeekFrom::Start(before))
+                    .with_context(read_context)?;
+                reader.fill_buf().with_context(read_context)?.first() == Some(&b'\n')
+            }
+            None => false,
+        };
+        if !starts_a_line {
+            return Err(stale(format!(
+                "does not start at its indexed offset {}",
+                record.offset()
+            )));
+        }
+        reader.consume(1);
+        let length = record.length();
+        let mut remaining = length;
         let mut hasher = Md5::new();
         let mut normalized = Vec::new();
         while remaining > 0 {
-            let buf = reader
-                .fill_buf()
-                .with_context(|| format!("failed to read {}", self.path.display()))?;
+            let buf = reader.fill_buf().with_context(read_context)?;
             if buf.is_empty() {
-                bail!(
-                    "contig `{}` ends {remaining} bp early in {}; its .fai index is stale",
-                    record.name(),
-                    self.path.display()
-                );
+                return Err(stale(format!(
+                    "has {} bp, not its indexed {length}",
+                    length - remaining
+                )));
             }
             normalized.clear();
             let mut consumed = 0;
@@ -162,20 +185,38 @@ impl HeaderCheck {
                 let rest = &buf[consumed..];
                 let run = rest
                     .iter()
-                    .position(|byte| !byte.is_ascii_graphic())
+                    .position(|&byte| !byte.is_ascii_graphic() || byte == b'>')
                     .unwrap_or(rest.len());
                 let take = run.min(usize::try_from(remaining).unwrap_or(usize::MAX));
                 normalized.extend_from_slice(&rest[..take]);
                 remaining -= take as u64;
-                consumed += if take == run && run < rest.len() {
-                    take + 1
-                } else {
-                    take
-                };
+                consumed += take;
+                if take == run && run < rest.len() {
+                    if rest[run] != b'>' {
+                        consumed += 1;
+                    } else if remaining > 0 {
+                        return Err(stale(format!(
+                            "has {} bp, not its indexed {length}",
+                            length - remaining
+                        )));
+                    }
+                }
             }
             normalized.make_ascii_uppercase();
             hasher.update(&normalized);
             reader.consume(consumed);
+        }
+        loop {
+            let buf = reader.fill_buf().with_context(read_context)?;
+            match buf.iter().position(u8::is_ascii_graphic) {
+                Some(i) if buf[i] == b'>' => break,
+                Some(_) => return Err(stale(format!("is longer than its indexed {length} bp"))),
+                None if buf.is_empty() => break,
+                None => {
+                    let skipped = buf.len();
+                    reader.consume(skipped);
+                }
+            }
         }
         Ok(hasher.finalize().into())
     }
@@ -328,17 +369,92 @@ mod tests {
         assert_eq!(digest(1), to_hex(&Md5::digest(b"AC").into()));
     }
 
+    /// Index `before`, then overwrite the FASTA with `after` and digest contig `i` against the old index.
+    fn digest_with_stale_index(before: &str, after: &str, i: usize) -> Result<Md5Digest> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_fasta(dir.path(), before);
+        std::fs::write(&path, after).unwrap();
+        let check = open(&path, 1);
+        check.digest(&check.index.as_ref()[i])
+    }
+
     #[test]
     fn test_digest_detects_a_stale_index() {
+        let two = ">a\nACGT\n>b\nTT\n";
+        let cases = [
+            (
+                ">a\nACGT\n",
+                ">a\nAC",
+                0,
+                "contig `a` has 2 bp, not its indexed 4",
+            ),
+            (
+                two,
+                ">a\nAC\n>b\nTT\n",
+                0,
+                "contig `a` has 2 bp, not its indexed 4",
+            ),
+            (
+                two,
+                ">a\nACGTA\n>b\nTT\n",
+                0,
+                "contig `a` is longer than its indexed 4 bp",
+            ),
+            (
+                two,
+                ">a\nACGT\n>bb\nTT\n",
+                1,
+                "contig `b` does not start at its indexed offset 11",
+            ),
+            (
+                two,
+                ">aa\nACGT\n>b\nTT\n",
+                0,
+                "contig `a` does not start at its indexed offset 3",
+            ),
+        ];
+        for (before, after, i, expected) in cases {
+            let err = digest_with_stale_index(before, after, i)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("the .fai index "), "{err}");
+            assert!(err.contains("ref.fa.fai is stale"), "{err}");
+            assert!(err.contains(expected), "{after:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn test_digest_accepts_line_endings_trailing_blank_lines_and_eof() {
+        let fasta = ">a\nACGT\r\n>b\nTT";
+        let digest = |i| to_hex(&digest_with_stale_index(fasta, fasta, i).unwrap());
+        assert_eq!(digest(0), to_hex(&Md5::digest(b"ACGT").into()));
+        assert_eq!(digest(1), to_hex(&Md5::digest(b"TT").into()));
+        let blank = digest_with_stale_index(">a\nACGT\n", ">a\nACGT\n\n\n", 0).unwrap();
+        assert_eq!(to_hex(&blank), to_hex(&Md5::digest(b"ACGT").into()));
+    }
+
+    #[test]
+    fn test_stale_index_errors_name_the_first_contig_in_header_order() {
         let dir = tempfile::tempdir().unwrap();
-        let path = write_fasta(dir.path(), ">a\nACGT\n");
-        std::fs::write(&path, ">a\nAC").unwrap();
-        let check = open(&path, 1);
-        let err = check
-            .digest(&check.index.as_ref()[0])
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("ends 2 bp early"), "{err}");
+        let body: String = (0..8).map(|i| format!(">c{i}\nACGTACGT\n")).collect();
+        let path = write_fasta(dir.path(), &body);
+        std::fs::write(&path, body.replacen("ACGTACGT", "ACGT", 1)).unwrap();
+        let md5 = to_hex(&Md5::digest(b"ACGTACGT").into());
+        let names: Vec<String> = (0..8).map(|i| format!("c{i}")).collect();
+        let contigs: Vec<(&str, usize, Option<&str>)> = names
+            .iter()
+            .map(|name| (name.as_str(), 8, Some(md5.as_str())))
+            .collect();
+        for _ in 0..20 {
+            let err = open(&path, 8)
+                .check(&header(&contigs), Path::new("in.cram"))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("contig `c0` has 4 bp, not its indexed 8"),
+                "{err}"
+            );
+        }
     }
 
     #[test]
