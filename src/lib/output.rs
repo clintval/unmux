@@ -191,7 +191,7 @@ pub fn build_tag_data(bindings: &[TagBinding], streams: &HashMap<&str, Extracted
 /// default mapping).
 pub(crate) fn qual_tag_name(binding: &TagBinding) -> Option<&str> {
     match &binding.qual {
-        QualTag::None => None,
+        QualTag::None | QualTag::Omitted => None,
         QualTag::Named(name) => Some(name.as_str()),
         QualTag::Default => default_qual_tag(&binding.tag),
     }

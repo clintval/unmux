@@ -110,6 +110,15 @@ pub struct Extracted {
 }
 
 impl Extracted {
+    /// A column stream's text, which has no qualities and no corrected form.
+    pub fn from_text(text: &str) -> Self {
+        Self {
+            bases: text.as_bytes().to_vec(),
+            quals: None,
+            corrected: None,
+        }
+    }
+
     /// The bases a SAM tag should emit: the corrected form when present and not
     /// raw-overridden, else the observed bases.
     pub fn tag_bases(&self, raw: bool) -> &[u8] {
@@ -134,7 +143,8 @@ impl Extracted {
 /// Returns `Ok(None)` when an anchored span references a group that did not
 /// match (the stream is absent); `Ok(Some(_))` otherwise, including a
 /// possibly-empty stream for a degenerate window or a between-anchors region
-/// whose endpoints touch.
+/// whose endpoints touch. A column span has no source range, so it also resolves
+/// to `Ok(None)` here; the engine looks its text up by the matched tag.
 pub fn extract(
     span: &Span,
     segments: &[Segment],
@@ -224,6 +234,7 @@ fn resolve_range(
             },
             None => SpanRange::Absent,
         },
+        SpanBody::Column { .. } => SpanRange::Absent,
         SpanBody::AnchorOffset {
             group,
             before,
@@ -577,5 +588,21 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(clamped.bases, b"AACC");
+    }
+
+    #[test]
+    fn test_column_span_has_no_source_range() {
+        let (hits, index) = anchors(&[(
+            "grp",
+            MatchSpan {
+                file: 0,
+                start: 0,
+                end: 4,
+            },
+        )]);
+        let segments = segs(b"ACGTACGT", b"IIIIIIII");
+        let span = sp("@grp::cell");
+        assert_eq!(extract(&span, &segments, &hits, &index).unwrap(), None);
+        assert_eq!(span_range(&span, &segments, &hits, &index).unwrap(), None);
     }
 }
