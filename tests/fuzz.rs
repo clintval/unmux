@@ -51,7 +51,7 @@ fn fuzz_parse_sample_sheet() {
 // between-anchor spans, and identifiers that are sometimes valid and sometimes
 // not. It mirrors the grammar in `src/lib/grammar.rs::parse_span`.
 
-/// A grammar-shaped span: `~`? then one of the four body forms.
+/// A grammar-shaped span: `~`? then one of the five body forms.
 #[derive(Debug, TypeGenerator)]
 struct SpanInput {
     revcomp: bool,
@@ -77,6 +77,8 @@ enum SpanBodyShape {
     },
     /// `@from..@to`
     Between { from: Ident, to: Ident },
+    /// `@group::column`
+    Column { group: Ident, column: Ident },
 }
 
 #[derive(Debug, TypeGenerator)]
@@ -177,6 +179,9 @@ fn render(span: &SpanInput) -> String {
         }
         SpanBodyShape::Between { from, to } => {
             let _ = write!(s, "@{}..@{}", ident_str(from), ident_str(to));
+        }
+        SpanBodyShape::Column { group, column } => {
+            let _ = write!(s, "@{}::{}", ident_str(group), ident_str(column));
         }
     }
     s

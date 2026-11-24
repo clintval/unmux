@@ -96,6 +96,7 @@ pub(crate) const CARGO_STYLING: Styles = Styles::styled()
 ///   @grp             a group's matched span. `@grp+off:len` & `@grp-off:len`
 ///                    step past & before it (trailing number is a LENGTH!).
 ///   @grpA..@grpB     the region between two matched spans.
+///   @grp::COLUMN     the matched tag's value in a tag-file column, or its `id`.
 ///   @RG[::F[::F]]    an input read-group `--group` source (SAM/BAM/CRAM only);
 ///                    bare = by RG ID, or by subfield(s), e.g. `@RG::SM::LB`.
 ///   +                concat streams (`cb+umi`) or 'AND' samples (`gA::a+gB::b`).
@@ -184,7 +185,8 @@ struct DemuxCmd {
     ///
     /// Sources (`NAME::SOURCE`):
     ///
-    ///   bc=tags.tsv        from a TSV file with `id` and `seq` columns
+    ///   bc=tags.tsv        from a TSV file with `id` and `seq` columns; any
+    ///                      other column can feed a `@bc::COLUMN` extract
     ///   bc={AAC,ACG,TTG}   inline set, auto tag IDs
     ///   bc={a=AAC,b=ACG}   inline set, explicit tag IDs
     ///   rg=@RG             the input @RG read groups, keyed by RG ID
@@ -236,6 +238,12 @@ struct DemuxCmd {
     /// (full record length); negatives count from the record end. The
     /// anchored `@grp` forms take a `LENGTH` as the trailing number instead.
     ///
+    /// The `@grp::COLUMN` form is the matched tag's text in a column of the
+    /// group's tag file (header case is ignored): printable ASCII with no
+    /// whitespace, where a blank means the tag's `seq`. The tag ID is
+    /// `@grp::id`, also for an inline set, and `@grp::seq` is the same as
+    /// `@grp`. Column streams have no qualities, so only `--tag` takes them.
+    ///
     ///   r=0:9:end          file 0, base 9 to the end
     ///   bc=1:0:8           file 1, bases [0,8)
     ///   tail=0:-10:end     last 10 bases of file 0
@@ -244,6 +252,8 @@ struct DemuxCmd {
     ///   umi=@grp+19:9      9 bases, 19 past grp's match end
     ///   up=@grp-0:9        9 bases just left of grp's match
     ///   ins=@grpA..@grpB   region between two anchors
+    ///   cell=@grp::cell    the matched tag's value in the `cell` column
+    ///   name=@grp::id      the matched tag's ID
     #[arg(long = "extract", value_name = "SPEC", verbatim_doc_comment)]
     extracts: Vec<String>,
 
@@ -273,8 +283,14 @@ struct DemuxCmd {
     /// (default: '`-`') and qualities with `qual-sep` (default: a space).
     /// Default `qual` tags pre-exist for: `CB`/`CY` `CR`/`CY` `RX`/`QX` `BC`/`QT` `OX`/`BZ`.
     ///
+    /// A tag with an `@grp::COLUMN` stream has no quality tag, since qualities
+    /// could not line up with its text: the default one is left out, and
+    /// setting `qual=TAG` is an error. Such a stream cannot take `~`, and `raw`
+    /// does not change it.
+    ///
     ///   --tag RX=umi             UMI tag (auto quality tag `QX`)
     ///   --tag CB=bc1+bc2+bc3     join three barcode streams
+    ///   --tag xc=cell+bc2+bc3    join column text and barcode streams
     ///   --tag CB::sep=_          join sequences with '`_`' not '`-`'
     ///   --tag CB::qual=CY        name the paired quality tag
     ///   --tag CB::qual=none      emit no quality tag

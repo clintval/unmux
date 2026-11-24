@@ -16,7 +16,7 @@
 //! record-parallel + pooled-BGZF engine are all implemented; matching is
 //! parallelized while the writer stays on the consumer thread.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 
 use std::fs::File;
@@ -58,7 +58,7 @@ use crate::output::{
     PathContext,
 };
 use crate::qc::{removed_slug, routed_slug, unassigned_slug, Unassigned};
-use crate::tags::{load_tag_file, TagSet};
+use crate::tags::{load_tag_file_columns, TagColumns, TagSet};
 use crate::writer::{encode_fragment, output_format, OutputFormat, OutputRead, StagedOutputs};
 
 /// Resolved arguments for the `unmux` demux command.
@@ -260,22 +260,74 @@ fn log_run_shape(plan: &DemuxPlan, input_formats: &[SniffedFormat], dests: &[Pat
 
 /// Load every `--group`'s tag set once, keyed by group name. The matcher (via
 /// [`compile_groups`]) and the router (via [`build_routing`]) share these, so a
-/// file is read and an inline set built only once.
+/// file is read and an inline set built only once. Also returns, by group name,
+/// the values of the columns that `@group::COLUMN` extracts read.
 fn load_tag_sets(
     plan: &DemuxPlan,
     resolved: &HashMap<String, crate::ResolvedReadGroup>,
-) -> Result<HashMap<String, TagSet>> {
+) -> Result<(HashMap<String, TagSet>, HashMap<String, TagColumns>)> {
     let mut tag_sets = HashMap::with_capacity(plan.groups.len());
+    let mut tag_columns = HashMap::new();
     for group in &plan.groups {
-        let tag_set = match &group.source {
-            GroupSource::File(path) => load_tag_file(path)
+        let wanted: BTreeSet<&str> = plan
+            .extracts
+            .iter()
+            .filter_map(|extract| match &extract.span.body {
+                SpanBody::Column { group: of, column } if *of == group.name => {
+                    Some(column.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        let wanted: Vec<&str> = wanted.into_iter().collect();
+        let (tag_set, columns) = match &group.source {
+            GroupSource::File(path) => load_tag_file_columns(path, &wanted)
                 .with_context(|| format!("failed to load tag set for group `{}`", group.name))?,
-            GroupSource::Inline(tags) => TagSet::from_inline(tags),
-            GroupSource::ReadGroup(_) => resolved[&group.name].tag_set.clone(),
+            GroupSource::Inline(tags) => {
+                let ids: Vec<String> = tags
+                    .iter()
+                    .map(|tag| if tag.id.is_empty() { &tag.seq } else { &tag.id })
+                    .cloned()
+                    .collect();
+                let columns = wanted
+                    .iter()
+                    .map(|column| (column.to_string(), ids.clone()))
+                    .collect();
+                (TagSet::from_inline(tags), columns)
+            }
+            GroupSource::ReadGroup(_) => (resolved[&group.name].tag_set.clone(), TagColumns::new()),
         };
         tag_sets.insert(group.name.clone(), tag_set);
+        tag_columns.insert(group.name.clone(), columns);
     }
-    Ok(tag_sets)
+    Ok((tag_sets, tag_columns))
+}
+
+/// A column stream's lookup: its group's canonical index and one value per tag.
+struct ColumnStream<'a> {
+    group: usize,
+    values: &'a [String],
+}
+
+/// Every column stream's lookup, keyed by stream name.
+fn resolve_column_streams<'a>(
+    plan: &'a DemuxPlan,
+    tag_columns: &'a HashMap<String, TagColumns>,
+    group_index: &HashMap<String, usize>,
+) -> HashMap<&'a str, ColumnStream<'a>> {
+    plan.extracts
+        .iter()
+        .filter_map(|extract| match &extract.span.body {
+            SpanBody::Column { group, column } => Some((
+                extract.name.as_str(),
+                ColumnStream {
+                    group: group_index[group],
+                    values: &tag_columns[group][column],
+                },
+            )),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Resolve every `@RG` group in the plan against the input header's read
@@ -1097,6 +1149,8 @@ struct Engine<'a> {
     plan: &'a DemuxPlan,
     groups: &'a [CompiledGroup],
     group_index: &'a HashMap<String, usize>,
+    /// The lookup of every `@group::COLUMN` extract stream, by stream name.
+    column_streams: &'a HashMap<&'a str, ColumnStream<'a>>,
     routing: &'a Routing,
     pool: &'a str,
     input_formats: &'a [SniffedFormat],
@@ -1168,8 +1222,9 @@ fn run_engine(plan: &DemuxPlan, command_line: Option<&str>) -> Result<()> {
     };
     let resolved = resolve_read_group_groups(plan, &rg_info)?;
 
-    let tag_sets = load_tag_sets(plan, &resolved)?;
+    let (tag_sets, tag_columns) = load_tag_sets(plan, &resolved)?;
     let (groups, group_index) = compile_groups(plan, &tag_sets, &resolved)?;
+    let column_streams = resolve_column_streams(plan, &tag_columns, &group_index);
     let pool = pool_id(plan);
     let routing = build_routing(plan, &tag_sets, &group_index, &pool, &resolved)?;
 
@@ -1375,6 +1430,7 @@ fn run_engine(plan: &DemuxPlan, command_line: Option<&str>) -> Result<()> {
         plan,
         groups: &groups,
         group_index: &group_index,
+        column_streams: &column_streams,
         routing: &routing,
         pool: &pool,
         input_formats: &input_formats,
@@ -2444,6 +2500,14 @@ fn canonical_correction<'a>(
     Some((canonical, hit.revcomp))
 }
 
+/// The matched tag's value for a column stream, or `None` when its group did not
+/// match.
+fn column_value<'a>(engine: &'a Engine, hits: &GroupHits, stream: &str) -> Option<&'a str> {
+    let column = engine.column_streams.get(stream)?;
+    let hit = hits.get(column.group)?.as_ref()?;
+    column.values.get(hit.tag_idx).map(String::as_str)
+}
+
 /// Assemble the output body for an assigned (`target = Some`) or pass-through
 /// (`target = None`) record into owned [`PreparedWrite`]s: resolve its
 /// extraction streams, build the `--template` bodies and the `--tag` data,
@@ -2464,6 +2528,12 @@ fn prepare_body(
     let input_formats = engine.input_formats;
     let mut streams: HashMap<&str, Extracted> = HashMap::new();
     for spec in &plan.extracts {
+        if matches!(spec.span.body, SpanBody::Column { .. }) {
+            if let Some(value) = column_value(engine, hits, &spec.name) {
+                streams.insert(spec.name.as_str(), Extracted::from_text(value));
+            }
+            continue;
+        }
         if let Some(mut extracted) = extract(&spec.span, segments, hits, engine.group_index)? {
             // Attach the matched tag's canonical sequence as the stream's
             // corrected form, so a `raw=false` `--tag`/`--template` emits the
@@ -4044,7 +4114,7 @@ mod tests {
             },
         )]);
 
-        let tag_sets = load_tag_sets(&plan, &resolved).unwrap();
+        let (tag_sets, _) = load_tag_sets(&plan, &resolved).unwrap();
         let (compiled, _index) = compile_groups(&plan, &tag_sets, &resolved).unwrap();
 
         let norm = compiled.iter().find(|g| g.name == "norm").unwrap();
@@ -5559,5 +5629,72 @@ mod tests {
         let mut unkept = fragment(Flags::SECONDARY);
         unkept.records[0].alignment = None;
         assert!(!is_non_primary(&unkept));
+    }
+
+    #[test]
+    fn test_column_streams_are_identical_across_threads() {
+        let dir = tempfile::tempdir().unwrap();
+        let tags = write_file(
+            dir.path(),
+            "tags.tsv",
+            b"id\tseq\tcell\nw1\tAACCGG\tA+B\nw2\tTTGGCC\t\n",
+        );
+        let mut fq = Vec::new();
+        for i in 0..3000 {
+            let bc = ["AACCGG", "AACCGT", "TTGGCC", "GAGAGA"][i % 4];
+            fq.extend_from_slice(format!("@r{i}\n{bc}ACGTACGT\n+\nABCDEFGHIJKLMN\n").as_bytes());
+        }
+        let input = write_file(dir.path(), "in.fq", &fq);
+        let run = |threads: usize, ext: &str| {
+            let out = dir.path().join(format!("{threads}.{ext}"));
+            let mut args = base_args();
+            args.threads = threads;
+            args.inputs = vec![format!("0={}", input.display())];
+            args.groups = vec![
+                format!("bc={}", tags.display()),
+                "bc::loc=0:0:6,dist=1".to_string(),
+            ];
+            args.extracts = [
+                "b=@bc",
+                "cell=@bc::cell",
+                "i=@bc::id",
+                "u=0:6:10",
+                "r=0:10:end",
+            ]
+            .map(String::from)
+            .to_vec();
+            args.templates = vec!["r".to_string()];
+            args.tags = ["BC=b", "CB=cell+u", "xi=i"].map(String::from).to_vec();
+            args.pool = Some("p".to_string());
+            args.out = Some(out.display().to_string());
+            run_demux(args).unwrap();
+            out
+        };
+        for ext in ["sam", "bam", "cram", "fa", "fq", "fq.gz"] {
+            let serial = read_back(&run(1, ext));
+            assert_eq!(serial.len(), 3000);
+            for threads in [2, 3, 8] {
+                assert!(
+                    serial == read_back(&run(threads, ext)),
+                    "{ext} with {threads} threads"
+                );
+            }
+        }
+        let records = read_back(&dir.path().join("1.fq"));
+        let text = |record: &InputRecord, tag: [u8; 2]| match record.tags.as_ref()?.get(&tag) {
+            Some(Value::String(value)) => Some(value.to_string()),
+            _ => None,
+        };
+        for (i, record) in records.iter().enumerate() {
+            let (cell, id) = [
+                ("A+B-ACGT", Some("w1")),
+                ("A+B-ACGT", Some("w1")),
+                ("TTGGCC-ACGT", Some("w2")),
+                ("ACGT", None),
+            ][i % 4];
+            assert_eq!(text(record, *b"CB").as_deref(), Some(cell), "record {i}");
+            assert_eq!(text(record, *b"xi").as_deref(), id, "record {i}");
+            assert_eq!(text(record, *b"CY"), None, "record {i}");
+        }
     }
 }

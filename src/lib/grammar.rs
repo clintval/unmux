@@ -248,6 +248,15 @@ pub enum SpanBody {
         /// The anchoring group.
         group: String,
     },
+    /// `@group::COLUMN`: the matched tag's value in a tag-file column, which is
+    /// text without base qualities. `@group::seq` parses as
+    /// [`SpanBody::AnchorMatch`].
+    Column {
+        /// The group whose matched tag is looked up.
+        group: String,
+        /// The column, as written.
+        column: String,
+    },
     /// `@group+offset:len` (rightward) or `@group-offset:len` (leftward): `len`
     /// bases offset from the group's match. With `+` (`before` = false) the
     /// span starts `offset` bases past the matched END. With `-` (`before` =
@@ -343,6 +352,7 @@ pub struct Template {
 pub enum QualTag {
     /// Use the built-in seq->qual map (`CB`/`CY`, `CR`/`CY`, `RX`/`QX`,
     /// `BC`/`QT`, `OX`/`BZ`); no quality tag for an unmapped sequence tag.
+    /// [`parse_demux`] turns this into `None` for a tag with a column stream.
     Default,
     /// `qual=QTAG`: an explicit quality tag.
     Named(String),
@@ -591,7 +601,7 @@ pub fn parse_demux(args: &DemuxArgs) -> Result<DemuxPlan> {
         None => None,
     };
 
-    let plan = DemuxPlan {
+    let mut plan = DemuxPlan {
         pool: args.pool.clone(),
         inputs,
         groups,
@@ -627,6 +637,16 @@ pub fn parse_demux(args: &DemuxArgs) -> Result<DemuxPlan> {
         skip_reference_check: args.skip_reference_check,
     };
     validate_plan(&plan)?;
+    let columns = column_streams(&plan.extracts);
+    for tag in &mut plan.tags {
+        if tag
+            .streams
+            .iter()
+            .any(|s| columns.contains(s.name.as_str()))
+        {
+            tag.qual = QualTag::None;
+        }
+    }
     for warning in plan_warnings(&plan) {
         log::warn!("{warning}");
     }
@@ -1101,6 +1121,9 @@ pub fn parse_span(value: &str) -> Result<Span> {
 
 /// Parse the body after a leading `@` in an extraction span.
 fn parse_anchor_body(rest: &str) -> Result<SpanBody> {
+    if let Some((group, column)) = rest.split_once("::") {
+        return parse_column_span(group.trim(), column.trim(), rest);
+    }
     // `@grpA..@grpB`: between two anchors.
     if let Some((from, to)) = rest.split_once("..") {
         let from = from.trim();
@@ -1152,6 +1175,32 @@ fn parse_anchor_body(rest: &str) -> Result<SpanBody> {
     validate_ident(group, "anchor group")?;
     Ok(SpanBody::AnchorMatch {
         group: group.to_string(),
+    })
+}
+
+/// Parse `@group::COLUMN`, where `@group::seq` is `@group` itself. Offsets and a
+/// second anchor are rejected.
+fn parse_column_span(group: &str, column: &str, rest: &str) -> Result<SpanBody> {
+    let is_column_char = |c: char| is_ident_char(c) || c == '-' || c == '.';
+    if column.is_empty()
+        || group.contains(['+', '-', '.'])
+        || column.contains("..")
+        || !column.chars().all(is_column_char)
+    {
+        bail!(
+            "a column span is `@group::COLUMN` with no offset or second anchor (COLUMN allows \
+             letters, digits, `_`, `-`, `.`), got `@{rest}`"
+        );
+    }
+    validate_ident(group, "anchor group")?;
+    let group = group.to_string();
+    Ok(if crate::tags::is_seq_column(column) {
+        SpanBody::AnchorMatch { group }
+    } else {
+        SpanBody::Column {
+            group,
+            column: column.to_string(),
+        }
     })
 }
 
@@ -1790,6 +1839,7 @@ fn validate_qc_tag(tag: &str) -> Result<String> {
 fn validate_plan(plan: &DemuxPlan) -> Result<()> {
     let group_names: HashSet<&str> = plan.groups.iter().map(|g| g.name.as_str()).collect();
     let extract_names: HashSet<&str> = plan.extracts.iter().map(|e| e.name.as_str()).collect();
+    let columns = column_streams(&plan.extracts);
     let groups_with_match: HashSet<&str> = plan
         .groups
         .iter()
@@ -1915,6 +1965,13 @@ fn validate_plan(plan: &DemuxPlan) -> Result<()> {
                     stream,
                     &format!("group `{}` match=", group.name),
                 )?;
+                if columns.contains(stream.as_str()) {
+                    bail!(
+                        "group `{}` match= uses column stream `{stream}`, which is text, not \
+                         bases; a column stream may be used only in `--tag`",
+                        group.name
+                    );
+                }
             }
         }
     }
@@ -1945,6 +2002,35 @@ fn validate_plan(plan: &DemuxPlan) -> Result<()> {
                 );
             }
         }
+        if let SpanBody::Column { group, column } = &extract.span.body {
+            let source = plan
+                .groups
+                .iter()
+                .find(|g| &g.name == group)
+                .map(|g| &g.source);
+            match source {
+                Some(GroupSource::ReadGroup(_)) => bail!(
+                    "extract `{}` reads a column of group `{group}`, but an `@RG` group has no tag columns",
+                    extract.name
+                ),
+                Some(GroupSource::Inline(tags)) if crate::tags::is_id_column(column) => {
+                    if let Some(tag) = tags.iter().find(|t| !crate::tags::is_column_value(&t.id)) {
+                        bail!(
+                            "extract `{}` reads the tag IDs of group `{group}`, but ID {:?} may hold \
+                             only printable ASCII with no whitespace",
+                            extract.name,
+                            tag.id
+                        );
+                    }
+                }
+                Some(GroupSource::Inline(_)) => bail!(
+                    "extract `{}` reads column `{column}` of group `{group}`, but an inline set has \
+                     only `id` and `seq`",
+                    extract.name
+                ),
+                _ => {}
+            }
+        }
     }
 
     // Template and tag stream references.
@@ -1955,11 +2041,37 @@ fn validate_plan(plan: &DemuxPlan) -> Result<()> {
                 &stream.name,
                 &format!("template #{}", i + 1),
             )?;
+            if columns.contains(stream.name.as_str()) {
+                bail!(
+                    "template #{} uses column stream `{}`, which is text without base qualities; a \
+                     column stream may be used only in `--tag`",
+                    i + 1,
+                    stream.name
+                );
+            }
         }
     }
     for tag in &plan.tags {
         for stream in &tag.streams {
             require_extract(&extract_names, &stream.name, &format!("tag `{}`", tag.tag))?;
+            if !columns.contains(stream.name.as_str()) {
+                continue;
+            }
+            if stream.revcomp {
+                bail!(
+                    "tag `{}` reverse-complements column stream `{}`, which is text, not bases",
+                    tag.tag,
+                    stream.name
+                );
+            }
+            if let QualTag::Named(qual) = &tag.qual {
+                bail!(
+                    "tag `{}` sets `qual={qual}`, but its column stream `{}` has no base qualities; \
+                     remove `qual` or set `qual=none`",
+                    tag.tag,
+                    stream.name
+                );
+            }
         }
     }
 
@@ -2026,9 +2138,19 @@ pub(crate) fn anchor_groups(body: &SpanBody) -> Vec<&str> {
     match body {
         SpanBody::File { .. } => Vec::new(),
         SpanBody::AnchorMatch { group } => vec![group.as_str()],
+        SpanBody::Column { group, .. } => vec![group.as_str()],
         SpanBody::AnchorOffset { group, .. } => vec![group.as_str()],
         SpanBody::Between { from, to } => vec![from.as_str(), to.as_str()],
     }
+}
+
+/// The names of the extract streams that read a tag-file column.
+fn column_streams(extracts: &[Extract]) -> HashSet<&str> {
+    extracts
+        .iter()
+        .filter(|extract| matches!(extract.span.body, SpanBody::Column { .. }))
+        .map(|extract| extract.name.as_str())
+        .collect()
 }
 
 /// Error if `name` is not a declared group.
@@ -2160,7 +2282,7 @@ fn plan_warnings(plan: &DemuxPlan) -> Vec<String> {
         }
         Some(format!(
             "{kind} `{label}` sets `raw=true` but none of its streams ({}) are error-corrected, so \
-             it emits the same observed bases as the default; `raw` differs from corrected only for \
+             it emits the same value as the default; `raw` differs from corrected only for \
              a matched `@grp` self-span stream.",
             join_streams(streams, ",")
         ))
@@ -3599,5 +3721,116 @@ mod tests {
             parse_group_source("@rg", "rg").unwrap(),
             GroupSource::File(PathBuf::from("@rg"))
         );
+    }
+
+    #[test]
+    fn test_parse_span_column() {
+        for column in ["cell", "Cell_1", "cell-type", "cell.type", "id"] {
+            assert_eq!(
+                parse_span(&format!("@grp::{column}")).unwrap().body,
+                SpanBody::Column {
+                    group: "grp".to_string(),
+                    column: column.to_string(),
+                }
+            );
+        }
+        for seq in ["@grp::seq", "@grp::SEQ"] {
+            assert_eq!(parse_span(seq).unwrap(), parse_span("@grp").unwrap());
+        }
+    }
+
+    #[test]
+    fn test_parse_span_column_rejects_offsets_anchors_and_other_characters() {
+        for bad in [
+            "@grp::",
+            "@::cell",
+            "@grp::a::b",
+            "@grp::cell+1:3",
+            "@grp::cell-1:3",
+            "@grp+1:3::cell",
+            "@grp-1:3::cell",
+            "@grp::cell..@grp",
+            "@grp..@grp::cell",
+            "@grp::a b",
+            "@grp::a,b",
+        ] {
+            assert!(parse_span(bad).is_err(), "{bad} should be rejected");
+        }
+    }
+
+    fn column_args() -> DemuxArgs {
+        let mut a = args();
+        a.groups = vec!["bc=tags.tsv".to_string()];
+        a.extracts = vec!["cell=@bc::cell".to_string(), "u=0:0:4".to_string()];
+        a
+    }
+
+    #[test]
+    fn test_column_stream_is_allowed_in_tags_and_emits_no_quality_tag() {
+        let mut a = column_args();
+        a.tags = ["CB=cell", "RX=u+cell", "BC=u"].map(String::from).to_vec();
+        let plan = parse_demux(&a).unwrap();
+        assert_eq!(plan.tags[0].qual, QualTag::None);
+        assert_eq!(plan.tags[1].qual, QualTag::None);
+        assert_eq!(plan.tags[2].qual, QualTag::Default);
+        assert!(!plan_warnings(&plan)
+            .iter()
+            .any(|w| w.contains("nothing consumes")));
+    }
+
+    #[test]
+    fn test_column_stream_with_a_named_quality_tag_is_error() {
+        for tag in ["CB=cell", "CB=u+cell"] {
+            let mut a = column_args();
+            a.tags = vec![tag.to_string(), "CB::qual=CY".to_string()];
+            let err = parse_demux(&a).unwrap_err().to_string();
+            assert!(err.contains("no base qualities"), "{err}");
+        }
+    }
+
+    #[test]
+    fn test_column_stream_revcomp_template_and_match_are_errors() {
+        let mut a = column_args();
+        a.tags = vec!["xc=u+~cell".to_string()];
+        let err = parse_demux(&a).unwrap_err().to_string();
+        assert!(err.contains("reverse-complements column stream"), "{err}");
+
+        for template in ["cell", "u+cell", "~cell"] {
+            let mut a = column_args();
+            a.templates = vec![template.to_string()];
+            let err = parse_demux(&a).unwrap_err().to_string();
+            assert!(err.contains("template #1 uses column stream"), "{err}");
+        }
+
+        let mut a = column_args();
+        a.groups.push("g={ACGT}".to_string());
+        a.groups.push("g::match=u+cell".to_string());
+        let err = parse_demux(&a).unwrap_err().to_string();
+        assert!(err.contains("match= uses column stream"), "{err}");
+    }
+
+    #[test]
+    fn test_column_of_an_inline_set_is_only_its_id() {
+        let with = |source: &str, span: &str| {
+            let mut a = column_args();
+            a.groups = vec![format!("bc={source}")];
+            a.extracts = vec![format!("cell={span}")];
+            parse_demux(&a).map_err(|err| err.to_string())
+        };
+        assert!(with("{a=ACGT}", "@bc::id").is_ok());
+        assert!(with("{a=ACGT}", "@bc::ID").is_ok());
+        assert!(with("{a=ACGT}", "@bc::seq").is_ok());
+        assert!(with("{a b=ACGT}", "@bc").is_ok());
+        let err = with("{a=ACGT}", "@bc::cell").unwrap_err();
+        assert!(err.contains("only `id` and `seq`"), "{err}");
+        let err = with("{a b=ACGT}", "@bc::id").unwrap_err();
+        assert!(err.contains("\"a b\""), "{err}");
+        let err = with("@RG", "@bc::id").unwrap_err();
+        assert!(err.contains("no tag columns"), "{err}");
+
+        let mut a = column_args();
+        a.groups.push("bc::match=u".to_string());
+        let err = parse_demux(&a).unwrap_err().to_string();
+        assert!(err.contains("`bc` is a match= group"), "{err}");
     }
 }

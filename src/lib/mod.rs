@@ -34,5 +34,5 @@ pub use grammar::{parse_demux, DemuxPlan};
 pub use input::{sniff_bytes, sniff_input, Fragment, FragmentReader, InputRecord, SniffedFormat};
 pub use matcher::{match_group, next_window, CompiledGroup, GroupOutcome, MatchStrand, TagMatch};
 pub use readgroup::{resolve as resolve_read_group, ResolvedReadGroup};
-pub use tags::{load_tag_file, TagEntry, TagSet};
+pub use tags::{load_tag_file, load_tag_file_columns, TagColumns, TagEntry, TagSet};
 pub use writer::{output_format, OutputFormat, OutputWriter};

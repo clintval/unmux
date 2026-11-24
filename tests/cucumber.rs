@@ -365,6 +365,19 @@ async fn file_larger_than(world: &mut SassWorld, bigger: String, smaller: String
     );
 }
 
+#[then(regex = r#"^the files "([^"]+)" and "([^"]+)" are identical$"#)]
+async fn files_identical(world: &mut SassWorld, first: String, second: String) {
+    let dir = world.work_dir();
+    let read = |name: &str| {
+        fs::read_to_string(dir.join(name)).unwrap_or_else(|_| panic!("read output file {name:?}"))
+    };
+    assert_eq!(
+        read(&first),
+        read(&second),
+        "{first:?} and {second:?} differ"
+    );
+}
+
 #[then(regex = r#"^the BAM header of "([^"]+)" contains "(.*)"$"#)]
 async fn bam_header_contains(world: &mut SassWorld, name: String, needle: String) {
     let header = bam_header_text(&world.work_dir().join(&name));
