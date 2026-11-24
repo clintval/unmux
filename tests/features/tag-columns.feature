@@ -124,9 +124,9 @@ Feature: Tag-file column streams
       name	barcode
       w1	AACCGG
       """
-    When I run `unmux reads.fq --group bc=barcodes.tsv --group bc::loc=0:0:6 --extract a=@bc::id --extract b=@bc::name --extract c=@bc::barcode --tag xa=a --tag xb=b --tag xc=c`
+    When I run `unmux reads.fq --group bc=barcodes.tsv --group bc::loc=0:0:6 --extract a=@bc::id --extract b=@bc::name --extract c=@bc::barcode --tag xa=a --tag xb=b --tag BC=c`
     Then the exit code is 0
-    And stdout contains "@r1 xa:Z:w1	xb:Z:w1	xc:Z:AACCGG"
+    And stdout contains "@r1 xa:Z:w1	xb:Z:w1	BC:Z:AACCGG	QT:Z:ABCDEF"
 
   Scenario: the tag ID of an inline set
     When I run `unmux reads.fq --group bc={w1=AACCGG,TTGGCC,=GAGAGA} --group bc::loc=0:0:6 --extract a=@bc::id --tag xa=a`
@@ -170,9 +170,10 @@ Feature: Tag-file column streams
       """
 
     Examples:
-      | span     |
-      | @bc      |
-      | @bc::seq |
+      | span         |
+      | @bc          |
+      | @bc::seq     |
+      | @bc::Barcode |
 
   Scenario: a blank value is the corrected sequence of a reverse-strand match
     Given a file "one.fq" containing:
@@ -224,18 +225,18 @@ Feature: Tag-file column streams
     And a file "out.sam" does not exist
     And a file "m.tsv" does not exist
 
-  Scenario: a value with whitespace is an error naming its line
+  Scenario: a value that is not printable ASCII is an error naming its line
     Given a file "spaced.tsv" containing:
       """
       # a comment
       id	seq	cell
 
       w1	AACCGG	ok
-      w2	TTGGCC	not ok
+      w2	TTGGCC	é
       """
     When I run `unmux reads.fq --group bc=spaced.tsv --extract cell=@bc::cell --tag xc=cell --out out.sam`
     Then the exit code is 1
-    And stderr contains "spaced.tsv: line 5: value "not ok" in column `cell`"
+    And stderr contains "spaced.tsv: line 5: value "é" in column `cell`"
     And a file "out.sam" does not exist
 
   Scenario Outline: a malformed column span is an error
@@ -272,9 +273,107 @@ Feature: Tag-file column streams
       id	seq	cell	CELL
       w1	AACCGG	x	y
       """
-    When I run `unmux reads.fq --group bc=extra.tsv --extract cell=@bc::cell --tag xc=cell`
+    When I run `unmux reads.fq --group bc=extra.tsv --extract cell=@bc::Cell --tag xc=cell`
     Then the exit code is 1
-    And stderr contains "more than one column `cell`"
+    And stderr contains "more than one column `Cell`"
+
+  Scenario: headers that differ only by case are read by their exact spelling
+    Given a file "extra.tsv" containing:
+      """
+      id	seq	cell	Cell
+      w1	AACCGG	x	y
+      """
+    When I run `unmux reads.fq --group bc=extra.tsv --group bc::loc=0:0:6 --extract a=@bc::cell --extract b=@bc::Cell --tag xa=a --tag xb=b`
+    Then the exit code is 0
+    And stdout contains "@r1 xa:Z:x	xb:Z:y"
+
+  Scenario: a header with spaces or punctuation is percent-escaped
+    Given a file "extra.tsv" containing:
+      """
+      id	seq	cell type	a+b::c	µ
+      w1	AACCGG	x	y	z
+      """
+    When I run `unmux reads.fq --group bc=extra.tsv --group bc::loc=0:0:6 --extract a=@bc::cell%20type --extract b=@bc::A%2Bb%3A%3Ac --extract c=@bc::%C2%B5 --tag xa=a+b+c`
+    Then the exit code is 0
+    And stdout contains "@r1 xa:Z:x-y-z"
+
+  Scenario Outline: a value may hold interior spaces and surrounding spaces are trimmed
+    Given a file "spaced.tsv" containing:
+      """
+      id	seq	cell	note
+      w 1	AACCGG	  two  words  	x
+      """
+    When I run `unmux reads.fq --group bc=spaced.tsv --group bc::loc=0:0:6 --extract cell=@bc::cell --extract i=@bc::id --tag xc=cell --tag xi=i --out out.<ext>`
+    Then the exit code is 0
+    When I run `unmux out.<ext> --out back.sam`
+    Then the exit code is 0
+    And the file "back.sam" contains "xc:Z:two  words	xi:Z:w 1"
+
+    Examples:
+      | ext  |
+      | sam  |
+      | bam  |
+      | cram |
+      | fq   |
+      | fa   |
+
+  Scenario Outline: a match= group has columns
+    Given a file "pairs.tsv" containing:
+      """
+      id	seq	cell
+      p1	AACCACGT	A+B
+      p2	TTGGTTTT	
+      """
+    When I run `unmux reads.fq --extract x=0:0:4 --extract y=0:6:10 --group pair=pairs.tsv --group pair::match=x+y --extract cell=@pair::cell --extract i=@pair::id --extract r=0:10:end --tag xc=cell+x --tag xi=i --template r --threads <threads> --out out.fa`
+    Then the exit code is 0
+    And the file "out.fa" is:
+      """
+      >r1 xc:Z:A+B-AACC	xi:Z:p1
+      AAAACCCC
+      >r2 xc:Z:A+B-AACC	xi:Z:p1
+      AAAACCCC
+      >r3 xc:Z:TTGGTTTT-TTGG	xi:Z:p2
+      AAAACCCC
+      >r4 xc:Z:GAGA
+      AAAACCCC
+      """
+
+    Examples:
+      | threads |
+      | 1       |
+      | 2       |
+      | 8       |
+
+  Scenario Outline: a carried default quality tag is dropped when a column tag replaces its tag
+    Given a file "carried.sam" containing:
+      """
+      @HD	VN:1.6
+      c1	4	*	0	0	*	*	0	0	AACCGGACGT	IIIIIIIIII	CB:Z:OLD	CY:Z:III	XX:Z:kept
+      c2	4	*	0	0	*	*	0	0	AACCGGACGT	IIIIIIIIII	CR:Z:OLD	CB:Z:OLD	CY:Z:III
+      c3	4	*	0	0	*	*	0	0	GAGAGAACGT	IIIIIIIIII	CB:Z:OLD	CY:Z:III
+      """
+    When I run `unmux carried.sam --pool p --group bc=tags.tsv --group bc::loc=0:0:6 --extract a=@bc::cell --extract u=0:6:10 --tag CB=a <qual> --threads <threads> --out out.<ext>`
+    Then the exit code is 0
+    And the records of "out.<ext>" are:
+      """
+      c1	4	*	0	255	*	*	0	0	AACCGGACGT	IIIIIIIIII	CB:Z:A+B	XX:Z:kept	RG:Z:p
+      c2	4	*	0	255	*	*	0	0	AACCGGACGT	IIIIIIIIII	CR:Z:OLD	CB:Z:A+B	CY:Z:III	RG:Z:p
+      c3	4	*	0	255	*	*	0	0	GAGAGAACGT	IIIIIIIIII	CB:Z:OLD	CY:Z:III	RG:Z:p
+      """
+
+    Examples:
+      | qual                   | ext | threads |
+      | --per-record           | sam | 1       |
+      | --per-record           | bam | 8       |
+      | --tag CB::qual=none    | sam | 8       |
+
+  Scenario: a default quality tag left out for a column is warned about
+    When I run `unmux reads.fq --group bc=tags.tsv --extract cell=@bc::cell --extract u=0:6:10 --tag CB=cell+u`
+    Then the exit code is 0
+    And stderr contains "tag `CB` has a column stream, which has no base qualities, so its default quality tag `CY` is left out"
+    When I run `unmux reads.fq --group bc=tags.tsv --extract cell=@bc::cell --extract u=0:6:10 --tag CB=cell+u --tag CB::qual=none --tag xc=cell`
+    Then the exit code is 0
+    And stderr does not contain "is left out"
 
   Scenario: routing, bins, metrics and QC are the same with and without a column stream
     When I run `unmux reads.fq --pool p --group bc=tags.tsv --group bc::loc=0:0:6,dist=1 --extract b=@bc --extract r=0:10:end --tag BC=b --template r --sample-from-group bc --qc-tag --remove bc::w2=rm.fq --unassigned un.fq --out a.%sample.fq --metrics-summary a.summary.tsv --metrics-per-sample a.samples.tsv --metrics-unassigned a.unassigned.tsv`

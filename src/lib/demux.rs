@@ -41,8 +41,8 @@ use crate::fanout::{
     Target,
 };
 use crate::grammar::{
-    Anchor, DemuxPlan, Endpoint, GroupSource, MatchMode, OutputPattern, Placeholder, SampleSpec,
-    SpanBody, Template,
+    column_tag_qualities, Anchor, DemuxPlan, Endpoint, GroupSource, MatchMode, OutputPattern,
+    Placeholder, SampleSpec, SpanBody, Template, DEFAULT_QUAL_TAGS,
 };
 use crate::input::{
     Alignment, Fragment, FragmentReader, InputRecord, PendingFragment, SniffedFormat,
@@ -1151,6 +1151,9 @@ struct Engine<'a> {
     group_index: &'a HashMap<String, usize>,
     /// The lookup of every `@group::COLUMN` extract stream, by stream name.
     column_streams: &'a HashMap<&'a str, ColumnStream<'a>>,
+    /// Every tag that has a column stream and a default quality tag, with that
+    /// quality tag.
+    column_tag_qualities: &'a [(&'a str, &'a str)],
     routing: &'a Routing,
     pool: &'a str,
     input_formats: &'a [SniffedFormat],
@@ -1225,6 +1228,7 @@ fn run_engine(plan: &DemuxPlan, command_line: Option<&str>) -> Result<()> {
     let (tag_sets, tag_columns) = load_tag_sets(plan, &resolved)?;
     let (groups, group_index) = compile_groups(plan, &tag_sets, &resolved)?;
     let column_streams = resolve_column_streams(plan, &tag_columns, &group_index);
+    let column_tag_qualities = column_tag_qualities(plan);
     let pool = pool_id(plan);
     let routing = build_routing(plan, &tag_sets, &group_index, &pool, &resolved)?;
 
@@ -1431,6 +1435,7 @@ fn run_engine(plan: &DemuxPlan, command_line: Option<&str>) -> Result<()> {
         groups: &groups,
         group_index: &group_index,
         column_streams: &column_streams,
+        column_tag_qualities: &column_tag_qualities,
         routing: &routing,
         pool: &pool,
         input_formats: &input_formats,
@@ -2599,7 +2604,13 @@ fn prepare_body(
 
     let mut datas: Vec<Data> = bodies
         .iter()
-        .map(|body| merge_data(body.carried.as_ref(), &tag_data))
+        .map(|body| {
+            merge_data(
+                body.carried.as_ref(),
+                &tag_data,
+                engine.column_tag_qualities,
+            )
+        })
         .collect();
     // With `--qc-tag`, every output body of this record carries the
     // routing-outcome slug (assigned with its sample, or pass-through). Built
@@ -2828,13 +2839,36 @@ fn assemble_bodies(
 }
 
 /// Merge the carried input tags (if any) with the assembled `--tag` fields,
-/// with `--tag` winning a key collision.
-fn merge_data(carried: Option<&Data>, tag_data: &Data) -> Data {
+/// with `--tag` winning a key collision. `column_qualities` pairs each tag that
+/// has a column stream with its default quality tag, which is dropped from the
+/// carried tags when that tag is rewritten without qualities.
+fn merge_data(carried: Option<&Data>, tag_data: &Data, column_qualities: &[(&str, &str)]) -> Data {
     let mut data = carried.cloned().unwrap_or_default();
+    for (tag, quality) in column_qualities {
+        if is_stale_quality(&data, tag_data, tag, quality) {
+            let quality = Tag::from(tag_bytes(quality));
+            data = data
+                .iter()
+                .filter(|(tag, _)| *tag != quality)
+                .map(|(tag, value)| (tag, value.clone()))
+                .collect();
+        }
+    }
     for (tag, value) in tag_data.iter() {
         data.insert(tag, value.clone());
     }
     data
+}
+
+/// Whether the carried `quality` tag described the old value of `tag`, which
+/// `tag_data` rewrites without qualities. A quality tag shared with another
+/// carried tag that is kept (`CR` and `CB` share `CY`) still describes that one.
+fn is_stale_quality(carried: &Data, tag_data: &Data, tag: &str, quality: &str) -> bool {
+    let has = |data: &Data, tag: &str| data.get(&tag_bytes(tag)).is_some();
+    let is_shared = DEFAULT_QUAL_TAGS.iter().any(|&(other, other_quality)| {
+        other != tag && other_quality == quality && has(carried, other) && !has(tag_data, other)
+    });
+    has(carried, quality) && has(tag_data, tag) && !has(tag_data, quality) && !is_shared
 }
 
 /// Build the corrected form of a matched `@grp` stream: always the declared
@@ -5696,5 +5730,30 @@ mod tests {
             assert_eq!(text(record, *b"xi").as_deref(), id, "record {i}");
             assert_eq!(text(record, *b"CY"), None, "record {i}");
         }
+    }
+
+    #[test]
+    fn test_merge_data_drops_only_a_stale_default_quality_tag() {
+        let data = |tags: &[&str]| -> Data {
+            tags.iter()
+                .map(|tag| (Tag::from(tag_bytes(tag)), Value::from(tag.to_string())))
+                .collect()
+        };
+        let merged = |carried: &[&str], written: &[&str], columns: &[(&str, &str)]| {
+            merge_data(Some(&data(carried)), &data(written), columns)
+                .iter()
+                .map(|(tag, _)| String::from_utf8(<[u8; 2]>::from(tag).to_vec()).unwrap())
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let cb = &[("CB", "CY")];
+        assert_eq!(merged(&["CB", "CY", "NH", "XX"], &["CB"], cb), "CB NH XX");
+        assert_eq!(merged(&["CB", "CY"], &["CB"], &[]), "CB CY");
+        assert_eq!(merged(&["CB", "CY"], &[], cb), "CB CY");
+        assert_eq!(merged(&["CB", "CY"], &["CB", "CY"], cb), "CB CY");
+        assert_eq!(merged(&["CY"], &["CB"], cb), "CB");
+        assert_eq!(merged(&["CR", "CB", "CY"], &["CB"], cb), "CR CB CY");
+        assert_eq!(merged(&["CR", "CB", "CY"], &["CB", "CR"], cb), "CR CB");
+        assert_eq!(merged(&["CB", "CY", "QX"], &["CB"], cb), "CB QX");
     }
 }

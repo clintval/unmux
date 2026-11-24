@@ -102,8 +102,8 @@ pub(crate) const CARGO_STYLING: Styles = Styles::styled()
 ///   +                concat streams (`cb+umi`) or 'AND' samples (`gA::a+gB::b`).
 ///   ~                reverse-complement the stream (`~cb`, `BC=~bc`).
 ///   ,                list separator ('OR' a tag pool & attribute lists).
-///   %XX              percent-escape a byte in a tag sep/qual-sep value or an
-///                    output path (`%20`=space, `%09`=tab, `%2C`=comma).
+///   %XX              percent-escape a byte in a tag sep/qual-sep value, a
+///                    COLUMN, or an output path (`%20`=space, `%2C`=comma).
 ///   %pool            the pool ID (see `--pool`).
 ///   %sample          the sample ID (`--out` only)
 ///   %sub_sample      the sub-sample ID (`@RG LB`) (`--out` only).
@@ -239,10 +239,13 @@ struct DemuxCmd {
     /// anchored `@grp` forms take a `LENGTH` as the trailing number instead.
     ///
     /// The `@grp::COLUMN` form is the matched tag's text in a column of the
-    /// group's tag file (header case is ignored): printable ASCII with no
-    /// whitespace, where a blank means the tag's `seq`. The tag ID is
-    /// `@grp::id`, also for an inline set, and `@grp::seq` is the same as
-    /// `@grp`. Column streams have no qualities, so only `--tag` takes them.
+    /// group's tag file, where a blank means the tag's `seq`. Header case is
+    /// ignored unless two headers differ only by case, and a header character
+    /// other than letters, digits, '`_`', '`-`', and '`.`' is percent-escaped.
+    /// Values may hold printable ASCII and spaces. The tag ID is `@grp::id`,
+    /// also for an inline set, and `@grp::seq` is the same as `@grp`. Column
+    /// streams have no qualities, so only `--tag` takes them, and a tag built
+    /// from one has no quality tag. A `match=` group has columns but no span.
     ///
     ///   r=0:9:end          file 0, base 9 to the end
     ///   bc=1:0:8           file 1, bases [0,8)
@@ -253,6 +256,7 @@ struct DemuxCmd {
     ///   up=@grp-0:9        9 bases just left of grp's match
     ///   ins=@grpA..@grpB   region between two anchors
     ///   cell=@grp::cell    the matched tag's value in the `cell` column
+    ///   t=@grp::a%20b      the same for a column headed 'a b'
     ///   name=@grp::id      the matched tag's ID
     #[arg(long = "extract", value_name = "SPEC", verbatim_doc_comment)]
     extracts: Vec<String>,
@@ -283,10 +287,10 @@ struct DemuxCmd {
     /// (default: '`-`') and qualities with `qual-sep` (default: a space).
     /// Default `qual` tags pre-exist for: `CB`/`CY` `CR`/`CY` `RX`/`QX` `BC`/`QT` `OX`/`BZ`.
     ///
-    /// A tag with an `@grp::COLUMN` stream has no quality tag, since qualities
-    /// could not line up with its text: the default one is left out, and
-    /// setting `qual=TAG` is an error. Such a stream cannot take `~`, and `raw`
-    /// does not change it.
+    /// A tag built from an `@grp::COLUMN` stream has no quality tag, since
+    /// qualities could not line up with its text: the default one is left out
+    /// (a carried one is dropped), and setting `qual=TAG` is an error. Such a
+    /// stream cannot take `~`, and `raw` does not change it.
     ///
     ///   --tag RX=umi             UMI tag (auto quality tag `QX`)
     ///   --tag CB=bc1+bc2+bc3     join three barcode streams

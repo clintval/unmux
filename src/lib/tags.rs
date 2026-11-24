@@ -70,6 +70,8 @@ impl TagSet {
     }
 }
 
+const BYTE_ORDER_MARK: char = '\u{feff}';
+
 /// The values of the tag-file columns that `@group::COLUMN` extracts read, keyed
 /// by the column as the extract spells it, each holding one value per tag.
 pub type TagColumns = HashMap<String, Vec<String>>;
@@ -83,24 +85,41 @@ pub fn load_tag_file(path: &Path) -> Result<TagSet> {
 pub fn load_tag_file_columns(path: &Path, wanted: &[&str]) -> Result<(TagSet, TagColumns)> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read tag file: {}", path.display()))?;
-    parse_tag_table(&text, wanted)
+    parse_marked_tag_table(&text, wanted)
         .with_context(|| format!("failed to parse tag file: {}", path.display()))
 }
 
-/// Whether a column reference is the tag ID.
+/// The headers of the id column. A file may have only one of them.
+const ID_COLUMNS: &[&str] = &["id", "tag", "name", "sample_id", "sample"];
+
+/// The headers of the sequence column. A file may have only one of them.
+const SEQ_COLUMNS: &[&str] = &["seq", "sequence", "barcode"];
+
+/// Whether a column reference is the tag ID, by any header the id column may have.
 pub(crate) fn is_id_column(column: &str) -> bool {
-    column.eq_ignore_ascii_case("id")
+    ID_COLUMNS.contains(&column.to_lowercase().as_str())
 }
 
-/// Whether a column reference is the tag sequence.
+/// Whether a column reference is the tag sequence, by any header the sequence
+/// column may have.
 pub(crate) fn is_seq_column(column: &str) -> bool {
-    column.eq_ignore_ascii_case("seq")
+    SEQ_COLUMNS.contains(&column.to_lowercase().as_str())
 }
 
-/// Whether `value` can be a SAM tag value with no spaces: every SAM/BAM/CRAM
-/// `Z` tag must be printable ASCII.
+/// Whether `value` can be a SAM/BAM/CRAM `Z` tag value: printable ASCII and
+/// spaces.
 pub(crate) fn is_column_value(value: &str) -> bool {
-    value.bytes().all(|byte| byte.is_ascii_graphic())
+    value.bytes().all(|byte| matches!(byte, b' '..=b'~'))
+}
+
+/// Parse a tag table that may start with a UTF-8 byte order mark. The mark is
+/// part of the first header cell for a table that parses with it, since stripping
+/// it there could change which columns are the id, sequence, and sub_sample.
+fn parse_marked_tag_table(text: &str, wanted: &[&str]) -> Result<(TagSet, TagColumns)> {
+    match text.strip_prefix(BYTE_ORDER_MARK) {
+        Some(unmarked) if parse_tag_table(text, &[]).is_err() => parse_tag_table(unmarked, wanted),
+        _ => parse_tag_table(text, wanted),
+    }
 }
 
 /// Parse the text of a tag table (headered TSV; blank lines and `#` comments
@@ -110,6 +129,7 @@ fn parse_tag_table(text: &str, wanted: &[&str]) -> Result<(TagSet, TagColumns)> 
         .lines()
         .map(|line| line.trim_end_matches('\r'))
         .enumerate()
+        .map(|(index, line)| (index + 1, line))
         .filter(|(_, line)| !line.trim().is_empty() && !line.trim_start().starts_with('#'));
 
     let (_, header) = rows
@@ -123,9 +143,9 @@ fn parse_tag_table(text: &str, wanted: &[&str]) -> Result<(TagSet, TagColumns)> 
     // `id` is the generic primary; `sample_id`/`sample` are accepted so a
     // sample-demux sheet (e.g. a `--sample-metadata`-style sheet whose id
     // column is `sample_id`) loads directly as a tag set.
-    let id_col = find_column(&columns, &["id", "tag", "name", "sample_id", "sample"])?
+    let id_col = find_column(&columns, ID_COLUMNS)?
         .context("tag file has no id column (expected one of: id, tag, name, sample_id, sample)")?;
-    let seq_col = find_column(&columns, &["seq", "sequence", "barcode"])?
+    let seq_col = find_column(&columns, SEQ_COLUMNS)?
         .context("tag file has no sequence column (expected one of: seq, sequence, barcode)")?;
     let sub_sample_col = find_column(&columns, &["sub_sample"])?;
     let mut values = wanted
@@ -137,14 +157,14 @@ fn parse_tag_table(text: &str, wanted: &[&str]) -> Result<(TagSet, TagColumns)> 
         .collect::<Result<Vec<(&str, usize, Vec<String>)>>>()?;
 
     let mut entries = Vec::new();
-    for (line_no, (file_line, row)) in rows.enumerate() {
+    for (line, row) in rows {
         let cells: Vec<&str> = row.split('\t').collect();
         let id = cell(&cells, id_col)
-            .with_context(|| format!("tag row {} is missing its id column", line_no + 1))?;
+            .with_context(|| format!("line {line} is missing its id column"))?;
         let seq = cell(&cells, seq_col)
-            .with_context(|| format!("tag row {} is missing its sequence column", line_no + 1))?;
+            .with_context(|| format!("line {line} is missing its sequence column"))?;
         if id.is_empty() || seq.is_empty() {
-            bail!("tag row {} has an empty id or sequence", line_no + 1);
+            bail!("line {line} has an empty id or sequence");
         }
         let sub_sample = sub_sample_col
             .and_then(|c| cell(&cells, c))
@@ -153,9 +173,8 @@ fn parse_tag_table(text: &str, wanted: &[&str]) -> Result<(TagSet, TagColumns)> 
         for (name, index, column) in &mut values {
             let value = match cell(&cells, *index).filter(|value| !value.is_empty()) {
                 Some(value) if !is_column_value(value) => bail!(
-                    "line {}: value {value:?} in column `{name}` may hold only printable ASCII \
-                     with no whitespace",
-                    file_line + 1
+                    "line {line}: value {value:?} in column `{name}` may hold only printable \
+                     ASCII and spaces"
                 ),
                 Some(value) => value,
                 None => seq,
@@ -178,9 +197,9 @@ fn parse_tag_table(text: &str, wanted: &[&str]) -> Result<(TagSet, TagColumns)> 
     Ok((TagSet { entries }, values))
 }
 
-/// Find the column an `@group::COLUMN` extract reads: `id` and `seq` are the id
-/// and sequence columns whatever their headers, and any other name matches a
-/// header regardless of case.
+/// Find the column an `@group::COLUMN` extract reads. Any header of the id or
+/// sequence column is that column whatever its header, and any other name matches
+/// a header exactly or else regardless of case.
 fn find_wanted_column(header: &str, name: &str, id_col: usize, seq_col: usize) -> Result<usize> {
     if is_id_column(name) {
         return Ok(id_col);
@@ -188,19 +207,28 @@ fn find_wanted_column(header: &str, name: &str, id_col: usize, seq_col: usize) -
     if is_seq_column(name) {
         return Ok(seq_col);
     }
-    let columns: Vec<&str> = header.split('\t').map(str::trim).collect();
-    let mut matches = columns
-        .iter()
-        .enumerate()
-        .filter(|(_, column)| column.to_lowercase() == name.to_lowercase());
-    let Some((index, _)) = matches.next() else {
-        let known: Vec<&str> = columns.into_iter().filter(|c| !c.is_empty()).collect();
-        bail!("no column `{name}`; the columns are: {}", known.join(", "));
+    let columns: Vec<&str> = header
+        .trim_start_matches(BYTE_ORDER_MARK)
+        .split('\t')
+        .map(str::trim)
+        .collect();
+    let positions = |matches: &dyn Fn(&str) -> bool| -> Vec<usize> {
+        (0..columns.len())
+            .filter(|&index| matches(columns[index]))
+            .collect()
     };
-    if matches.next().is_some() {
-        bail!("more than one column `{name}`");
+    let mut found = positions(&|column| column == name);
+    if found.is_empty() {
+        found = positions(&|column| column.to_lowercase() == name.to_lowercase());
     }
-    Ok(index)
+    match found.as_slice() {
+        [index] => Ok(*index),
+        [] => {
+            let known: Vec<&str> = columns.into_iter().filter(|c| !c.is_empty()).collect();
+            bail!("no column `{name}`; the columns are: {}", known.join(", "))
+        }
+        _ => bail!("more than one column `{name}`"),
+    }
 }
 
 /// Find the one column whose lowercased header matches an accepted alias.
@@ -367,12 +395,14 @@ mod tests {
     #[test]
     fn test_parse_tag_table_wanted_columns() {
         let table = "Note\tname\tbarcode\tCell\nx y\tt1\tACGT\tA+B\n\tt2\tTTTT\t \nz\tt3\tGGGG\n";
-        let (set, columns) = parse_tag_table(table, &["cell", "id", "NAME", "barcode"]).unwrap();
+        let wanted = ["cell", "id", "NAME", "tag", "note"];
+        let (set, columns) = parse_tag_table(table, &wanted).unwrap();
         assert_eq!(set.entries.len(), 3);
         assert_eq!(columns["cell"], vec!["A+B", "TTTT", "GGGG"]);
         assert_eq!(columns["id"], vec!["t1", "t2", "t3"]);
         assert_eq!(columns["NAME"], vec!["t1", "t2", "t3"]);
-        assert_eq!(columns["barcode"], vec!["ACGT", "TTTT", "GGGG"]);
+        assert_eq!(columns["tag"], vec!["t1", "t2", "t3"]);
+        assert_eq!(columns["note"], vec!["x y", "TTTT", "z"]);
     }
 
     #[test]
@@ -386,15 +416,20 @@ mod tests {
 
     #[test]
     fn test_parse_tag_table_repeated_column_is_an_error_only_when_wanted() {
-        let table = "id\tseq\tcell\tCell\nt1\tACGT\tx\ty\n";
+        let table = "id\tseq\tcell\tCell\tx\tx\nt1\tACGT\ta\tb\tc\td\n";
         assert!(parse_tag_table(table, &[]).is_ok());
-        let err = parse_tag_table(table, &["cell"]).unwrap_err();
-        assert!(err.to_string().contains("more than one column"), "{err}");
+        for repeated in ["CELL", "x", "X"] {
+            let err = parse_tag_table(table, &[repeated]).unwrap_err();
+            assert!(err.to_string().contains("more than one column"), "{err}");
+        }
+        let (_, columns) = parse_tag_table(table, &["cell", "Cell"]).unwrap();
+        assert_eq!(columns["cell"], vec!["a"]);
+        assert_eq!(columns["Cell"], vec!["b"]);
     }
 
     #[test]
     fn test_parse_tag_table_rejects_unprintable_wanted_values() {
-        for bad in ["a b", "a\u{b}b", "a\u{1}", "a\u{7f}", "a\rb", "\u{e9}"] {
+        for bad in ["a\u{b}b", "a\u{a0}b", "a\u{1}", "a\u{7f}", "a\rb", "\u{e9}"] {
             let table = format!("# comment\n\nid\tseq\tcell\nt1\tACGT\tok\nt2\tTTTT\t{bad}\n");
             assert!(parse_tag_table(&table, &[]).is_ok());
             let err = parse_tag_table(&table, &["cell"]).unwrap_err().to_string();
@@ -403,10 +438,65 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_tag_table_rejects_an_id_with_whitespace_only_when_wanted() {
-        let table = "id\tseq\nt 1\tACGT\n";
+    fn test_parse_tag_table_rejects_an_unprintable_id_only_when_wanted() {
+        let table = "id\tseq\nt 1\tACGT\n\u{e9}\tTTTT\n";
         assert!(parse_tag_table(table, &[]).is_ok());
         let err = parse_tag_table(table, &["id"]).unwrap_err().to_string();
-        assert!(err.starts_with("line 2: value \"t 1\""), "{err}");
+        assert!(err.starts_with("line 3: value \"\u{e9}\""), "{err}");
+    }
+
+    #[test]
+    fn test_parse_tag_table_errors_give_the_file_line() {
+        for (row, message) in [
+            ("t2", "line 4 is missing its sequence column"),
+            ("t2\t", "line 4 has an empty id or sequence"),
+        ] {
+            let table = format!("id\tseq\n# comment\nt1\tACGT\n{row}\n");
+            let err = parse_tag_table(&table, &[]).unwrap_err().to_string();
+            assert_eq!(err, message);
+        }
+    }
+
+    #[test]
+    fn test_byte_order_mark_is_stripped() {
+        for table in [
+            "\u{feff}id\tseq\tcell\r\nt1\tACGT\tx\r\n",
+            "\u{feff}# comment\nid\tseq\tcell\nt1\tACGT\tx\n",
+            "\u{feff}cell\tid\tseq\nx\tt1\tACGT\n",
+        ] {
+            let (set, columns) = parse_marked_tag_table(table, &["cell"]).unwrap();
+            assert_eq!(set.entries[0].id, "t1");
+            assert_eq!(set.entries[0].seq, "ACGT");
+            assert_eq!(columns["cell"], vec!["x"]);
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tags.tsv");
+        std::fs::write(&path, "\u{feff}id\tseq\nt1\tACGT\n").unwrap();
+        assert_eq!(load_tag_file(&path).unwrap().entries[0].id, "t1");
+
+        let err = parse_marked_tag_table("\u{feff}cell\tid\tseq\nx\tt1\tACGT\n", &["no"]);
+        assert_eq!(
+            err.unwrap_err().to_string(),
+            "no column `no`; the columns are: cell, id, seq"
+        );
+    }
+
+    #[test]
+    fn test_byte_order_mark_never_changes_a_table_that_parses_with_it() {
+        for table in [
+            "\u{feff}id\tname\tseq\nx\tt1\tACGT\n",
+            "\u{feff}sub_sample\tid\tseq\nx\tt1\tACGT\n",
+            "\u{feff}# note\tid\tseq\nx\tt1\tACGT\n",
+        ] {
+            let (set, _) = parse_marked_tag_table(table, &[]).unwrap();
+            assert_eq!(
+                set.entries,
+                vec![TagEntry {
+                    id: "t1".to_string(),
+                    seq: "ACGT".to_string(),
+                    sub_sample: None,
+                }]
+            );
+        }
     }
 }

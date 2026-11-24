@@ -249,12 +249,12 @@ pub enum SpanBody {
         group: String,
     },
     /// `@group::COLUMN`: the matched tag's value in a tag-file column, which is
-    /// text without base qualities. `@group::seq` parses as
-    /// [`SpanBody::AnchorMatch`].
+    /// text without base qualities. `@group::seq` (or another sequence header)
+    /// parses as [`SpanBody::AnchorMatch`].
     Column {
         /// The group whose matched tag is looked up.
         group: String,
-        /// The column, as written.
+        /// The column, percent-decoded.
         column: String,
     },
     /// `@group+offset:len` (rightward) or `@group-offset:len` (leftward): `len`
@@ -352,8 +352,10 @@ pub struct Template {
 pub enum QualTag {
     /// Use the built-in seq->qual map (`CB`/`CY`, `CR`/`CY`, `RX`/`QX`,
     /// `BC`/`QT`, `OX`/`BZ`); no quality tag for an unmapped sequence tag.
-    /// [`parse_demux`] turns this into `None` for a tag with a column stream.
     Default,
+    /// No quality tag, because `qual` is unset and a stream is a column, which
+    /// has no qualities.
+    Omitted,
     /// `qual=QTAG`: an explicit quality tag.
     Named(String),
     /// `qual=none`: drop the quality tag.
@@ -383,6 +385,15 @@ pub struct TagBinding {
     /// error-corrected barcode when its stream came from a matched keeplist
     /// `@grp`. No effect on a stream that was never corrected.
     pub raw: bool,
+}
+
+impl TagBinding {
+    /// Whether any stream of this tag is one of the column streams `columns`.
+    fn has_column(&self, columns: &HashSet<&str>) -> bool {
+        self.streams
+            .iter()
+            .any(|stream| columns.contains(stream.name.as_str()))
+    }
 }
 
 /// An optional finer fan-out level under a sample, written to read-group `LB`.
@@ -639,12 +650,8 @@ pub fn parse_demux(args: &DemuxArgs) -> Result<DemuxPlan> {
     validate_plan(&plan)?;
     let columns = column_streams(&plan.extracts);
     for tag in &mut plan.tags {
-        if tag
-            .streams
-            .iter()
-            .any(|s| columns.contains(s.name.as_str()))
-        {
-            tag.qual = QualTag::None;
+        if tag.has_column(&columns) && tag.qual == QualTag::Default {
+            tag.qual = QualTag::Omitted;
         }
     }
     for warning in plan_warnings(&plan) {
@@ -1179,28 +1186,26 @@ fn parse_anchor_body(rest: &str) -> Result<SpanBody> {
 }
 
 /// Parse `@group::COLUMN`, where `@group::seq` is `@group` itself. Offsets and a
-/// second anchor are rejected.
+/// second anchor are rejected, and a `%XX` escape in COLUMN is decoded.
 fn parse_column_span(group: &str, column: &str, rest: &str) -> Result<SpanBody> {
-    let is_column_char = |c: char| is_ident_char(c) || c == '-' || c == '.';
+    let is_column_char = |c: char| is_ident_char(c) || matches!(c, '-' | '.' | '%');
     if column.is_empty()
         || group.contains(['+', '-', '.'])
         || column.contains("..")
         || !column.chars().all(is_column_char)
     {
         bail!(
-            "a column span is `@group::COLUMN` with no offset or second anchor (COLUMN allows \
-             letters, digits, `_`, `-`, `.`), got `@{rest}`"
+            "a column span is `@group::COLUMN` with no offset or second anchor (in COLUMN, \
+             percent-escape every character but letters, digits, `_`, `-`, `.`), got `@{rest}`"
         );
     }
     validate_ident(group, "anchor group")?;
     let group = group.to_string();
-    Ok(if crate::tags::is_seq_column(column) {
+    let column = decode_percent(column)?;
+    Ok(if crate::tags::is_seq_column(&column) {
         SpanBody::AnchorMatch { group }
     } else {
-        SpanBody::Column {
-            group,
-            column: column.to_string(),
-        }
+        SpanBody::Column { group, column }
     })
 }
 
@@ -1411,17 +1416,33 @@ fn parse_separator(value: &str, tag: &str, attr: &str) -> Result<String> {
 /// The built-in seq->qual tag map; used when a tag binding leaves `qual` at its
 /// default.
 pub(crate) fn default_qual_tag(tag: &str) -> Option<&'static str> {
-    match tag {
-        "CB" => Some("CY"),
-        // CR is the raw cellular barcode; its quality has no dedicated SAM tag,
-        // so it shares CY (the cell-barcode quality) by convention, letting
-        // `--tag CR=bc::raw=true` pair a quality with no explicit `qual=`.
-        "CR" => Some("CY"),
-        "RX" => Some("QX"),
-        "BC" => Some("QT"),
-        "OX" => Some("BZ"),
-        _ => None,
-    }
+    DEFAULT_QUAL_TAGS
+        .iter()
+        .find(|(sequence, _)| *sequence == tag)
+        .map(|&(_, quality)| quality)
+}
+
+/// Each sequence tag with its default quality tag.
+pub(crate) const DEFAULT_QUAL_TAGS: &[(&str, &str)] = &[
+    ("CB", "CY"),
+    // CR is the raw cellular barcode; its quality has no dedicated SAM tag,
+    // so it shares CY (the cell-barcode quality) by convention, letting
+    // `--tag CR=bc::raw=true` pair a quality with no explicit `qual=`.
+    ("CR", "CY"),
+    ("RX", "QX"),
+    ("BC", "QT"),
+    ("OX", "BZ"),
+];
+
+/// The tags with a column stream that have a default quality tag, each with that
+/// quality tag.
+pub(crate) fn column_tag_qualities(plan: &DemuxPlan) -> Vec<(&str, &'static str)> {
+    let columns = column_streams(&plan.extracts);
+    plan.tags
+        .iter()
+        .filter(|tag| tag.has_column(&columns))
+        .filter_map(|tag| Some((tag.tag.as_str(), default_qual_tag(&tag.tag)?)))
+        .collect()
 }
 
 /// Finalize a tag builder: require streams and enforce the separator rules.
@@ -1434,7 +1455,7 @@ fn finish_tag(builder: TagBuilder) -> Result<TagBinding> {
     })?;
     let qual = builder.qual.unwrap_or(QualTag::Default);
     let emits_qual = match &qual {
-        QualTag::None => false,
+        QualTag::None | QualTag::Omitted => false,
         QualTag::Named(_) => true,
         QualTag::Default => default_qual_tag(&builder.tag).is_some(),
     };
@@ -1995,7 +2016,8 @@ fn validate_plan(plan: &DemuxPlan) -> Result<()> {
     for extract in &plan.extracts {
         for group in anchor_groups(&extract.span.body) {
             require_group(&group_names, group, &format!("extract `{}`", extract.name))?;
-            if groups_with_match.contains(group) {
+            let needs_span = !matches!(extract.span.body, SpanBody::Column { .. });
+            if needs_span && groups_with_match.contains(group) {
                 bail!(
                     "extract `{}` anchors on `@{group}`, but `{group}` is a match= group (it has no read span to anchor)",
                     extract.name
@@ -2017,7 +2039,7 @@ fn validate_plan(plan: &DemuxPlan) -> Result<()> {
                     if let Some(tag) = tags.iter().find(|t| !crate::tags::is_column_value(&t.id)) {
                         bail!(
                             "extract `{}` reads the tag IDs of group `{group}`, but ID {:?} may hold \
-                             only printable ASCII with no whitespace",
+                             only printable ASCII and spaces",
                             extract.name,
                             tag.id
                         );
@@ -2258,6 +2280,16 @@ fn plan_warnings(plan: &DemuxPlan) -> Vec<String> {
                 join_streams(&template.streams, "+"),
                 template.streams.len(),
                 per_read,
+            ));
+        }
+    }
+
+    for tag in &plan.tags {
+        if let (QualTag::Omitted, Some(qual)) = (&tag.qual, default_qual_tag(&tag.tag)) {
+            warnings.push(format!(
+                "tag `{tag}` has a column stream, which has no base qualities, so its default \
+                 quality tag `{qual}` is left out; set `{tag}::qual=none` to silence this.",
+                tag = tag.tag
             ));
         }
     }
@@ -3734,7 +3766,21 @@ mod tests {
                 }
             );
         }
-        for seq in ["@grp::seq", "@grp::SEQ"] {
+        for (escaped, column) in [
+            ("cell%20type", "cell type"),
+            ("a%2Bb%3A%3Ac%2E%2Ed", "a+b::c..d"),
+            ("%C2%B5", "\u{b5}"),
+            ("p%25", "p%"),
+        ] {
+            assert_eq!(
+                parse_span(&format!("@grp::{escaped}")).unwrap().body,
+                SpanBody::Column {
+                    group: "grp".to_string(),
+                    column: column.to_string(),
+                }
+            );
+        }
+        for seq in ["@grp::seq", "@grp::SEQ", "@grp::sequence", "@grp::Barcode"] {
             assert_eq!(parse_span(seq).unwrap(), parse_span("@grp").unwrap());
         }
     }
@@ -3770,8 +3816,8 @@ mod tests {
         let mut a = column_args();
         a.tags = ["CB=cell", "RX=u+cell", "BC=u"].map(String::from).to_vec();
         let plan = parse_demux(&a).unwrap();
-        assert_eq!(plan.tags[0].qual, QualTag::None);
-        assert_eq!(plan.tags[1].qual, QualTag::None);
+        assert_eq!(plan.tags[0].qual, QualTag::Omitted);
+        assert_eq!(plan.tags[1].qual, QualTag::Omitted);
         assert_eq!(plan.tags[2].qual, QualTag::Default);
         assert!(!plan_warnings(&plan)
             .iter()
@@ -3820,17 +3866,41 @@ mod tests {
         assert!(with("{a=ACGT}", "@bc::id").is_ok());
         assert!(with("{a=ACGT}", "@bc::ID").is_ok());
         assert!(with("{a=ACGT}", "@bc::seq").is_ok());
-        assert!(with("{a b=ACGT}", "@bc").is_ok());
+        assert!(with("{a b=ACGT}", "@bc::id").is_ok());
+        assert!(with("{a=ACGT}", "@bc::name").is_ok());
+        assert!(with("{a=ACGT}", "@bc::barcode").is_ok());
+        assert!(with("{\u{e9}=ACGT}", "@bc").is_ok());
         let err = with("{a=ACGT}", "@bc::cell").unwrap_err();
         assert!(err.contains("only `id` and `seq`"), "{err}");
-        let err = with("{a b=ACGT}", "@bc::id").unwrap_err();
-        assert!(err.contains("\"a b\""), "{err}");
+        let err = with("{\u{e9}=ACGT}", "@bc::id").unwrap_err();
+        assert!(err.contains("ID \"\u{e9}\""), "{err}");
         let err = with("@RG", "@bc::id").unwrap_err();
         assert!(err.contains("no tag columns"), "{err}");
 
         let mut a = column_args();
         a.groups.push("bc::match=u".to_string());
-        let err = parse_demux(&a).unwrap_err().to_string();
-        assert!(err.contains("`bc` is a match= group"), "{err}");
+        parse_demux(&a).unwrap();
+        for span in ["@bc::seq", "@bc::barcode", "@bc"] {
+            a.extracts[0] = format!("cell={span}");
+            let err = parse_demux(&a).unwrap_err().to_string();
+            assert!(err.contains("`bc` is a match= group"), "{err}");
+        }
+    }
+
+    #[test]
+    fn test_warn_once_per_default_quality_tag_left_out_by_a_column() {
+        let warnings = |tags: &[&str]| {
+            let mut a = column_args();
+            a.tags = tags.iter().map(|tag| tag.to_string()).collect();
+            let mut warnings = plan_warnings(&parse_demux(&a).unwrap());
+            warnings.retain(|warning| warning.contains("is left out"));
+            warnings
+        };
+        let found = warnings(&["CB=cell+u+cell", "xc=cell", "BC=u"]);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].contains("tag `CB`") && found[0].contains("`CY`"));
+        assert_eq!(warnings(&["CB=cell", "RX=cell"]).len(), 2);
+        assert!(warnings(&["CB=cell", "CB::qual=none"]).is_empty());
+        assert!(warnings(&["CB=u", "xc=cell"]).is_empty());
     }
 }
