@@ -1416,23 +1416,18 @@ fn parse_separator(value: &str, tag: &str, attr: &str) -> Result<String> {
 /// The built-in seq->qual tag map; used when a tag binding leaves `qual` at its
 /// default.
 pub(crate) fn default_qual_tag(tag: &str) -> Option<&'static str> {
-    DEFAULT_QUAL_TAGS
-        .iter()
-        .find(|(sequence, _)| *sequence == tag)
-        .map(|&(_, quality)| quality)
+    match tag {
+        "CB" => Some("CY"),
+        // CR is the raw cellular barcode; its quality has no dedicated SAM tag,
+        // so it shares CY (the cell-barcode quality) by convention, letting
+        // `--tag CR=bc::raw=true` pair a quality with no explicit `qual=`.
+        "CR" => Some("CY"),
+        "RX" => Some("QX"),
+        "BC" => Some("QT"),
+        "OX" => Some("BZ"),
+        _ => None,
+    }
 }
-
-/// Each sequence tag with its default quality tag.
-pub(crate) const DEFAULT_QUAL_TAGS: &[(&str, &str)] = &[
-    ("CB", "CY"),
-    // CR is the raw cellular barcode; its quality has no dedicated SAM tag,
-    // so it shares CY (the cell-barcode quality) by convention, letting
-    // `--tag CR=bc::raw=true` pair a quality with no explicit `qual=`.
-    ("CR", "CY"),
-    ("RX", "QX"),
-    ("BC", "QT"),
-    ("OX", "BZ"),
-];
 
 /// The tags with a column stream that have a default quality tag, each with that
 /// quality tag.
@@ -2046,7 +2041,7 @@ fn validate_plan(plan: &DemuxPlan) -> Result<()> {
                     }
                 }
                 Some(GroupSource::Inline(_)) => bail!(
-                    "extract `{}` reads column `{column}` of group `{group}`, but an inline set has \
+                    "extract `{}` reads column {column:?} of group `{group}`, but an inline set has \
                      only `id` and `seq`",
                     extract.name
                 ),

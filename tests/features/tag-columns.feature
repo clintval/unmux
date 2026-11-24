@@ -138,7 +138,7 @@ Feature: Tag-file column streams
   Scenario: an inline set has no other column
     When I run `unmux reads.fq --group bc={w1=AACCGG} --extract a=@bc::cell --tag xa=a --out out.sam`
     Then the exit code is 1
-    And stderr contains "extract `a` reads column `cell` of group `bc`, but an inline set has only `id` and `seq`"
+    And stderr contains "extract `a` reads column "cell" of group `bc`, but an inline set has only `id` and `seq`"
     And a file "out.sam" does not exist
 
   Scenario Outline: an inline tag ID must be printable ASCII to be read
@@ -221,9 +221,14 @@ Feature: Tag-file column streams
   Scenario: an unknown column is an error that lists the file's columns
     When I run `unmux reads.fq --group bc=tags.tsv --extract cell=@bc::nope --tag xc=cell --out out.sam --metrics-summary m.tsv`
     Then the exit code is 1
-    And stderr contains "tags.tsv: no column `nope`; the columns are: id, seq, Cell, note"
+    And stderr contains "tags.tsv: no column "nope"; the columns are: id, seq, Cell, note"
     And a file "out.sam" does not exist
     And a file "m.tsv" does not exist
+
+  Scenario: an unknown column is escaped in its error
+    When I run `unmux reads.fq --group bc=tags.tsv --extract cell=@bc::%09%00 --tag xc=cell`
+    Then the exit code is 1
+    And stderr contains "no column "\t\0"; the columns are: id, seq, Cell, note"
 
   Scenario: a value that is not printable ASCII is an error naming its line
     Given a file "spaced.tsv" containing:
@@ -236,7 +241,7 @@ Feature: Tag-file column streams
       """
     When I run `unmux reads.fq --group bc=spaced.tsv --extract cell=@bc::cell --tag xc=cell --out out.sam`
     Then the exit code is 1
-    And stderr contains "spaced.tsv: line 5: value "é" in column `cell`"
+    And stderr contains "spaced.tsv: line 5: value "é" in column "cell""
     And a file "out.sam" does not exist
 
   Scenario Outline: a malformed column span is an error
@@ -275,7 +280,7 @@ Feature: Tag-file column streams
       """
     When I run `unmux reads.fq --group bc=extra.tsv --extract cell=@bc::Cell --tag xc=cell`
     Then the exit code is 1
-    And stderr contains "more than one column `Cell`"
+    And stderr contains "more than one column "Cell""
 
   Scenario: headers that differ only by case are read by their exact spelling
     Given a file "extra.tsv" containing:
@@ -366,6 +371,21 @@ Feature: Tag-file column streams
       | --per-record           | sam | 1       |
       | --per-record           | bam | 8       |
       | --tag CB::qual=none    | sam | 8       |
+
+  Scenario: a carried CY is dropped when a column tag replaces CR
+    Given a file "carried.sam" containing:
+      """
+      @HD	VN:1.6
+      c1	4	*	0	0	*	*	0	0	AACCGGACGT	IIIIIIIIII	CB:Z:OLD	CY:Z:III
+      c2	4	*	0	0	*	*	0	0	AACCGGACGT	IIIIIIIIII	CR:Z:OLD	CB:Z:OLD	CY:Z:III
+      """
+    When I run `unmux carried.sam --pool p --group bc=tags.tsv --group bc::loc=0:0:6 --extract cell=@bc::cell --tag CR=cell --out out.sam`
+    Then the exit code is 0
+    And the records of "out.sam" are:
+      """
+      c1	4	*	0	255	*	*	0	0	AACCGGACGT	IIIIIIIIII	CB:Z:OLD	CR:Z:A+B	RG:Z:p
+      c2	4	*	0	255	*	*	0	0	AACCGGACGT	IIIIIIIIII	CR:Z:A+B	CB:Z:OLD	RG:Z:p
+      """
 
   Scenario: a default quality tag left out for a column is warned about
     When I run `unmux reads.fq --group bc=tags.tsv --extract cell=@bc::cell --extract u=0:6:10 --tag CB=cell+u`

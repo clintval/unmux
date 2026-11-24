@@ -171,9 +171,14 @@ fn parse_tag_table(text: &str, wanted: &[&str]) -> Result<(TagSet, TagColumns)> 
             .filter(|s| !s.is_empty())
             .map(str::to_string);
         for (name, index, column) in &mut values {
-            let value = match cell(&cells, *index).filter(|value| !value.is_empty()) {
+            let value = if *index == id_col {
+                Some(id)
+            } else {
+                cells.get(*index).map(|cell| cell.trim_matches(' '))
+            };
+            let value = match value.filter(|value| !value.is_empty()) {
                 Some(value) if !is_column_value(value) => bail!(
-                    "line {line}: value {value:?} in column `{name}` may hold only printable \
+                    "line {line}: value {value:?} in column {name:?} may hold only printable \
                      ASCII and spaces"
                 ),
                 Some(value) => value,
@@ -224,10 +229,14 @@ fn find_wanted_column(header: &str, name: &str, id_col: usize, seq_col: usize) -
     match found.as_slice() {
         [index] => Ok(*index),
         [] => {
-            let known: Vec<&str> = columns.into_iter().filter(|c| !c.is_empty()).collect();
-            bail!("no column `{name}`; the columns are: {}", known.join(", "))
+            let known: Vec<String> = columns
+                .iter()
+                .filter(|column| !column.is_empty())
+                .map(|column| column.escape_debug().to_string())
+                .collect();
+            bail!("no column {name:?}; the columns are: {}", known.join(", "))
         }
-        _ => bail!("more than one column `{name}`"),
+        _ => bail!("more than one column {name:?}"),
     }
 }
 
@@ -410,8 +419,33 @@ mod tests {
         let err = parse_tag_table("id\tseq\tCell\t\nt1\tACGT\tx\n", &["nope"]).unwrap_err();
         assert_eq!(
             err.to_string(),
-            "no column `nope`; the columns are: id, seq, Cell"
+            "no column \"nope\"; the columns are: id, seq, Cell"
         );
+    }
+
+    #[test]
+    fn test_parse_tag_table_escapes_column_names_in_errors() {
+        let err = parse_tag_table("id\tseq\ta\u{1}b\nt1\tACGT\tx\n", &["\t\0"]).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "no column \"\\t\\0\"; the columns are: id, seq, a\\u{1}b"
+        );
+    }
+
+    #[test]
+    fn test_parse_tag_table_trims_only_ascii_spaces_from_column_values() {
+        for bad in ["\u{a0}ok\u{3000}", "\u{a0}", "ok\u{b}", "\u{c}", " \u{85} "] {
+            let table = format!("id\tseq\tcell\tnote\nt1\tACGT\t{bad}\tx\n");
+            assert!(parse_tag_table(&table, &[]).is_ok());
+            let err = parse_tag_table(&table, &["cell"]).unwrap_err().to_string();
+            assert!(err.starts_with("line 2: value"), "{bad:?}: {err}");
+        }
+        let table = "id\tseq\tcell\n\u{a0}t1\u{b}\t\u{3000}ACGT\t  a b  \nt2\tTTTT\t   \n";
+        let (set, columns) = parse_tag_table(table, &["cell", "id"]).unwrap();
+        assert_eq!(set.entries[0].id, "t1");
+        assert_eq!(set.entries[0].seq, "ACGT");
+        assert_eq!(columns["id"], vec!["t1", "t2"]);
+        assert_eq!(columns["cell"], vec!["a b", "TTTT"]);
     }
 
     #[test]
@@ -477,7 +511,7 @@ mod tests {
         let err = parse_marked_tag_table("\u{feff}cell\tid\tseq\nx\tt1\tACGT\n", &["no"]);
         assert_eq!(
             err.unwrap_err().to_string(),
-            "no column `no`; the columns are: cell, id, seq"
+            "no column \"no\"; the columns are: cell, id, seq"
         );
     }
 

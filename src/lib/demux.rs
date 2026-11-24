@@ -42,7 +42,7 @@ use crate::fanout::{
 };
 use crate::grammar::{
     column_tag_qualities, Anchor, DemuxPlan, Endpoint, GroupSource, MatchMode, OutputPattern,
-    Placeholder, SampleSpec, SpanBody, Template, DEFAULT_QUAL_TAGS,
+    Placeholder, SampleSpec, SpanBody, Template,
 };
 use crate::input::{
     Alignment, Fragment, FragmentReader, InputRecord, PendingFragment, SniffedFormat,
@@ -2861,14 +2861,12 @@ fn merge_data(carried: Option<&Data>, tag_data: &Data, column_qualities: &[(&str
 }
 
 /// Whether the carried `quality` tag described the old value of `tag`, which
-/// `tag_data` rewrites without qualities. A quality tag shared with another
-/// carried tag that is kept (`CR` and `CB` share `CY`) still describes that one.
+/// `tag_data` rewrites without qualities. A `CY` is the quality of `CR`, so one
+/// carried with a `CR` that is kept outlives a rewritten `CB`.
 fn is_stale_quality(carried: &Data, tag_data: &Data, tag: &str, quality: &str) -> bool {
     let has = |data: &Data, tag: &str| data.get(&tag_bytes(tag)).is_some();
-    let is_shared = DEFAULT_QUAL_TAGS.iter().any(|&(other, other_quality)| {
-        other != tag && other_quality == quality && has(carried, other) && !has(tag_data, other)
-    });
-    has(carried, quality) && has(tag_data, tag) && !has(tag_data, quality) && !is_shared
+    let keeps_cr = tag == "CB" && has(carried, "CR") && !has(tag_data, "CR");
+    has(carried, quality) && has(tag_data, tag) && !has(tag_data, quality) && !keeps_cr
 }
 
 /// Build the corrected form of a matched `@grp` stream: always the declared
@@ -5754,6 +5752,14 @@ mod tests {
         assert_eq!(merged(&["CY"], &["CB"], cb), "CB");
         assert_eq!(merged(&["CR", "CB", "CY"], &["CB"], cb), "CR CB CY");
         assert_eq!(merged(&["CR", "CB", "CY"], &["CB", "CR"], cb), "CR CB");
+        let cr = &[("CR", "CY")];
+        assert_eq!(merged(&["CB", "CY"], &["CR"], cr), "CB CR");
+        assert_eq!(merged(&["CR", "CY"], &["CR"], cr), "CR");
+        assert_eq!(merged(&["CR", "CB", "CY"], &["CR"], cr), "CR CB");
+        assert_eq!(merged(&["CR", "CB", "CY"], &["CB"], cr), "CR CB CY");
+        let both = &[("CB", "CY"), ("CR", "CY")];
+        assert_eq!(merged(&["CR", "CB", "CY"], &["CB", "CR"], both), "CR CB");
+        assert_eq!(merged(&["CR", "CB", "CY"], &["CB"], both), "CR CB CY");
         assert_eq!(merged(&["CB", "CY", "QX"], &["CB"], cb), "CB QX");
     }
 }
