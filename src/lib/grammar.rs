@@ -3571,6 +3571,28 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_plan_nearest_with_zero_delta_is_error() {
+        let parse = |attrs: &[&str]| {
+            let mut a = args();
+            a.groups = vec!["g={ACGT}".to_string()];
+            a.groups
+                .extend(attrs.iter().map(|attr| format!("g::{attr}")));
+            parse_demux(&a)
+        };
+        let err = parse(&["mode=nearest,delta=0"]).unwrap_err();
+        assert!(
+            err.to_string().contains("delta must be at least 1"),
+            "{err}"
+        );
+        assert!(
+            parse(&["delta=0", "mode=nearest"]).is_err(),
+            "the two attributes conflict across separate flags too"
+        );
+        assert!(parse(&["mode=nearest"]).is_ok());
+        assert!(parse(&["mode=nearest,delta=1"]).is_ok());
+    }
+
+    #[test]
     fn test_parse_group_anchored() {
         let mut a = args();
         a.groups = vec!["g={ACGT}".to_string(), "g::loc=0:0:4,anchor=5p".to_string()];

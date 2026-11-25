@@ -4397,6 +4397,36 @@ mod tests {
     }
 
     #[test]
+    fn test_compile_groups_defaults_nearest_delta_to_one() {
+        let mut args = base_args();
+        args.inputs = vec!["0=/dev/null".to_string()];
+        args.groups = vec![
+            "g={s1=TGAGC,s2=TGAGA}".to_string(),
+            "g::loc=0:0:5,dist=1,mode=nearest".to_string(),
+        ];
+        let plan = crate::grammar::parse_demux(&args).unwrap();
+        let resolved = HashMap::new();
+        let (tag_sets, _) = load_tag_sets(&plan, &resolved).unwrap();
+        let (compiled, _index) = compile_groups(&plan, &tag_sets, &resolved).unwrap();
+        let outcome = |read: &[u8]| match_group(&compiled[0], &mut Scratch::new(), &[read]);
+        let matched_tags = |result: &GroupOutcome| -> BTreeSet<usize> {
+            result.accepted.iter().map(|hit| hit.tag_idx).collect()
+        };
+
+        let winner = outcome(b"TGAGCCCC");
+        assert_eq!(matched_tags(&winner), BTreeSet::from([0, 1]));
+        assert_eq!(
+            winner.best.map(|hit| (hit.tag_idx, hit.cost)),
+            Some((0, 0)),
+            "a one-cost gap over the runner-up meets the default delta"
+        );
+
+        let tie = outcome(b"TGAGTCCC");
+        assert_eq!(matched_tags(&tie), BTreeSet::from([0, 1]));
+        assert_eq!(tie.best, None, "a tie is left unmatched with no delta");
+    }
+
+    #[test]
     fn test_anchor5p_relative_next_window() {
         // anchor5p as a relative next= window target (no own loc): grp_a
         // matches AAAA at [0,4], its next=grp_b:0-4 window starts at grp_a's

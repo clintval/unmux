@@ -1421,6 +1421,18 @@ mod tests {
     }
 
     #[test]
+    fn test_match_group_nearest_bare_group_rejects_ties() {
+        let mut g = group(&["AAAACCCC", "GGGGTTTT"]);
+        g.mode = MatchMode::Nearest;
+        let tie = outcome(&g, "AAAACCCCGGGGTTTT");
+        assert_eq!(tie.accepted.len(), 2, "both tags match: {tie:?}");
+        assert!(
+            tie.best.is_none(),
+            "two cost-0 matches are ambiguous: {tie:?}"
+        );
+    }
+
+    #[test]
     fn test_match_group_total_order_leftmost_breaks_cost_tie() {
         // The same tag occurs twice at cost 0; the leftmost wins.
         let g = group(&["ACGTACGT"]);
