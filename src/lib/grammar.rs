@@ -2076,6 +2076,22 @@ fn validate_plan(plan: &DemuxPlan) -> Result<()> {
                 );
             }
         }
+        if let SpanBody::Between { from, to } = &extract.span.body {
+            let pinned_file = |name: &str| {
+                let group = plan.groups.iter().find(|g| g.name == name)?;
+                Some(group.attrs.loc.as_ref()?.file)
+            };
+            if let (Some(from_file), Some(to_file)) = (pinned_file(from), pinned_file(to)) {
+                if from_file != to_file {
+                    bail!(
+                        "extract `{}` anchors on `@{from}..@{to}`, but `loc` pins `{from}` to input \
+                         file {from_file} and `{to}` to input file {to_file}; a between-anchors \
+                         region lies within one input file",
+                        extract.name
+                    );
+                }
+            }
+        }
         if let SpanBody::Column { group, column } = &extract.span.body {
             let source = plan
                 .groups
@@ -3699,6 +3715,29 @@ mod tests {
         a.groups = vec!["sb=meta.tsv".to_string(), "sb::match=i7".to_string()];
         let err = parse_demux(&a).unwrap_err();
         assert!(err.to_string().contains("match= group"), "{err}");
+    }
+
+    #[test]
+    fn test_validate_plan_between_anchors_pinned_to_different_files_is_error() {
+        let between = |from_attrs: &str, to_attrs: &str| {
+            let mut a = args();
+            a.inputs = vec!["0=r1.fq".to_string(), "1=r2.fq".to_string()];
+            a.extracts = vec!["ins=@g1..@g2".to_string()];
+            a.groups = vec![
+                "g1={AAAA}".to_string(),
+                "g2={TTTT}".to_string(),
+                format!("g1::{from_attrs}"),
+                format!("g2::{to_attrs}"),
+            ];
+            parse_demux(&a)
+        };
+        let err = between("loc=0:0:4", "loc=1:0:4").unwrap_err().to_string();
+        assert!(err.contains("extract `ins`"), "{err}");
+        assert!(err.contains("`g1` to input file 0"), "{err}");
+        assert!(err.contains("`g2` to input file 1"), "{err}");
+        assert!(between("loc=1:0:4", "loc=1:8:12").is_ok());
+        assert!(between("loc=0:0:4", "dist=1").is_ok());
+        assert!(between("dist=1", "loc=1:0:4").is_ok());
     }
 
     #[test]

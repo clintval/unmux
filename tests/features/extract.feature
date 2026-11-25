@@ -5,7 +5,7 @@ Feature: Extraction spans and preserved qualities
   offsets, and multi-stream tag assembly with separators. sassy never touches qualities: an extracted
   stream slices the original quals by the matched coordinates, so no separate quality-repair step is needed.
 
-  Each scenario surfaces the extracted bases (and, where relevant, the sliced qualities) as SAM tags
+  Most scenarios surface the extracted bases (and, where relevant, the sliced qualities) as SAM tags
   in the FASTQ read-name comment (`TAG:Z:VALUE` plus a paired quality tag), so they are directly
   observable on stdout. Every fixture uses non-repeating bases and per-position-distinct quality
   characters so that a wrong slice position, a missing reverse, or a leaked separator would change the
@@ -101,6 +101,68 @@ Feature: Extraction spans and preserved qualities
     Then the exit code is 0
     And stdout contains "SP:Z:CGCGCGTACG"
     And stdout does not contain "SP:Z:CGCGCGTACGTTTTTT"
+
+  Scenario: A between-anchor span is empty for a record whose anchors are out of order
+    Given a file "reads.fq" containing:
+      """
+      @fwd1
+      AAAAAACGCGCGTACGTTTTTTGGGG
+      +
+      0123456789abcdefghijklmnop
+      @swapped
+      TTTTTTCGCGCGTACGAAAAAAGGGG
+      +
+      0123456789abcdefghijklmnop
+      @fwd2
+      AAAAAAGGATCCTTTTTTGGGG
+      +
+      0123456789abcdefghijkl
+      """
+    # In @swapped gB (TTTTTT) sits at [0,6), before gA (AAAAAA) at [16,22), so no bases run from gA's
+    # end to gB's start: the spacer is empty but present, as it is when an anchor does not match, and
+    # the record is written empty. The run carries on, so @fwd1 and @fwd2 keep their spacers [6,16) and
+    # [6,12) with the qualities of those positions.
+    When I run `unmux reads.fq --group gA={s1=AAAAAA} --group gB={s1=TTTTTT} --extract spacer=@gA..@gB --template spacer --out out.fq`
+    Then the exit code is 0
+    And the file "out.fq" is:
+      """
+      @fwd1
+      CGCGCGTACG
+      +
+      6789abcdef
+      @swapped
+
+      +
+
+      @fwd2
+      GGATCC
+      +
+      6789ab
+      """
+
+  Scenario: A between-anchor span over groups pinned to different input files is a fail-fast error
+    Given a file "r1.fq" containing:
+      """
+      @q
+      AAAAAACGCGCGTACG
+      +
+      IIIIIIIIIIIIIIII
+      """
+    And a file "r2.fq" containing:
+      """
+      @q
+      GGATCCTTTTTTGGGG
+      +
+      IIIIIIIIIIIIIIII
+      """
+    # gA is pinned to file 0 and gB to file 1, so no record can hold a region between them. The check
+    # runs at parse time (before any record) and reports the extract and both pins. Dropping either
+    # `loc` leaves that group free to match in the other group's file, and the run succeeds.
+    When I run `unmux r1.fq r2.fq --group gA={s1=AAAAAA} --group gA::loc=0:0:6 --group gB={s1=TTTTTT} --group gB::loc=1:6:12 --extract spacer=@gA..@gB --extract body=0:0:end --tag SP=spacer --template body`
+    Then the exit code is 1
+    And stderr contains "extract `spacer`"
+    And stderr contains "`gA` to input file 0"
+    And stderr contains "`gB` to input file 1"
 
   Scenario: A ~ tag stream reverse-complements an anchored-offset span
     Given a file "reads.fq" containing:
