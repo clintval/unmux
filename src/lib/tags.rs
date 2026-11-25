@@ -4,7 +4,8 @@
 //! (`group::id-or-seq`) and sheet cells resolve against.
 //!
 //! A tag file is a headered TSV with `#` comments skipped, an id column (header
-//! `id`, `tag`, `name`, `sample_id`, or `sample`) and a sequence column (header
+//! `id`, `tag`, `name`, `sample_id`, or `sample`; no ID may repeat, though IDs
+//! that differ only by case are distinct) and a sequence column (header
 //! `seq`, `sequence`, or `barcode`), plus an optional `sub_sample` column
 //! consumed by `--sample-from-group` to set read-group `LB`. Any other column is
 //! ignored unless an `--extract NAME=@group::COLUMN` reads it.
@@ -123,7 +124,8 @@ fn parse_marked_tag_table(text: &str, wanted: &[&str]) -> Result<(TagSet, TagCol
 }
 
 /// Parse the text of a tag table (headered TSV; blank lines and `#` comments
-/// skipped), keeping the values of its `wanted` columns.
+/// skipped), keeping the values of its `wanted` columns. Each row must have its
+/// own ID.
 fn parse_tag_table(text: &str, wanted: &[&str]) -> Result<(TagSet, TagColumns)> {
     let mut rows = text
         .lines()
@@ -157,6 +159,7 @@ fn parse_tag_table(text: &str, wanted: &[&str]) -> Result<(TagSet, TagColumns)> 
         .collect::<Result<Vec<(&str, usize, Vec<String>)>>>()?;
 
     let mut entries = Vec::new();
+    let mut id_lines: HashMap<&str, usize> = HashMap::new();
     for (line, row) in rows {
         let cells: Vec<&str> = row.split('\t').collect();
         let id = cell(&cells, id_col)
@@ -165,6 +168,9 @@ fn parse_tag_table(text: &str, wanted: &[&str]) -> Result<(TagSet, TagColumns)> 
             .with_context(|| format!("line {line} is missing its sequence column"))?;
         if id.is_empty() || seq.is_empty() {
             bail!("line {line} has an empty id or sequence");
+        }
+        if let Some(first) = id_lines.insert(id, line) {
+            bail!("line {line} repeats tag ID {id:?} from line {first}; each tag needs its own ID");
         }
         let sub_sample = sub_sample_col
             .and_then(|c| cell(&cells, c))
@@ -489,6 +495,46 @@ mod tests {
             let err = parse_tag_table(&table, &[]).unwrap_err().to_string();
             assert_eq!(err, message);
         }
+    }
+
+    #[test]
+    fn test_parse_tag_table_repeated_id_gives_both_file_lines() {
+        let err = parse_tag_table("id\tseq\ns1\tAAAA\ns1\tCCCC\ns2\tGGGG\n", &[]).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "line 3 repeats tag ID \"s1\" from line 2; each tag needs its own ID"
+        );
+        let table = "# note\n\nid\tseq\tcell\n# inner\ns1\tAAAA\tx\n\ns2\tGGGG\ty\ns1\tCCCC\tz\n";
+        for wanted in [&[][..], &["cell"], &["id"]] {
+            let err = parse_tag_table(table, wanted).unwrap_err().to_string();
+            assert!(
+                err.starts_with("line 8 repeats tag ID \"s1\" from line 5"),
+                "{err}"
+            );
+        }
+        let err = parse_marked_tag_table("\u{feff}id\tseq\ns1\tAAAA\ns1\tCCCC\n", &[]);
+        assert!(err.unwrap_err().to_string().starts_with("line 3 repeats"));
+    }
+
+    #[test]
+    fn test_parse_tag_table_ids_differing_only_by_case_are_distinct() {
+        let set = parse_tag_table("id\tseq\ns1\tAAAA\nS1\tCCCC\n", &[])
+            .unwrap()
+            .0;
+        assert_eq!(set.resolve("s1"), Some(0));
+        assert_eq!(set.resolve("S1"), Some(1));
+    }
+
+    #[test]
+    fn test_load_tag_file_rejects_a_repeated_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tags.tsv");
+        std::fs::write(&path, "id\tseq\ns1\tAAAA\ns1\tCCCC\n").unwrap();
+        let err = format!("{:#}", load_tag_file(&path).unwrap_err());
+        assert!(
+            err.ends_with("line 3 repeats tag ID \"s1\" from line 2; each tag needs its own ID"),
+            "{err}"
+        );
     }
 
     #[test]

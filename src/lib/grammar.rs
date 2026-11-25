@@ -17,7 +17,7 @@
 //! key twice is a fail-fast error. The full grammar is derivable from `--help`
 //! (every flag carries its own examples).
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
@@ -790,7 +790,8 @@ fn parse_group_source(value: &str, group: &str) -> Result<GroupSource> {
             format!("inline tag set for group `{group}` is missing a closing `}}`: {value:?}")
         })?;
         let mut tags = Vec::new();
-        for entry in inner.split(',') {
+        let mut id_positions: HashMap<String, usize> = HashMap::new();
+        for (index, entry) in inner.split(',').enumerate() {
             let entry = entry.trim();
             if entry.is_empty() {
                 continue;
@@ -807,6 +808,14 @@ fn parse_group_source(value: &str, group: &str) -> Result<GroupSource> {
                     seq: entry.to_string(),
                 },
             };
+            let id = if tag.id.is_empty() { &tag.seq } else { &tag.id };
+            if let Some(first) = id_positions.insert(id.clone(), index + 1) {
+                bail!(
+                    "inline tag set for group `{group}`: entry {} repeats tag ID {id:?} from \
+                     entry {first}; each tag needs its own ID",
+                    index + 1
+                );
+            }
             tags.push(tag);
         }
         if tags.is_empty() {
@@ -3027,6 +3036,39 @@ mod tests {
                 seq: "ACAGGCG".to_string()
             }
         );
+    }
+
+    #[test]
+    fn test_parse_groups_inline_set_repeated_id_is_error() {
+        for (source, entries) in [
+            (
+                "{s1=AAAA,s1=CCCC}",
+                "entry 2 repeats tag ID \"s1\" from entry 1",
+            ),
+            (
+                "{AAAA=CCCC, AAAA}",
+                "entry 2 repeats tag ID \"AAAA\" from entry 1",
+            ),
+            (
+                "{,s1=AAAA,,s2=GGGG,s1=CCCC}",
+                "entry 5 repeats tag ID \"s1\" from entry 2",
+            ),
+        ] {
+            let err = parse_groups(&[format!("bc={source}")]).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                format!("inline tag set for group `bc`: {entries}; each tag needs its own ID")
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_groups_inline_set_ids_differing_only_by_case_are_distinct() {
+        let groups = parse_groups(&["bc={s1=AAAA,S1=CCCC}".to_string()]).unwrap();
+        let GroupSource::Inline(tags) = &groups[0].source else {
+            panic!("expected inline source");
+        };
+        assert_eq!(tags.len(), 2);
     }
 
     #[test]
