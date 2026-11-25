@@ -35,7 +35,7 @@ use crate::grammar::{
     default_qual_tag, OutputPattern, PatternSegment, Placeholder, QualTag, TagBinding,
 };
 use crate::input::{SniffedFormat, PHRED_OFFSET};
-use crate::writer::{output_format, OutputRead, OutputWriter};
+use crate::writer::{file_id, output_format, FileId, OutputRead, OutputWriter};
 
 /// A non-standard read-group field tag (e.g. `SM`/`LB`/`CN`), as the
 /// `Map<ReadGroup>` builder takes.
@@ -624,79 +624,125 @@ impl std::fmt::Display for OutputOrigin {
 /// Refuse outputs that would be one file: paths differing only in case, or two spellings of one.
 pub fn check_output_collisions(outputs: &[(PathBuf, OutputOrigin)]) -> Result<()> {
     let mut dirs: HashMap<PathBuf, PathBuf> = HashMap::new();
-    let mut seen: HashMap<String, (&Path, &OutputOrigin)> = HashMap::new();
-    for (path, origin) in outputs {
-        let Some(key) = file_key(path, &mut dirs) else {
+    let mut by_name: HashMap<String, usize> = HashMap::new();
+    let mut by_file: HashMap<FileId, usize> = HashMap::new();
+    for (index, (path, origin)) in outputs.iter().enumerate() {
+        let Some((name, file)) = file_key(path, &mut dirs) else {
             continue;
         };
-        let Some(&(first, first_origin)) = seen.get(&key) else {
-            seen.insert(key, (path, origin));
+        let earlier = by_name
+            .get(&name)
+            .or_else(|| file.and_then(|file| by_file.get(&file)))
+            .copied();
+        by_name.entry(name).or_insert(index);
+        if let Some(file) = file {
+            by_file.entry(file).or_insert(index);
+        }
+        let Some((first, first_origin)) = earlier.map(|earlier| &outputs[earlier]) else {
             continue;
         };
         // Record outputs on one path share a writer, but a metrics file is written on its own.
         let metrics = |o: &OutputOrigin| matches!(o, OutputOrigin::Metrics(_));
-        if first == path.as_path() && !metrics(first_origin) && !metrics(origin) {
+        if first == path && !metrics(first_origin) && !metrics(origin) {
             continue;
         }
+        let (lexical_a, lexical_b) = (lexical(first), lexical(path));
+        let case_only = lexical_a != lexical_b
+            && fold(&lexical_a.to_string_lossy()) == fold(&lexical_b.to_string_lossy());
         let advice = match (first_origin, origin) {
-            (OutputOrigin::Target(a), OutputOrigin::Target(b)) if a.sample == b.sample => {
-                "rename one sub_sample"
+            (OutputOrigin::Target(a), OutputOrigin::Target(b)) if case_only => {
+                if a.sample == b.sample {
+                    "rename one sub_sample"
+                } else {
+                    "rename one sample"
+                }
             }
-            (OutputOrigin::Target(_), OutputOrigin::Target(_)) => "rename one sample",
             _ => "give them distinct paths",
         };
-        let (a, b) = (first.to_string_lossy(), path.to_string_lossy());
-        let reason = if a != b && a.to_lowercase() == b.to_lowercase() {
+        let reason = if case_only {
             "differ only in case, so they would be one file on a case-insensitive file system"
         } else {
             "are the same file"
         };
+        let (a, b) = (first.display(), path.display());
         bail!("outputs \"{a}\" ({first_origin}) and \"{b}\" ({origin}) {reason}; {advice}");
     }
     Ok(())
 }
 
-/// A case-folded absolute spelling of the file `path` writes, or `None` for a non-regular file.
-fn file_key(path: &Path, dirs: &mut HashMap<PathBuf, PathBuf>) -> Option<String> {
-    let target = crate::writer::link_target(path);
-    let resolved = match std::fs::metadata(&target) {
-        Ok(metadata) if !metadata.is_file() => return None,
-        Ok(_) => std::fs::canonicalize(&target).unwrap_or(target),
-        Err(_) => match target.file_name() {
-            Some(name) => {
-                let parent = target.parent().unwrap_or(Path::new(""));
-                dirs.entry(parent.to_path_buf())
-                    .or_insert_with(|| resolve_dir(parent))
-                    .join(name)
+/// The case-folded absolute path `path` writes and its existing file, or `None` if not regular.
+fn file_key(path: &Path, dirs: &mut HashMap<PathBuf, PathBuf>) -> Option<(String, Option<FileId>)> {
+    let resolved = match path.file_name() {
+        Some(name) => {
+            let parent = path.parent().unwrap_or(Path::new(""));
+            let candidate = dirs
+                .entry(parent.to_path_buf())
+                .or_insert_with(|| resolve(parent, &mut 0))
+                .join(name);
+            match std::fs::symlink_metadata(&candidate) {
+                Ok(metadata) if metadata.file_type().is_symlink() => resolve(&candidate, &mut 0),
+                _ => candidate,
             }
-            None => resolve_dir(&target),
-        },
+        }
+        None => resolve(path, &mut 0),
     };
-    Some(resolved.to_string_lossy().to_lowercase())
+    let file = match std::fs::metadata(&resolved) {
+        Ok(metadata) if !metadata.is_file() => return None,
+        Ok(metadata) => file_id(&metadata),
+        Err(_) => None,
+    };
+    Some((fold(&resolved.to_string_lossy()), file))
 }
 
-/// The absolute form of `dir`, canonicalizing its longest existing ancestor.
-fn resolve_dir(dir: &Path) -> PathBuf {
-    for base in dir.ancestors() {
-        let real = if base.as_os_str().is_empty() {
-            std::env::current_dir()
-        } else {
-            std::fs::canonicalize(base)
-        };
-        if let Ok(mut real) = real {
-            for part in dir.strip_prefix(base).unwrap_or(Path::new("")).components() {
-                match part {
-                    Component::ParentDir => {
-                        real.pop();
-                    }
-                    Component::CurDir => {}
-                    part => real.push(part),
-                }
+/// The absolute form of `path`, following every symbolic link in it, even a dangling one.
+fn resolve(path: &Path, hops: &mut u32) -> PathBuf {
+    let mut real = if path.is_absolute() {
+        PathBuf::new()
+    } else {
+        std::env::current_dir().unwrap_or_default()
+    };
+    for part in path.components() {
+        match part {
+            Component::ParentDir => {
+                real.pop();
             }
-            return real;
+            Component::CurDir => {}
+            Component::Normal(name) => {
+                let next = real.join(name);
+                real = match std::fs::read_link(&next) {
+                    Ok(target) if *hops < 40 => {
+                        *hops += 1;
+                        resolve(&real.join(target), hops)
+                    }
+                    _ => next,
+                };
+            }
+            root => real.push(root),
         }
     }
-    dir.to_path_buf()
+    real
+}
+
+/// The components of `path` with `.` dropped and each `..` removing the name before it.
+fn lexical(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for part in path.components() {
+        match part {
+            Component::CurDir => {}
+            Component::ParentDir
+                if matches!(out.components().next_back(), Some(Component::Normal(_))) =>
+            {
+                out.pop();
+            }
+            part => out.push(part),
+        }
+    }
+    out
+}
+
+/// Lowercase `text` for comparing paths.
+fn fold(text: &str) -> String {
+    text.to_lowercase()
 }
 
 #[cfg(test)]
@@ -1414,5 +1460,54 @@ mod tests {
                 OutputOrigin::Records("--unassigned".to_string())
             ),
         ]));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_collision_hard_links_to_one_file_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (dir.path().join("a.fq"), dir.path().join("b.fq"));
+        std::fs::write(&a, "").unwrap();
+        std::fs::hard_link(&a, &b).unwrap();
+        let outputs = [(a, sample("a", None)), (b, sample("b", None))];
+        let error = check_output_collisions(&outputs).unwrap_err().to_string();
+        assert!(
+            error.contains("are the same file; give them distinct paths"),
+            "{error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_collision_dangling_symbolic_links_are_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink("missing.fq", dir.path().join("to-missing.fq")).unwrap();
+        std::os::unix::fs::symlink("new", dir.path().join("L")).unwrap();
+        for (a, b) in [("missing.fq", "to-missing.fq"), ("new/a.fq", "L/a.fq")] {
+            let outputs = [
+                (dir.path().join(a), sample("a", None)),
+                (
+                    dir.path().join(b),
+                    OutputOrigin::Records("--unassigned".to_string()),
+                ),
+            ];
+            let error = check_output_collisions(&outputs).unwrap_err().to_string();
+            assert!(error.contains("are the same file"), "{a} and {b}: {error}");
+        }
+    }
+
+    #[test]
+    fn test_collision_through_parent_directories_asks_for_distinct_paths() {
+        for other in ["b", "A"] {
+            let error = collision(&[
+                ("o/a/../x.fq", sample("a", None)),
+                (&format!("o/{other}/../x.fq"), sample(other, None)),
+            ])
+            .unwrap();
+            assert!(
+                error.ends_with("are the same file; give them distinct paths"),
+                "{error}"
+            );
+        }
     }
 }

@@ -655,7 +655,7 @@ impl Drop for StagedOutputs {
 }
 
 /// The file `path` finally points to, following symbolic links even when the last one dangles.
-pub(crate) fn link_target(path: &Path) -> PathBuf {
+fn link_target(path: &Path) -> PathBuf {
     let mut target = path.to_path_buf();
     for _ in 0..40 {
         match std::fs::read_link(&target) {
@@ -701,6 +701,21 @@ fn carries_over(existing: &std::fs::Metadata, temporary: &Path) -> bool {
 #[cfg(not(unix))]
 fn carries_over(_: &std::fs::Metadata, _: &Path) -> bool {
     true
+}
+
+/// A file's device and inode, which two names of one file share.
+pub(crate) type FileId = (u64, u64);
+
+/// The device and inode of a file, where the platform reports them.
+#[cfg(unix)]
+pub(crate) fn file_id(metadata: &std::fs::Metadata) -> Option<FileId> {
+    use std::os::unix::fs::MetadataExt;
+    Some((metadata.dev(), metadata.ino()))
+}
+
+#[cfg(not(unix))]
+pub(crate) fn file_id(_: &std::fs::Metadata) -> Option<FileId> {
+    None
 }
 
 /// Create an output file, making any missing parent directories first. Shared

@@ -1,0 +1,77 @@
+//! Outputs that are one file under two names are refused before any record is written.
+
+#![cfg(unix)]
+
+use std::path::Path;
+
+use assert_cmd::Command;
+
+const READS: &str =
+    "@r1\nAAAAAAAACCCCGGGG\n+\nIIIIIIIIIIIIIIII\n@r2\nTTTTTTTTGGCCATGC\n+\nIIIIIIIIIIIIIIII\n";
+
+fn unmux(dir: &Path, args: &[&str]) -> (i32, String) {
+    std::fs::write(dir.join("reads.fq"), READS).unwrap();
+    let output = Command::cargo_bin("unmux")
+        .unwrap()
+        .current_dir(dir)
+        .arg("reads.fq")
+        .args(["--group", "bc={a=AAAAAAAA,b=TTTTTTTT}"])
+        .args(args)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    (output.status.code().unwrap(), stderr)
+}
+
+fn entries(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+#[test]
+fn hard_linked_outputs_are_refused_and_left_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("o");
+    std::fs::create_dir(&out).unwrap();
+    std::fs::write(out.join("a.fq"), "keep").unwrap();
+    std::fs::hard_link(out.join("a.fq"), out.join("b.fq")).unwrap();
+    let (code, stderr) = unmux(
+        dir.path(),
+        &["--sample-from-group", "bc", "--out", "o/%sample.fq"],
+    );
+    assert_eq!(code, 1, "{stderr}");
+    assert!(
+        stderr
+            .contains("outputs \"o/a.fq\" (sample a) and \"o/b.fq\" (sample b) are the same file"),
+        "{stderr}"
+    );
+    assert_eq!(entries(&out), ["a.fq", "b.fq"]);
+    assert_eq!(std::fs::read_to_string(out.join("b.fq")).unwrap(), "keep");
+}
+
+#[test]
+fn an_output_through_a_dangling_directory_link_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("o");
+    std::fs::create_dir(&out).unwrap();
+    std::os::unix::fs::symlink("new", out.join("L")).unwrap();
+    let args = [
+        "--sample",
+        "a=bc::a",
+        "--out",
+        "o/new/%sample.fq",
+        "--unassigned",
+        "o/L/a.fq",
+    ];
+    let (code, stderr) = unmux(dir.path(), &args);
+    assert_eq!(code, 1, "{stderr}");
+    assert!(
+        stderr.contains("(--unassigned) are the same file"),
+        "{stderr}"
+    );
+    assert_eq!(entries(&out), ["L"]);
+}
