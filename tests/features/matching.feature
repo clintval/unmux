@@ -74,6 +74,19 @@ Feature: Tag matching with distance tolerance and error handling
     And stdout contains "BC:Z:GGTAGG"
     And stdout contains "CB:Z:GGGGGG"
 
+  Scenario: A substitution at the tag's last base is accepted when that base follows in the read
+    Given a file "reads.fq" containing:
+      """
+      @onesub
+      ACGTACGATGGCCAA
+      +
+      IIIIIIIIIIIIIII
+      """
+    When I run `unmux reads.fq --group bc8={s1=ACGTACGT} --group bc8::dist=1 --extract bc=@bc8 --tag BC=bc --tag BC::raw=true --tag CB=bc --tag CB::qual=none --template bc`
+    Then the exit code is 0
+    And stdout contains "BC:Z:ACGTACGA"
+    And stdout contains "CB:Z:ACGTACGT"
+
   Scenario: Two substitutions exceed dist=1 and the read does not match
     Given a file "reads.fq" containing:
       """

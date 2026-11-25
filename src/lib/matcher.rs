@@ -1015,6 +1015,47 @@ mod tests {
         match_group(group, &mut Scratch::new(), &[read.as_bytes()])
     }
 
+    /// A budget of `n` substitutions and no indels.
+    fn substitutions(n: usize) -> Dist {
+        Dist {
+            mismatch: n,
+            indel: 0,
+            total: n,
+        }
+    }
+
+    /// The `[start, end)` window of the first file.
+    fn window(start: usize, end: usize) -> Option<Location> {
+        Some(Location {
+            file: 0,
+            start: Endpoint::FromStart(start),
+            end: Some(Endpoint::FromStart(end)),
+        })
+    }
+
+    /// A deterministic SplitMix64 generator.
+    struct Rng(u64);
+
+    impl Rng {
+        fn below(&mut self, n: usize) -> usize {
+            self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            ((z ^ (z >> 31)) % n as u64) as usize
+        }
+
+        fn sample(&mut self, len: usize, letters: &[u8]) -> Vec<u8> {
+            (0..len)
+                .map(|_| letters[self.below(letters.len())])
+                .collect()
+        }
+
+        fn bases(&mut self, len: usize) -> Vec<u8> {
+            self.sample(len, b"ACGT")
+        }
+    }
+
     #[test]
     fn test_match_group_exact_match_coordinates() {
         let g = group(&["ACGTACGT"]);
@@ -1219,6 +1260,176 @@ mod tests {
         assert_eq!(best.cost, 1);
         assert_eq!(best.subs, 1);
         assert_eq!(best.indels, 0);
+    }
+
+    #[test]
+    fn test_substitution_is_matched_when_an_indel_alignment_hides_it() {
+        // The last base is substituted; an equal-cost indel alignment ends one base later.
+        let mut g = group(&["ACGTACGT"]);
+        g.dist = substitutions(1);
+        for loc in [None, window(0, 12), window(0, 8)] {
+            g.loc = loc;
+            let best = outcome(&g, "ACGTACGATGGCCAA").best.expect("a match");
+            assert_eq!((best.start, best.end), (0, 8), "loc={:?}", g.loc);
+            assert_eq!((best.cost, best.subs, best.indels), (1, 1, 0));
+        }
+    }
+
+    #[test]
+    fn test_substitutions_are_matched_when_a_cheaper_indel_alignment_hides_them() {
+        // Hamming distance 2, where an alignment that deletes one tag base costs only 1.
+        let mut g = group(&["AACCGGTT"]);
+        g.dist = substitutions(2);
+        g.loc = window(0, 8);
+        let best = outcome(&g, "TAACGGTTCCCCAA").best.expect("a match");
+        assert_eq!((best.start, best.end), (0, 8));
+        assert_eq!((best.cost, best.subs, best.indels), (2, 2, 0));
+    }
+
+    #[test]
+    fn test_planted_substitutions_within_budget_are_always_matched() {
+        let mut rng = Rng(0x5eed);
+        for trial in 0..600 {
+            let len = 6 + rng.below(15);
+            let mismatch = 1 + rng.below(2);
+            let n_tags = [1, BATCHED_MIN_TAGS + 2][trial % 2];
+            let mut g = CompiledGroup::new("g", (0..n_tags).map(|_| rng.bases(len)).collect());
+            g.dist = substitutions(mismatch);
+            g.revcomp = trial % 3 == 0;
+            g.encode();
+
+            let target = rng.below(n_tags);
+            let mut planted = g.tags[target].clone();
+            let mut planted_subs = 0;
+            for _ in 0..rng.below(mismatch + 1) {
+                let at = rng.below(len);
+                planted[at] = b"ACGTN"[rng.below(5)];
+            }
+            for (a, b) in planted.iter().zip(&g.tags[target]) {
+                planted_subs += usize::from(a != b);
+            }
+            if g.revcomp && rng.below(2) == 0 {
+                crate::iupac::reverse_complement(&mut planted);
+            }
+            let left = rng.below(90);
+            let right = rng.below(90);
+            let read = [rng.bases(left), planted, rng.bases(right)].concat();
+            let read = std::str::from_utf8(&read).unwrap();
+            let end = left + len;
+
+            for loc in [
+                None,
+                window(left, end),
+                window(left.saturating_sub(4), end + 4),
+                window(left, end + 4),
+                window(left.saturating_sub(4), end),
+                Some(Location {
+                    file: 0,
+                    start: Endpoint::FromEnd(right + len),
+                    end: None,
+                }),
+            ] {
+                g.loc = loc;
+                let result = outcome(&g, read);
+                assert!(
+                    result.accepted.iter().any(|m| m.tag_idx == target
+                        && m.cost <= planted_subs
+                        && m.start < end
+                        && left < m.end),
+                    "tag {} with {planted_subs} substitutions at {left} in {read} \
+                     dist={mismatch} loc={:?}: {result:?}",
+                    String::from_utf8_lossy(&g.tags[target]),
+                    g.loc
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_each_tag_cost_equals_its_cheapest_alignment_within_caps() {
+        let mut rng = Rng(0xcafe);
+        for trial in 0..400 {
+            let (mismatch, indel, total) = [
+                (1, 0, 1),
+                (2, 0, 2),
+                (0, 1, 1),
+                (1, 1, 1),
+                (1, 1, 2),
+                (2, 1, 2),
+                (1, 2, 2),
+                (2, 1, 3),
+            ][trial % 8];
+            let len = 6 + rng.below(8);
+            // N, R, and Y are wildcards in a tag and mismatches in a read.
+            let letters: &[u8] = [&b"ACGT"[..], b"AC", b"ACGTNRY"][rng.below(3)];
+            let n_tags = [1, BATCHED_MIN_TAGS][rng.below(2)];
+            let mut g =
+                CompiledGroup::new("g", (0..n_tags).map(|_| rng.sample(len, letters)).collect());
+            g.dist = Dist {
+                mismatch,
+                indel,
+                total,
+            };
+            g.revcomp = trial % 3 == 0;
+            g.encode();
+
+            let mut planted = g.tags[0].clone();
+            for _ in 0..rng.below(4) {
+                let at = rng.below(planted.len());
+                match rng.below(3) {
+                    0 => planted[at] = letters[rng.below(letters.len())],
+                    1 => planted.insert(at, letters[rng.below(letters.len())]),
+                    _ => drop(planted.remove(at)),
+                }
+            }
+            let (left, right) = (rng.below(20), rng.below(20));
+            let left = rng.sample(left, letters);
+            let mut read = [left, planted, rng.sample(right, letters)].concat();
+            let mut other_strand = read.clone();
+            crate::iupac::reverse_complement(&mut other_strand);
+            if rng.below(2) == 0 {
+                std::mem::swap(&mut read, &mut other_strand);
+            }
+
+            let result = outcome(&g, std::str::from_utf8(&read).unwrap());
+            let strands = if g.revcomp {
+                vec![&read, &other_strand]
+            } else {
+                vec![&read]
+            };
+            for (tag_idx, tag) in g.tags.iter().enumerate() {
+                let cheapest = strands
+                    .iter()
+                    .flat_map(|text| {
+                        (0..text.len()).filter_map(|start| {
+                            let end = (start + len + indel).min(text.len());
+                            anchored_align(tag, &text[start..end], &g.dist)
+                        })
+                    })
+                    .map(|hit| hit.subs + hit.indels)
+                    .min();
+                let reported = result.accepted.iter().filter(|m| m.tag_idx == tag_idx);
+                assert_eq!(
+                    reported.map(|m| m.cost).min(),
+                    cheapest,
+                    "tag {} in {} dist={mismatch}:{indel}:{total}",
+                    String::from_utf8_lossy(tag),
+                    String::from_utf8_lossy(&read)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_hidden_match_is_found_in_a_partial_group() {
+        let mut g = group(&["ACGTACGT"]);
+        g.dist = substitutions(1);
+        g.partial5 = Some(Partial {
+            min_match: 7,
+            max_mismatch_freq: None,
+        });
+        let best = outcome(&g, "GGACGTACGATGGCCAA").best.expect("a match");
+        assert_eq!((best.start, best.end, best.cost), (2, 10, 1));
     }
 
     #[test]
