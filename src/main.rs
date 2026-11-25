@@ -288,6 +288,9 @@ struct DemuxCmd {
     /// (default: '`-`') and qualities with `qual-sep` (default: a space).
     /// Default `qual` tags pre-exist for: `CB`/`CY` `CR`/`CY` `RX`/`QX` `BC`/`QT` `OX`/`BZ`.
     ///
+    /// A tag is written only when every stream in it is present; otherwise
+    /// the tag, its quality tag, and any input copies of them are left out.
+    ///
     /// A tag built from an `@grp::COLUMN` stream has no quality tag, since
     /// qualities could not line up with its text: the default one is left out
     /// (a carried one is dropped), and setting `qual=TAG` is an error. Such a

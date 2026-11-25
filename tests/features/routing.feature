@@ -187,14 +187,117 @@ Feature: Read routing, removal, and fan-out primitives
       IIIIIIIIIIII
       """
     # There is no --assign flag: a combined barcode is just a multi-stream --tag over per-group extracts.
-    # @r1 matches both groups so CB joins them as AAAA-TTTT; @r2 matches grp_a only, so its CB degrades to
-    # the single AAAA stream. The sep=- is load-bearing on the join, and the @r2 result shows the missing
-    # grp_b stream simply drops out rather than erroring.
-    When I run `unmux reads.fq --group grp_a={A=AAAA} --group grp_a::loc=0:0:4 --group grp_b={B=TTTT} --group grp_b::loc=0:4:8 --extract bc_a=@grp_a --extract bc_b=@grp_b --extract body=0:0:end --template body --tag CB=bc_a+bc_b --tag CB::sep=- --tag CB::qual=none`
+    # @r1 matches both groups so CB joins them as AAAA-TTTT; @r2 matches grp_a only, so its grp_b stream
+    # is absent and CB is left out rather than written as the shorter AAAA.
+    When I run `unmux reads.fq --group grp_a={A=AAAA} --group grp_a::loc=0:0:4 --group grp_b={B=TTTT} --group grp_b::loc=0:4:8 --extract bc_a=@grp_a --extract bc_b=@grp_b --extract body=0:0:end --template body --tag CB=bc_a+bc_b --tag CB::sep=- --tag CB::qual=none --out out.fq`
     Then the exit code is 0
-    And stdout contains "@r1 CB:Z:AAAA-TTTT"
-    And stdout contains "@r2 CB:Z:AAAA"
-    And stdout does not contain "@r2 CB:Z:AAAA-TTTT"
+    And the file "out.fq" is:
+      """
+      @r1 CB:Z:AAAA-TTTT
+      AAAATTTTGGGG
+      +
+      IIIIIIIIIIII
+      @r2
+      AAAACCCCGGGG
+      +
+      IIIIIIIIIIII
+      """
+
+  Scenario Outline: a tag is left out when any of its streams is absent
+    Given a file "reads.fq" containing:
+      """
+      @r1
+      AAAACCCCTTTT
+      +
+      IIIIIIIIIIII
+      @r2
+      AAAAACGTTTTT
+      +
+      IIIIIIIIIIII
+      @r3
+      AAAATTTTACGT
+      +
+      IIIIIIIIIIII
+      """
+    And a file "rounds.tsv" containing:
+      """
+      id	seq
+      w1	CCCC
+      w2	GGGG
+      w3	TTTT
+      """
+    # Rounds b and c share one whitelist. @r2 misses round b and @r3 misses round c, so joining only
+    # their present streams would give both the same AAAA-TTTT; each tag that uses a missing stream is
+    # left out instead, along with its quality tag, while @r1 matches every round.
+    When I run `unmux reads.fq --pool p --group a={AAAA} --group a::loc=0:0:4 --group b=rounds.tsv --group b::loc=0:4:8 --group c=rounds.tsv --group c::loc=0:8:12 --extract a=@a --extract b=@b --extract c=@c --extract cid=@c::id <tag> --out out.sam`
+    Then the exit code is 0
+    And the records of "out.sam" are:
+      """
+      r1	4	*	0	255	*	*	0	0	AAAACCCCTTTT	IIIIIIIIIIII	<r1>	RG:Z:p
+      r2	4	*	0	255	*	*	0	0	AAAAACGTTTTT	IIIIIIIIIIII	RG:Z:p
+      r3	4	*	0	255	*	*	0	0	AAAATTTTACGT	IIIIIIIIIIII	RG:Z:p
+      """
+
+    Examples:
+      | tag                                | r1                                       |
+      | --tag CB=a+b+c                     | CB:Z:AAAA-CCCC-TTTT	CY:Z:IIII IIII IIII |
+      | --tag CR=a+b+c --tag CR::raw=true  | CR:Z:AAAA-CCCC-TTTT	CY:Z:IIII IIII IIII |
+      | --tag CB=a+~b+c                    | CB:Z:AAAA-GGGG-TTTT	CY:Z:IIII IIII IIII |
+      | --tag xc=a+b+cid                   | xc:Z:AAAA-CCCC-w3                        |
+
+  Scenario Outline: a carried tag is dropped when its --tag binding is left out
+    Given a file "in.sam" containing:
+      """
+      @HD	VN:1.6
+      r1	4	*	0	0	*	*	0	0	AAAACCCCTTTT	IIIIIIIIIIII	CB:Z:OLDOLD	CY:Z:FFFFFF	RX:Z:GGGG	QX:Z:FFFF
+      r2	4	*	0	0	*	*	0	0	AAAAACGTTTTT	IIIIIIIIIIII	CB:Z:OLDOLD	CY:Z:FFFFFF	RX:Z:GGGG	QX:Z:FFFF
+      """
+    And a file "rounds.tsv" containing:
+      """
+      id	seq
+      w1	CCCC
+      w2	GGGG
+      w3	TTTT
+      """
+    # @r2 misses round b, so its CB binding is left out; the carried CB and CY would be stale, so
+    # they go too, while the unbound carried RX and QX stay.
+    When I run `unmux in.sam --out in.<ext>`
+    Then the exit code is 0
+    When I run `unmux in.<ext> --pool p --group a={AAAA} --group a::loc=0:0:4 --group b=rounds.tsv --group b::loc=0:4:8 --group c=rounds.tsv --group c::loc=0:8:12 --extract a=@a --extract b=@b --extract c=@c --tag CB=a+b+c --out out.sam`
+    Then the exit code is 0
+    And the records of "out.sam" are:
+      """
+      r1	4	*	0	255	*	*	0	0	AAAACCCCTTTT	IIIIIIIIIIII	CB:Z:AAAA-CCCC-TTTT	CY:Z:IIII IIII IIII	RX:Z:GGGG	QX:Z:FFFF	RG:Z:p
+      r2	4	*	0	255	*	*	0	0	AAAAACGTTTTT	IIIIIIIIIIII	RX:Z:GGGG	QX:Z:FFFF	RG:Z:p
+      """
+
+    Examples:
+      | ext  |
+      | sam  |
+      | bam  |
+      | cram |
+
+  Scenario: an empty but present stream keeps its slot in a tag
+    Given a file "reads.fq" containing:
+      """
+      @r1
+      AAAACCCCTTTT
+      +
+      IIIIIIIIIIII
+      @r2
+      AAAACCCCGGGG
+      +
+      IIIIIIIIIIII
+      """
+    # A between-anchors span whose second anchor did not match is empty but present, so @r2 still gets
+    # CB with an empty middle slot, unlike a stream whose group did not match.
+    When I run `unmux reads.fq --pool p --group a={AAAA} --group a::loc=0:0:4 --group t={TTTT} --group t::loc=0:8:12 --extract a=@a --extract mid=@a..@t --extract t=@t --tag CB=a+mid --tag RX=a+t --out out.sam`
+    Then the exit code is 0
+    And the records of "out.sam" are:
+      """
+      r1	4	*	0	255	*	*	0	0	AAAACCCCTTTT	IIIIIIIIIIII	CB:Z:AAAA-CCCC	CY:Z:IIII IIII	RX:Z:AAAA-TTTT	QX:Z:IIII IIII	RG:Z:p
+      r2	4	*	0	255	*	*	0	0	AAAACCCCGGGG	IIIIIIIIIIII	CB:Z:AAAA-	CY:Z:IIII 	RG:Z:p
+      """
 
   Scenario: a literal sub_sample and the %pool placeholder set different read-group LB values
     Given a file "reads.fq" containing:
