@@ -5719,12 +5719,12 @@ mod tests {
         };
         for (i, record) in records.iter().enumerate() {
             let (cell, id) = [
-                ("A+B-ACGT", Some("w1")),
-                ("A+B-ACGT", Some("w1")),
-                ("TTGGCC-ACGT", Some("w2")),
-                ("ACGT", None),
+                (Some("A+B-ACGT"), Some("w1")),
+                (Some("A+B-ACGT"), Some("w1")),
+                (Some("TTGGCC-ACGT"), Some("w2")),
+                (None, None),
             ][i % 4];
-            assert_eq!(text(record, *b"CB").as_deref(), Some(cell), "record {i}");
+            assert_eq!(text(record, *b"CB").as_deref(), cell, "record {i}");
             assert_eq!(text(record, *b"xi").as_deref(), id, "record {i}");
             assert_eq!(text(record, *b"CY"), None, "record {i}");
         }

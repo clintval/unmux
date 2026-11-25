@@ -112,13 +112,16 @@ fn placeholder_value(placeholder: Placeholder, ctx: &PathContext) -> String {
 }
 
 /// Assemble the `--tag` SAM data fields for one record from its extracted
-/// streams. Each binding's sequence tag is the present streams' bases joined by
-/// `sep` (a stream absent because its anchoring group did not match is skipped;
-/// a tag with no present stream is omitted entirely, so an unmatched group
-/// leaves a null tag rather than an empty one). The paired quality tag (from
-/// the default seq->qual map, an explicit `qual=`, or off for `qual=none`) is
-/// the present streams' qualities re-encoded to ASCII Phred+33 and joined by
-/// `qual-sep`; it is emitted only when every present stream carries qualities.
+/// streams. Each binding's sequence tag is its streams' bases joined by `sep`.
+/// A tag is written only when every one of its streams is present: a stream is
+/// absent when its anchoring group did not match, and then the tag and its
+/// quality tag are left out, so a partial match never yields a shorter value
+/// that could equal another record's. An empty but present stream (a
+/// between-anchors region with a missing anchor) keeps its empty slot. The
+/// paired quality tag (from the default seq->qual map, an explicit `qual=`, or
+/// off for `qual=none`) is the streams' qualities re-encoded to ASCII Phred+33
+/// and joined by `qual-sep`; it is emitted only when every stream carries
+/// qualities.
 pub fn build_tag_data(bindings: &[TagBinding], streams: &HashMap<&str, Extracted>) -> Data {
     let mut data = Data::default();
     for binding in bindings {
@@ -130,7 +133,7 @@ pub fn build_tag_data(bindings: &[TagBinding], streams: &HashMap<&str, Extracted
             .iter()
             .filter_map(|s| streams.get(s.name.as_str()).map(|e| (s, e)))
             .collect();
-        if present.is_empty() {
+        if present.len() != binding.streams.len() {
             continue;
         }
         let sep = binding.sep.as_deref().unwrap_or_default().as_bytes();
@@ -899,13 +902,49 @@ mod tests {
     }
 
     #[test]
-    fn test_build_tag_data_present_streams_only() {
-        // CB=a,b::sep=-: only `a` matched, so CB is just its bases (no trailing
-        // separator).
-        let cb = binding("CB", &["a", "b"], QualTag::None, Some("-"));
+    fn test_build_tag_data_one_absent_stream_omits_tag_and_qual_tag() {
+        // CB=a+b+c: `b` is absent, so neither CB nor CY is written rather than
+        // a CB of `AAAA-TTTT` that a full match of other streams could share.
+        let streams = HashMap::from([
+            ("a", extracted(b"AAAA", Some(&[30; 4]))),
+            ("c", extracted(b"TTTT", Some(&[30; 4]))),
+        ]);
+        for cb in [
+            binding("CB", &["a", "b", "c"], QualTag::Default, Some("-")),
+            binding("CB", &["a", "~b", "c"], QualTag::Default, Some("-")),
+        ] {
+            let data = build_tag_data(&[cb], &streams);
+            assert!(data.is_empty(), "{data:?}");
+        }
+        let mut raw = binding("CR", &["a", "b", "c"], QualTag::Default, Some("-"));
+        raw.raw = true;
+        assert!(build_tag_data(&[raw], &streams).is_empty());
+    }
+
+    #[test]
+    fn test_build_tag_data_one_absent_stream_leaves_other_tags() {
+        let cb = binding("CB", &["a", "b"], QualTag::Default, Some("-"));
+        let rx = binding("RX", &["a"], QualTag::Default, None);
         let streams = HashMap::from([("a", extracted(b"AAAA", Some(&[30; 4])))]);
+        let data = build_tag_data(&[cb, rx], &streams);
+        assert_eq!(tag_str(&data, "CB"), None);
+        assert_eq!(tag_str(&data, "CY"), None);
+        assert_eq!(tag_str(&data, "RX").as_deref(), Some("AAAA"));
+        assert_eq!(tag_str(&data, "QX").as_deref(), Some("????"));
+    }
+
+    #[test]
+    fn test_build_tag_data_empty_present_stream_keeps_its_slot() {
+        // An empty but present stream is not absent: its empty slot is joined.
+        let cb = binding("CB", &["a", "b", "c"], QualTag::Default, Some("-"));
+        let streams = HashMap::from([
+            ("a", extracted(b"AAAA", Some(&[30; 4]))),
+            ("b", extracted(b"", Some(&[]))),
+            ("c", extracted(b"TTTT", Some(&[30; 4]))),
+        ]);
         let data = build_tag_data(&[cb], &streams);
-        assert_eq!(tag_str(&data, "CB").as_deref(), Some("AAAA"));
+        assert_eq!(tag_str(&data, "CB").as_deref(), Some("AAAA--TTTT"));
+        assert_eq!(tag_str(&data, "CY").as_deref(), Some("????  ????"));
     }
 
     #[test]

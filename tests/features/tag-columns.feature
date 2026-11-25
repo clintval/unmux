@@ -41,7 +41,7 @@ Feature: Tag-file column streams
       r1	4	*	0	255	*	*	0	0	AAAACCCC	KLMNOPQR	BC:Z:AACCGG	QT:Z:ABCDEF	CB:Z:A+B-ACGT	xc:Z:A+B-ACGT-ACGT	xd:Z:A+B	RG:Z:reads
       r2	4	*	0	255	*	*	0	0	AAAACCCC	KLMNOPQR	BC:Z:AACCGG	QT:Z:ABCDEF	CB:Z:A+B-ACGT	xc:Z:A+B-ACGT-ACGT	xd:Z:A+B	RG:Z:reads
       r3	4	*	0	255	*	*	0	0	AAAACCCC	KLMNOPQR	BC:Z:TTGGCC	QT:Z:ABCDEF	CB:Z:TTGGCC-TTTT	xc:Z:TTGGCC-TTTT-TTTT	xd:Z:TTGGCC	RG:Z:reads
-      r4	4	*	0	255	*	*	0	0	AAAACCCC	KLMNOPQR	CB:Z:TTTT	xc:Z:TTTT-TTTT	RG:Z:reads
+      r4	4	*	0	255	*	*	0	0	AAAACCCC	KLMNOPQR	RG:Z:reads
       """
 
     Examples:
@@ -83,7 +83,7 @@ Feature: Tag-file column streams
       AAAACCCC
       +
       KLMNOPQR
-      @r4 xc:Z:TTTT
+      @r4
       AAAACCCC
       +
       KLMNOPQR
@@ -196,7 +196,7 @@ Feature: Tag-file column streams
     When I run `unmux reads.fq --group bc=tags.tsv --group bc::loc=0:0:6 --extract cell=@bc::cell --extract u=0:6:10 --tag CB=cell --tag RX=cell+u --tag BC=u+cell --tag BC::qual=none`
     Then the exit code is 0
     And stdout contains "@r1 CB:Z:A+B	RX:Z:A+B-ACGT	BC:Z:ACGT-A+B"
-    And stdout contains "@r4 RX:Z:TTTT	BC:Z:TTTT"
+    And stdout does not contain "@r4 "
     And stdout does not contain "CY:Z:"
     And stdout does not contain "QX:Z:"
     And stdout does not contain "QT:Z:"
@@ -339,7 +339,7 @@ Feature: Tag-file column streams
       AAAACCCC
       >r3 xc:Z:TTGGTTTT-TTGG	xi:Z:p2
       AAAACCCC
-      >r4 xc:Z:GAGA
+      >r4
       AAAACCCC
       """
 

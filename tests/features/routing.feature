@@ -187,14 +187,13 @@ Feature: Read routing, removal, and fan-out primitives
       IIIIIIIIIIII
       """
     # There is no --assign flag: a combined barcode is just a multi-stream --tag over per-group extracts.
-    # @r1 matches both groups so CB joins them as AAAA-TTTT; @r2 matches grp_a only, so its CB degrades to
-    # the single AAAA stream. The sep=- is load-bearing on the join, and the @r2 result shows the missing
-    # grp_b stream simply drops out rather than erroring.
+    # @r1 matches both groups so CB joins them as AAAA-TTTT; @r2 matches grp_a only, so its grp_b stream
+    # is absent and CB is left out rather than written as the shorter AAAA.
     When I run `unmux reads.fq --group grp_a={A=AAAA} --group grp_a::loc=0:0:4 --group grp_b={B=TTTT} --group grp_b::loc=0:4:8 --extract bc_a=@grp_a --extract bc_b=@grp_b --extract body=0:0:end --template body --tag CB=bc_a+bc_b --tag CB::sep=- --tag CB::qual=none`
     Then the exit code is 0
     And stdout contains "@r1 CB:Z:AAAA-TTTT"
-    And stdout contains "@r2 CB:Z:AAAA"
-    And stdout does not contain "@r2 CB:Z:AAAA-TTTT"
+    And stdout contains "@r2"
+    And stdout does not contain "@r2 CB:Z:"
 
   Scenario: a literal sub_sample and the %pool placeholder set different read-group LB values
     Given a file "reads.fq" containing:
