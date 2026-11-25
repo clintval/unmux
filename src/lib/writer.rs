@@ -655,7 +655,7 @@ impl Drop for StagedOutputs {
 }
 
 /// The file `path` finally points to, following symbolic links even when the last one dangles.
-fn link_target(path: &Path) -> PathBuf {
+pub(crate) fn link_target(path: &Path) -> PathBuf {
     let mut target = path.to_path_buf();
     for _ in 0..40 {
         match std::fs::read_link(&target) {

@@ -53,9 +53,9 @@ use crate::matcher::{
 };
 use crate::metrics::Metrics;
 use crate::output::{
-    alignment_header, build_tag_data, default_read_group_header, insert_string_tag, qual_tag_name,
-    read_group_header, resolve_metrics_path, resolve_pattern, ConstituentReadGroups, MultiWriter,
-    OutputOrigin, PathContext,
+    alignment_header, build_tag_data, check_output_collisions, default_read_group_header,
+    insert_string_tag, qual_tag_name, read_group_header, resolve_metrics_path, resolve_pattern,
+    ConstituentReadGroups, MultiWriter, OutputOrigin, PathContext,
 };
 use crate::qc::{removed_slug, routed_slug, unassigned_slug, Unassigned};
 use crate::tags::{load_tag_file_columns, TagColumns, TagSet};
@@ -833,6 +833,30 @@ fn labeled_dests(
     Ok(paths)
 }
 
+/// Refuse outputs that would be one file, before any is created.
+fn check_outputs(
+    plan: &DemuxPlan,
+    routing: &Routing,
+    pool: &str,
+    input_formats: &[SniffedFormat],
+    fragment_width: usize,
+) -> Result<()> {
+    let mut outputs = labeled_dests(plan, routing, pool, input_formats, fragment_width)?;
+    for (pattern, option) in [
+        (&plan.metrics_per_sample, "--metrics-per-sample"),
+        (&plan.metrics_summary, "--metrics-summary"),
+        (&plan.metrics_unassigned, "--metrics-unassigned"),
+    ] {
+        if let Some(pattern) = pattern {
+            outputs.push((
+                resolve_metrics_path(pattern, pool),
+                OutputOrigin::Metrics(option),
+            ));
+        }
+    }
+    check_output_collisions(&outputs)
+}
+
 /// The `--out` file path(s) for one target (or `None` for a pure pass-through),
 /// mirroring the destination resolution in `write_body`: a non-alignment
 /// template set with more than one body fans out over `%ordinal`, everything
@@ -1336,6 +1360,13 @@ fn run_engine(plan: &DemuxPlan, command_line: Option<&str>) -> Result<()> {
     // Every directed output file, created up front so a directed file always
     // exists, even empty.
     let dests = enumerate_dests(
+        plan,
+        &routing,
+        &pool,
+        &input_formats,
+        reader.fragment_width(),
+    )?;
+    check_outputs(
         plan,
         &routing,
         &pool,
