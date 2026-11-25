@@ -234,7 +234,7 @@ fn resolve_range(
             },
             None => SpanRange::Absent,
         },
-        SpanBody::Column { .. } => SpanRange::Absent,
+        SpanBody::Column { .. } | SpanBody::SampleColumn { .. } => SpanRange::Absent,
         SpanBody::AnchorOffset {
             group,
             before,

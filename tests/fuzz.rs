@@ -38,6 +38,8 @@ fn fuzz_parse_sample_sheet() {
         .with_type::<String>()
         .for_each(|text: &String| {
             let _ = unmux::parse_sample_sheet(text, &declared, &HashSet::new());
+            let reads = [("v", "note"), ("s", "sample"), ("u", "sub_sample")];
+            let _ = unmux::parse_sample_sheet_columns(text, &declared, &HashSet::new(), &reads);
         });
 }
 
@@ -51,7 +53,7 @@ fn fuzz_parse_sample_sheet() {
 // between-anchor spans, and identifiers that are sometimes valid and sometimes
 // not. It mirrors the grammar in `src/lib/grammar.rs::parse_span`.
 
-/// A grammar-shaped span: `~`? then one of the five body forms.
+/// A grammar-shaped span: `~`? then one of the six body forms.
 #[derive(Debug, TypeGenerator)]
 struct SpanInput {
     revcomp: bool,
@@ -79,6 +81,8 @@ enum SpanBodyShape {
     Between { from: Ident, to: Ident },
     /// `@group::column`
     Column { group: Ident, column: Ident },
+    /// `%sample::column`
+    SampleColumn { column: Ident },
 }
 
 #[derive(Debug, TypeGenerator)]
@@ -182,6 +186,9 @@ fn render(span: &SpanInput) -> String {
         }
         SpanBodyShape::Column { group, column } => {
             let _ = write!(s, "@{}::{}", ident_str(group), ident_str(column));
+        }
+        SpanBodyShape::SampleColumn { column } => {
+            let _ = write!(s, "%sample::{}", ident_str(column));
         }
     }
     s

@@ -25,9 +25,10 @@ use anyhow::{anyhow, bail, Context, Result};
 
 use crate::extract::GroupHits;
 use crate::grammar::{
-    GroupSelector, OutputPattern, RemoveRule, RemoveSelector, Sample, Selector, SubSample,
+    escape_column, GroupSelector, OutputPattern, RemoveRule, RemoveSelector, Sample, Selector,
+    SubSample,
 };
-use crate::tags::TagSet;
+use crate::tags::{find_header, is_column_value, known_columns, TagSet};
 
 /// A resolved fan-out target: the sample (read-group `SM`) and an optional
 /// sub_sample (read-group `LB`). The fan-out key is the whole `(sample,
@@ -154,6 +155,87 @@ impl Routing {
     /// each).
     pub fn targets(&self) -> &[Target] {
         &self.targets
+    }
+
+    /// Each route's target, in route order.
+    pub fn route_targets(&self) -> impl ExactSizeIterator<Item = &Target> {
+        self.routes.iter().map(|route| &route.target)
+    }
+
+    /// Fail when two sample-sheet rows can route one record to the same target
+    /// but hold different `values` in `column`, one value per route. A sheet row
+    /// selects one tag per filled group cell, so two rows can route one record
+    /// when they select the same tags in the groups both fill.
+    pub fn check_row_values(&self, column: &str, values: &[Option<String>]) -> Result<()> {
+        let mut shapes: Vec<(&Target, Vec<usize>, Vec<usize>)> = Vec::new();
+        for (index, route) in self.routes.iter().enumerate() {
+            let mut groups: Vec<usize> = route.terms.iter().map(|term| term.group).collect();
+            groups.sort_unstable();
+            match shapes
+                .iter_mut()
+                .find(|(target, shape, _)| **target == route.target && *shape == groups)
+            {
+                Some((_, _, rows)) => rows.push(index),
+                None => shapes.push((&route.target, groups, vec![index])),
+            }
+        }
+        let mut conflict: Option<(usize, usize)> = None;
+        for (i, (target, first, first_rows)) in shapes.iter().enumerate() {
+            for (other, second, second_rows) in &shapes[i..] {
+                if target != other {
+                    continue;
+                }
+                let shared: Vec<usize> = first
+                    .iter()
+                    .filter(|group| second.contains(group))
+                    .copied()
+                    .collect();
+                let key = |index: usize| -> Vec<Option<&[usize]>> {
+                    let terms = &self.routes[index].terms;
+                    shared
+                        .iter()
+                        .map(|group| {
+                            terms
+                                .iter()
+                                .find(|term| term.group == *group)
+                                .and_then(|term| term.members.as_deref())
+                        })
+                        .collect()
+                };
+                let mut seen: HashMap<Vec<Option<&[usize]>>, Vec<usize>> = HashMap::new();
+                for &index in second_rows {
+                    let rows = seen.entry(key(index)).or_default();
+                    if rows.len() < 2 && rows.iter().all(|&row| values[row] != values[index]) {
+                        rows.push(index);
+                    }
+                }
+                for &index in first_rows {
+                    let Some(rows) = seen.get(&key(index)) else {
+                        continue;
+                    };
+                    if let Some(&row) = rows.iter().find(|&&row| values[row] != values[index]) {
+                        let pair = (row.min(index), row.max(index));
+                        conflict = Some(conflict.map_or(pair, |found| found.min(pair)));
+                    }
+                }
+            }
+        }
+        let Some((first, second)) = conflict else {
+            return Ok(());
+        };
+        let quote = |value: &Option<String>| match value {
+            Some(value) => format!("{value:?}"),
+            None => "a blank cell".to_string(),
+        };
+        bail!(
+            "sample sheet rows {} and {} can both route a record to `{}` but disagree on {column:?} \
+             ({} vs {})",
+            first + 1,
+            second + 1,
+            self.routes[first].target.label(),
+            quote(&values[first]),
+            quote(&values[second])
+        )
     }
 }
 
@@ -476,6 +558,21 @@ pub fn expand_from_group(group: &str, tag_set: &TagSet) -> Vec<Sample> {
         .collect()
 }
 
+/// What a `%sample::COLUMN` extract reads from each sample-sheet row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SheetColumn {
+    /// The routed target's sample ID.
+    Sample,
+    /// The routed target's sub-sample ID, when it has one.
+    SubSample,
+    /// Each row's trimmed cell, `None` when blank.
+    Cells(Vec<Option<String>>),
+}
+
+/// The sample-sheet columns that `%sample::COLUMN` extracts read, keyed by the
+/// column as the extract spells it.
+pub type SheetColumns = HashMap<String, SheetColumn>;
+
 /// Parse a `--sample-sheet` TSV into the same [`Sample`] targets `--sample`
 /// produces.
 ///
@@ -496,6 +593,18 @@ pub fn parse_sample_sheet(
     declared_groups: &HashSet<&str>,
     ignored_columns: &HashSet<&str>,
 ) -> Result<Vec<Sample>> {
+    parse_sample_sheet_columns(text, declared_groups, ignored_columns, &[]).map(|(rows, _)| rows)
+}
+
+/// Parse a `--sample-sheet` TSV as [`parse_sample_sheet`] does, along with the
+/// columns that `reads` pairs of `(extract, column)` read. A read column may
+/// not be a group column, and its cells hold printable ASCII and spaces.
+pub fn parse_sample_sheet_columns(
+    text: &str,
+    declared_groups: &HashSet<&str>,
+    ignored_columns: &HashSet<&str>,
+    reads: &[(&str, &str)],
+) -> Result<(Vec<Sample>, SheetColumns)> {
     let mut rows = text
         .lines()
         .map(|line| line.trim_end_matches('\r'))
@@ -530,8 +639,49 @@ pub fn parse_sample_sheet(
         }
     }
 
-    // Every remaining non-empty column must name a declared group; its cells
-    // select within it.
+    let mut sheet_columns = SheetColumns::new();
+    let mut read_cols: Vec<(String, usize)> = Vec::new();
+    for &(extract, column) in reads {
+        if sheet_columns.contains_key(column) {
+            continue;
+        }
+        let found = find_header(&columns, column).map_err(|_| {
+            anyhow!(
+                "extract `{extract}` reads sample-sheet column {column:?}, but more than one \
+                 column matches it regardless of case"
+            )
+        })?;
+        let read = match found {
+            Some(i) if i == sample_col => SheetColumn::Sample,
+            Some(i) if Some(i) == sub_sample_col => SheetColumn::SubSample,
+            None if column.eq_ignore_ascii_case("sub_sample") => SheetColumn::SubSample,
+            None => bail!(
+                "extract `{extract}` reads sample-sheet column {column:?}; the columns are: {}",
+                known_columns(&columns)
+            ),
+            Some(i) if declared_groups.contains(columns[i]) => bail!(
+                "extract `{extract}` reads sample-sheet column {column:?}, a group column; use \
+                 `@{}::id` for the matched tag",
+                columns[i]
+            ),
+            Some(i) => {
+                if ignored_columns.contains(columns[i]) {
+                    log::warn!(
+                        "--sample-sheet-ignore skips {:?}, which `%sample::{}` reads; the column \
+                         is read",
+                        columns[i],
+                        escape_column(column)
+                    );
+                }
+                read_cols.push((column.to_string(), i));
+                SheetColumn::Cells(Vec::new())
+            }
+        };
+        sheet_columns.insert(column.to_string(), read);
+    }
+
+    // Every remaining non-empty column must be a declared group or be read by
+    // an extract; a group column's cells select within it.
     let mut group_cols = Vec::new();
     let mut seen_groups = HashSet::new();
     for (i, column) in columns.iter().enumerate() {
@@ -539,6 +689,7 @@ pub fn parse_sample_sheet(
             || Some(i) == sub_sample_col
             || column.is_empty()
             || ignored_columns.contains(column)
+            || read_cols.iter().any(|(_, read)| *read == i)
         {
             continue;
         }
@@ -594,6 +745,23 @@ pub fn parse_sample_sheet(
                 line_no + 1
             );
         }
+        for (column, i) in &read_cols {
+            let value = cells
+                .get(*i)
+                .map(|cell| cell.trim_matches(' '))
+                .filter(|cell| !cell.is_empty());
+            if let Some(value) = value.filter(|value| !is_column_value(value)) {
+                bail!(
+                    "sample sheet row {}: value {value:?} in column {:?} may hold only printable \
+                     ASCII and spaces",
+                    line_no + 1,
+                    columns[*i]
+                );
+            }
+            if let Some(SheetColumn::Cells(values)) = sheet_columns.get_mut(column) {
+                values.push(value.map(str::to_string));
+            }
+        }
         samples.push(Sample {
             sample: sample.to_string(),
             sub_sample,
@@ -603,7 +771,7 @@ pub fn parse_sample_sheet(
     if samples.is_empty() {
         bail!("sample sheet has a header but no rows");
     }
-    Ok(samples)
+    Ok((samples, sheet_columns))
 }
 
 /// Load and parse a `--sample-sheet` from a file.
@@ -612,9 +780,20 @@ pub fn load_sample_sheet(
     declared_groups: &HashSet<&str>,
     ignored_columns: &HashSet<&str>,
 ) -> Result<Vec<Sample>> {
+    load_sample_sheet_columns(path, declared_groups, ignored_columns, &[]).map(|(rows, _)| rows)
+}
+
+/// Load and parse a `--sample-sheet` from a file, along with the columns that
+/// `reads` pairs of `(extract, column)` read.
+pub fn load_sample_sheet_columns(
+    path: &Path,
+    declared_groups: &HashSet<&str>,
+    ignored_columns: &HashSet<&str>,
+    reads: &[(&str, &str)],
+) -> Result<(Vec<Sample>, SheetColumns)> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read sample sheet: {}", path.display()))?;
-    parse_sample_sheet(&text, declared_groups, ignored_columns)
+    parse_sample_sheet_columns(&text, declared_groups, ignored_columns, reads)
         .with_context(|| format!("failed to parse sample sheet: {}", path.display()))
 }
 
@@ -1374,5 +1553,200 @@ mod tests {
         let err = parse_sample_sheet(sheet, &groups, &ignored).unwrap_err();
         assert!(err.to_string().contains("`notes`"), "{err}");
         assert!(err.to_string().contains("declared --group"), "{err}");
+    }
+
+    /// Parse a sheet whose extracts read `columns`, with groups `a` and `b`.
+    fn sheet_columns(
+        sheet: &str,
+        ignored: &[&str],
+        columns: &[&str],
+    ) -> Result<(Vec<Sample>, SheetColumns)> {
+        let groups: HashSet<&str> = ["a", "b"].into_iter().collect();
+        let ignored: HashSet<&str> = ignored.iter().copied().collect();
+        let reads: Vec<(&str, &str)> = columns.iter().map(|column| ("v", *column)).collect();
+        parse_sample_sheet_columns(sheet, &groups, &ignored, &reads)
+    }
+
+    fn cells(values: &[Option<&str>]) -> SheetColumn {
+        SheetColumn::Cells(values.iter().map(|v| v.map(str::to_string)).collect())
+    }
+
+    #[test]
+    fn test_parse_sample_sheet_columns_reads_one_trimmed_value_per_row() {
+        let sheet = "sample\ta\tnucleus\n\
+                     s1\tx\t  007 Ab  \n\
+                     # a comment\n\
+                     \n\
+                     s1\ty\t\n\
+                     s2\tz\tx,y;z+w\n\
+                     s2\tw\n";
+        let (samples, columns) = sheet_columns(sheet, &[], &["nucleus"]).unwrap();
+        assert_eq!(samples.len(), 4);
+        assert_eq!(
+            columns["nucleus"],
+            cells(&[Some("007 Ab"), None, Some("x,y;z+w"), None])
+        );
+        assert_eq!(
+            samples,
+            parse_sample_sheet(
+                "sample\ta\ns1\tx\ns1\ty\ns2\tz\ns2\tw\n",
+                &["a", "b"].into_iter().collect(),
+                &HashSet::new()
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn test_parse_sample_sheet_columns_reserved_columns() {
+        let sheet = "sample\tsub_sample\ta\ns1\t%pool\tx\n";
+        let (_, columns) = sheet_columns(sheet, &[], &["sample", "SAMPLE", "sub_sample"]).unwrap();
+        assert_eq!(columns["sample"], SheetColumn::Sample);
+        assert_eq!(columns["SAMPLE"], SheetColumn::Sample);
+        assert_eq!(columns["sub_sample"], SheetColumn::SubSample);
+        let (_, columns) = sheet_columns("sample\ta\ns1\tx\n", &[], &["sub_sample"]).unwrap();
+        assert_eq!(columns["sub_sample"], SheetColumn::SubSample);
+    }
+
+    #[test]
+    fn test_parse_sample_sheet_columns_finds_headers() {
+        let read = |header: &str, column: &str| {
+            sheet_columns(
+                &format!("sample\ta\t{header}\ns1\tx\tv1\tv2\n"),
+                &[],
+                &[column],
+            )
+            .map(|(_, columns)| columns[column].clone())
+            .map_err(|err| err.to_string())
+        };
+        assert_eq!(read("nucleus", "nucleus").unwrap(), cells(&[Some("v1")]));
+        assert_eq!(read("Nucleus", "nucleus").unwrap(), cells(&[Some("v1")]));
+        assert_eq!(read("a b", "a b").unwrap(), cells(&[Some("v1")]));
+        assert_eq!(
+            read("Nucleus\tnucleus", "nucleus").unwrap_err(),
+            "sample sheet column `Nucleus` is not a declared --group (every non-reserved column \
+             must name a group)"
+        );
+        assert_eq!(
+            read("nucleus", "nucleu").unwrap_err(),
+            "extract `v` reads sample-sheet column \"nucleu\"; the columns are: sample, a, nucleus"
+        );
+        assert_eq!(
+            read("Nucleus\tNUCLEUS", "nucleus").unwrap_err(),
+            "extract `v` reads sample-sheet column \"nucleus\", but more than one column matches \
+             it regardless of case"
+        );
+        assert_eq!(
+            read("b", "b").unwrap_err(),
+            "extract `v` reads sample-sheet column \"b\", a group column; use `@b::id` for the \
+             matched tag"
+        );
+        let (_, columns) = sheet_columns(
+            "sample\ta\tNucleus\tnucleus\ns1\tx\tv1\tv2\n",
+            &[],
+            &["Nucleus", "nucleus"],
+        )
+        .unwrap();
+        assert_eq!(columns["Nucleus"], cells(&[Some("v1")]));
+        assert_eq!(columns["nucleus"], cells(&[Some("v2")]));
+    }
+
+    #[test]
+    fn test_parse_sample_sheet_columns_read_and_ignored_is_read() {
+        let (_, columns) =
+            sheet_columns("sample\ta\tnucleus\ns1\tx\tv\n", &["nucleus"], &["nucleus"]).unwrap();
+        assert_eq!(columns["nucleus"], cells(&[Some("v")]));
+    }
+
+    #[test]
+    fn test_parse_sample_sheet_columns_rejects_a_value_that_is_not_printable_ascii() {
+        let err = sheet_columns(
+            "sample\ta\tnucleus\ns1\tx\tok\ns2\ty\t\u{c1}1\n",
+            &[],
+            &["nucleus"],
+        )
+        .unwrap_err()
+        .to_string();
+        assert_eq!(
+            err,
+            "sample sheet row 2: value \"\u{c1}1\" in column \"nucleus\" may hold only printable \
+             ASCII and spaces"
+        );
+    }
+
+    /// Compile a two-group sheet and check `values` of column `v` for conflicts.
+    fn check_rows(sheet: &str, values: &[Option<&str>]) -> std::result::Result<(), String> {
+        let groups: HashSet<&str> = ["a", "b"].into_iter().collect();
+        let samples = parse_sample_sheet(sheet, &groups, &HashSet::new()).unwrap();
+        let tag_sets = sets(&[
+            ("a", tagset(&[("a1", "AAAA"), ("a2", "CCCC")])),
+            ("b", tagset(&[("b1", "GGGG"), ("b2", "TTTT")])),
+        ]);
+        let (routing, _) = compile(&samples, &[], &tag_sets, "p", true, false).unwrap();
+        let values: Vec<Option<String>> = values.iter().map(|v| v.map(str::to_string)).collect();
+        routing
+            .check_row_values("v", &values)
+            .map_err(|err| err.to_string())
+    }
+
+    #[test]
+    fn test_check_row_values_rejects_rows_that_can_route_one_record_to_one_target() {
+        let duplicate = "sample\ta\tb\ns1\ta1\tb1\ns1\ta1\tb1\n";
+        assert_eq!(
+            check_rows(duplicate, &[Some("x"), Some("y")]).unwrap_err(),
+            "sample sheet rows 1 and 2 can both route a record to `s1` but disagree on \"v\" \
+             (\"x\" vs \"y\")"
+        );
+        let subset = "sample\ta\tb\ns2\ta2\tb2\ns1\ta1\tb1\ns1\ta1\t\n";
+        let err = check_rows(subset, &[Some("x"), Some("x"), None]).unwrap_err();
+        assert!(
+            err.contains("rows 2 and 3 can both route a record to `s1`")
+                && err.ends_with("(\"x\" vs a blank cell)"),
+            "{err}"
+        );
+        let crossing = "sample\ta\tb\ns1\ta1\t\ns1\t\tb1\n";
+        assert!(check_rows(crossing, &[Some("x"), Some("y")]).is_err());
+        let by_sequence = "sample\ta\tb\ns1\ta1\tb1\ns1\tAAAA\tGGGG\n";
+        assert!(check_rows(by_sequence, &[Some("x"), Some("y")]).is_err());
+        let third = "sample\ta\tb\ns1\ta1\tb1\ns1\ta1\tb2\ns1\ta1\t\n";
+        let err = check_rows(third, &[Some("x"), Some("y"), Some("x")]).unwrap_err();
+        assert!(err.contains("rows 2 and 3"), "{err}");
+    }
+
+    #[test]
+    fn test_check_row_values_accepts_rows_that_agree_or_cannot_overlap() {
+        let sheet = "sample\ta\tb\n\
+                     s1\ta1\tb1\n\
+                     s1\ta1\tb1\n\
+                     s1\ta1\t\n\
+                     s1\ta2\tb2\n\
+                     s2\ta1\tb2\n";
+        let values = [Some("x"), Some("x"), Some("x"), Some("y"), Some("z")];
+        assert_eq!(check_rows(sheet, &values), Ok(()));
+        let blanks = "sample\ta\tb\ns1\ta1\tb1\ns1\ta1\tb1\n";
+        assert_eq!(check_rows(blanks, &[None, None]), Ok(()));
+    }
+
+    #[test]
+    fn test_route_reports_the_index_of_the_route_that_matched() {
+        let groups: HashSet<&str> = ["a", "b"].into_iter().collect();
+        let sheet = "sample\ta\tb\ns1\ta1\tb1\ns1\ta1\tb2\ns2\ta2\t\n";
+        let samples = parse_sample_sheet(sheet, &groups, &HashSet::new()).unwrap();
+        let tag_sets = sets(&[
+            ("a", tagset(&[("a1", "AAAA"), ("a2", "CCCC")])),
+            ("b", tagset(&[("b1", "GGGG"), ("b2", "TTTT")])),
+        ]);
+        let (routing, index) = compile(&samples, &[], &tag_sets, "p", true, false).unwrap();
+        let route = |pairs: &[(&str, usize)]| match routing.route(&matched(&index, pairs)) {
+            Disposition::Assigned(target, route) => Some((target.sample.clone(), route)),
+            _ => None,
+        };
+        assert_eq!(route(&[("a", 0), ("b", 0)]), Some(("s1".to_string(), 0)));
+        assert_eq!(route(&[("a", 0), ("b", 1)]), Some(("s1".to_string(), 1)));
+        assert_eq!(route(&[("a", 1), ("b", 1)]), Some(("s2".to_string(), 2)));
+        assert_eq!(route(&[("a", 1)]), Some(("s2".to_string(), 2)));
+        assert_eq!(route(&[("a", 0)]), None);
+        let targets: Vec<&str> = routing.route_targets().map(|t| t.sample.as_str()).collect();
+        assert_eq!(targets, ["s1", "s1", "s2"]);
     }
 }

@@ -119,7 +119,10 @@ fn placeholder_value(placeholder: Placeholder, ctx: &PathContext) -> String {
 /// the default seq->qual map, an explicit `qual=`, or off for `qual=none`) is
 /// the present streams' qualities re-encoded to ASCII Phred+33 and joined by
 /// `qual-sep`; it is emitted only when every present stream carries qualities.
-pub fn build_tag_data(bindings: &[TagBinding], streams: &HashMap<&str, Extracted>) -> Data {
+pub fn build_tag_data<'a>(
+    bindings: impl IntoIterator<Item = &'a TagBinding>,
+    streams: &HashMap<&str, Extracted>,
+) -> Data {
     let mut data = Data::default();
     for binding in bindings {
         // Each present stream is paired with its `StreamRef` so a `~`
