@@ -444,11 +444,17 @@ pub struct Scratch {
     /// per group ([`MATCH_CACHE_CAP`]) so a pathological high-cardinality
     /// window cannot grow memory unbounded; barcode groups stay far under it
     /// (low tag/error cardinality), which keeps memory tiny.
-    cache: AHashMap<String, AHashMap<Vec<u8>, GroupOutcome>>,
+    cache: AHashMap<String, GroupCache>,
     /// Reused scratch for building a cache lookup key, so a cache hit (the
     /// common case) does not allocate a fresh key Vec per record; only a cache
     /// miss clones it into the owned map key.
     key_buf: Vec<u8>,
+}
+
+/// One group's cached outcomes and the [`key_reach`] that their keys cover.
+struct GroupCache {
+    reach: usize,
+    outcomes: AHashMap<Vec<u8>, GroupOutcome>,
 }
 
 /// Per-(group, worker) match-cache entry cap. Barcode windows recur with low
@@ -497,20 +503,21 @@ pub fn match_group(
     // group is not cached (its window is the entire read, unique per read), so
     // it never churns the cache. `match=` (`loc` is illegal there) is cached
     // because the joined barcode text is short and recurring. The outcome is a
-    // pure function of the group's attributes and the window bytes, so caching
-    // is exact.
+    // pure function of the group's attributes and the keyed bytes, which cover
+    // every base the group's kernel reads, so caching is exact.
     if group.match_streams.is_none() && group.loc.is_none() {
         return match_group_at(group, scratch, segments, group.loc.as_ref());
     }
+    let cached = scratch.cache.get(group.name.as_str());
+    let reach = match cached {
+        Some(cached) => cached.reach,
+        None => key_reach(group),
+    };
     // Build the lookup key into the reused per-worker buffer so a cache hit
     // allocates nothing.
     scratch.key_buf.clear();
-    write_window_key(&mut scratch.key_buf, group.loc.as_ref(), segments);
-    if let Some(hit) = scratch
-        .cache
-        .get(group.name.as_str())
-        .and_then(|windows| windows.get(&scratch.key_buf))
-    {
+    write_window_key(&mut scratch.key_buf, group.loc.as_ref(), segments, reach);
+    if let Some(hit) = cached.and_then(|cached| cached.outcomes.get(&scratch.key_buf)) {
         return hit.clone();
     }
     let outcome = match_group_at(group, scratch, segments, group.loc.as_ref());
@@ -518,24 +525,43 @@ pub fn match_group(
     // before the cache mutable borrow, so the two disjoint `Scratch` fields
     // never overlap).
     let owned_key = scratch.key_buf.clone();
-    let windows = scratch.cache.entry(group.name.clone()).or_default();
-    if windows.len() < MATCH_CACHE_CAP {
-        windows.insert(owned_key, outcome.clone());
+    let cached = scratch
+        .cache
+        .entry(group.name.clone())
+        .or_insert_with(|| GroupCache {
+            reach,
+            outcomes: AHashMap::new(),
+        });
+    if cached.outcomes.len() < MATCH_CACHE_CAP {
+        cached.outcomes.insert(owned_key, outcome.clone());
     }
     outcome
 }
 
+/// The bases from a window start that the kernel reads whatever the window end.
+fn key_reach(group: &CompiledGroup) -> usize {
+    if group.anchor != Some(Anchor::FivePrime) {
+        return 0;
+    }
+    let longest = group.tags.iter().map(Vec::len).max().unwrap_or(0);
+    longest.saturating_add(group.dist.indel)
+}
+
 /// Build the match-cache key for a group's resolved search windows: each
-/// `(file, start, end)` plus the window bytes, so two records hit only when the
-/// *same* bytes are searched at the *same* offsets (cached absolute match
-/// coordinates therefore remain valid). `0xff` separates windows and never
+/// `(file, start, end)` plus the bytes the kernel reads there, which are the
+/// window bytes and any of the `reach` bases from the window start that lie
+/// past its end (see [`key_reach`]). Two records hit only when the *same*
+/// bytes are read at the *same* offsets (cached absolute match coordinates
+/// therefore remain valid). The `0xff` byte separates windows and never
 /// collides with a base or the no-call mask.
-fn write_window_key(key: &mut Vec<u8>, loc: Option<&Location>, segments: &[&[u8]]) {
+fn write_window_key(key: &mut Vec<u8>, loc: Option<&Location>, segments: &[&[u8]], reach: usize) {
     for (file, start, end) in resolve_windows(loc, segments) {
+        let segment = segments[file];
+        let key_end = end.max(start.saturating_add(reach).min(segment.len()));
         key.extend_from_slice(&(file as u32).to_le_bytes());
         key.extend_from_slice(&(start as u32).to_le_bytes());
         key.extend_from_slice(&(end as u32).to_le_bytes());
-        key.extend_from_slice(&segments[file][start..end]);
+        key.extend_from_slice(&segment[start..key_end]);
         key.push(0xff);
     }
 }
@@ -1194,6 +1220,235 @@ mod tests {
             .best
             .expect("sub+del match");
         assert_eq!((both.subs, both.indels), (1, 1));
+    }
+
+    /// An `anchor=5p` group over `tags` with a `loc` of `[0, end)` in file 0.
+    fn anchored5p(tags: &[&str], end: usize, dist: Dist) -> CompiledGroup {
+        let mut g = group(tags);
+        g.anchor = Some(Anchor::FivePrime);
+        g.dist = dist;
+        g.loc = Some(Location {
+            file: 0,
+            start: Endpoint::FromStart(0),
+            end: Some(Endpoint::FromStart(end)),
+        });
+        g
+    }
+
+    /// A best match as `(tag, start, end)`, or `None` for an unmatched read.
+    type Best = Option<(usize, usize, usize)>;
+
+    /// Assert each read's best match from one warm `Scratch`, in both orders.
+    fn assert_best_in_both_orders(group: &CompiledGroup, expected: &[(&str, Best)]) {
+        let mut order = expected.to_vec();
+        for _ in 0..2 {
+            let mut warm = Scratch::new();
+            let found: Vec<(&str, Best)> = order
+                .iter()
+                .map(|&(read, _)| {
+                    let best = match_group(group, &mut warm, &[read.as_bytes()]).best;
+                    (read, best.map(|m| (m.tag_idx, m.start, m.end)))
+                })
+                .collect();
+            assert_eq!(found, order);
+            order.reverse();
+        }
+    }
+
+    #[test]
+    fn test_anchor5p_indel_budget_outcome_ignores_earlier_reads() {
+        let indel = Dist {
+            mismatch: 0,
+            indel: 1,
+            total: 1,
+        };
+        // The reads differ at base 8, which the inserted G pulls into the tag.
+        assert_best_in_both_orders(
+            &anchored5p(&["ACGTACGT"], 8, indel),
+            &[("ACGGTACGTAAAA", Some((0, 0, 9))), ("ACGGTACGAAAAA", None)],
+        );
+    }
+
+    #[test]
+    fn test_anchor5p_tag_past_window_end_outcome_ignores_earlier_reads() {
+        assert_best_in_both_orders(
+            &anchored5p(&["AAAAAACC", "AAAAAAGG"], 6, Dist::default()),
+            &[
+                ("AAAAAACCTTTT", Some((0, 0, 8))),
+                ("AAAAAAGGTTTT", Some((1, 0, 8))),
+            ],
+        );
+    }
+
+    #[test]
+    fn test_anchor5p_short_read_outcome_ignores_earlier_reads() {
+        assert_best_in_both_orders(
+            &anchored5p(&["AAAAAACC"], 6, Dist::default()),
+            &[
+                ("AAAAAACC", Some((0, 0, 8))),
+                ("AAAAAAC", None),
+                ("AAAAAA", None),
+            ],
+        );
+        let indel = Dist {
+            mismatch: 0,
+            indel: 1,
+            total: 1,
+        };
+        assert_best_in_both_orders(
+            &anchored5p(&["ACGTACGT"], 8, indel),
+            &[("ACGGTACGT", Some((0, 0, 9))), ("ACGGTACG", None)],
+        );
+    }
+
+    #[test]
+    fn test_key_reach_is_anchor5p_longest_tag_plus_indel_budget() {
+        let mut g = group(&["ACGT", "ACGTAC"]);
+        g.dist = Dist {
+            mismatch: 1,
+            indel: 2,
+            total: 3,
+        };
+        assert_eq!(key_reach(&g), 0);
+        g.anchor = Some(Anchor::ThreePrime);
+        assert_eq!(key_reach(&g), 0);
+        g.anchor = Some(Anchor::FivePrime);
+        assert_eq!(key_reach(&g), 8);
+    }
+
+    #[test]
+    fn test_write_window_key_covers_the_reach_within_the_read() {
+        let loc = Location {
+            file: 0,
+            start: Endpoint::FromStart(2),
+            end: Some(Endpoint::FromStart(4)),
+        };
+        let key = |read: &str, reach: usize| {
+            let mut key = Vec::new();
+            write_window_key(&mut key, Some(&loc), &[read.as_bytes()], reach);
+            key
+        };
+        assert_eq!(key("AAGTAAAA", 0), key("AAGTCCCC", 0));
+        assert_eq!(key("AAGTAAAA", 2), key("AAGTCCCC", 2));
+        assert_eq!(key("AAGTACGA", 5), key("AAGTACGC", 5));
+        assert_ne!(key("AAGTACGA", 5), key("AAGTACTA", 5));
+        assert_ne!(key("AAGTAC", 5), key("AAGTACG", 5));
+        assert_ne!(key("A", 5), key("AAG", 5));
+    }
+
+    #[test]
+    fn test_anchor5p_cache_splits_entries_within_the_reach_only() {
+        let entries = |g: &CompiledGroup, reads: &[&str]| {
+            let mut warm = Scratch::new();
+            for read in reads {
+                match_group(g, &mut warm, &[read.as_bytes()]);
+            }
+            warm.cache["g"].outcomes.len()
+        };
+        let exact = anchored5p(&["ACGTACGT"], 8, Dist::default());
+        assert_eq!(entries(&exact, &["ACGTACGTAAAA", "ACGTACGTCCCC"]), 1);
+        let indel = Dist {
+            mismatch: 0,
+            indel: 1,
+            total: 1,
+        };
+        let reads = ["ACGGTACGTAAAA", "ACGGTACGTCCCC", "ACGGTACGAAAAA"];
+        assert_eq!(entries(&anchored5p(&["ACGTACGT"], 8, indel), &reads), 2);
+    }
+
+    /// Every read over `alphabet` of up to `max_len` bases, shortest first.
+    fn reads_up_to(alphabet: &str, max_len: usize) -> Vec<String> {
+        let mut reads = vec![String::new()];
+        let mut longest = 0..1;
+        for _ in 0..max_len {
+            for index in longest.clone() {
+                for base in alphabet.chars() {
+                    reads.push(format!("{}{base}", reads[index]));
+                }
+            }
+            longest = longest.end..reads.len();
+        }
+        reads
+    }
+
+    /// Assert a warm `Scratch` gives each read its fresh-`Scratch` outcome.
+    fn assert_warm_scratch_matches_fresh(group: &CompiledGroup, reads: &[String]) {
+        let fresh: Vec<GroupOutcome> = reads.iter().map(|read| outcome(group, read)).collect();
+        let mut order: Vec<usize> = (0..reads.len()).collect();
+        for _ in 0..2 {
+            let mut warm = Scratch::new();
+            for &index in &order {
+                assert_eq!(
+                    match_group(group, &mut warm, &[reads[index].as_bytes()]),
+                    fresh[index],
+                    "read {:?} with {:?}, {:?}",
+                    reads[index],
+                    group.loc,
+                    group.dist
+                );
+            }
+            order.reverse();
+        }
+    }
+
+    /// Sweep `loc` windows, `(mismatch, indel)` budgets, and every short read.
+    fn assert_sweep_matches_fresh(anchor: Option<Anchor>, budgets: &[(usize, usize)]) {
+        let reads = reads_up_to("AC", 8);
+        let windows = [
+            (Endpoint::FromStart(0), Some(Endpoint::FromStart(2))),
+            (Endpoint::FromStart(0), Some(Endpoint::FromStart(4))),
+            (Endpoint::FromStart(1), Some(Endpoint::FromStart(3))),
+            (Endpoint::FromStart(2), None),
+            (Endpoint::FromEnd(4), Some(Endpoint::ReadEnd)),
+            (Endpoint::FromStart(0), Some(Endpoint::FromEnd(2))),
+        ];
+        for (start, end) in windows {
+            for &(mismatch, indel) in budgets {
+                let mut g = group(&["ACA", "CCAC", "AACCA"]);
+                g.anchor = anchor;
+                g.dist = Dist {
+                    mismatch,
+                    indel,
+                    total: mismatch + indel,
+                };
+                g.loc = Some(Location {
+                    file: 0,
+                    start,
+                    end,
+                });
+                assert_warm_scratch_matches_fresh(&g, &reads);
+            }
+        }
+    }
+
+    #[test]
+    fn test_anchor5p_warm_scratch_matches_fresh_scratch() {
+        assert_sweep_matches_fresh(
+            Some(Anchor::FivePrime),
+            &[(0, 0), (1, 0), (0, 1), (1, 1), (0, 2)],
+        );
+    }
+
+    #[test]
+    fn test_anchor3p_warm_scratch_matches_fresh_scratch() {
+        assert_sweep_matches_fresh(Some(Anchor::ThreePrime), &[(0, 0), (1, 0)]);
+    }
+
+    #[test]
+    fn test_sliding_window_warm_scratch_matches_fresh_scratch() {
+        assert_sweep_matches_fresh(None, &[(0, 0), (1, 1)]);
+    }
+
+    #[test]
+    fn test_joined_stream_warm_scratch_matches_fresh_scratch() {
+        let mut g = group(&["ACA", "CCAC", "AACCA"]);
+        g.match_streams = Some(vec!["i7".to_string(), "i5".to_string()]);
+        g.dist = Dist {
+            mismatch: 1,
+            indel: 1,
+            total: 2,
+        };
+        assert_warm_scratch_matches_fresh(&g, &reads_up_to("AC", 8));
     }
 
     #[test]

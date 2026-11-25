@@ -314,6 +314,99 @@ Feature: Tag matching with distance tolerance and error handling
     And stdout contains "BC:Z:AGTACTC"
     And stdout does not contain "BC:Z:TACTCA"
 
+  Scenario: anchor=5p with an indel budget judges each read by the base past the loc window
+    Given a file "reads.fq" containing:
+      """
+      @hit1
+      ACGGTACGTAAAA
+      +
+      IIIIIIIIIIIII
+      @miss1
+      ACGGTACGAAAAA
+      +
+      IIIIIIIIIIIII
+      @miss2
+      ACGTAACGAAAAA
+      +
+      IIIIIIIIIIIII
+      @hit2
+      ACGTAACGTAAAA
+      +
+      IIIIIIIIIIIII
+      """
+    # Each pair agrees over the loc window [0,8); the inserted base makes base 8 decide the match.
+    When I run `unmux reads.fq --threads 1 --group bc={a=ACGTACGT} --group bc::loc=0:0:8,dist=0:1:1,anchor=5p --sample s1=bc::a --out %sample.fq --unassigned un.fq`
+    Then the exit code is 0
+    And the file "s1.fq" is:
+      """
+      @hit1
+      ACGGTACGTAAAA
+      +
+      IIIIIIIIIIIII
+      @hit2
+      ACGTAACGTAAAA
+      +
+      IIIIIIIIIIIII
+      """
+    And the file "un.fq" is:
+      """
+      @miss1
+      ACGGTACGAAAAA
+      +
+      IIIIIIIIIIIII
+      @miss2
+      ACGTAACGAAAAA
+      +
+      IIIIIIIIIIIII
+      """
+
+  Scenario: anchor=5p tags longer than the loc window are told apart by the bases past it
+    Given a file "reads.fq" containing:
+      """
+      @r1
+      AAAAAACCTTTT
+      +
+      IIIIIIIIIIII
+      @r2
+      AAAAAAGGTTTT
+      +
+      IIIIIIIIIIII
+      """
+    When I run `unmux reads.fq --threads 1 --group bc={s1=AAAAAACC,s2=AAAAAAGG} --group bc::loc=0:0:6,anchor=5p --sample-from-group bc --out %sample.fq --unassigned un.fq`
+    Then the exit code is 0
+    And the file "s1.fq" is:
+      """
+      @r1
+      AAAAAACCTTTT
+      +
+      IIIIIIIIIIII
+      """
+    And the file "s2.fq" is:
+      """
+      @r2
+      AAAAAAGGTTTT
+      +
+      IIIIIIIIIIII
+      """
+
+  Scenario: a read too short for an anchor=5p match does not take a longer read's match
+    Given a file "reads.fq" containing:
+      """
+      @long
+      ACGGTACGT
+      +
+      IIIIIIIII
+      @short
+      ACGGTACG
+      +
+      IIIIIIII
+      """
+    When I run `unmux reads.fq --threads 1 --group bc={a=ACGTACGT} --group bc::loc=0:0:8,dist=0:1:1,anchor=5p --extract bc=@bc --tag BC=bc --tag BC::raw=true --sample s1=bc::a --out %sample.fq --unassigned un.fq`
+    Then the exit code is 0
+    And the file "s1.fq" contains "BC:Z:ACGGTACGT"
+    And the file "s1.fq" does not contain "@short"
+    And the file "un.fq" contains "@short"
+
   Scenario: A leftward anchor offset extracts a UMI upstream of the matched barcode
     Given a file "reads.fq" containing:
       """
