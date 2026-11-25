@@ -718,6 +718,31 @@ pub(crate) fn file_id(_: &std::fs::Metadata) -> Option<FileId> {
     None
 }
 
+/// Refuse two outputs whose staged files were created as one file, whatever the reason.
+pub(crate) fn refuse_shared_files<'a>(
+    staged: &StagedOutputs,
+    outputs: impl IntoIterator<Item = &'a PathBuf>,
+) -> Result<()> {
+    let mut seen: HashMap<FileId, &Path> = HashMap::new();
+    for path in outputs {
+        let Ok(metadata) = std::fs::metadata(staged.path(path)) else {
+            continue;
+        };
+        let Some(id) = file_id(&metadata).filter(|_| metadata.is_file()) else {
+            continue;
+        };
+        match seen.get(&id) {
+            Some(first) if *first != path.as_path() => bail!(
+                "outputs {first:?} and {path:?} are one file on this file system; give them distinct paths"
+            ),
+            _ => {
+                seen.insert(id, path);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Create an output file, making any missing parent directories first. Shared
 /// by the inline writers and the pooled-writer exchange so both create files
 /// (and dirs) identically.
@@ -1001,6 +1026,32 @@ fn segment_flags(index: usize, total: usize) -> Flags {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn test_refuse_shared_files_when_staged_outputs_are_one_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b, c) = (
+            dir.path().join("o/a.fq"),
+            dir.path().join("o/b.fq"),
+            dir.path().join("o/c.fq"),
+        );
+        let mut staged = StagedOutputs::default();
+        staged.stage([a.clone(), b.clone(), c.clone()]);
+        create_output_file(staged.path(&a)).unwrap();
+        create_output_file(staged.path(&c)).unwrap();
+        assert!(refuse_shared_files(&staged, [&a, &a, &c]).is_ok());
+        std::fs::hard_link(staged.path(&a), staged.path(&b)).unwrap();
+        let error = refuse_shared_files(&staged, [&a, &b, &c])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("are one file on this file system"),
+            "{error}"
+        );
+        drop(staged);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
 
     #[test]
     fn test_staged_outputs_leave_existing_files_untouched_on_failure() {

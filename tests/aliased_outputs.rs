@@ -75,3 +75,28 @@ fn an_output_through_a_dangling_directory_link_is_refused() {
     );
     assert_eq!(entries(&out), ["L"]);
 }
+
+/// On a file system that ignores Unicode normalization, NFC and NFD spellings are one file.
+#[cfg(target_os = "macos")]
+#[test]
+fn outputs_one_file_only_on_this_file_system_are_refused_and_cleaned_up() {
+    let (nfc, nfd) = ("o/\u{e9}.fq", "o/e\u{301}.fq");
+    let remove = format!("bc::b={nfd}");
+    for args in [
+        ["--unassigned", nfc, "--remove", remove.as_str()],
+        ["--metrics-summary", nfc, "--metrics-per-sample", nfd],
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("o");
+        std::fs::create_dir(&out).unwrap();
+        let mut all = vec!["--sample", "a=bc::a", "--out", "o/%sample.fq"];
+        all.extend(args);
+        let (code, stderr) = unmux(dir.path(), &all);
+        assert_eq!(code, 1, "{stderr}");
+        assert!(
+            stderr.contains("are one file on this file system"),
+            "{stderr}"
+        );
+        assert!(entries(&out).is_empty(), "{:?}", entries(&out));
+    }
+}

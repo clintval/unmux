@@ -1377,18 +1377,16 @@ fn run_engine(plan: &DemuxPlan, command_line: Option<&str>) -> Result<()> {
     if let Some(reference) = &reference {
         reader.check_reference(&plan.inputs, reference)?;
     }
-    staged.stage(
-        dests.iter().cloned().chain(
-            [
-                &plan.metrics_per_sample,
-                &plan.metrics_summary,
-                &plan.metrics_unassigned,
-            ]
-            .into_iter()
-            .flatten()
-            .map(|pattern| resolve_metrics_path(pattern, &pool)),
-        ),
-    );
+    let metrics_paths: Vec<PathBuf> = [
+        &plan.metrics_per_sample,
+        &plan.metrics_summary,
+        &plan.metrics_unassigned,
+    ]
+    .into_iter()
+    .flatten()
+    .map(|pattern| resolve_metrics_path(pattern, &pool))
+    .collect();
+    staged.stage(dests.iter().chain(&metrics_paths).cloned());
     writer.write_files_to(staged.temporaries());
 
     // Route poolable destinations (gzipped FASTX and BAM) through a shared BGZF
@@ -1506,6 +1504,13 @@ fn run_engine(plan: &DemuxPlan, command_line: Option<&str>) -> Result<()> {
     // error.
     let run_result = (|| -> Result<()> {
         writer.create_all(&dests)?;
+        for path in &metrics_paths {
+            let temporary = staged.path(path);
+            if temporary != path.as_path() {
+                crate::writer::create_output_file(temporary)?;
+            }
+        }
+        crate::writer::refuse_shared_files(&staged, dests.iter().chain(&metrics_paths))?;
         match threads {
             1 => drive_serial(&engine, reader, &mut writer, &mut metrics),
             2 => drive_pipelined(&engine, reader, &mut writer, &mut metrics),
