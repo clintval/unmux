@@ -38,8 +38,6 @@ fn fuzz_parse_sample_sheet() {
         .with_type::<String>()
         .for_each(|text: &String| {
             let _ = unmux::parse_sample_sheet(text, &declared, &HashSet::new());
-            let reads = [("v", "note"), ("s", "sample"), ("u", "sub_sample")];
-            let _ = unmux::parse_sample_sheet_columns(text, &declared, &HashSet::new(), &reads);
         });
 }
 

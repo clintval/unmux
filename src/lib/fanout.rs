@@ -176,7 +176,7 @@ impl Routing {
     }
 
     /// Each route's target, in route order.
-    pub fn route_targets(&self) -> impl ExactSizeIterator<Item = &Target> {
+    pub(crate) fn route_targets(&self) -> impl ExactSizeIterator<Item = &Target> {
         self.routes.iter().map(|route| &route.target)
     }
 
@@ -610,7 +610,7 @@ pub fn expand_from_group(group: &str, tag_set: &TagSet) -> Vec<Sample> {
 
 /// What a `%sample::COLUMN` extract reads from each sample-sheet row.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SheetColumn {
+pub(crate) enum SheetColumn {
     /// The routed target's sample ID.
     Sample,
     /// The routed target's sub-sample ID, when it has one.
@@ -621,7 +621,7 @@ pub enum SheetColumn {
 
 /// The sample-sheet columns that `%sample::COLUMN` extracts read, keyed by the
 /// column as the extract spells it.
-pub type SheetColumns = HashMap<String, SheetColumn>;
+pub(crate) type SheetColumns = HashMap<String, SheetColumn>;
 
 /// Parse a `--sample-sheet` TSV into the same [`Sample`] targets `--sample`
 /// produces.
@@ -649,7 +649,7 @@ pub fn parse_sample_sheet(
 /// Parse a `--sample-sheet` TSV as [`parse_sample_sheet`] does, along with the
 /// columns that `reads` pairs of `(extract, column)` read. A read column may
 /// not be a group column, and its cells hold printable ASCII and spaces.
-pub fn parse_sample_sheet_columns(
+pub(crate) fn parse_sample_sheet_columns(
     text: &str,
     declared_groups: &HashSet<&str>,
     ignored_columns: &HashSet<&str>,
@@ -835,7 +835,7 @@ pub fn load_sample_sheet(
 
 /// Load and parse a `--sample-sheet` from a file, along with the columns that
 /// `reads` pairs of `(extract, column)` read.
-pub fn load_sample_sheet_columns(
+pub(crate) fn load_sample_sheet_columns(
     path: &Path,
     declared_groups: &HashSet<&str>,
     ignored_columns: &HashSet<&str>,
@@ -1791,6 +1791,17 @@ mod tests {
             panic!("not assigned");
         };
         assert_eq!((route.column(0), route.column(1)), (None, Some("s2")));
+    }
+
+    #[test]
+    fn fuzz_parse_sample_sheet_columns() {
+        let declared: HashSet<&str> = ["bc", "grp", "cbt"].into_iter().collect();
+        let reads = [("v", "note"), ("s", "sample"), ("u", "sub_sample")];
+        bolero::check!()
+            .with_type::<String>()
+            .for_each(|text: &String| {
+                let _ = parse_sample_sheet_columns(text, &declared, &HashSet::new(), &reads);
+            });
     }
 
     #[test]
