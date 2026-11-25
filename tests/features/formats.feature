@@ -1,9 +1,10 @@
 Feature: Input and output format handling
   Input auto-detection by byte-sniffing (FASTA, FASTQ, gzip, SAM, BAM, CRAM); stdin via '-';
-  interleaving auto-detected from read-name pairing (--per-record opts out, no --interleaved flag);
-  output format inferred from extension (FASTX/SAM/BAM/CRAM); --compression 0-9 for BGZF/gzip;
-  stdout via --out - (mirrors the input format). With no --extract/--template the record body is the
-  raw input read, so these pass-through scenarios isolate format detection and output framing.
+  interleaving auto-detected from read-name pairing and SAM/BAM/CRAM pairs from the record flags
+  (--per-record opts out, no --interleaved flag); output format inferred from extension
+  (FASTX/SAM/BAM/CRAM); --compression 0-9 for BGZF/gzip; stdout via --out - (mirrors the input
+  format). With no --extract/--template the record body is the raw input read, so these
+  pass-through scenarios isolate format detection and output framing.
 
   Scenario: A .bam extension produces a BGZF-framed binary file (not plain text)
     Given a file "reads.fq" containing:
@@ -132,6 +133,265 @@ Feature: Input and output format handling
     And a file "out.R2.fq" does not exist
     And the file "out.R1.fq" contains "ACGTACGT"
     And the file "out.R1.fq" contains "TTTTGGGG"
+
+  Scenario: Paired SAM input is auto-detected from the record flags
+    Given a file "paired.sam" containing:
+      """
+      @HD	VN:1.6
+      read1	77	*	0	0	*	*	0	0	ACGTACGT	IIIIIIII
+      read1	141	*	0	0	*	*	0	0	TTTTGGGG	JJJJJJJJ
+      read2	77	*	0	0	*	*	0	0	CCCCAAAA	IIIIIIII
+      read2	141	*	0	0	*	*	0	0	GGGGTTTT	JJJJJJJJ
+      """
+    # Flags 77 and 141 mark the two mates of an unmapped pair, and each pair is one read.
+    When I run `unmux paired.sam --pool p --out out.sam`
+    Then the exit code is 0
+    And the records of "out.sam" are:
+      """
+      read1	77	*	0	255	*	*	0	0	ACGTACGT	IIIIIIII	RG:Z:p
+      read1	141	*	0	255	*	*	0	0	TTTTGGGG	JJJJJJJJ	RG:Z:p
+      read2	77	*	0	255	*	*	0	0	CCCCAAAA	IIIIIIII	RG:Z:p
+      read2	141	*	0	255	*	*	0	0	GGGGTTTT	JJJJJJJJ	RG:Z:p
+      """
+    And stderr contains "2 reads (0 assigned, 2 pass-through"
+
+  Scenario: Paired SAM input writes its mates to R1 and R2 FASTQ files
+    Given a file "paired.sam" containing:
+      """
+      @HD	VN:1.6
+      read1	77	*	0	0	*	*	0	0	ACGTACGT	IIIIIIII
+      read1	141	*	0	0	*	*	0	0	TTTTGGGG	JJJJJJJJ
+      read2	77	*	0	0	*	*	0	0	CCCCAAAA	IIIIIIII
+      read2	141	*	0	0	*	*	0	0	GGGGTTTT	JJJJJJJJ
+      """
+    When I run `unmux paired.sam --out out.R%ordinal.fq`
+    Then the exit code is 0
+    And the file "out.R1.fq" is:
+      """
+      @read1
+      ACGTACGT
+      +
+      IIIIIIII
+      @read2
+      CCCCAAAA
+      +
+      IIIIIIII
+      """
+    And the file "out.R2.fq" is:
+      """
+      @read1
+      TTTTGGGG
+      +
+      JJJJJJJJ
+      @read2
+      GGGGTTTT
+      +
+      JJJJJJJJ
+      """
+
+  Scenario Outline: A pair written to <format> reads back as a pair on <threads> threads
+    Given a file "r1.fq" containing:
+      """
+      @read1
+      ACGTACGT
+      +
+      IIIIIIII
+      @read2
+      CCCCAAAA
+      +
+      IIIIIIII
+      """
+    And a file "r2.fq" containing:
+      """
+      @read1
+      TTTTGGGG
+      +
+      JJJJJJJJ
+      @read2
+      GGGGTTTT
+      +
+      JJJJJJJJ
+      """
+    When I run `unmux r1.fq r2.fq --out pairs.<format>`
+    Then the exit code is 0
+    When I run `unmux pairs.<format> --pool p --threads <threads> --out back.sam`
+    Then the exit code is 0
+    And the records of "back.sam" are:
+      """
+      read1	77	*	0	255	*	*	0	0	ACGTACGT	IIIIIIII	RG:Z:p
+      read1	141	*	0	255	*	*	0	0	TTTTGGGG	JJJJJJJJ	RG:Z:p
+      read2	77	*	0	255	*	*	0	0	CCCCAAAA	IIIIIIII	RG:Z:p
+      read2	141	*	0	255	*	*	0	0	GGGGTTTT	JJJJJJJJ	RG:Z:p
+      """
+
+    Examples:
+      | format | threads |
+      | sam    | 1       |
+      | sam    | 2       |
+      | sam    | 8       |
+      | bam    | 1       |
+      | bam    | 2       |
+      | bam    | 8       |
+      | bam    | 16      |
+      | cram   | 1       |
+      | cram   | 2       |
+      | cram   | 8       |
+
+  Scenario: A SAM pair whose last mate comes first is read first mate first
+    Given a file "swapped.sam" containing:
+      """
+      @HD	VN:1.6
+      read1	141	*	0	0	*	*	0	0	TTTTGGGG	JJJJJJJJ
+      read1	77	*	0	0	*	*	0	0	ACGTACGT	IIIIIIII
+      read2	77	*	0	0	*	*	0	0	CCCCAAAA	IIIIIIII
+      read2	141	*	0	0	*	*	0	0	GGGGTTTT	JJJJJJJJ
+      """
+    When I run `unmux swapped.sam --pool p --out out.sam`
+    Then the exit code is 0
+    And the records of "out.sam" are:
+      """
+      read1	77	*	0	255	*	*	0	0	ACGTACGT	IIIIIIII	RG:Z:p
+      read1	141	*	0	255	*	*	0	0	TTTTGGGG	JJJJJJJJ	RG:Z:p
+      read2	77	*	0	255	*	*	0	0	CCCCAAAA	IIIIIIII	RG:Z:p
+      read2	141	*	0	255	*	*	0	0	GGGGTTTT	JJJJJJJJ	RG:Z:p
+      """
+    When I run `unmux swapped.sam --out out.R%ordinal.fq`
+    Then the exit code is 0
+    And the file "out.R1.fq" is:
+      """
+      @read1
+      ACGTACGT
+      +
+      IIIIIIII
+      @read2
+      CCCCAAAA
+      +
+      IIIIIIII
+      """
+    And the file "out.R2.fq" is:
+      """
+      @read1
+      TTTTGGGG
+      +
+      JJJJJJJJ
+      @read2
+      GGGGTTTT
+      +
+      JJJJJJJJ
+      """
+
+  Scenario: A mapped SAM pair whose last mate is leftmost is read first mate first
+    Given a file "mapped.sam" containing:
+      """
+      @HD	VN:1.6	SO:unsorted	GO:query
+      @SQ	SN:chr1	LN:1000
+      q1	163	chr1	100	60	8M	=	150	58	ACGTACGT	ABCDEFGH
+      q1	83	chr1	150	60	8M	=	100	-58	GGGGTTTT	HGFEDCBA
+      """
+    When I run `unmux mapped.sam --pool p --out out.sam`
+    Then the exit code is 0
+    And the records of "out.sam" are:
+      """
+      q1	77	*	0	255	*	*	0	0	AAAACCCC	ABCDEFGH	RG:Z:p
+      q1	141	*	0	255	*	*	0	0	ACGTACGT	ABCDEFGH	RG:Z:p
+      """
+
+  Scenario: A mapped SAM pair outside an aligned read-group split becomes an unmapped pair
+    Given a file "mapped.sam" containing:
+      """
+      @HD	VN:1.6	SO:unsorted	GO:query
+      @SQ	SN:chr1	LN:1000
+      q1	99	chr1	100	60	8M	=	150	58	ACGTACGT	ABCDEFGH	MC:Z:8M	NM:i:0
+      q1	2147	chr1	400	9	4H4M	=	150	0	ACGT	ABCD	NM:i:0
+      q1	147	chr1	150	60	8M	=	100	-58	GGGGTTTT	HGFEDCBA	MC:Z:8M	NM:i:1
+      """
+    # The supplementary record is skipped and the reverse-strand mate is written as sequenced.
+    When I run `unmux mapped.sam --pool p --out out.sam`
+    Then the exit code is 0
+    And the records of "out.sam" are:
+      """
+      q1	77	*	0	255	*	*	0	0	ACGTACGT	ABCDEFGH	RG:Z:p
+      q1	141	*	0	255	*	*	0	0	AAAACCCC	ABCDEFGH	RG:Z:p
+      """
+
+  Scenario: File index 1 is the second mate of a paired SAM input
+    Given a file "paired.sam" containing:
+      """
+      @HD	VN:1.6
+      read1	77	*	0	0	*	*	0	0	ACGTACGT	IIIIIIII
+      read1	141	*	0	0	*	*	0	0	TTTTGGGG	JJJJJJJJ
+      read2	77	*	0	0	*	*	0	0	CCCCAAAA	IIIIIIII
+      read2	141	*	0	0	*	*	0	0	GGGGTTTT	JJJJJJJJ
+      """
+    When I run `unmux paired.sam --pool p --extract r1=0:0:end --extract umi=1:0:4 --template r1 --tag RX=umi --out out.sam`
+    Then the exit code is 0
+    And the records of "out.sam" are:
+      """
+      read1	4	*	0	255	*	*	0	0	ACGTACGT	IIIIIIII	RX:Z:TTTT	QX:Z:JJJJ	RG:Z:p
+      read2	4	*	0	255	*	*	0	0	CCCCAAAA	IIIIIIII	RX:Z:GGGG	QX:Z:JJJJ	RG:Z:p
+      """
+
+  Scenario: --per-record reads each mate of a paired SAM input on its own
+    Given a file "paired.sam" containing:
+      """
+      @HD	VN:1.6
+      read1	77	*	0	0	*	*	0	0	ACGTACGT	IIIIIIII
+      read1	141	*	0	0	*	*	0	0	TTTTGGGG	JJJJJJJJ
+      """
+    When I run `unmux paired.sam --out paired.R%ordinal.fq`
+    Then the exit code is 0
+    And stderr contains "1 reads (0 assigned, 1 pass-through"
+    And the file "paired.R2.fq" contains "TTTTGGGG"
+    When I run `unmux paired.sam --pool p --per-record --out alone.sam`
+    Then the exit code is 0
+    And stderr contains "2 reads (0 assigned, 2 pass-through"
+    And the records of "alone.sam" are:
+      """
+      read1	4	*	0	255	*	*	0	0	ACGTACGT	IIIIIIII	RG:Z:p
+      read1	4	*	0	255	*	*	0	0	TTTTGGGG	JJJJJJJJ	RG:Z:p
+      """
+    When I run `unmux paired.sam --per-record --out alone.R%ordinal.fq`
+    Then the exit code is 0
+    And a file "alone.R2.fq" does not exist
+
+  Scenario: Paired SAM records with their mates apart are refused unless --per-record reads each alone
+    Given a file "apart.sam" containing:
+      """
+      @HD	VN:1.6
+      read1	77	*	0	0	*	*	0	0	ACGTACGT	IIIIIIII
+      read2	77	*	0	0	*	*	0	0	CCCCAAAA	IIIIIIII
+      read1	141	*	0	0	*	*	0	0	TTTTGGGG	JJJJJJJJ
+      read2	141	*	0	0	*	*	0	0	GGGGTTTT	JJJJJJJJ
+      """
+    When I run `unmux apart.sam --pool p --out out.sam`
+    Then the exit code is 1
+    And stderr contains "paired record `read1` is followed by `read2`, not its mate"
+    And stderr contains "samtools sort -n"
+    And stderr contains "--per-record"
+    And a file "out.sam" does not exist
+    When I run `unmux apart.sam --pool p --per-record --out out.sam`
+    Then the exit code is 0
+    And the records of "out.sam" are:
+      """
+      read1	4	*	0	255	*	*	0	0	ACGTACGT	IIIIIIII	RG:Z:p
+      read2	4	*	0	255	*	*	0	0	CCCCAAAA	IIIIIIII	RG:Z:p
+      read1	4	*	0	255	*	*	0	0	TTTTGGGG	JJJJJJJJ	RG:Z:p
+      read2	4	*	0	255	*	*	0	0	GGGGTTTT	JJJJJJJJ	RG:Z:p
+      """
+
+  Scenario: A SAM input that mixes paired and unpaired records is refused
+    Given a file "mixed.sam" containing:
+      """
+      @HD	VN:1.6
+      read1	77	*	0	0	*	*	0	0	ACGTACGT	IIIIIIII
+      read1	141	*	0	0	*	*	0	0	TTTTGGGG	JJJJJJJJ
+      read2	4	*	0	0	*	*	0	0	CCCCAAAA	IIIIIIII
+      """
+    When I run `unmux mixed.sam --out out.sam`
+    Then the exit code is 1
+    And stderr contains "input mixes paired and unpaired records (`read2` is unpaired, unlike the first record)"
+    And stderr contains "--per-record"
+    And a file "out.sam" does not exist
 
   Scenario: CRAM output format by extension and SAM input
     Given a file "unmapped.sam" containing:

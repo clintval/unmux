@@ -131,8 +131,8 @@ pub struct DemuxArgs {
     /// `--qc-tag`: emit a per-record JSON demux-provenance slug under this SAM
     /// tag (a local-use tag, default `ZS`). `None` = off (the default).
     pub qc_tag: Option<String>,
-    /// `--per-record`: disable auto pair-detection (interleaving is
-    /// auto-detected otherwise).
+    /// `--per-record`: disable auto pair-detection (interleaving and
+    /// SAM/BAM/CRAM pairs are auto-detected otherwise).
     pub per_record: bool,
     /// `--compression`: level (0-9) for BGZF (BAM) and gzip (FASTX.gz) outputs;
     /// CRAM uses its own per-block codecs. Output format is inferred from the
@@ -3447,6 +3447,8 @@ mod tests {
             args.groups = vec!["rg=@RG".to_string()];
             args.sample_from_group = Some("rg".to_string());
             args.out = Some(format!("{}/%sample.{ext}", out.display()));
+            // FASTQ output is not a pass-through, and these paired records have no mates.
+            args.per_record = ext == "fq";
             run_demux(args).unwrap();
             out
         };

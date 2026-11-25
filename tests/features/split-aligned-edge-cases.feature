@@ -67,6 +67,31 @@ Feature: Edge cases of an aligned read-group split
       IIIIIIII
       """
 
+  Scenario: mates next to each other still pass through one record at a time, in input order
+    Given a file "in.sam" containing:
+      """
+      @HD	VN:1.6	SO:unsorted	GO:query
+      @SQ	SN:chr1	LN:1000
+      @RG	ID:rg1	SM:sampleA
+      q1	163	chr1	100	60	8M	=	150	58	ACGTACGT	ABCDEFGH	MC:Z:8M	RG:Z:rg1
+      q1	2131	chr1	400	9	4H4M	=	100	0	TTTT	IIII	RG:Z:rg1
+      q1	83	chr1	150	60	8M	=	100	-58	GGGGTTTT	HGFEDCBA	MC:Z:8M	RG:Z:rg1
+      """
+    When I run `unmux in.sam --pool p1 --group rg=@RG --sample-from-group rg --out out/%sample.sam --metrics-per-sample p.tsv`
+    Then the exit code is 0
+    And the records of "out/rg1.sam" are:
+      """
+      q1	163	chr1	100	60	8M	=	150	58	ACGTACGT	ABCDEFGH	MC:Z:8M	RG:Z:rg1
+      q1	2131	chr1	400	9	4H4M	=	100	0	TTTT	IIII	RG:Z:rg1
+      q1	83	chr1	150	60	8M	=	100	-58	GGGGTTTT	HGFEDCBA	MC:Z:8M	RG:Z:rg1
+      """
+    And the file "p.tsv" is:
+      """
+      pool	sample	sub_sample	reads	frac_of_pool	frac_bases_unextracted
+      p1	rg1		2	1.000000	0.000000
+      """
+    And stderr contains "1 secondary/supplementary records passed through"
+
   Scenario: a --tag that would replace a kept RG:Z is refused
     Given a file "in.sam" containing:
       """

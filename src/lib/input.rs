@@ -10,7 +10,8 @@
 //! from input file `i`, which is exactly the per-file segment model the matcher
 //! and extraction consume. SAM/BAM/CRAM inputs carry their record tags through
 //! for the writer to re-emit. A single FASTX input is auto-detected as
-//! interleaved (two mates per fragment). An input path of `-` reads stdin (at
+//! interleaved, and a single SAM/BAM/CRAM input as paired when its first record
+//! has flag `0x1` (two mates per fragment). An input path of `-` reads stdin (at
 //! most one). CRAM input decodes against a `--reference` FASTA when given,
 //! which must match the CRAM's `@SQ` lines; a CRAM that needs one and has none
 //! fails at its first reference-compressed slice.
@@ -32,6 +33,7 @@ use std::collections::HashMap;
 
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use noodles::sam::alignment::record::data::field::Tag;
+use noodles::sam::alignment::record::Flags;
 use noodles::sam::alignment::record_buf::data::field::Value;
 use noodles::sam::alignment::record_buf::Data;
 use noodles::sam::alignment::RecordBuf;
@@ -683,10 +685,11 @@ impl CramContainers {
 }
 
 impl FormatReader {
-    /// Read the next record from this stream, or `None` at end of input. With
-    /// `keep` set, secondary and supplementary records are returned too and each
-    /// record carries its untouched source alignment.
-    fn read_next(&mut self, keep: bool) -> Result<Option<InputRecord>> {
+    /// Read the next record from this stream with its `FLAG` field (empty for
+    /// FASTX), or `None` at end of input. With `keep` set, secondary and
+    /// supplementary records are returned too and each record carries its
+    /// untouched source alignment.
+    fn read_next(&mut self, keep: bool) -> Result<Option<(InputRecord, Flags)>> {
         match self {
             FormatReader::Fastq { reader, record } => {
                 if reader
@@ -708,7 +711,7 @@ impl FormatReader {
                         String::from_utf8_lossy(&first_token(record.name()))
                     );
                 }
-                Ok(Some(InputRecord {
+                let input = InputRecord {
                     name: first_token(record.name()),
                     bases: record.sequence().to_vec(),
                     quals: Some(
@@ -720,7 +723,8 @@ impl FormatReader {
                     ),
                     tags: parse_comment_tags(record.description()),
                     alignment: None,
-                }))
+                };
+                Ok(Some((input, Flags::empty())))
             }
             FormatReader::Fasta { reader, definition } => {
                 // noodles `read_definition` appends to the buffer, so clear the
@@ -750,13 +754,14 @@ impl FormatReader {
                     .trim_start()
                     .split_once([' ', '\t'])
                     .map_or("", |(_, rest)| rest);
-                Ok(Some(InputRecord {
+                let input = InputRecord {
                     name,
                     bases,
                     quals: None,
                     tags: parse_comment_tags(comment.as_bytes()),
                     alignment: None,
-                }))
+                };
+                Ok(Some((input, Flags::empty())))
             }
             FormatReader::Sam {
                 reader,
@@ -770,20 +775,22 @@ impl FormatReader {
                 {
                     return Ok(None);
                 }
+                let flags = record.flags();
                 if keep {
-                    return Ok(Some(kept_alignment(std::mem::take(record))));
+                    return Ok(Some((kept_alignment(std::mem::take(record)), flags)));
                 }
                 // Secondary/supplementary alignments are not distinct reads;
                 // skip to the next primary record so the per-file segment count
                 // stays one-per-template.
-                let flags = record.flags();
                 if flags.is_secondary() || flags.is_supplementary() {
                     continue;
                 }
-                return Ok(Some(alignment_to_input(record)));
+                return Ok(Some((alignment_to_input(record), flags)));
             },
             FormatReader::Bam { .. } => match self.read_pending(keep)? {
-                Some(pending) => pending.decode(&mut RecordBuf::default()).map(Some),
+                Some((pending, flags)) => {
+                    Ok(Some((pending.decode(&mut RecordBuf::default())?, flags)))
+                }
                 None => Ok(None),
             },
             FormatReader::Cram {
@@ -792,14 +799,14 @@ impl FormatReader {
                 ..
             } => loop {
                 if let Some(record) = buffered.next() {
-                    if keep {
-                        return Ok(Some(kept_alignment(record)));
-                    }
                     let flags = record.flags();
+                    if keep {
+                        return Ok(Some((kept_alignment(record), flags)));
+                    }
                     if flags.is_secondary() || flags.is_supplementary() {
                         continue;
                     }
-                    return Ok(Some(alignment_to_input(&record)));
+                    return Ok(Some((alignment_to_input(&record), flags)));
                 }
                 match containers.next()? {
                     None => return Ok(None),
@@ -810,13 +817,14 @@ impl FormatReader {
         }
     }
 
-    /// Read the next record, leaving a BAM record raw for a worker to decode.
-    fn read_pending(&mut self, keep: bool) -> Result<Option<PendingRecord>> {
+    /// [`Self::read_next`], leaving a BAM record raw for a worker to decode.
+    fn read_pending(&mut self, keep: bool) -> Result<Option<(PendingRecord, Flags)>> {
         let FormatReader::Bam {
             reader, skipped, ..
         } = self
         else {
-            return Ok(self.read_next(keep)?.map(PendingRecord::Ready));
+            let read = self.read_next(keep)?;
+            return Ok(read.map(|(record, flags)| (PendingRecord::Ready(record), flags)));
         };
         loop {
             let Some(raw) = read_raw_bam(reader.as_mut())? else {
@@ -824,7 +832,7 @@ impl FormatReader {
             };
             let flags = raw_bam_flags(&raw);
             if keep || !(flags.is_secondary() || flags.is_supplementary()) {
-                return Ok(Some(PendingRecord::Bam { raw, keep }));
+                return Ok(Some((PendingRecord::Bam { raw, keep }, flags)));
             }
             decode_raw_bam(&raw, skipped)?;
         }
@@ -840,6 +848,18 @@ impl FormatReader {
             _ => None,
         }
     }
+}
+
+/// The first record of an alignment input, kept whole and read on the CRAM decode stack.
+fn probe_first(reader: &mut FormatReader) -> Result<Option<(InputRecord, Flags)>> {
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .stack_size(CRAM_DECODE_STACK)
+            .spawn_scoped(scope, || reader.read_next(true))
+            .context("failed to start a thread to read the first record")?
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+    })
 }
 
 /// The first whitespace-delimited token of a name. FASTX names may carry a
@@ -1122,8 +1142,8 @@ pub struct ReadGroupInfo {
 
 /// Reads logical records across all inputs. With several `--in` files, one
 /// record is pulled from each in lockstep; a single FASTX input is
-/// auto-detected as interleaved (two mates per fragment) unless `--per-record`
-/// opts out.
+/// auto-detected as interleaved and a single SAM/BAM/CRAM input as paired (two
+/// mates per fragment) unless `--per-record` opts out.
 pub struct FragmentReader {
     readers: Vec<FormatReader>,
     /// The sniffed format of each input, in `--in` order (blend-compatible by
@@ -1132,20 +1152,31 @@ pub struct FragmentReader {
     /// A single FASTX input detected as interleaved: pull two mates per
     /// fragment from `readers[0]`.
     interleaved: bool,
-    /// Records buffered from `readers[0]` during interleaving detection, served
-    /// before fresh reads.
+    /// Whether a single alignment input is paired, or `None` when pairs are not probed.
+    paired: Option<bool>,
+    /// Records buffered from `readers[0]` during pair detection, served before
+    /// fresh reads. A SAM/BAM/CRAM record is held whole, as
+    /// [`Self::keep_alignments`] may still be called.
     buffered: Vec<InputRecord>,
+    /// A read error from pair detection, held so the checks before streaming report first.
+    probe_error: Option<anyhow::Error>,
     /// Pass SAM/BAM/CRAM records through whole (see [`Self::keep_alignments`]).
     keep_alignments: bool,
     /// The BAM inflate and CRAM decode workers started across all inputs.
     decode_threads: usize,
 }
 
+/// What to do about a SAM/BAM/CRAM input whose mates are not next to each other.
+const REGROUP_HINT: &str = "sort the input by read name (e.g. `samtools sort -n`), or pass \
+                            --per-record to read each record on its own";
+
 impl FragmentReader {
     /// Open every input by sniffing and dispatching, preserving 0-based `--in`
     /// order. With a single FASTX input and `per_record` false, the stream is
     /// probed for interleaving: a leading `/1` mate, or two adjacent records
-    /// that share a mate-pairing key, marks it interleaved.
+    /// that share a mate-pairing key, marks it interleaved. A single
+    /// SAM/BAM/CRAM input is probed for a first record with flag `0x1`, which
+    /// marks it paired.
     pub fn open(paths: &[PathBuf], per_record: bool) -> Result<Self> {
         Self::open_with_reference(paths, per_record, None)
     }
@@ -1199,8 +1230,9 @@ impl FragmentReader {
 
         let mut buffered = Vec::new();
         let mut interleaved = false;
-        // Interleaving is only meaningful for a single FASTX input; SAM/BAM
-        // segment pairing and multi-file inputs are handled by their own paths.
+        let mut paired = None;
+        let mut probe_error = None;
+        // Only a single input is probed for pairs; several inputs are zipped.
         if !per_record
             && readers.len() == 1
             && matches!(
@@ -1208,7 +1240,7 @@ impl FragmentReader {
                 FormatReader::Fastq { .. } | FormatReader::Fasta { .. }
             )
         {
-            if let Some(first) = readers[0].read_next(false)? {
+            if let Some((first, _)) = readers[0].read_next(false)? {
                 if first.name.ends_with(b"/2") {
                     bail!(
                         "interleaved input starts with a `/2` mate (mates out of order): {}",
@@ -1219,10 +1251,19 @@ impl FragmentReader {
                 buffered.push(first);
                 if first_is_r1 {
                     interleaved = true;
-                } else if let Some(second) = readers[0].read_next(false)? {
+                } else if let Some((second, _)) = readers[0].read_next(false)? {
                     interleaved = mate_key(&second.name) == mate_key(&buffered[0].name);
                     buffered.push(second);
                 }
+            }
+        } else if !per_record && readers.len() == 1 && readers[0].header().is_some() {
+            match probe_first(&mut readers[0]) {
+                Ok(Some((first, flags))) => {
+                    paired = Some(flags.is_segmented());
+                    buffered.push(first);
+                }
+                Ok(None) => {}
+                Err(error) => probe_error = Some(error),
             }
         }
 
@@ -1230,15 +1271,17 @@ impl FragmentReader {
             readers,
             formats,
             interleaved,
+            paired,
             buffered,
+            probe_error,
             keep_alignments: false,
             decode_threads: shares.iter().sum(),
         })
     }
 
     /// Pass SAM/BAM/CRAM records through whole: every record, secondary and
-    /// supplementary included, is yielded with its untouched source alignment
-    /// in [`InputRecord::alignment`].
+    /// supplementary included, is yielded on its own with its untouched source
+    /// alignment in [`InputRecord::alignment`], and mates are not paired.
     pub fn keep_alignments(&mut self) {
         self.keep_alignments = true;
     }
@@ -1318,23 +1361,25 @@ impl FragmentReader {
     }
 
     /// The number of records every fragment carries: two for a single
-    /// auto-detected interleaved input, otherwise one per input file. This
-    /// fixes the pass-through body count (one body per record), so output
+    /// auto-detected interleaved or paired input, otherwise one per input file.
+    /// This fixes the pass-through body count (one body per record), so output
     /// destinations can be enumerated before streaming.
     pub fn fragment_width(&self) -> usize {
-        if self.interleaved {
+        let paired = self.paired == Some(true) && !self.keep_alignments;
+        if self.interleaved || paired {
             2
         } else {
             self.readers.len()
         }
     }
 
-    /// Read the next logical record. A single interleaved input yields a
-    /// two-mate fragment; a single plain input yields a one-record fragment;
-    /// multiple inputs are zipped one record each. Returns `None` once every
-    /// input is exhausted together. A file that ends before the others, or
-    /// input segments whose read names disagree, is a fail-fast error (both
-    /// would silently mispair records).
+    /// Read the next logical record. A single interleaved or paired input
+    /// yields a two-mate fragment; a single plain input yields a one-record
+    /// fragment; multiple inputs are zipped one record each. Returns `None`
+    /// once every input is exhausted together. A file that ends before the
+    /// others, input segments whose read names disagree, a paired record not
+    /// followed by its mate, or a mix of paired and unpaired records is a
+    /// fail-fast error (each would silently mispair records).
     pub fn next_fragment(&mut self) -> Result<Option<Fragment>> {
         match self.next_pending_fragment()? {
             Some(pending) => pending.decode(&mut RecordBuf::default()).map(Some),
@@ -1345,17 +1390,23 @@ impl FragmentReader {
     /// [`Self::next_fragment`], leaving BAM records raw so the caller can decode
     /// them on another thread with [`PendingFragment::decode`].
     pub fn next_pending_fragment(&mut self) -> Result<Option<PendingFragment>> {
+        if let Some(error) = self.probe_error.take() {
+            return Err(error);
+        }
         if self.readers.len() == 1 {
-            let first = match self.next_from_first()? {
-                Some(record) => record,
+            let (first, flags) = match self.next_from_first()? {
+                Some(read) => read,
                 None => return Ok(None),
             };
+            if let Some(paired) = self.paired.filter(|_| !self.keep_alignments) {
+                return self.flagged_fragment(first, flags, paired).map(Some);
+            }
             if !self.interleaved {
                 return Ok(Some(PendingFragment {
                     records: smallvec::smallvec![first],
                 }));
             }
-            let second = self.next_from_first()?.ok_or_else(|| {
+            let (second, _) = self.next_from_first()?.ok_or_else(|| {
                 anyhow!("interleaved input ended on an unpaired mate (odd number of records)")
             })?;
             check_names_concord(&[first.name(), second.name()])?;
@@ -1367,7 +1418,8 @@ impl FragmentReader {
         let mut maybe: SmallVec<[Option<PendingRecord>; 4]> =
             SmallVec::with_capacity(self.readers.len());
         for reader in &mut self.readers {
-            maybe.push(reader.read_pending(self.keep_alignments)?);
+            let read = reader.read_pending(self.keep_alignments)?;
+            maybe.push(read.map(|(record, _)| record));
         }
         let present = maybe.iter().filter(|record| record.is_some()).count();
         if present == 0 {
@@ -1386,11 +1438,73 @@ impl FragmentReader {
         Ok(Some(PendingFragment { records }))
     }
 
-    /// The next record from the first input, draining any records buffered
-    /// during interleaving detection before reading fresh ones.
-    fn next_from_first(&mut self) -> Result<Option<PendingRecord>> {
-        if !self.buffered.is_empty() {
-            return Ok(Some(PendingRecord::Ready(self.buffered.remove(0))));
+    /// The fragment that `first` starts in a single alignment input that is `paired` or not.
+    fn flagged_fragment(
+        &mut self,
+        first: PendingRecord,
+        flags: Flags,
+        paired: bool,
+    ) -> Result<PendingFragment> {
+        let name = |record: &PendingRecord| String::from_utf8_lossy(record.name()).into_owned();
+        if flags.is_segmented() != paired {
+            bail!(
+                "input mixes paired and unpaired records (`{}` is {}, unlike the first record); \
+                 pass --per-record to read each record on its own",
+                name(&first),
+                if paired { "unpaired" } else { "paired" }
+            );
+        }
+        if !paired {
+            return Ok(PendingFragment {
+                records: smallvec::smallvec![first],
+            });
+        }
+        let Some((second, mate_flags)) = self.next_from_first()? else {
+            bail!(
+                "paired record `{}` ends the input without its mate; {REGROUP_HINT}",
+                name(&first)
+            );
+        };
+        if mate_key(second.name()) != mate_key(first.name()) {
+            bail!(
+                "paired record `{}` is followed by `{}`, not its mate; {REGROUP_HINT}",
+                name(&first),
+                name(&second)
+            );
+        }
+        let segment = Flags::SEGMENTED | Flags::FIRST_SEGMENT | Flags::LAST_SEGMENT;
+        let is_first = |flags: Flags| flags & segment == Flags::SEGMENTED | Flags::FIRST_SEGMENT;
+        let is_last = |flags: Flags| flags & segment == Flags::SEGMENTED | Flags::LAST_SEGMENT;
+        let records = if is_first(flags) && is_last(mate_flags) {
+            smallvec::smallvec![first, second]
+        } else if is_last(flags) && is_first(mate_flags) {
+            smallvec::smallvec![second, first]
+        } else {
+            bail!(
+                "adjacent records `{}` have flags {} and {}, not those of one first mate (0x40) \
+                 and one last mate (0x80); pass --per-record to read each record on its own",
+                name(&first),
+                u16::from(flags),
+                u16::from(mate_flags)
+            );
+        };
+        Ok(PendingFragment { records })
+    }
+
+    /// The next record from the first input with its `FLAG` field, draining
+    /// any records buffered during pair detection before reading fresh ones.
+    fn next_from_first(&mut self) -> Result<Option<(PendingRecord, Flags)>> {
+        while !self.buffered.is_empty() {
+            let mut record = self.buffered.remove(0);
+            let alignment = record.alignment.as_ref();
+            let flags = alignment.map(Alignment::flags).unwrap_or_default();
+            if !self.keep_alignments {
+                if flags.is_secondary() || flags.is_supplementary() {
+                    continue;
+                }
+                record.alignment = None;
+            }
+            return Ok(Some((PendingRecord::Ready(record), flags)));
         }
         self.readers[0].read_pending(self.keep_alignments)
     }
@@ -2284,6 +2398,237 @@ mod tests {
             count += 1;
         }
         assert_eq!(count, 2);
+    }
+
+    const PAIRED_SAM: &[u8] = b"@HD\tVN:1.6\n\
+        a\t77\t*\t0\t0\t*\t*\t0\t0\tAAAA\tIIII\n\
+        a\t141\t*\t0\t0\t*\t*\t0\t0\tCCCC\tIIII\n\
+        b\t77\t*\t0\t0\t*\t*\t0\t0\tGGGG\tIIII\n\
+        b\t141\t*\t0\t0\t*\t*\t0\t0\tTTTT\tIIII\n";
+
+    /// The pairs of [`PAIRED_SAM`] among supplementary and secondary records.
+    const PAIRED_AMONG_OTHERS_SAM: &[u8] = b"@HD\tVN:1.6\n\
+        a\t2125\t*\t0\t0\t*\t*\t0\t0\tNNNN\tIIII\n\
+        a\t77\t*\t0\t0\t*\t*\t0\t0\tAAAA\tIIII\n\
+        a\t141\t*\t0\t0\t*\t*\t0\t0\tCCCC\tIIII\n\
+        b\t77\t*\t0\t0\t*\t*\t0\t0\tGGGG\tIIII\n\
+        b\t397\t*\t0\t0\t*\t*\t0\t0\tNNNN\tIIII\n\
+        b\t141\t*\t0\t0\t*\t*\t0\t0\tTTTT\tIIII\n";
+
+    /// The records of SAM text as BAM bytes and as CRAM bytes.
+    fn bam_and_cram(sam: &[u8]) -> (Vec<u8>, Vec<u8>) {
+        use noodles::sam::alignment::io::Write as _;
+        let mut reader = sam::io::Reader::new(sam);
+        let header = reader.read_header().unwrap();
+        let records: Vec<RecordBuf> = reader
+            .record_bufs(&header)
+            .collect::<std::io::Result<_>>()
+            .unwrap();
+        let mut bam_bytes = Vec::new();
+        {
+            let mut writer = bam::io::Writer::new(&mut bam_bytes);
+            writer.write_header(&header).unwrap();
+            for record in &records {
+                writer.write_alignment_record(&header, record).unwrap();
+            }
+            writer.try_finish().unwrap();
+        }
+        let mut cram_bytes = Vec::new();
+        {
+            let mut writer = cram::io::Writer::new(&mut cram_bytes);
+            writer.write_header(&header).unwrap();
+            for record in &records {
+                writer.write_alignment_record(&header, record).unwrap();
+            }
+            writer.try_finish(&header).unwrap();
+        }
+        (bam_bytes, cram_bytes)
+    }
+
+    /// The bases of each fragment's records, for one input read on `threads` decode workers.
+    fn fragment_bases(bytes: &[u8], per_record: bool, threads: usize) -> Result<Vec<Vec<String>>> {
+        let file = temp_with(bytes);
+        let path = file.path().to_path_buf();
+        let mut reader =
+            FragmentReader::open_with_threads(&[path], per_record, None, |_| vec![threads])?;
+        let bases = |record: &InputRecord| String::from_utf8_lossy(&record.bases).into_owned();
+        let mut fragments = Vec::new();
+        while let Some(fragment) = reader.next_fragment()? {
+            assert_eq!(fragment.records.len(), reader.fragment_width());
+            fragments.push(fragment.records.iter().map(bases).collect());
+        }
+        Ok(fragments)
+    }
+
+    #[test]
+    fn test_paired_sam_bam_and_cram_yield_two_record_fragments() {
+        for sam in [PAIRED_SAM, PAIRED_AMONG_OTHERS_SAM] {
+            let (bam, cram) = bam_and_cram(sam);
+            for bytes in [sam.to_vec(), bam, cram] {
+                for threads in [0, 3] {
+                    assert_eq!(
+                        fragment_bases(&bytes, false, threads).unwrap(),
+                        vec![vec!["AAAA", "CCCC"], vec!["GGGG", "TTTT"]]
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_mates_are_ordered_by_their_flags() {
+        let sam: &[u8] = b"@HD\tVN:1.6\n\
+            a\t141\t*\t0\t0\t*\t*\t0\t0\tCCCC\tIIII\n\
+            a\t77\t*\t0\t0\t*\t*\t0\t0\tAAAA\tIIII\n\
+            b\t77\t*\t0\t0\t*\t*\t0\t0\tGGGG\tIIII\n\
+            b\t141\t*\t0\t0\t*\t*\t0\t0\tTTTT\tIIII\n\
+            c\t141\t*\t0\t0\t*\t*\t0\t0\tCGCG\tIIII\n\
+            c\t77\t*\t0\t0\t*\t*\t0\t0\tATAT\tIIII\n";
+        let (bam, cram) = bam_and_cram(sam);
+        for bytes in [sam.to_vec(), bam, cram] {
+            for threads in [0, 3] {
+                assert_eq!(
+                    fragment_bases(&bytes, false, threads).unwrap(),
+                    vec![
+                        vec!["AAAA", "CCCC"],
+                        vec!["GGGG", "TTTT"],
+                        vec!["ATAT", "CGCG"]
+                    ]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_pairs_stay_together_across_cram_containers_and_bgzf_blocks() {
+        let pairs = 15_000;
+        let mut sam = String::from("@HD\tVN:1.6\n");
+        for i in 0..pairs {
+            sam.push_str(&format!("r{i}\t77\t*\t0\t0\t*\t*\t0\t0\tAAAA\tIIII\n"));
+            if i % 7 == 0 {
+                sam.push_str(&format!("r{i}\t333\t*\t0\t0\t*\t*\t0\t0\tNNNN\tIIII\n"));
+            }
+            sam.push_str(&format!("r{i}\t141\t*\t0\t0\t*\t*\t0\t0\tCCCC\tIIII\n"));
+        }
+        let (bam, cram) = bam_and_cram(sam.as_bytes());
+        for bytes in [bam, cram] {
+            for threads in [0, 3] {
+                let fragments = fragment_bases(&bytes, false, threads).unwrap();
+                assert_eq!(fragments.len(), pairs);
+                assert!(fragments.iter().all(|bases| bases == &["AAAA", "CCCC"]));
+            }
+        }
+    }
+
+    #[test]
+    fn test_paired_bam_mates_stay_raw_until_decoded() {
+        let (bam, _) = bam_and_cram(PAIRED_SAM);
+        let file = temp_with(&bam);
+        let mut reader = FragmentReader::open(&[file.path().to_path_buf()], false).unwrap();
+        let first = reader.next_pending_fragment().unwrap().unwrap();
+        let second = reader.next_pending_fragment().unwrap().unwrap();
+        assert!(reader.next_pending_fragment().unwrap().is_none());
+        assert!(second
+            .records
+            .iter()
+            .all(|record| matches!(record, PendingRecord::Bam { keep: false, .. })));
+        let mut bases: Vec<Vec<Vec<u8>>> = Vec::new();
+        for pending in [first, second] {
+            let fragment = pending.decode(&mut RecordBuf::default()).unwrap();
+            assert!(fragment.records.iter().all(|r| r.alignment.is_none()));
+            bases.push(fragment.records.into_iter().map(|r| r.bases).collect());
+        }
+        let expected: Vec<Vec<Vec<u8>>> = vec![
+            vec![b"AAAA".to_vec(), b"CCCC".to_vec()],
+            vec![b"GGGG".to_vec(), b"TTTT".to_vec()],
+        ];
+        assert_eq!(bases, expected);
+    }
+
+    #[test]
+    fn test_unpairable_alignment_records_are_errors() {
+        let mates_error = |flags: &str| {
+            format!(
+                "adjacent records `a` have flags {flags}, not those of one first mate (0x40) and \
+                 one last mate (0x80); pass --per-record"
+            )
+        };
+        let cases: [(&[(&str, u16)], String); 9] = [
+            (
+                &[("a", 77), ("b", 77), ("a", 141), ("b", 141)],
+                "paired record `a` is followed by `b`, not its mate; sort the input".to_string(),
+            ),
+            (
+                &[("a", 77), ("a", 141), ("b", 77)],
+                "paired record `b` ends the input without its mate; sort the input".to_string(),
+            ),
+            (
+                &[("a", 77), ("a", 141), ("b", 4)],
+                "input mixes paired and unpaired records (`b` is unpaired".to_string(),
+            ),
+            (
+                &[("a", 4), ("b", 77), ("b", 141)],
+                "input mixes paired and unpaired records (`b` is paired".to_string(),
+            ),
+            (&[("a", 77), ("a", 77)], mates_error("77 and 77")),
+            (&[("a", 141), ("a", 141)], mates_error("141 and 141")),
+            (&[("a", 77), ("a", 4)], mates_error("77 and 4")),
+            (&[("a", 13), ("a", 141)], mates_error("13 and 141")),
+            (&[("a", 205), ("a", 141)], mates_error("205 and 141")),
+        ];
+        for (records, expected) in cases {
+            let mut sam = String::from("@HD\tVN:1.6\n");
+            for (name, flags) in records {
+                sam.push_str(&format!("{name}\t{flags}\t*\t0\t0\t*\t*\t0\t0\tA\tI\n"));
+            }
+            let error = match fragment_bases(sam.as_bytes(), false, 0) {
+                Ok(fragments) => panic!("expected `{expected}`, read {fragments:?}"),
+                Err(error) => format!("{error:#}"),
+            };
+            assert!(error.contains(&expected), "{error}");
+            assert!(error.contains("--per-record"), "{error}");
+        }
+    }
+
+    #[test]
+    fn test_per_record_reads_paired_alignments_one_per_fragment() {
+        let (bam, cram) = bam_and_cram(PAIRED_SAM);
+        for bytes in [PAIRED_SAM.to_vec(), bam, cram] {
+            assert_eq!(
+                fragment_bases(&bytes, true, 0).unwrap(),
+                vec![vec!["AAAA"], vec!["CCCC"], vec!["GGGG"], vec!["TTTT"]]
+            );
+        }
+    }
+
+    #[test]
+    fn test_keep_alignments_reads_paired_records_one_per_fragment_in_input_order() {
+        let (bam, cram) = bam_and_cram(PAIRED_AMONG_OTHERS_SAM);
+        for bytes in [PAIRED_AMONG_OTHERS_SAM.to_vec(), bam, cram] {
+            let file = temp_with(&bytes);
+            let mut reader = FragmentReader::open(&[file.path().to_path_buf()], false).unwrap();
+            reader.keep_alignments();
+            assert_eq!(reader.fragment_width(), 1);
+            let mut flags = Vec::new();
+            while let Some(fragment) = reader.next_fragment().unwrap() {
+                assert_eq!(fragment.records.len(), 1);
+                let alignment = fragment.records[0].alignment.as_ref().unwrap();
+                flags.push(u16::from(alignment.flags()));
+            }
+            assert_eq!(flags, vec![2125, 77, 141, 77, 397, 141]);
+        }
+    }
+
+    #[test]
+    fn test_unreadable_first_alignment_record_fails_the_first_read_not_the_open() {
+        let file = temp_with(b"@HD\tVN:1.6\na\t77\t*\tx\t0\t*\t*\t0\t0\tAAAA\tIIII\n");
+        let mut reader = FragmentReader::open(&[file.path().to_path_buf()], false).unwrap();
+        assert_eq!(reader.fragment_width(), 1);
+        let error = reader.next_fragment().unwrap_err();
+        assert!(
+            format!("{error:#}").contains("failed to read SAM record"),
+            "{error:#}"
+        );
     }
 
     #[test]
