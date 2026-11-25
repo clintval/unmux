@@ -219,9 +219,9 @@ impl FindKind {
 }
 
 impl CompiledGroup {
-    /// A bare group: exact, forward-strand, whole-record, `mode=all`, no delta,
-    /// no find bounds. Tests and callers set the attributes they care about on
-    /// top of this.
+    /// A bare group: exact, forward-strand, whole-record, `mode=all`, a `delta`
+    /// of 1, no find bounds. Tests and callers set the attributes they care
+    /// about on top of this.
     pub fn new(name: impl Into<String>, tags: Vec<Vec<u8>>) -> Self {
         Self {
             name: name.into(),
@@ -230,7 +230,7 @@ impl CompiledGroup {
             loc: None,
             revcomp: false,
             mode: MatchMode::All,
-            delta: 0,
+            delta: 1,
             min_finds_per_tag: None,
             max_finds_per_tag: None,
             min_finds_per_group: None,

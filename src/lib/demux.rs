@@ -428,7 +428,7 @@ fn compile_groups(
             loc: attrs.loc.clone(),
             revcomp: attrs.revcomp.unwrap_or(false),
             mode,
-            delta: attrs.delta.unwrap_or(0),
+            delta: attrs.delta.unwrap_or(1),
             min_finds_per_tag: attrs.min_finds_per_tag,
             max_finds_per_tag: attrs.max_finds_per_tag,
             min_finds_per_group: attrs.min_finds_per_group,

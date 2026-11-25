@@ -132,7 +132,7 @@ pub fn validate_group(
                     "group `{name}`: tags `{a_s}` and `{b_s}` can both match one read within dist={k} (they differ at only {disjoint} position(s))"
                 );
                 match mode {
-                    MatchMode::All => bail!("{overlap}; with mode=all this silently mis-assigns - separate the tags, lower dist, or use mode=nearest with a delta"),
+                    MatchMode::All => bail!("{overlap}; with mode=all this silently mis-assigns - separate the tags, lower dist, or use mode=nearest"),
                     MatchMode::Nearest => warnings.push(format!(
                         "{overlap}; mode=nearest leaves ambiguous reads unassigned unless delta separates them"
                     )),
