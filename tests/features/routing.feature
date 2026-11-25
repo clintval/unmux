@@ -237,6 +237,38 @@ Feature: Read routing, removal, and fan-out primitives
       | --tag CB=a+~b+c                    | CB:Z:AAAA-GGGG-TTTT	CY:Z:IIII IIII IIII |
       | --tag xc=a+b+cid                   | xc:Z:AAAA-CCCC-w3                        |
 
+  Scenario Outline: a carried tag is dropped when its --tag binding is left out
+    Given a file "in.sam" containing:
+      """
+      @HD	VN:1.6
+      r1	4	*	0	0	*	*	0	0	AAAACCCCTTTT	IIIIIIIIIIII	CB:Z:OLDOLD	CY:Z:FFFFFF	RX:Z:GGGG	QX:Z:FFFF
+      r2	4	*	0	0	*	*	0	0	AAAAACGTTTTT	IIIIIIIIIIII	CB:Z:OLDOLD	CY:Z:FFFFFF	RX:Z:GGGG	QX:Z:FFFF
+      """
+    And a file "rounds.tsv" containing:
+      """
+      id	seq
+      w1	CCCC
+      w2	GGGG
+      w3	TTTT
+      """
+    # @r2 misses round b, so its CB binding is left out; the carried CB and CY would be stale, so
+    # they go too, while the unbound carried RX and QX stay.
+    When I run `unmux in.sam --out in.<ext>`
+    Then the exit code is 0
+    When I run `unmux in.<ext> --pool p --group a={AAAA} --group a::loc=0:0:4 --group b=rounds.tsv --group b::loc=0:4:8 --group c=rounds.tsv --group c::loc=0:8:12 --extract a=@a --extract b=@b --extract c=@c --tag CB=a+b+c --out out.sam`
+    Then the exit code is 0
+    And the records of "out.sam" are:
+      """
+      r1	4	*	0	255	*	*	0	0	AAAACCCCTTTT	IIIIIIIIIIII	CB:Z:AAAA-CCCC-TTTT	CY:Z:IIII IIII IIII	RX:Z:GGGG	QX:Z:FFFF	RG:Z:p
+      r2	4	*	0	255	*	*	0	0	AAAAACGTTTTT	IIIIIIIIIIII	RX:Z:GGGG	QX:Z:FFFF	RG:Z:p
+      """
+
+    Examples:
+      | ext  |
+      | sam  |
+      | bam  |
+      | cram |
+
   Scenario: an empty but present stream keeps its slot in a tag
     Given a file "reads.fq" containing:
       """

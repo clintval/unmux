@@ -363,7 +363,7 @@ Feature: Tag-file column streams
       """
       c1	4	*	0	255	*	*	0	0	AACCGGACGT	IIIIIIIIII	CB:Z:A+B	XX:Z:kept	RG:Z:p
       c2	4	*	0	255	*	*	0	0	AACCGGACGT	IIIIIIIIII	CR:Z:OLD	CB:Z:A+B	CY:Z:III	RG:Z:p
-      c3	4	*	0	255	*	*	0	0	GAGAGAACGT	IIIIIIIIII	CB:Z:OLD	CY:Z:III	RG:Z:p
+      c3	4	*	0	255	*	*	0	0	GAGAGAACGT	IIIIIIIIII	RG:Z:p
       """
 
     Examples:

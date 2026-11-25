@@ -41,8 +41,8 @@ use crate::fanout::{
     Target,
 };
 use crate::grammar::{
-    column_tag_qualities, Anchor, DemuxPlan, Endpoint, GroupSource, MatchMode, OutputPattern,
-    Placeholder, SampleSpec, SpanBody, Template,
+    column_tag_qualities, default_qual_tag, Anchor, DemuxPlan, Endpoint, GroupSource, MatchMode,
+    OutputPattern, Placeholder, QualTag, SampleSpec, SpanBody, TagBinding, Template,
 };
 use crate::input::{
     Alignment, Fragment, FragmentReader, InputRecord, PendingFragment, SniffedFormat,
@@ -2590,6 +2590,7 @@ fn prepare_body(
     };
 
     let tag_data = build_tag_data(&plan.tags, &streams);
+    let left_out = left_out_tags(&plan.tags, &tag_data);
     // An assigned read carries its sample's read group; a pass-through read (no
     // target) carries the default pool read group, so a SAM/BAM/CRAM `--out`
     // matches the default `@RG` in its header. On an `@RG`-split run the record
@@ -2609,6 +2610,7 @@ fn prepare_body(
                 body.carried.as_ref(),
                 &tag_data,
                 engine.column_tag_qualities,
+                &left_out,
             )
         })
         .collect();
@@ -2838,11 +2840,37 @@ fn assemble_bodies(
     Ok(bodies)
 }
 
+/// The `--tag` bindings that `tag_data` leaves out because a stream is absent,
+/// each with its explicit `qual=` tag, if any.
+fn left_out_tags<'a>(
+    bindings: &'a [TagBinding],
+    tag_data: &Data,
+) -> Vec<(&'a str, Option<&'a str>)> {
+    bindings
+        .iter()
+        .filter(|binding| tag_data.get(&tag_bytes(&binding.tag)).is_none())
+        .map(|binding| {
+            let quality = match &binding.qual {
+                QualTag::Named(name) => Some(name.as_str()),
+                _ => None,
+            };
+            (binding.tag.as_str(), quality)
+        })
+        .collect()
+}
+
 /// Merge the carried input tags (if any) with the assembled `--tag` fields,
 /// with `--tag` winning a key collision. `column_qualities` pairs each tag that
 /// has a column stream with its default quality tag, which is dropped from the
-/// carried tags when that tag is rewritten without qualities.
-fn merge_data(carried: Option<&Data>, tag_data: &Data, column_qualities: &[(&str, &str)]) -> Data {
+/// carried tags when that tag is rewritten without qualities. A `left_out` tag
+/// is dropped from the carried tags, along with its explicit and default
+/// quality tags unless another carried tag keeps one (a `CY` with a `CR`).
+fn merge_data(
+    carried: Option<&Data>,
+    tag_data: &Data,
+    column_qualities: &[(&str, &str)],
+    left_out: &[(&str, Option<&str>)],
+) -> Data {
     let mut data = carried.cloned().unwrap_or_default();
     for (tag, quality) in column_qualities {
         if is_stale_quality(&data, tag_data, tag, quality) {
@@ -2853,6 +2881,29 @@ fn merge_data(carried: Option<&Data>, tag_data: &Data, column_qualities: &[(&str
                 .map(|(tag, value)| (tag, value.clone()))
                 .collect();
         }
+    }
+    let is_left_out = |tag: &[u8; 2]| left_out.iter().any(|(name, _)| tag_bytes(name) == *tag);
+    let keeps_quality = |quality: &str| {
+        data.iter().any(|(tag, _)| {
+            let tag = <[u8; 2]>::from(tag);
+            !is_left_out(&tag)
+                && std::str::from_utf8(&tag).is_ok_and(|tag| default_qual_tag(tag) == Some(quality))
+        })
+    };
+    let dropped: Vec<[u8; 2]> = left_out
+        .iter()
+        .flat_map(|(tag, quality)| {
+            let qualities = quality.iter().copied().chain(default_qual_tag(tag));
+            let qualities = qualities.filter(|quality| !keeps_quality(quality));
+            std::iter::once(*tag).chain(qualities).map(tag_bytes)
+        })
+        .collect();
+    if !dropped.is_empty() {
+        data = data
+            .iter()
+            .filter(|(tag, _)| !dropped.contains(&<[u8; 2]>::from(*tag)))
+            .map(|(tag, value)| (tag, value.clone()))
+            .collect();
     }
     for (tag, value) in tag_data.iter() {
         data.insert(tag, value.clone());
@@ -5738,7 +5789,7 @@ mod tests {
                 .collect()
         };
         let merged = |carried: &[&str], written: &[&str], columns: &[(&str, &str)]| {
-            merge_data(Some(&data(carried)), &data(written), columns)
+            merge_data(Some(&data(carried)), &data(written), columns, &[])
                 .iter()
                 .map(|(tag, _)| String::from_utf8(<[u8; 2]>::from(tag).to_vec()).unwrap())
                 .collect::<Vec<_>>()
@@ -5761,5 +5812,38 @@ mod tests {
         assert_eq!(merged(&["CR", "CB", "CY"], &["CB", "CR"], both), "CR CB");
         assert_eq!(merged(&["CR", "CB", "CY"], &["CB"], both), "CR CB CY");
         assert_eq!(merged(&["CB", "CY", "QX"], &["CB"], cb), "CB QX");
+    }
+
+    #[test]
+    fn test_merge_data_drops_a_carried_tag_whose_binding_is_left_out() {
+        let data = |tags: &[&str]| -> Data {
+            tags.iter()
+                .map(|tag| (Tag::from(tag_bytes(tag)), Value::from(tag.to_string())))
+                .collect()
+        };
+        let merged = |carried: &[&str], written: &[&str], left_out: &[(&str, Option<&str>)]| {
+            merge_data(Some(&data(carried)), &data(written), &[], left_out)
+                .iter()
+                .map(|(tag, _)| String::from_utf8(<[u8; 2]>::from(tag).to_vec()).unwrap())
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let cb = &[("CB", None)];
+        assert_eq!(merged(&["CB", "CY", "RX", "QX"], &[], cb), "RX QX");
+        assert_eq!(
+            merged(&["CB", "CY", "RX", "QX"], &["RX", "QX"], cb),
+            "RX QX"
+        );
+        assert_eq!(merged(&["RX", "QX"], &[], cb), "RX QX");
+        assert_eq!(merged(&["CR", "CB", "CY"], &[], cb), "CR CY");
+        assert_eq!(
+            merged(&["CR", "CB", "CY"], &[], &[("CB", None), ("CR", None)]),
+            ""
+        );
+        assert_eq!(merged(&["CB", "CY", "XY"], &[], &[("CB", Some("XY"))]), "");
+        assert_eq!(
+            merged(&["xc", "BZ", "XX"], &[], &[("xc", Some("BZ"))]),
+            "XX"
+        );
     }
 }
