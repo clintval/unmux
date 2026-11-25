@@ -2474,6 +2474,30 @@ mod tests {
     }
 
     #[test]
+    fn test_mates_are_ordered_by_their_flags() {
+        let sam: &[u8] = b"@HD\tVN:1.6\n\
+            a\t141\t*\t0\t0\t*\t*\t0\t0\tCCCC\tIIII\n\
+            a\t77\t*\t0\t0\t*\t*\t0\t0\tAAAA\tIIII\n\
+            b\t77\t*\t0\t0\t*\t*\t0\t0\tGGGG\tIIII\n\
+            b\t141\t*\t0\t0\t*\t*\t0\t0\tTTTT\tIIII\n\
+            c\t141\t*\t0\t0\t*\t*\t0\t0\tCGCG\tIIII\n\
+            c\t77\t*\t0\t0\t*\t*\t0\t0\tATAT\tIIII\n";
+        let (bam, cram) = bam_and_cram(sam);
+        for bytes in [sam.to_vec(), bam, cram] {
+            for threads in [0, 3] {
+                assert_eq!(
+                    fragment_bases(&bytes, false, threads).unwrap(),
+                    vec![
+                        vec!["AAAA", "CCCC"],
+                        vec!["GGGG", "TTTT"],
+                        vec!["ATAT", "CGCG"]
+                    ]
+                );
+            }
+        }
+    }
+
+    #[test]
     fn test_pairs_stay_together_across_cram_containers_and_bgzf_blocks() {
         let pairs = 15_000;
         let mut sam = String::from("@HD\tVN:1.6\n");
@@ -2523,8 +2547,8 @@ mod tests {
     fn test_unpairable_alignment_records_are_errors() {
         let mates_error = |flags: &str| {
             format!(
-                "adjacent records `a` have flags {flags}, not those of a first mate (0x40) then a \
-                 last mate (0x80) (mates out of order); sort the input by read name"
+                "adjacent records `a` have flags {flags}, not those of one first mate (0x40) and \
+                 one last mate (0x80); pass --per-record"
             )
         };
         let cases: [(&[(&str, u16)], String); 9] = [
@@ -2544,8 +2568,8 @@ mod tests {
                 &[("a", 4), ("b", 77), ("b", 141)],
                 "input mixes paired and unpaired records (`b` is paired".to_string(),
             ),
-            (&[("a", 141), ("a", 77)], mates_error("141 and 77")),
             (&[("a", 77), ("a", 77)], mates_error("77 and 77")),
+            (&[("a", 141), ("a", 141)], mates_error("141 and 141")),
             (&[("a", 77), ("a", 4)], mates_error("77 and 4")),
             (&[("a", 13), ("a", 141)], mates_error("13 and 141")),
             (&[("a", 205), ("a", 141)], mates_error("205 and 141")),

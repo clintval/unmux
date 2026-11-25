@@ -237,19 +237,64 @@ Feature: Input and output format handling
       | cram   | 2       |
       | cram   | 8       |
 
-  Scenario: A SAM pair whose last segment comes first is refused
+  Scenario: A SAM pair whose last mate comes first is read first mate first
     Given a file "swapped.sam" containing:
       """
       @HD	VN:1.6
       read1	141	*	0	0	*	*	0	0	TTTTGGGG	JJJJJJJJ
       read1	77	*	0	0	*	*	0	0	ACGTACGT	IIIIIIII
+      read2	77	*	0	0	*	*	0	0	CCCCAAAA	IIIIIIII
+      read2	141	*	0	0	*	*	0	0	GGGGTTTT	JJJJJJJJ
       """
-    When I run `unmux swapped.sam --out out.sam`
-    Then the exit code is 1
-    And stderr contains "mates out of order"
-    And stderr contains "samtools sort -n"
-    And stderr contains "--per-record"
-    And a file "out.sam" does not exist
+    When I run `unmux swapped.sam --pool p --out out.sam`
+    Then the exit code is 0
+    And the records of "out.sam" are:
+      """
+      read1	77	*	0	255	*	*	0	0	ACGTACGT	IIIIIIII	RG:Z:p
+      read1	141	*	0	255	*	*	0	0	TTTTGGGG	JJJJJJJJ	RG:Z:p
+      read2	77	*	0	255	*	*	0	0	CCCCAAAA	IIIIIIII	RG:Z:p
+      read2	141	*	0	255	*	*	0	0	GGGGTTTT	JJJJJJJJ	RG:Z:p
+      """
+    When I run `unmux swapped.sam --out out.R%ordinal.fq`
+    Then the exit code is 0
+    And the file "out.R1.fq" is:
+      """
+      @read1
+      ACGTACGT
+      +
+      IIIIIIII
+      @read2
+      CCCCAAAA
+      +
+      IIIIIIII
+      """
+    And the file "out.R2.fq" is:
+      """
+      @read1
+      TTTTGGGG
+      +
+      JJJJJJJJ
+      @read2
+      GGGGTTTT
+      +
+      JJJJJJJJ
+      """
+
+  Scenario: A mapped SAM pair whose last mate is leftmost is read first mate first
+    Given a file "mapped.sam" containing:
+      """
+      @HD	VN:1.6	SO:unsorted	GO:query
+      @SQ	SN:chr1	LN:1000
+      q1	163	chr1	100	60	8M	=	150	58	ACGTACGT	ABCDEFGH
+      q1	83	chr1	150	60	8M	=	100	-58	GGGGTTTT	HGFEDCBA
+      """
+    When I run `unmux mapped.sam --pool p --out out.sam`
+    Then the exit code is 0
+    And the records of "out.sam" are:
+      """
+      q1	77	*	0	255	*	*	0	0	AAAACCCC	ABCDEFGH	RG:Z:p
+      q1	141	*	0	255	*	*	0	0	ACGTACGT	ABCDEFGH	RG:Z:p
+      """
 
   Scenario: A mapped SAM pair outside an aligned read-group split becomes an unmapped pair
     Given a file "mapped.sam" containing:
