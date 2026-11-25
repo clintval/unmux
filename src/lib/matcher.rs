@@ -1728,6 +1728,82 @@ mod tests {
         assert_warm_scratch_matches_fresh(&g, &reads_up_to("AC", 8));
     }
 
+    /// The `(subs, indels, end)` of the best alignment, by visiting every reachable state.
+    fn exhaustive_align(tag: &[u8], window: &[u8], dist: &Dist) -> Option<(usize, usize, usize)> {
+        let mut seen = AHashSet::new();
+        let mut pending = vec![(0, 0, 0, 0)];
+        while let Some(state) = pending.pop() {
+            let (j, i, subs, indels) = state;
+            let over_caps =
+                subs > dist.mismatch || indels > dist.indel || subs + indels > dist.total;
+            if over_caps || j > tag.len() || i > window.len() || !seen.insert(state) {
+                continue;
+            }
+            pending.push((j + 1, i, subs, indels + 1));
+            pending.push((j, i + 1, subs, indels + 1));
+            if j < tag.len() && i < window.len() {
+                let sub = usize::from(!iupac_overlap(window[i], tag[j]));
+                pending.push((j + 1, i + 1, subs + sub, indels));
+            }
+        }
+        seen.into_iter()
+            .filter(|state| state.0 == tag.len())
+            .map(|(_, end, subs, indels)| (subs, indels, end))
+            .min_by_key(|&(subs, indels, end)| {
+                (subs + indels, indels, end.abs_diff(tag.len()), end)
+            })
+    }
+
+    #[test]
+    fn test_anchored_alignments_equal_an_exhaustive_search() {
+        let reversed = |seq: &[u8]| seq.iter().rev().copied().collect::<Vec<u8>>();
+        let counts = |hit: AnchoredHit| (hit.subs, hit.indels, hit.end);
+        let mut rng = Rng(0xa11e);
+        for trial in 0..1200 {
+            let letters: &[u8] = [&b"ACGT"[..], b"AC", b"ACGTNRY"][rng.below(3)];
+            let (longest, most) = [(16, 1), (16, 2), (12, 4), (6, 20)][trial % 4];
+            let len = rng.below(longest + 1);
+            let tag = rng.sample(len, letters);
+            let (mismatch, indel) = (rng.below(most + 1), rng.below(most + 1));
+            let dist = Dist {
+                mismatch,
+                indel,
+                total: mismatch + rng.below(indel + 2),
+            };
+
+            let (left, right) = (1 + rng.below(3), 3 + rng.below(4));
+            let left = rng.sample(left, letters);
+            let mut text = [left, tag.clone(), rng.sample(right, letters)].concat();
+            for _ in 0..rng.below(4) {
+                let at = rng.below(text.len());
+                match rng.below(3) {
+                    0 => text[at] = letters[rng.below(letters.len())],
+                    1 => text.insert(at, letters[rng.below(letters.len())]),
+                    _ => drop(text.remove(at)),
+                }
+            }
+
+            for at in 0..=text.len() {
+                let (before, after) = text.split_at(at);
+                let context = format!(
+                    "tag {} at {at} of {} {dist:?}",
+                    String::from_utf8_lossy(&tag),
+                    String::from_utf8_lossy(&text)
+                );
+                assert_eq!(
+                    anchored_align(&tag, after, &dist).map(counts),
+                    exhaustive_align(&tag, after, &dist),
+                    "starting: {context}"
+                );
+                assert_eq!(
+                    align_ending_at(&tag, &text, at, &dist).map(counts),
+                    exhaustive_align(&reversed(&tag), &reversed(before), &dist),
+                    "ending: {context}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn test_match_group_exact_required_rejects_mismatch() {
         // dist defaults to exact, so a one-base substitution does not match.
