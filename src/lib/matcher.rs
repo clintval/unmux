@@ -102,7 +102,7 @@ pub enum MatchStrand {
 /// One accepted match of a group's tag within a record. Coordinates are
 /// absolute offsets into the matched input file's bases (the search-window
 /// offset is already folded in).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TagMatch {
     /// Index of the matched tag within the group (definition order).
     pub tag_idx: usize,
@@ -426,12 +426,36 @@ impl GroupOutcome {
     }
 }
 
+/// What routing and extraction read from a group's outcome on one record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GroupVerdict {
+    /// The single best match, or `None` when the group is unmatched.
+    pub best: Option<TagMatch>,
+    /// The find-count constraint the outcome violates, if any.
+    pub failure: Option<FindFailure>,
+}
+
+impl GroupVerdict {
+    /// The verdict of `outcome` under the find-count bounds of `group`.
+    pub fn of(group: &CompiledGroup, outcome: &GroupOutcome) -> Self {
+        Self {
+            best: outcome.best,
+            failure: group.find_failure(outcome),
+        }
+    }
+
+    /// The verdict of a group that is skipped, as if it had no match.
+    pub fn unmatched(group: &CompiledGroup) -> Self {
+        Self::of(group, &GroupOutcome::unmatched())
+    }
+}
+
 /// Per-worker reusable matcher scratch: one `sassy` [`Searcher`] per `(revcomp,
 /// partial)` variant a group can need, built on first use and reused across
 /// every record the worker handles. A `Searcher` owns mutable internal buffers
 /// (`hp`/`hm`/`cost_matrices`/`lanes`/`matches`) and its search methods take
 /// `&mut self`, so it must be thread-local: build exactly one `Scratch` per
-/// rayon worker, never construct a `Searcher` per record, and never share one
+/// worker, never construct a `Searcher` per record, and never share one
 /// across threads. The group's precomputed `encoded` patterns stay read-only
 /// shared and are not part of `Scratch`.
 #[derive(Default)]
@@ -440,32 +464,91 @@ pub struct Scratch {
     rc: Option<Searcher<Iupac>>,
     fwd_overhang: Option<Searcher<Iupac>>,
     rc_overhang: Option<Searcher<Iupac>>,
-    /// Per-worker match cache, group name -> (resolved-window key -> outcome).
-    /// The same barcode window recurs across millions of records, so a hit
-    /// turns the per-record `sassy` search into a hash lookup (an `AHashMap`
-    /// cache trick). Keyed with `ahash`; the window key encodes the resolved
-    /// `(file, start, end)` so cached absolute coordinates stay valid. Bounded
-    /// per group ([`MATCH_CACHE_CAP`]) so a pathological high-cardinality
-    /// window cannot grow memory unbounded; barcode groups stay far under it
-    /// (low tag/error cardinality), which keeps memory tiny.
+    /// Per-worker verdict cache, group name -> (window key -> verdict). The
+    /// same barcode window recurs across millions of records, so a hit turns
+    /// the per-record `sassy` search into a hash lookup. The key holds the
+    /// bytes the kernel reads, not where they are, so windows at different
+    /// offsets share an entry and the cached match is kept relative to its
+    /// window. Bounded per group ([`MATCH_CACHE_CAP`]).
     cache: AHashMap<String, GroupCache>,
     /// Reused scratch for building a cache lookup key, so a cache hit (the
-    /// common case) does not allocate a fresh key Vec per record; only a cache
-    /// miss clones it into the owned map key.
-    key_buf: Vec<u8>,
+    /// common case) does not allocate a fresh key per record.
+    key_buf: WindowKey,
 }
 
-/// One group's cached outcomes and the [`key_reach`] that their keys cover.
+/// A window key, inline for windows of up to 20 bases.
+type WindowKey = SmallVec<[u8; 24]>;
+
+/// One group's cached verdicts and the [`key_reach`] that their keys cover.
 struct GroupCache {
     reach: usize,
-    outcomes: AHashMap<Vec<u8>, GroupOutcome>,
+    verdicts: AHashMap<WindowKey, CachedVerdict>,
 }
 
-/// Per-(group, worker) match-cache entry cap. Barcode windows recur with low
-/// cardinality (tags plus a few error variants), so this is never reached for
-/// them; it only caps a degenerate high-cardinality window, beyond which that
-/// group simply falls back to searching (graceful, bounded memory).
-const MATCH_CACHE_CAP: usize = 1 << 16;
+/// A cached verdict, with its best match relative to the window start.
+#[derive(Clone, Copy)]
+struct CachedVerdict {
+    best: Option<RelativeMatch>,
+    failure: Option<FindFailure>,
+}
+
+/// A best match with offsets from its window start.
+#[derive(Clone, Copy)]
+struct RelativeMatch {
+    tag_idx: u32,
+    start: u32,
+    end: u32,
+    cost: u32,
+    subs: u32,
+    indels: u32,
+    strand: MatchStrand,
+}
+
+impl CachedVerdict {
+    /// The verdict with its best match made relative to `win_start`, unless an
+    /// offset or count does not fit.
+    fn relative(verdict: &GroupVerdict, win_start: usize) -> Option<Self> {
+        let narrow = |value: usize| u32::try_from(value).ok();
+        let best = match &verdict.best {
+            None => None,
+            Some(m) => Some(RelativeMatch {
+                tag_idx: narrow(m.tag_idx)?,
+                start: narrow(m.start.checked_sub(win_start)?)?,
+                end: narrow(m.end.checked_sub(win_start)?)?,
+                cost: narrow(m.cost)?,
+                subs: narrow(m.subs)?,
+                indels: narrow(m.indels)?,
+                strand: m.strand,
+            }),
+        };
+        Some(Self {
+            best,
+            failure: verdict.failure,
+        })
+    }
+
+    /// The verdict for a window that starts at `win_start` in input `file`.
+    fn placed(&self, file: usize, win_start: usize) -> GroupVerdict {
+        GroupVerdict {
+            best: self.best.map(|m| TagMatch {
+                tag_idx: m.tag_idx as usize,
+                file,
+                start: win_start + m.start as usize,
+                end: win_start + m.end as usize,
+                cost: m.cost as usize,
+                subs: m.subs as usize,
+                indels: m.indels as usize,
+                strand: m.strand,
+            }),
+            failure: self.failure,
+        }
+    }
+}
+
+/// Per-(group, worker) cache entry cap, about 1.6 MB. Barcode windows recur
+/// with low cardinality (tags plus a few error variants), so this is not
+/// reached for them; past it a group searches each new window uncached.
+const MATCH_CACHE_CAP: usize = 1 << 14;
 
 impl Scratch {
     /// A fresh scratch with no searchers yet built; build one per worker
@@ -501,45 +584,51 @@ pub fn match_group(
     scratch: &mut Scratch,
     segments: &[&[u8]],
 ) -> GroupOutcome {
-    // Cache the (group, resolved-window) -> outcome for windowed and `match=`
-    // groups: the same barcode window recurs across reads, so a hit replaces
-    // the per-read `sassy` search with a hash lookup. A whole-read non-`match=`
-    // group is not cached (its window is the entire read, unique per read), so
-    // it never churns the cache. `match=` (`loc` is illegal there) is cached
-    // because the joined barcode text is short and recurring. The outcome is a
-    // pure function of the group's attributes and the keyed bytes, which cover
-    // every base the group's kernel reads, so caching is exact.
-    if group.match_streams.is_none() && group.loc.is_none() {
-        return match_group_at(group, scratch, segments, group.loc.as_ref());
+    match_group_at(group, scratch, segments, group.loc.as_ref())
+}
+
+/// The verdict of matching a group in the window `loc` (the whole record when
+/// `None`), cached for a windowed or `match=` group. A whole-record search is
+/// not cached, as its window is unique per record. The verdict is a pure
+/// function of the group and the keyed bytes, which cover every base the
+/// kernel reads, so the cache is exact.
+pub fn match_verdict(
+    group: &CompiledGroup,
+    scratch: &mut Scratch,
+    segments: &[&[u8]],
+    loc: Option<&Location>,
+) -> GroupVerdict {
+    let windows = resolve_windows(loc, segments);
+    let whole_record = loc.is_none() && group.match_streams.is_none();
+    let &[(file, start, end)] = windows.as_slice() else {
+        return GroupVerdict::of(group, &match_group_at(group, scratch, segments, loc));
+    };
+    if whole_record {
+        return GroupVerdict::of(group, &match_group_at(group, scratch, segments, loc));
     }
     let cached = scratch.cache.get(group.name.as_str());
-    let reach = match cached {
-        Some(cached) => cached.reach,
-        None => key_reach(group),
-    };
-    // Build the lookup key into the reused per-worker buffer so a cache hit
-    // allocates nothing.
+    let reach = cached.map_or_else(|| key_reach(group), |cached| cached.reach);
     scratch.key_buf.clear();
-    write_window_key(&mut scratch.key_buf, group.loc.as_ref(), segments, reach);
-    if let Some(hit) = cached.and_then(|cached| cached.outcomes.get(&scratch.key_buf)) {
-        return hit.clone();
+    write_window_key(&mut scratch.key_buf, segments[file], start, end, reach);
+    if let Some(hit) = cached.and_then(|cached| cached.verdicts.get(&scratch.key_buf)) {
+        return hit.placed(file, start);
     }
-    let outcome = match_group_at(group, scratch, segments, group.loc.as_ref());
-    // On a miss, clone the key buffer into an owned map key (borrow released
-    // before the cache mutable borrow, so the two disjoint `Scratch` fields
-    // never overlap).
-    let owned_key = scratch.key_buf.clone();
+    let verdict = GroupVerdict::of(group, &match_group_at(group, scratch, segments, loc));
+    let Some(relative) = CachedVerdict::relative(&verdict, start) else {
+        return verdict;
+    };
+    let key = scratch.key_buf.clone();
     let cached = scratch
         .cache
         .entry(group.name.clone())
         .or_insert_with(|| GroupCache {
             reach,
-            outcomes: AHashMap::new(),
+            verdicts: AHashMap::new(),
         });
-    if cached.outcomes.len() < MATCH_CACHE_CAP {
-        cached.outcomes.insert(owned_key, outcome.clone());
+    if cached.verdicts.len() < MATCH_CACHE_CAP {
+        cached.verdicts.insert(key, relative);
     }
-    outcome
+    verdict
 }
 
 /// The bases from a window start that the kernel reads whatever the window end.
@@ -551,28 +640,20 @@ fn key_reach(group: &CompiledGroup) -> usize {
     longest.saturating_add(group.dist.indel)
 }
 
-/// Build the match-cache key for a group's resolved search windows: each
-/// `(file, start, end)` plus the bytes the kernel reads there, which are the
-/// window bytes and any of the `reach` bases from the window start that lie
-/// past its end (see [`key_reach`]). Two records hit only when the *same*
-/// bytes are read at the *same* offsets (cached absolute match coordinates
-/// therefore remain valid). The `0xff` byte separates windows and never
-/// collides with a base or the no-call mask.
-fn write_window_key(key: &mut Vec<u8>, loc: Option<&Location>, segments: &[&[u8]], reach: usize) {
-    for (file, start, end) in resolve_windows(loc, segments) {
-        let segment = segments[file];
-        let key_end = end.max(start.saturating_add(reach).min(segment.len()));
-        key.extend_from_slice(&(file as u32).to_le_bytes());
-        key.extend_from_slice(&(start as u32).to_le_bytes());
-        key.extend_from_slice(&(end as u32).to_le_bytes());
-        key.extend_from_slice(&segment[start..key_end]);
-        key.push(0xff);
-    }
+/// Build the cache key for the window `[start, end)` of `segment`: the window
+/// length, then the bytes the kernel reads, which are the window bytes and any
+/// of the `reach` bases from the window start that lie past its end (see
+/// [`key_reach`]). Two windows hit only when the same bytes are read, wherever
+/// they start.
+fn write_window_key(key: &mut WindowKey, segment: &[u8], start: usize, end: usize, reach: usize) {
+    let key_end = end.max(start.saturating_add(reach).min(segment.len()));
+    key.extend_from_slice(&((end - start) as u32).to_le_bytes());
+    key.extend_from_slice(&segment[start..key_end]);
 }
 
 /// Match a compiled group with an explicit search window `loc`, overriding the
-/// group's own. The engine passes the window a relative `next=GROUP:lo-hi` link
-/// computes from the upstream match; all other attributes
+/// group's own, as for the window a relative `next=GROUP:lo-hi` link computes
+/// from the upstream match; all other attributes
 /// (`dist`/`bothStrands`/`mode`/`delta`/find counts) come from `group`. The
 /// reusable [`Scratch`] supplies the thread-local searcher.
 pub fn match_group_at(
@@ -1240,7 +1321,7 @@ fn select_best(accepted: &[TagMatch], group: &CompiledGroup) -> Option<TagMatch>
             }
         }
     }
-    Some(best.clone())
+    Some(*best)
 }
 
 /// The deterministic total order for picking the single best match: lowest
@@ -1525,7 +1606,9 @@ mod tests {
             let found: Vec<(&str, Best)> = order
                 .iter()
                 .map(|&(read, _)| {
-                    let best = match_group(group, &mut warm, &[read.as_bytes()]).best;
+                    let segments = [read.as_bytes()];
+                    let loc = group.loc.as_ref();
+                    let best = match_verdict(group, &mut warm, &segments, loc).best;
                     (read, best.map(|m| (m.tag_idx, m.start, m.end)))
                 })
                 .collect();
@@ -1597,22 +1680,75 @@ mod tests {
 
     #[test]
     fn test_write_window_key_covers_the_reach_within_the_read() {
-        let loc = Location {
-            file: 0,
-            start: Endpoint::FromStart(2),
-            end: Some(Endpoint::FromStart(4)),
-        };
-        let key = |read: &str, reach: usize| {
-            let mut key = Vec::new();
-            write_window_key(&mut key, Some(&loc), &[read.as_bytes()], reach);
+        let key = |read: &str, start: usize, end: usize, reach: usize| {
+            let mut key = WindowKey::new();
+            let end = end.min(read.len());
+            write_window_key(&mut key, read.as_bytes(), start.min(end), end, reach);
             key
         };
-        assert_eq!(key("AAGTAAAA", 0), key("AAGTCCCC", 0));
-        assert_eq!(key("AAGTAAAA", 2), key("AAGTCCCC", 2));
-        assert_eq!(key("AAGTACGA", 5), key("AAGTACGC", 5));
-        assert_ne!(key("AAGTACGA", 5), key("AAGTACTA", 5));
-        assert_ne!(key("AAGTAC", 5), key("AAGTACG", 5));
-        assert_ne!(key("A", 5), key("AAG", 5));
+        let window = |read: &str, reach: usize| key(read, 2, 4, reach);
+        assert_eq!(window("AAGTAAAA", 0), window("AAGTCCCC", 0));
+        assert_eq!(window("AAGTAAAA", 2), window("AAGTCCCC", 2));
+        assert_eq!(window("AAGTACGA", 5), window("AAGTACGC", 5));
+        assert_ne!(window("AAGTACGA", 5), window("AAGTACTA", 5));
+        assert_ne!(window("AAGTAC", 5), window("AAGTACG", 5));
+        assert_ne!(window("A", 5), window("AAG", 5));
+        assert_eq!(key("TTTTGTAC", 4, 6, 0), window("AAGTCCCC", 0));
+        assert_ne!(key("AAGTCCCC", 2, 5, 0), window("AAGTCCCC", 0));
+    }
+
+    #[test]
+    fn test_windows_at_other_offsets_share_a_cache_entry() {
+        let mut g = group(&["ACGT", "TTGA"]);
+        g.dist = substitutions(1);
+        let mut warm = Scratch::new();
+        let read: &[u8] = b"GGACGTCCTGACGTCC";
+        let mut verdicts = Vec::new();
+        for start in [1, 9, 1] {
+            let loc = window(start, start + 6);
+            verdicts.push(match_verdict(&g, &mut warm, &[read], loc.as_ref()));
+            let fresh = match_group_at(&g, &mut Scratch::new(), &[read], loc.as_ref());
+            assert_eq!(*verdicts.last().unwrap(), GroupVerdict::of(&g, &fresh));
+        }
+        assert_eq!(warm.cache["g"].verdicts.len(), 1);
+        let starts: Vec<usize> = verdicts.iter().map(|v| v.best.unwrap().start).collect();
+        assert_eq!(starts, [2, 10, 2]);
+    }
+
+    #[test]
+    fn test_random_windows_warm_scratch_matches_fresh_scratch() {
+        let mut rng = Rng(11);
+        for anchor in [None, Some(Anchor::FivePrime), Some(Anchor::ThreePrime)] {
+            for (mismatch, indel) in [(0, 0), (1, 0), (1, 1), (0, 2)] {
+                if anchor == Some(Anchor::ThreePrime) && indel > 0 {
+                    continue;
+                }
+                let mut g = group(&["ACGT", "AGGTA", "CCA"]);
+                g.anchor = anchor;
+                g.dist = Dist {
+                    mismatch,
+                    indel,
+                    total: mismatch + indel,
+                };
+                g.mode = MatchMode::Nearest;
+                g.max_finds_per_tag = Some(1);
+                let mut warm = Scratch::new();
+                for _ in 0..400 {
+                    let len = rng.below(14);
+                    let read = rng.sample(len, b"ACGTN");
+                    let start = rng.below(len + 2);
+                    let loc = window(start, start + rng.below(9));
+                    let segments = [read.as_slice()];
+                    let fresh = match_group_at(&g, &mut Scratch::new(), &segments, loc.as_ref());
+                    assert_eq!(
+                        match_verdict(&g, &mut warm, &segments, loc.as_ref()),
+                        GroupVerdict::of(&g, &fresh),
+                        "{read:?} in {loc:?} with {anchor:?} {:?}",
+                        g.dist
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -1620,9 +1756,9 @@ mod tests {
         let entries = |g: &CompiledGroup, reads: &[&str]| {
             let mut warm = Scratch::new();
             for read in reads {
-                match_group(g, &mut warm, &[read.as_bytes()]);
+                match_verdict(g, &mut warm, &[read.as_bytes()], g.loc.as_ref());
             }
-            warm.cache["g"].outcomes.len()
+            warm.cache["g"].verdicts.len()
         };
         let exact = anchored5p(&["ACGTACGT"], 8, Dist::default());
         assert_eq!(entries(&exact, &["ACGTACGTAAAA", "ACGTACGTCCCC"]), 1);
@@ -1650,15 +1786,19 @@ mod tests {
         reads
     }
 
-    /// Assert a warm `Scratch` gives each read its fresh-`Scratch` outcome.
+    /// Assert a warm `Scratch` gives each read its fresh-`Scratch` verdict.
     fn assert_warm_scratch_matches_fresh(group: &CompiledGroup, reads: &[String]) {
-        let fresh: Vec<GroupOutcome> = reads.iter().map(|read| outcome(group, read)).collect();
+        let fresh: Vec<GroupVerdict> = reads
+            .iter()
+            .map(|read| GroupVerdict::of(group, &outcome(group, read)))
+            .collect();
         let mut order: Vec<usize> = (0..reads.len()).collect();
         for _ in 0..2 {
             let mut warm = Scratch::new();
             for &index in &order {
+                let segments = [reads[index].as_bytes()];
                 assert_eq!(
-                    match_group(group, &mut warm, &[reads[index].as_bytes()]),
+                    match_verdict(group, &mut warm, &segments, group.loc.as_ref()),
                     fresh[index],
                     "read {:?} with {:?}, {:?}",
                     reads[index],
@@ -2176,7 +2316,7 @@ mod tests {
         };
         // ACGTACGT exact at 0..8; TTTTGGGG with one sub later.
         let result = outcome(&g, "ACGTACGTTTTTGGGC");
-        let best = result.best.clone().expect("a match");
+        let best = result.best.expect("a match");
         assert_eq!(best.tag_idx, 0);
         assert_eq!(best.cost, 0);
         assert!(result.accepted.len() >= 2, "both tags accepted: {result:?}");
@@ -2248,7 +2388,7 @@ mod tests {
         // The same tag occurs twice at cost 0; the leftmost wins.
         let g = group(&["ACGTACGT"]);
         let result = outcome(&g, "ACGTACGTACGTACGT");
-        let best = result.best.clone().expect("a match");
+        let best = result.best.expect("a match");
         assert_eq!(best.start, 0, "leftmost occurrence wins: {result:?}");
     }
 
@@ -2267,7 +2407,6 @@ mod tests {
         let result = outcome(&g, "ACGTACGTACGTACGT");
         let best = result
             .best
-            .clone()
             .expect("a repeated single tag is unambiguous: {result:?}");
         assert_eq!(best.tag_idx, 0);
         assert_eq!(best.cost, 0);

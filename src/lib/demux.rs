@@ -49,8 +49,8 @@ use crate::input::{
     Alignment, Fragment, FragmentReader, InputRecord, PendingFragment, SniffedFormat,
 };
 use crate::matcher::{
-    match_group, match_group_at, window_after, CompiledGroup, GroupOutcome, MatchStrand, Prereq,
-    RelativeWindow, Scratch,
+    match_verdict, window_after, CompiledGroup, GroupVerdict, MatchStrand, Prereq, RelativeWindow,
+    Scratch,
 };
 use crate::metrics::Metrics;
 use crate::output::{
@@ -1996,7 +1996,7 @@ fn match_fragment(
             }
             continue;
         }
-        let outcome = match &group.match_streams {
+        let verdict = match &group.match_streams {
             // A `match=` group matches the joined `--extract` streams, not a
             // read window.
             Some(streams) => match_joined(
@@ -2013,7 +2013,7 @@ fn match_fragment(
         // A failed find constraint (e.g. an unmet minFindsPerGroup) leaves the
         // read unassigned; carry the specific failure and the partial hits so
         // far for the optional QC slug.
-        if let Some(failure) = group.find_failure(&outcome) {
+        if let Some(failure) = verdict.failure {
             return Ok(FragmentMatch::Unassigned {
                 reason: Unassigned::FindConstraint {
                     group: idx,
@@ -2022,7 +2022,7 @@ fn match_fragment(
                 hits,
             });
         }
-        if let Some(best) = &outcome.best {
+        if let Some(best) = &verdict.best {
             // A `match=` group matches a synthetic joined text, not a read
             // span, so it anchors nothing (the grammar already forbids `@grp`
             // on a match= group): its slot records the tag but no span, which
@@ -2452,6 +2452,41 @@ fn drive_pipelined(
     }
 }
 
+/// Matcher scratches kept across the jobs of a run, so each job reuses the
+/// match cache that earlier jobs filled.
+#[derive(Default)]
+struct Scratches(std::sync::Mutex<Vec<(Scratch, RecordBuf)>>);
+
+impl Scratches {
+    /// A warm scratch if one is free, else a new one.
+    fn lease(&self) -> Lease<'_> {
+        let mut free = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let warm = free.pop().unwrap_or_default();
+        Lease { pool: self, warm }
+    }
+}
+
+/// A scratch taken from [`Scratches`], put back when dropped.
+struct Lease<'a> {
+    pool: &'a Scratches,
+    warm: (Scratch, RecordBuf),
+}
+
+impl Drop for Lease<'_> {
+    fn drop(&mut self) {
+        let warm = std::mem::take(&mut self.warm);
+        let mut free = self
+            .pool
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        free.push(warm);
+    }
+}
+
 /// Drive the engine in parallel as three overlapped stages: a read-ahead thread
 /// streams bounded chunks of raw fragments; a task on the rayon pool decodes and
 /// fully prepares every record of each chunk ([`process_pending`]); and the
@@ -2477,6 +2512,8 @@ fn drive_parallel(
     let reader_handle = spawn_reader(reader, tx)?;
 
     let (prepared_tx, prepared_rx) = std::sync::mpsc::sync_channel::<Vec<Result<Prepared>>>(1);
+    let scratches = Scratches::default();
+    let scratches = &scratches;
     let outcome = pool.in_place_scope(|scope| {
         scope.spawn(move |_| {
             for chunk in rx {
@@ -2484,8 +2521,9 @@ fn drive_parallel(
                     .into_par_iter()
                     .with_min_len(MATCHER_MIN_JOB)
                     .map_init(
-                        || (Scratch::new(), RecordBuf::default()),
-                        |(scratch, record), pending| {
+                        || scratches.lease(),
+                        |lease, pending| {
+                            let (scratch, record) = &mut lease.warm;
                             process_pending(engine, scratch, record, pending)
                         },
                     )
@@ -2599,21 +2637,21 @@ fn match_joined(
     segments: &[Segment],
     hits: &GroupHits,
     group_index: &HashMap<String, usize>,
-) -> Result<GroupOutcome> {
+) -> Result<GroupVerdict> {
     let mut joined = Vec::new();
     for name in streams {
         let Some(spec) = extracts.iter().find(|e| &e.name == name) else {
-            return Ok(GroupOutcome::unmatched());
+            return Ok(GroupVerdict::unmatched(group));
         };
         match extract(&spec.span, segments, hits, group_index)? {
             Some(extracted) => joined.extend_from_slice(&extracted.bases),
-            None => return Ok(GroupOutcome::unmatched()),
+            None => return Ok(GroupVerdict::unmatched(group)),
         }
     }
     if joined.is_empty() {
-        return Ok(GroupOutcome::unmatched());
+        return Ok(GroupVerdict::unmatched(group));
     }
-    Ok(match_group(group, scratch, &[joined.as_slice()]))
+    Ok(match_verdict(group, scratch, &[joined.as_slice()], None))
 }
 
 /// Match one group, honoring its sequential prerequisite: a group with no
@@ -2625,9 +2663,9 @@ fn match_group_for(
     scratch: &mut Scratch,
     segments: &[&[u8]],
     hits: &GroupHits,
-) -> GroupOutcome {
+) -> GroupVerdict {
     let Some(prereq) = &group.prereq else {
-        return match_group(group, scratch, segments);
+        return match_verdict(group, scratch, segments, group.loc.as_ref());
     };
     // Skip the group when any prerequisite upstream did not match (its slot is
     // `None`). Upstreams are earlier in dependency order, so their slots are
@@ -2637,7 +2675,7 @@ fn match_group_for(
         .iter()
         .any(|&upstream| hits[upstream].is_none())
     {
-        return GroupOutcome::unmatched();
+        return GroupVerdict::unmatched(group);
     }
     // A relative `next` link windows the search relative to its upstream's
     // match (present, since the upstream is one of the now-satisfied upstreams;
@@ -2649,14 +2687,10 @@ fn match_group_for(
                 .as_ref()
                 .and_then(|hit| hit.span)
                 .expect("a relative-window upstream is a matched non-match= group with a span");
-            match_group_at(
-                group,
-                scratch,
-                segments,
-                Some(&window_after(&span, window.lo, window.hi)),
-            )
+            let window = window_after(&span, window.lo, window.hi);
+            match_verdict(group, scratch, segments, Some(&window))
         }
-        None => match_group(group, scratch, segments),
+        None => match_verdict(group, scratch, segments, group.loc.as_ref()),
     }
 }
 
@@ -4598,8 +4632,9 @@ mod tests {
         let resolved = HashMap::new();
         let (tag_sets, _) = load_tag_sets(&plan, &resolved).unwrap();
         let (compiled, _index) = compile_groups(&plan, &tag_sets, &resolved).unwrap();
-        let outcome = |read: &[u8]| match_group(&compiled[0], &mut Scratch::new(), &[read]);
-        let matched_tags = |result: &GroupOutcome| -> BTreeSet<usize> {
+        let outcome =
+            |read: &[u8]| crate::matcher::match_group(&compiled[0], &mut Scratch::new(), &[read]);
+        let matched_tags = |result: &crate::matcher::GroupOutcome| -> BTreeSet<usize> {
             result.accepted.iter().map(|hit| hit.tag_idx).collect()
         };
 
