@@ -16,7 +16,7 @@
 //! uncompressed FASTX, and stdout use an inline sink.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use anyhow::{bail, Result};
 use noodles::sam;
@@ -35,7 +35,7 @@ use crate::grammar::{
     default_qual_tag, OutputPattern, PatternSegment, Placeholder, QualTag, TagBinding,
 };
 use crate::input::{SniffedFormat, PHRED_OFFSET};
-use crate::writer::{output_format, OutputRead, OutputWriter};
+use crate::writer::{file_id, output_format, FileId, OutputRead, OutputWriter};
 
 /// A non-standard read-group field tag (e.g. `SM`/`LB`/`CN`), as the
 /// `Map<ReadGroup>` builder takes.
@@ -112,17 +112,17 @@ fn placeholder_value(placeholder: Placeholder, ctx: &PathContext) -> String {
 }
 
 /// Assemble the `--tag` SAM data fields for one record from its extracted
-/// streams. Each binding's sequence tag is the present streams' bases joined by
-/// `sep` (a stream absent because its anchoring group did not match is skipped;
-/// a tag with no present stream is omitted entirely, so an unmatched group
-/// leaves a null tag rather than an empty one). The paired quality tag (from
-/// the default seq->qual map, an explicit `qual=`, or off for `qual=none`) is
-/// the present streams' qualities re-encoded to ASCII Phred+33 and joined by
-/// `qual-sep`; it is emitted only when every present stream carries qualities.
-pub fn build_tag_data<'a>(
-    bindings: impl IntoIterator<Item = &'a TagBinding>,
-    streams: &HashMap<&str, Extracted>,
-) -> Data {
+/// streams. Each binding's sequence tag is its streams' bases joined by `sep`.
+/// A tag is written only when every one of its streams is present: a stream is
+/// absent when its anchoring group did not match, and then the tag and its
+/// quality tag are left out, so a partial match never yields a shorter value
+/// that could equal another record's. An empty but present stream (a
+/// between-anchors region with a missing anchor) keeps its empty slot. The
+/// paired quality tag (from the default seq->qual map, an explicit `qual=`, or
+/// off for `qual=none`) is the streams' qualities re-encoded to ASCII Phred+33
+/// and joined by `qual-sep`; it is emitted only when every stream carries
+/// qualities.
+pub fn build_tag_data(bindings: &[TagBinding], streams: &HashMap<&str, Extracted>) -> Data {
     let mut data = Data::default();
     for binding in bindings {
         // Each present stream is paired with its `StreamRef` so a `~`
@@ -133,7 +133,7 @@ pub fn build_tag_data<'a>(
             .iter()
             .filter_map(|s| streams.get(s.name.as_str()).map(|e| (s, e)))
             .collect();
-        if present.is_empty() {
+        if present.len() != binding.streams.len() {
             continue;
         }
         let sep = binding.sep.as_deref().unwrap_or_default().as_bytes();
@@ -599,6 +599,158 @@ impl MultiWriter {
     }
 }
 
+/// What writes one output file, reported when two outputs would be one file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OutputOrigin {
+    /// An `--out` file of one fan-out target.
+    Target(Target),
+    /// Records written through one writer per path, such as `--unassigned` or `--remove grp`.
+    Records(String),
+    /// A metrics TSV written on its own after the run, such as `--metrics-summary`.
+    Metrics(&'static str),
+}
+
+impl std::fmt::Display for OutputOrigin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Target(Target {
+                sample,
+                sub_sample: Some(sub_sample),
+            }) => write!(f, "sample {sample}, sub_sample {sub_sample}"),
+            Self::Target(target) => write!(f, "sample {}", target.sample),
+            Self::Records(option) => f.write_str(option),
+            Self::Metrics(option) => f.write_str(option),
+        }
+    }
+}
+
+/// Refuse outputs that would be one file: paths differing only in case, or two spellings of one.
+pub fn check_output_collisions(outputs: &[(PathBuf, OutputOrigin)]) -> Result<()> {
+    let mut dirs: HashMap<PathBuf, PathBuf> = HashMap::new();
+    let mut by_name: HashMap<String, usize> = HashMap::new();
+    let mut by_file: HashMap<FileId, usize> = HashMap::new();
+    for (index, (path, origin)) in outputs.iter().enumerate() {
+        let Some((name, file)) = file_key(path, &mut dirs) else {
+            continue;
+        };
+        let earlier = by_name
+            .get(&name)
+            .or_else(|| file.and_then(|file| by_file.get(&file)))
+            .copied();
+        by_name.entry(name).or_insert(index);
+        if let Some(file) = file {
+            by_file.entry(file).or_insert(index);
+        }
+        let Some((first, first_origin)) = earlier.map(|earlier| &outputs[earlier]) else {
+            continue;
+        };
+        // Record outputs on one path share a writer, but a metrics file is written on its own.
+        let metrics = |o: &OutputOrigin| matches!(o, OutputOrigin::Metrics(_));
+        if first == path && !metrics(first_origin) && !metrics(origin) {
+            continue;
+        }
+        let (lexical_a, lexical_b) = (lexical(first), lexical(path));
+        let case_only = lexical_a != lexical_b
+            && fold(&lexical_a.to_string_lossy()) == fold(&lexical_b.to_string_lossy());
+        let advice = match (first_origin, origin) {
+            (OutputOrigin::Target(a), OutputOrigin::Target(b)) if case_only => {
+                if a.sample == b.sample {
+                    "rename one sub_sample"
+                } else {
+                    "rename one sample"
+                }
+            }
+            _ => "give them distinct paths",
+        };
+        let reason = if case_only {
+            "differ only in case, so they would be one file on a case-insensitive file system"
+        } else {
+            "are the same file"
+        };
+        let (a, b) = (first.display(), path.display());
+        bail!("outputs \"{a}\" ({first_origin}) and \"{b}\" ({origin}) {reason}; {advice}");
+    }
+    Ok(())
+}
+
+/// The case-folded absolute path `path` writes and its existing file, or `None` if not regular.
+fn file_key(path: &Path, dirs: &mut HashMap<PathBuf, PathBuf>) -> Option<(String, Option<FileId>)> {
+    let resolved = match path.file_name() {
+        Some(name) => {
+            let parent = path.parent().unwrap_or(Path::new(""));
+            let candidate = dirs
+                .entry(parent.to_path_buf())
+                .or_insert_with(|| resolve(parent, &mut 0))
+                .join(name);
+            match std::fs::symlink_metadata(&candidate) {
+                Ok(metadata) if metadata.file_type().is_symlink() => resolve(&candidate, &mut 0),
+                _ => candidate,
+            }
+        }
+        None => resolve(path, &mut 0),
+    };
+    let file = match std::fs::metadata(&resolved) {
+        Ok(metadata) if !metadata.is_file() => return None,
+        Ok(metadata) => file_id(&metadata),
+        Err(_) => None,
+    };
+    Some((fold(&resolved.to_string_lossy()), file))
+}
+
+/// The absolute form of `path`, following every symbolic link in it, even a dangling one.
+fn resolve(path: &Path, hops: &mut u32) -> PathBuf {
+    let mut real = if path.is_absolute() {
+        PathBuf::new()
+    } else {
+        std::env::current_dir().unwrap_or_default()
+    };
+    for part in path.components() {
+        match part {
+            Component::ParentDir => {
+                real.pop();
+            }
+            Component::CurDir => {}
+            Component::Normal(name) => {
+                let next = real.join(name);
+                real = match std::fs::read_link(&next) {
+                    Ok(target) if *hops < 40 => {
+                        *hops += 1;
+                        resolve(&real.join(target), hops)
+                    }
+                    _ => next,
+                };
+            }
+            root => real.push(root),
+        }
+    }
+    real
+}
+
+/// The components of `path` with `.` dropped and each `..` removing the name before it.
+fn lexical(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for part in path.components() {
+        match part {
+            Component::CurDir => {}
+            Component::ParentDir
+                if matches!(out.components().next_back(), Some(Component::Normal(_))) =>
+            {
+                out.pop();
+            }
+            part => out.push(part),
+        }
+    }
+    out
+}
+
+/// Fold case per character through upper case, so `ß`/`ss`, `ſ`/`s` and `ς`/`σ` compare equal.
+fn fold(text: &str) -> String {
+    text.chars()
+        .flat_map(char::to_uppercase)
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -902,13 +1054,49 @@ mod tests {
     }
 
     #[test]
-    fn test_build_tag_data_present_streams_only() {
-        // CB=a,b::sep=-: only `a` matched, so CB is just its bases (no trailing
-        // separator).
-        let cb = binding("CB", &["a", "b"], QualTag::None, Some("-"));
+    fn test_build_tag_data_one_absent_stream_omits_tag_and_qual_tag() {
+        // CB=a+b+c: `b` is absent, so neither CB nor CY is written rather than
+        // a CB of `AAAA-TTTT` that a full match of other streams could share.
+        let streams = HashMap::from([
+            ("a", extracted(b"AAAA", Some(&[30; 4]))),
+            ("c", extracted(b"TTTT", Some(&[30; 4]))),
+        ]);
+        for cb in [
+            binding("CB", &["a", "b", "c"], QualTag::Default, Some("-")),
+            binding("CB", &["a", "~b", "c"], QualTag::Default, Some("-")),
+        ] {
+            let data = build_tag_data(&[cb], &streams);
+            assert!(data.is_empty(), "{data:?}");
+        }
+        let mut raw = binding("CR", &["a", "b", "c"], QualTag::Default, Some("-"));
+        raw.raw = true;
+        assert!(build_tag_data(&[raw], &streams).is_empty());
+    }
+
+    #[test]
+    fn test_build_tag_data_one_absent_stream_leaves_other_tags() {
+        let cb = binding("CB", &["a", "b"], QualTag::Default, Some("-"));
+        let rx = binding("RX", &["a"], QualTag::Default, None);
         let streams = HashMap::from([("a", extracted(b"AAAA", Some(&[30; 4])))]);
+        let data = build_tag_data(&[cb, rx], &streams);
+        assert_eq!(tag_str(&data, "CB"), None);
+        assert_eq!(tag_str(&data, "CY"), None);
+        assert_eq!(tag_str(&data, "RX").as_deref(), Some("AAAA"));
+        assert_eq!(tag_str(&data, "QX").as_deref(), Some("????"));
+    }
+
+    #[test]
+    fn test_build_tag_data_empty_present_stream_keeps_its_slot() {
+        // An empty but present stream is not absent: its empty slot is joined.
+        let cb = binding("CB", &["a", "b", "c"], QualTag::Default, Some("-"));
+        let streams = HashMap::from([
+            ("a", extracted(b"AAAA", Some(&[30; 4]))),
+            ("b", extracted(b"", Some(&[]))),
+            ("c", extracted(b"TTTT", Some(&[30; 4]))),
+        ]);
         let data = build_tag_data(&[cb], &streams);
-        assert_eq!(tag_str(&data, "CB").as_deref(), Some("AAAA"));
+        assert_eq!(tag_str(&data, "CB").as_deref(), Some("AAAA--TTTT"));
+        assert_eq!(tag_str(&data, "CY").as_deref(), Some("????  ????"));
     }
 
     #[test]
@@ -1097,5 +1285,288 @@ mod tests {
         };
         assert_eq!(names(&a), vec![b"ra".to_vec(), b"ra2".to_vec()]);
         assert_eq!(names(&b), vec![b"rb".to_vec()]);
+    }
+
+    fn sample(sample: &str, sub_sample: Option<&str>) -> OutputOrigin {
+        OutputOrigin::Target(Target {
+            sample: sample.to_string(),
+            sub_sample: sub_sample.map(str::to_string),
+        })
+    }
+
+    fn collision(outputs: &[(&str, OutputOrigin)]) -> Option<String> {
+        let outputs: Vec<(PathBuf, OutputOrigin)> = outputs
+            .iter()
+            .map(|(path, origin)| (PathBuf::from(path), origin.clone()))
+            .collect();
+        check_output_collisions(&outputs)
+            .err()
+            .map(|e| e.to_string())
+    }
+
+    #[test]
+    fn test_collision_paths_differing_only_in_case_are_refused() {
+        let error = collision(&[
+            ("o/s1.fq", sample("s1", None)),
+            ("o/S1.fq", sample("S1", None)),
+        ]);
+        assert_eq!(
+            error.as_deref(),
+            Some(
+                "outputs \"o/s1.fq\" (sample s1) and \"o/S1.fq\" (sample S1) differ only in case, \
+                 so they would be one file on a case-insensitive file system; rename one sample"
+            )
+        );
+    }
+
+    #[test]
+    fn test_collision_case_folding_covers_directories_and_non_ascii() {
+        let error = collision(&[
+            ("Run/a.fq", sample("a", None)),
+            (
+                "run/a.fq",
+                OutputOrigin::Records("--unassigned".to_string()),
+            ),
+        ])
+        .unwrap();
+        assert!(error.contains("differ only in case"), "{error}");
+        assert!(error.contains("give them distinct paths"), "{error}");
+        let error = collision(&[
+            ("o/\u{c9}.fq", sample("\u{c9}", None)),
+            ("o/\u{e9}.fq", sample("\u{e9}", None)),
+        ])
+        .unwrap();
+        assert!(error.contains("differ only in case"), "{error}");
+    }
+
+    #[test]
+    fn test_collision_sub_samples_differing_only_in_case_are_refused() {
+        let error = collision(&[
+            ("o/a.x.fq", sample("a", Some("x"))),
+            ("o/a.X.fq", sample("a", Some("X"))),
+        ])
+        .unwrap();
+        assert!(
+            error.contains("(sample a, sub_sample x) and \"o/a.X.fq\" (sample a, sub_sample X)"),
+            "{error}"
+        );
+        assert!(error.ends_with("rename one sub_sample"), "{error}");
+    }
+
+    #[test]
+    fn test_collision_identical_record_paths_share_one_writer() {
+        assert_eq!(
+            collision(&[
+                ("all.fq", sample("a", None)),
+                ("all.fq", sample("b", None)),
+                ("all.fq", OutputOrigin::Records("--unassigned".to_string())),
+            ]),
+            None
+        );
+    }
+
+    #[test]
+    fn test_collision_metrics_may_not_share_a_path() {
+        let error = collision(&[
+            ("o/a.fq", sample("a", None)),
+            ("o/a.fq", OutputOrigin::Metrics("--metrics-summary")),
+        ]);
+        assert_eq!(
+            error.as_deref(),
+            Some(
+                "outputs \"o/a.fq\" (sample a) and \"o/a.fq\" (--metrics-summary) are the same \
+                 file; give them distinct paths"
+            )
+        );
+        let error = collision(&[
+            ("m.tsv", OutputOrigin::Metrics("--metrics-per-sample")),
+            ("M.tsv", OutputOrigin::Metrics("--metrics-summary")),
+        ])
+        .unwrap();
+        assert!(error.contains("differ only in case"), "{error}");
+    }
+
+    #[test]
+    fn test_collision_distinct_paths_and_directories_pass() {
+        assert_eq!(
+            collision(&[
+                ("o/s1.fq", sample("s1", None)),
+                ("o/s2.fq", sample("s2", None)),
+                ("p/s1.fq", OutputOrigin::Records("--unassigned".to_string())),
+                (
+                    "o/s1.fq.gz",
+                    OutputOrigin::Records("--remove grp".to_string())
+                ),
+                ("o/m.tsv", OutputOrigin::Metrics("--metrics-summary")),
+            ]),
+            None
+        );
+    }
+
+    #[test]
+    fn test_collision_different_spellings_of_one_path_are_refused() {
+        for (a, b) in [("o/a.fq", "./o/a.fq"), ("o/a.fq", "o/x/../a.fq")] {
+            let error = collision(&[
+                (a, sample("a", None)),
+                (b, OutputOrigin::Records("--unassigned".to_string())),
+            ])
+            .unwrap_or_else(|| panic!("{a} and {b} were accepted"));
+            assert!(error.contains("are the same file"), "{error}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_collision_symbolic_link_to_another_output_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        std::os::unix::fs::symlink(&real, dir.path().join("link")).unwrap();
+        std::fs::write(real.join("b.fq"), "").unwrap();
+        std::os::unix::fs::symlink(real.join("b.fq"), real.join("to-b.fq")).unwrap();
+        for (a, b) in [("real/a.fq", "link/a.fq"), ("real/b.fq", "real/to-b.fq")] {
+            let (a, b) = (dir.path().join(a), dir.path().join(b));
+            let outputs = [
+                (a.clone(), sample("a", None)),
+                (b.clone(), sample("b", None)),
+            ];
+            let error = check_output_collisions(&outputs).unwrap_err().to_string();
+            assert!(error.contains("are the same file"), "{error}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_collision_existing_non_regular_files_are_skipped() {
+        assert_eq!(
+            collision(&[
+                ("/dev/null", OutputOrigin::Metrics("--metrics-per-sample")),
+                ("/dev/null", OutputOrigin::Metrics("--metrics-summary")),
+            ]),
+            None
+        );
+    }
+
+    #[test]
+    fn test_collision_rendered_placeholders_differing_only_in_case_are_refused() {
+        let out = pattern(
+            "out/%pool/%sample.%sub_sample.R%ordinal.fq",
+            &[
+                Placeholder::Pool,
+                Placeholder::Sample,
+                Placeholder::SubSample,
+                Placeholder::Ordinal,
+            ],
+        );
+        let bin = pattern(
+            "out/%pool/UN.%source.R1.fq",
+            &[Placeholder::Pool, Placeholder::Source],
+        );
+        let render = |pool: &str, sample: &str, sub_sample: &str| {
+            let ctx = PathContext {
+                pool,
+                sample: Some(sample),
+                sub_sample: Some(sub_sample),
+                ordinal: Some(1),
+                source: None,
+            };
+            resolve_pattern(&out, &ctx).unwrap()
+        };
+        let unassigned = resolve_pattern(
+            &bin,
+            &PathContext {
+                pool: "Lib",
+                source: Some(0),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let check = |outputs: &[(PathBuf, OutputOrigin)]| check_output_collisions(outputs).is_err();
+        let a = (render("Lib", "a", "x"), sample("a", Some("x")));
+        assert!(!check(&[
+            a.clone(),
+            (render("Lib", "b", "x"), sample("b", Some("x")))
+        ]));
+        assert!(check(&[
+            a.clone(),
+            (render("LIB", "a", "x"), sample("a", Some("x")))
+        ]));
+        assert!(check(&[
+            a.clone(),
+            (render("Lib", "a", "X"), sample("a", Some("X")))
+        ]));
+        assert!(check(&[
+            (render("Lib", "un", "0"), sample("un", Some("0"))),
+            (
+                unassigned,
+                OutputOrigin::Records("--unassigned".to_string())
+            ),
+        ]));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_collision_hard_links_to_one_file_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (dir.path().join("a.fq"), dir.path().join("b.fq"));
+        std::fs::write(&a, "").unwrap();
+        std::fs::hard_link(&a, &b).unwrap();
+        let outputs = [(a, sample("a", None)), (b, sample("b", None))];
+        let error = check_output_collisions(&outputs).unwrap_err().to_string();
+        assert!(
+            error.contains("are the same file; give them distinct paths"),
+            "{error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_collision_dangling_symbolic_links_are_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink("missing.fq", dir.path().join("to-missing.fq")).unwrap();
+        std::os::unix::fs::symlink("new", dir.path().join("L")).unwrap();
+        for (a, b) in [("missing.fq", "to-missing.fq"), ("new/a.fq", "L/a.fq")] {
+            let outputs = [
+                (dir.path().join(a), sample("a", None)),
+                (
+                    dir.path().join(b),
+                    OutputOrigin::Records("--unassigned".to_string()),
+                ),
+            ];
+            let error = check_output_collisions(&outputs).unwrap_err().to_string();
+            assert!(error.contains("are the same file"), "{a} and {b}: {error}");
+        }
+    }
+
+    #[test]
+    fn test_collision_full_case_folding_is_refused() {
+        for (a, b) in [
+            ("o/\u{df}.fq", "o/ss.fq"),
+            ("o/\u{17f}.fq", "o/s.fq"),
+            ("o/\u{fb01}.fq", "o/fi.fq"),
+            ("o/x\u{3a3}", "o/x\u{3c3}"),
+        ] {
+            let error = collision(&[
+                (a, OutputOrigin::Records("--unassigned".to_string())),
+                (b, OutputOrigin::Records("--remove grp".to_string())),
+            ])
+            .unwrap_or_else(|| panic!("{a} and {b} were accepted"));
+            assert!(error.contains("differ only in case"), "{error}");
+        }
+    }
+
+    #[test]
+    fn test_collision_through_parent_directories_asks_for_distinct_paths() {
+        for other in ["b", "A"] {
+            let error = collision(&[
+                ("o/a/../x.fq", sample("a", None)),
+                (&format!("o/{other}/../x.fq"), sample(other, None)),
+            ])
+            .unwrap();
+            assert!(
+                error.ends_with("are the same file; give them distinct paths"),
+                "{error}"
+            );
+        }
     }
 }

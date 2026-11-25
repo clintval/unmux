@@ -41,8 +41,8 @@ use crate::fanout::{
     Route, Routing, SheetColumn, SheetColumns, Target,
 };
 use crate::grammar::{
-    column_tag_qualities, Anchor, DemuxPlan, Endpoint, GroupSource, MatchMode, OutputPattern,
-    Placeholder, SampleSpec, SpanBody, TagBinding, Template,
+    column_tag_qualities, default_qual_tag, Anchor, DemuxPlan, Endpoint, GroupSource, MatchMode,
+    OutputPattern, Placeholder, QualTag, SampleSpec, SpanBody, TagBinding, Template,
 };
 use crate::input::{
     Alignment, Fragment, FragmentReader, InputRecord, PendingFragment, SniffedFormat,
@@ -53,9 +53,9 @@ use crate::matcher::{
 };
 use crate::metrics::Metrics;
 use crate::output::{
-    alignment_header, build_tag_data, default_read_group_header, insert_string_tag, qual_tag_name,
-    read_group_header, resolve_metrics_path, resolve_pattern, ConstituentReadGroups, MultiWriter,
-    PathContext,
+    alignment_header, build_tag_data, check_output_collisions, default_read_group_header,
+    insert_string_tag, qual_tag_name, read_group_header, resolve_metrics_path, resolve_pattern,
+    ConstituentReadGroups, MultiWriter, OutputOrigin, PathContext,
 };
 use crate::qc::{removed_slug, routed_slug, unassigned_slug, Unassigned};
 use crate::tags::{is_column_value, load_tag_file_columns, TagColumns, TagSet};
@@ -877,15 +877,27 @@ fn enumerate_dests(
     input_formats: &[SniffedFormat],
     fragment_width: usize,
 ) -> Result<Vec<PathBuf>> {
-    let mut paths: Vec<PathBuf> = Vec::new();
     let mut seen: HashSet<PathBuf> = HashSet::new();
-    let add = |path: Option<PathBuf>, seen: &mut HashSet<PathBuf>, paths: &mut Vec<PathBuf>| {
-        if let Some(path) = path {
-            if seen.insert(path.clone()) {
-                paths.push(path);
-            }
-        }
-    };
+    Ok(
+        labeled_dests(plan, routing, pool, input_formats, fragment_width)?
+            .into_iter()
+            .map(|(path, _)| path)
+            .filter(|path| seen.insert(path.clone()))
+            .collect(),
+    )
+}
+
+/// Every directed output file path, before deduplication, with what writes it.
+fn labeled_dests(
+    plan: &DemuxPlan,
+    routing: &Routing,
+    pool: &str,
+    input_formats: &[SniffedFormat],
+    fragment_width: usize,
+) -> Result<Vec<(PathBuf, OutputOrigin)>> {
+    use crate::grammar::RemoveSelector;
+
+    let mut paths: Vec<(PathBuf, OutputOrigin)> = Vec::new();
 
     // `--out`: one set of paths per assigned target (a `%sample` pattern fans
     // out; a plain pattern dedups to one). A pure pass-through run (no targets)
@@ -899,12 +911,12 @@ fn enumerate_dests(
         let targets = routing.targets();
         if targets.is_empty() {
             for path in out_paths(pattern, pool, None, body_count, input_formats)? {
-                add(Some(path), &mut seen, &mut paths);
+                paths.push((path, OutputOrigin::Records("--out".to_string())));
             }
         }
         for target in targets {
             for path in out_paths(pattern, pool, Some(target), body_count, input_formats)? {
-                add(Some(path), &mut seen, &mut paths);
+                paths.push((path, OutputOrigin::Target(target.clone())));
             }
         }
     }
@@ -912,17 +924,45 @@ fn enumerate_dests(
     // over the input files).
     if let Some(pattern) = &plan.unassigned {
         for path in bin_paths(pattern, pool, plan.inputs.len()) {
-            add(Some(path), &mut seen, &mut paths);
+            paths.push((path, OutputOrigin::Records("--unassigned".to_string())));
         }
     }
     for rule in &plan.remove {
         if let Some(pattern) = &rule.pattern {
+            let selector = match &rule.selector {
+                RemoveSelector::Group(group) => group.clone(),
+                RemoveSelector::GroupTag { group, id } => format!("{group}::{id}"),
+            };
             for path in bin_paths(pattern, pool, plan.inputs.len()) {
-                add(Some(path), &mut seen, &mut paths);
+                paths.push((path, OutputOrigin::Records(format!("--remove {selector}"))));
             }
         }
     }
     Ok(paths)
+}
+
+/// Refuse outputs that would be one file, before any is created.
+fn check_outputs(
+    plan: &DemuxPlan,
+    routing: &Routing,
+    pool: &str,
+    input_formats: &[SniffedFormat],
+    fragment_width: usize,
+) -> Result<()> {
+    let mut outputs = labeled_dests(plan, routing, pool, input_formats, fragment_width)?;
+    for (pattern, option) in [
+        (&plan.metrics_per_sample, "--metrics-per-sample"),
+        (&plan.metrics_summary, "--metrics-summary"),
+        (&plan.metrics_unassigned, "--metrics-unassigned"),
+    ] {
+        if let Some(pattern) = pattern {
+            outputs.push((
+                resolve_metrics_path(pattern, pool),
+                OutputOrigin::Metrics(option),
+            ));
+        }
+    }
+    check_output_collisions(&outputs)
 }
 
 /// The `--out` file path(s) for one target (or `None` for a pure pass-through),
@@ -1436,22 +1476,27 @@ fn run_engine(plan: &DemuxPlan, command_line: Option<&str>) -> Result<()> {
         &input_formats,
         reader.fragment_width(),
     )?;
+    check_outputs(
+        plan,
+        &routing,
+        &pool,
+        &input_formats,
+        reader.fragment_width(),
+    )?;
     log_run_shape(plan, &input_formats, &dests);
     if let Some(reference) = &reference {
         reader.check_reference(&plan.inputs, reference)?;
     }
-    staged.stage(
-        dests.iter().cloned().chain(
-            [
-                &plan.metrics_per_sample,
-                &plan.metrics_summary,
-                &plan.metrics_unassigned,
-            ]
-            .into_iter()
-            .flatten()
-            .map(|pattern| resolve_metrics_path(pattern, &pool)),
-        ),
-    );
+    let metrics_paths: Vec<PathBuf> = [
+        &plan.metrics_per_sample,
+        &plan.metrics_summary,
+        &plan.metrics_unassigned,
+    ]
+    .into_iter()
+    .flatten()
+    .map(|pattern| resolve_metrics_path(pattern, &pool))
+    .collect();
+    staged.stage(dests.iter().chain(&metrics_paths).cloned());
     writer.write_files_to(staged.temporaries());
 
     // Route poolable destinations (gzipped FASTX and BAM) through a shared BGZF
@@ -1569,6 +1614,13 @@ fn run_engine(plan: &DemuxPlan, command_line: Option<&str>) -> Result<()> {
     // error.
     let run_result = (|| -> Result<()> {
         writer.create_all(&dests)?;
+        for path in &metrics_paths {
+            let temporary = staged.path(path);
+            if temporary != path.as_path() {
+                crate::writer::create_output_file(temporary)?;
+            }
+        }
+        crate::writer::refuse_shared_files(&staged, dests.iter().chain(&metrics_paths))?;
         match threads {
             1 => drive_serial(&engine, reader, &mut writer, &mut metrics),
             2 => drive_pipelined(&engine, reader, &mut writer, &mut metrics),
@@ -2644,17 +2696,13 @@ fn prepare_body(
     let input_formats = engine.input_formats;
     let target = route.map(Route::target);
     let mut streams: HashMap<&str, Extracted> = HashMap::new();
-    let mut blank: SmallVec<[&str; 2]> = SmallVec::new();
     let mut slot = 0;
     for spec in &plan.extracts {
         if matches!(spec.span.body, SpanBody::SampleColumn { .. }) {
             let value = route.and_then(|route| route.column(slot));
             slot += 1;
-            match value {
-                Some(value) => {
-                    streams.insert(spec.name.as_str(), Extracted::from_text(value));
-                }
-                None => blank.push(spec.name.as_str()),
+            if let Some(value) = value {
+                streams.insert(spec.name.as_str(), Extracted::from_text(value));
             }
             continue;
         }
@@ -2714,9 +2762,8 @@ fn prepare_body(
         Err(missing) => return Ok(BodyOutcome::MissingStream(missing)),
     };
 
-    let uses_blank =
-        |tag: &&TagBinding| tag.streams.iter().any(|s| blank.contains(&s.name.as_str()));
-    let tag_data = build_tag_data(plan.tags.iter().filter(|tag| !uses_blank(tag)), &streams);
+    let tag_data = build_tag_data(&plan.tags, &streams);
+    let left_out = left_out_tags(&plan.tags, &tag_data);
     // An assigned read carries its sample's read group; a pass-through read (no
     // target) carries the default pool read group, so a SAM/BAM/CRAM `--out`
     // matches the default `@RG` in its header. On an `@RG`-split run the record
@@ -2736,6 +2783,7 @@ fn prepare_body(
                 body.carried.as_ref(),
                 &tag_data,
                 engine.column_tag_qualities,
+                &left_out,
             )
         })
         .collect();
@@ -2965,11 +3013,37 @@ fn assemble_bodies(
     Ok(bodies)
 }
 
+/// The `--tag` bindings that `tag_data` leaves out because a stream is absent,
+/// each with its explicit `qual=` tag, if any.
+fn left_out_tags<'a>(
+    bindings: &'a [TagBinding],
+    tag_data: &Data,
+) -> Vec<(&'a str, Option<&'a str>)> {
+    bindings
+        .iter()
+        .filter(|binding| tag_data.get(&tag_bytes(&binding.tag)).is_none())
+        .map(|binding| {
+            let quality = match &binding.qual {
+                QualTag::Named(name) => Some(name.as_str()),
+                _ => None,
+            };
+            (binding.tag.as_str(), quality)
+        })
+        .collect()
+}
+
 /// Merge the carried input tags (if any) with the assembled `--tag` fields,
 /// with `--tag` winning a key collision. `column_qualities` pairs each tag that
 /// has a column stream with its default quality tag, which is dropped from the
-/// carried tags when that tag is rewritten without qualities.
-fn merge_data(carried: Option<&Data>, tag_data: &Data, column_qualities: &[(&str, &str)]) -> Data {
+/// carried tags when that tag is rewritten without qualities. A `left_out` tag
+/// is dropped from the carried tags, along with its explicit and default
+/// quality tags unless another carried tag keeps one (a `CY` with a `CR`).
+fn merge_data(
+    carried: Option<&Data>,
+    tag_data: &Data,
+    column_qualities: &[(&str, &str)],
+    left_out: &[(&str, Option<&str>)],
+) -> Data {
     let mut data = carried.cloned().unwrap_or_default();
     for (tag, quality) in column_qualities {
         if is_stale_quality(&data, tag_data, tag, quality) {
@@ -2980,6 +3054,29 @@ fn merge_data(carried: Option<&Data>, tag_data: &Data, column_qualities: &[(&str
                 .map(|(tag, value)| (tag, value.clone()))
                 .collect();
         }
+    }
+    let is_left_out = |tag: &[u8; 2]| left_out.iter().any(|(name, _)| tag_bytes(name) == *tag);
+    let keeps_quality = |quality: &str| {
+        data.iter().any(|(tag, _)| {
+            let tag = <[u8; 2]>::from(tag);
+            !is_left_out(&tag)
+                && std::str::from_utf8(&tag).is_ok_and(|tag| default_qual_tag(tag) == Some(quality))
+        })
+    };
+    let dropped: Vec<[u8; 2]> = left_out
+        .iter()
+        .flat_map(|(tag, quality)| {
+            let qualities = quality.iter().copied().chain(default_qual_tag(tag));
+            let qualities = qualities.filter(|quality| !keeps_quality(quality));
+            std::iter::once(*tag).chain(qualities).map(tag_bytes)
+        })
+        .collect();
+    if !dropped.is_empty() {
+        data = data
+            .iter()
+            .filter(|(tag, _)| !dropped.contains(&<[u8; 2]>::from(*tag)))
+            .map(|(tag, value)| (tag, value.clone()))
+            .collect();
     }
     for (tag, value) in tag_data.iter() {
         data.insert(tag, value.clone());
@@ -5846,12 +5943,12 @@ mod tests {
         };
         for (i, record) in records.iter().enumerate() {
             let (cell, id) = [
-                ("A+B-ACGT", Some("w1")),
-                ("A+B-ACGT", Some("w1")),
-                ("TTGGCC-ACGT", Some("w2")),
-                ("ACGT", None),
+                (Some("A+B-ACGT"), Some("w1")),
+                (Some("A+B-ACGT"), Some("w1")),
+                (Some("TTGGCC-ACGT"), Some("w2")),
+                (None, None),
             ][i % 4];
-            assert_eq!(text(record, *b"CB").as_deref(), Some(cell), "record {i}");
+            assert_eq!(text(record, *b"CB").as_deref(), cell, "record {i}");
             assert_eq!(text(record, *b"xi").as_deref(), id, "record {i}");
             assert_eq!(text(record, *b"CY"), None, "record {i}");
         }
@@ -5945,7 +6042,7 @@ mod tests {
                 .collect()
         };
         let merged = |carried: &[&str], written: &[&str], columns: &[(&str, &str)]| {
-            merge_data(Some(&data(carried)), &data(written), columns)
+            merge_data(Some(&data(carried)), &data(written), columns, &[])
                 .iter()
                 .map(|(tag, _)| String::from_utf8(<[u8; 2]>::from(tag).to_vec()).unwrap())
                 .collect::<Vec<_>>()
@@ -5968,5 +6065,38 @@ mod tests {
         assert_eq!(merged(&["CR", "CB", "CY"], &["CB", "CR"], both), "CR CB");
         assert_eq!(merged(&["CR", "CB", "CY"], &["CB"], both), "CR CB CY");
         assert_eq!(merged(&["CB", "CY", "QX"], &["CB"], cb), "CB QX");
+    }
+
+    #[test]
+    fn test_merge_data_drops_a_carried_tag_whose_binding_is_left_out() {
+        let data = |tags: &[&str]| -> Data {
+            tags.iter()
+                .map(|tag| (Tag::from(tag_bytes(tag)), Value::from(tag.to_string())))
+                .collect()
+        };
+        let merged = |carried: &[&str], written: &[&str], left_out: &[(&str, Option<&str>)]| {
+            merge_data(Some(&data(carried)), &data(written), &[], left_out)
+                .iter()
+                .map(|(tag, _)| String::from_utf8(<[u8; 2]>::from(tag).to_vec()).unwrap())
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let cb = &[("CB", None)];
+        assert_eq!(merged(&["CB", "CY", "RX", "QX"], &[], cb), "RX QX");
+        assert_eq!(
+            merged(&["CB", "CY", "RX", "QX"], &["RX", "QX"], cb),
+            "RX QX"
+        );
+        assert_eq!(merged(&["RX", "QX"], &[], cb), "RX QX");
+        assert_eq!(merged(&["CR", "CB", "CY"], &[], cb), "CR CY");
+        assert_eq!(
+            merged(&["CR", "CB", "CY"], &[], &[("CB", None), ("CR", None)]),
+            ""
+        );
+        assert_eq!(merged(&["CB", "CY", "XY"], &[], &[("CB", Some("XY"))]), "");
+        assert_eq!(
+            merged(&["xc", "BZ", "XX"], &[], &[("xc", Some("BZ"))]),
+            "XX"
+        );
     }
 }

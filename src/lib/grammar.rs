@@ -17,7 +17,7 @@
 //! key twice is a fail-fast error. The full grammar is derivable from `--help`
 //! (every flag carries its own examples).
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
@@ -797,23 +797,30 @@ fn parse_group_source(value: &str, group: &str) -> Result<GroupSource> {
             format!("inline tag set for group `{group}` is missing a closing `}}`: {value:?}")
         })?;
         let mut tags = Vec::new();
-        for entry in inner.split(',') {
+        let mut id_positions: HashMap<String, usize> = HashMap::new();
+        for (index, entry) in inner.split(',').enumerate() {
             let entry = entry.trim();
             if entry.is_empty() {
                 continue;
             }
-            let tag = match entry.split_once('=') {
-                Some((id, seq)) => InlineTag {
-                    id: id.trim().to_string(),
-                    seq: seq.trim().to_string(),
-                },
-                // No id given: the sequence doubles as the id (splitcode
-                // behavior).
-                None => InlineTag {
-                    id: entry.to_string(),
-                    seq: entry.to_string(),
-                },
+            // With no id (`SEQ` or `=SEQ`), the sequence doubles as the id.
+            let (id, seq) = match entry.split_once('=') {
+                Some((id, seq)) if !id.trim().is_empty() => (id.trim(), seq.trim()),
+                Some((_, seq)) => (seq.trim(), seq.trim()),
+                None => (entry, entry),
             };
+            let tag = InlineTag {
+                id: id.to_string(),
+                seq: seq.to_string(),
+            };
+            if let Some(first) = id_positions.insert(tag.id.clone(), index + 1) {
+                bail!(
+                    "inline tag set for group `{group}`: entry {} repeats tag ID {id:?} from \
+                     entry {first}; each tag needs its own ID (pool tags with \
+                     `--sample NAME={group}::ID1,ID2`)",
+                    index + 1
+                );
+            }
             tags.push(tag);
         }
         if tags.is_empty() {
@@ -3129,6 +3136,56 @@ mod tests {
                 seq: "ACAGGCG".to_string()
             }
         );
+    }
+
+    #[test]
+    fn test_parse_groups_inline_set_repeated_id_is_error() {
+        for (source, entries) in [
+            (
+                "{s1=AAAA,s1=CCCC}",
+                "entry 2 repeats tag ID \"s1\" from entry 1",
+            ),
+            (
+                "{AAAA=CCCC, AAAA}",
+                "entry 2 repeats tag ID \"AAAA\" from entry 1",
+            ),
+            (
+                "{,s1=AAAA,,s2=GGGG,s1=CCCC}",
+                "entry 5 repeats tag ID \"s1\" from entry 2",
+            ),
+        ] {
+            let err = parse_groups(&[format!("bc={source}")]).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "inline tag set for group `bc`: {entries}; each tag needs its own ID (pool \
+                     tags with `--sample NAME=bc::ID1,ID2`)"
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_groups_inline_set_empty_id_is_the_sequence() {
+        let groups = parse_groups(&["bc={=AAAA, =CCCC,x=GGGG}".to_string()]).unwrap();
+        let GroupSource::Inline(tags) = &groups[0].source else {
+            panic!("expected inline source");
+        };
+        let ids: Vec<&str> = tags.iter().map(|tag| tag.id.as_str()).collect();
+        assert_eq!(ids, ["AAAA", "CCCC", "x"]);
+        let err = parse_groups(&["bc={=AAAA,AAAA=CCCC}".to_string()]).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("entry 2 repeats tag ID \"AAAA\" from entry 1"));
+    }
+
+    #[test]
+    fn test_parse_groups_inline_set_ids_differing_only_by_case_are_distinct() {
+        let groups = parse_groups(&["bc={s1=AAAA,S1=CCCC}".to_string()]).unwrap();
+        let GroupSource::Inline(tags) = &groups[0].source else {
+            panic!("expected inline source");
+        };
+        assert_eq!(tags.len(), 2);
     }
 
     #[test]

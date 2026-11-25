@@ -167,7 +167,9 @@ struct DemuxCmd {
     /// are SAM/BAM/CRAM-only; FASTX puts `--tag` values in the record-name
     /// comment. Missing parent dirs are created. Placeholders fan-out the
     /// pool into multiple files including `%pool`, `%sample`, `%sub_sample`,
-    /// and `%ordinal`.
+    /// and `%ordinal`. Outputs that would be one file are refused: paths
+    /// differing only in case (one file on a case-insensitive file system),
+    /// two spellings of one file, or a metrics file on another output's path.
     ///
     ///   --out out.bam                   one file with all assigned records
     ///   --out %sample.bam               one file per sample
@@ -182,7 +184,8 @@ struct DemuxCmd {
     ///
     /// `NAME=SOURCE` is the UMI/barcode/adapter set; `NAME::ATTRS` constrains
     /// matching. Tags may use IUPAC codes. A matched `@grp` span is
-    /// error-corrected by default.
+    /// error-corrected by default. Each tag in a set needs its own ID; pool
+    /// several tags into one sample with `--sample NAME=GROUP::ID1,ID2`.
     ///
     /// Sources (`NAME::SOURCE`):
     ///
@@ -294,6 +297,9 @@ struct DemuxCmd {
     /// sets `qual`/`sep`/`raw`. A multi-stream tag joins sequences with `sep`
     /// (default: '`-`') and qualities with `qual-sep` (default: a space).
     /// Default `qual` tags pre-exist for: `CB`/`CY` `CR`/`CY` `RX`/`QX` `BC`/`QT` `OX`/`BZ`.
+    ///
+    /// A tag is written only when every stream in it is present; otherwise
+    /// the tag, its quality tag, and any input copies of them are left out.
     ///
     /// A tag built from an `@grp::COLUMN` or `%sample::COLUMN` stream has no
     /// quality tag, since qualities could not line up with its text: the
