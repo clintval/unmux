@@ -54,6 +54,8 @@ pub struct OutputRead<'a> {
     /// assigned record on SAM/BAM output (an `RG:Z` data field, matching an
     /// `@RG` header line). FASTX has no read groups, so it is ignored there.
     pub read_group: Option<&'a str>,
+    /// Whether the read fails quality control, written as flag `0x200` on SAM/BAM.
+    pub qc_fail: bool,
     /// A source alignment to write on SAM/BAM in place of a record built from
     /// the fields above; BAM output keeps a raw BAM record's input bytes. FASTX
     /// ignores it.
@@ -959,7 +961,9 @@ fn write_alignments<W: AlignmentSink>(
     for (index, read) in reads.iter().enumerate() {
         let mut record = match read.alignment {
             Some(alignment) => alignment.to_record_buf()?,
-            None => std::borrow::Cow::Owned(build_record(read, segment_flags(index, reads.len()))),
+            None => {
+                std::borrow::Cow::Owned(build_record(read, record_flags(read, index, reads.len())))
+            }
         };
         if W::NEEDS_MISSING_QUALITIES_FILLED {
             fill_missing_qualities(&mut record);
@@ -1081,6 +1085,16 @@ fn raw_bam_records(header: &sam::Header, reads: &[OutputRead]) -> Option<Vec<u8>
         }
     }
     Some(bytes)
+}
+
+/// The flags for `read` at `index` of `total` output records.
+fn record_flags(read: &OutputRead, index: usize, total: usize) -> Flags {
+    let flags = segment_flags(index, total);
+    if read.qc_fail {
+        flags | Flags::QC_FAIL
+    } else {
+        flags
+    }
 }
 
 /// The flags for output record `index` of `total`: a lone record is just
@@ -1403,6 +1417,20 @@ mod tests {
     }
 
     #[test]
+    fn test_record_flags_carry_qc_fail() {
+        let flags = |qc_fail: bool, index: usize, total: usize| {
+            let read = OutputRead {
+                qc_fail,
+                ..output_read(b"r1", b"ACGT", None, None)
+            };
+            u16::from(record_flags(&read, index, total))
+        };
+        assert_eq!((flags(false, 0, 1), flags(true, 0, 1)), (4, 516));
+        assert_eq!((flags(false, 0, 2), flags(true, 0, 2)), (77, 589));
+        assert_eq!((flags(false, 1, 2), flags(true, 1, 2)), (141, 653));
+    }
+
+    #[test]
     fn test_segment_flags() {
         assert_eq!(segment_flags(0, 1), Flags::UNMAPPED);
         let first = segment_flags(0, 2);
@@ -1442,6 +1470,7 @@ mod tests {
                 quals: Some(&[30, 30, 30, 30]),
                 tags: None,
                 read_group: Some("dna01.lib01"),
+                qc_fail: false,
                 alignment: None,
             }])
             .unwrap();
@@ -1494,6 +1523,7 @@ mod tests {
                 quals: Some(&[30, 31, 32, 33, 34, 35, 36, 37]),
                 tags: None,
                 read_group: Some("dna01"),
+                qc_fail: false,
                 alignment: None,
             }],
             vec![
@@ -1503,6 +1533,7 @@ mod tests {
                     quals: Some(&q),
                     tags: None,
                     read_group: Some("dna01"),
+                    qc_fail: false,
                     alignment: None,
                 },
                 OutputRead {
@@ -1511,6 +1542,7 @@ mod tests {
                     quals: Some(&q),
                     tags: None,
                     read_group: Some("dna01"),
+                    qc_fail: false,
                     alignment: None,
                 },
             ],
@@ -1609,6 +1641,7 @@ mod tests {
             quals: Some(&[30, 30, 30, 30]),
             tags: None,
             read_group: None,
+            qc_fail: false,
             alignment: None,
         }])
         .unwrap();
@@ -1676,6 +1709,7 @@ mod tests {
             quals,
             tags,
             read_group: None,
+            qc_fail: false,
             alignment: None,
         }
     }
@@ -1771,6 +1805,7 @@ mod tests {
                 quals: Some(&q),
                 tags: None,
                 read_group: None,
+                qc_fail: false,
                 alignment: None,
             })
             .collect();
@@ -1813,6 +1848,7 @@ mod tests {
             quals: None,
             tags: None,
             read_group: Some("ignored"),
+            qc_fail: false,
             alignment: Some(&alignment),
         };
         let sam_bytes =
@@ -1857,6 +1893,7 @@ mod tests {
                 quals: None,
                 tags: None,
                 read_group: None,
+                qc_fail: false,
                 alignment: Some(&alignment),
             };
             encode_fragment(OutputFormat::Bam, &header, &[read]).map_err(|e| format!("{e:#}"))

@@ -1710,6 +1710,7 @@ struct PreparedRead {
     quals: Option<Vec<u8>>,
     tags: Option<Data>,
     read_group: Option<String>,
+    qc_fail: bool,
     alignment: Option<Alignment>,
 }
 
@@ -1723,6 +1724,7 @@ impl PreparedRead {
             quals: self.quals.as_deref(),
             tags: self.tags.as_ref(),
             read_group: self.read_group.as_deref(),
+            qc_fail: self.qc_fail,
             alignment: self.alignment.as_ref(),
         }
     }
@@ -2652,6 +2654,7 @@ fn prepared_raw_read(
         quals: record.quals.clone(),
         tags,
         read_group: Some(pool.to_string()),
+        qc_fail: record.qc_fail,
         alignment,
     })
 }
@@ -2892,6 +2895,7 @@ fn prepared_body_read(body: Body, data: Data, read_group: Option<String>) -> Pre
         quals: body.quals,
         tags: (!data.is_empty()).then_some(data),
         read_group,
+        qc_fail: body.qc_fail,
         alignment: None,
     }
 }
@@ -2927,6 +2931,7 @@ fn passed_through_read(
         quals: None,
         tags: None,
         read_group: None,
+        qc_fail: false,
         alignment: Some(alignment),
     })
 }
@@ -2938,6 +2943,7 @@ struct Body {
     bases: Vec<u8>,
     quals: Option<Vec<u8>>,
     carried: Option<Data>,
+    qc_fail: bool,
     alignment: Option<Alignment>,
 }
 
@@ -2965,6 +2971,7 @@ fn assemble_bodies(
                         bases: Vec::new(),
                         quals: None,
                         carried: None,
+                        qc_fail: false,
                         alignment: Some(alignment.clone()),
                     },
                     None => Body {
@@ -2972,6 +2979,7 @@ fn assemble_bodies(
                         bases: record.bases.clone(),
                         quals: record.quals.clone(),
                         carried: record.tags.clone(),
+                        qc_fail: record.qc_fail,
                         alignment: None,
                     },
                 },
@@ -2983,6 +2991,7 @@ fn assemble_bodies(
         .first()
         .map(|record| record.name.clone())
         .unwrap_or_default();
+    let qc_fail = fragment.records.iter().any(|record| record.qc_fail);
     let mut bodies = Vec::with_capacity(plan.templates.len());
     for template in &plan.templates {
         // A single-stream template whose stream is referenced nowhere else is
@@ -3017,6 +3026,7 @@ fn assemble_bodies(
             bases,
             quals,
             carried: None,
+            qc_fail,
             alignment: None,
         });
     }
@@ -5770,6 +5780,7 @@ mod tests {
                     .into_iter()
                     .collect(),
             ),
+            qc_fail: false,
             alignment: None,
         };
 
@@ -5787,6 +5798,7 @@ mod tests {
             bases: b"ACGT".to_vec(),
             quals: None,
             tags: None,
+            qc_fail: false,
             alignment: None,
         };
         let fragment = Fragment {
@@ -5916,6 +5928,7 @@ mod tests {
                 bases: Vec::new(),
                 quals: None,
                 tags: None,
+                qc_fail: false,
                 alignment: Some(Alignment::Record(
                     RecordBuf::builder().set_flags(flags).build(),
                 )),

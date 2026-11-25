@@ -1278,6 +1278,7 @@ mod tests {
             quals: Some(&[30, 30, 30, 30]),
             tags: None,
             read_group: None,
+            qc_fail: false,
             alignment: None,
         };
         writer.write(Some(&a), &[read(b"ra")]).unwrap();
@@ -1320,6 +1321,7 @@ mod tests {
             quals: Some(&[30, 30, 30, 30]),
             tags: None,
             read_group: None,
+            qc_fail: false,
             alignment: None,
         };
         let encoded = b"@r\nACGT\n+\n????\n";

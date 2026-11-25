@@ -81,7 +81,7 @@ unmux "R1.fastq.gz" "R2.fastq.gz" \
 
 ## Features
 
-- **FASTX/SAM/BAM/CRAM in and out**, with per-segment qualities carried through extraction. Demultiplexed SAM/BAM/CRAM is written unmapped, except an aligned read-group split.
+- **FASTX/SAM/BAM/CRAM in and out**, with per-segment qualities carried through extraction. Demultiplexed SAM/BAM/CRAM is written unmapped, keeping the pair and QC-fail flags, except an aligned read-group split.
 - **Alignment-preserving read-group splits**: `unmux "in.bam" --group sm=@RG::SM --sample-from-group sm --out "%sample.bam"` splits an aligned SAM/BAM into per-sample SAM/BAM files with every record (secondary and supplementary included), the `@SQ` dictionary, and the sort order kept intact. For unmapped records, run `samtools reset` on the outputs.
 - **splitcode-style matching**: tag groups, variable-length tags, location windows, mismatch/indel tolerance, sequential `next`/`prev` anchoring, `@extract` spans, and error-correction to canonical barcodes.
 - **Tag-file columns as SAM tags**: an extract such as `--extract "cell=@bc::cell"` takes the matched tag's value in the `cell` column of `--group "bc=tags.tsv"`, alone or joined with barcodes (`--tag "CB=cell+bc2+bc3"`). A tag built from a column has no quality tag. A joined tag is written only when every stream in it is present, so a record that misses one barcode carries no `CB` rather than a shorter value that another barcode combination could share.

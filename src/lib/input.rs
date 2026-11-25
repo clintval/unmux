@@ -265,6 +265,8 @@ pub struct InputRecord {
     /// Carried SAM tags from an alignment input (`None` for FASTX), re-emitted
     /// to the output record.
     pub tags: Option<Data>,
+    /// Whether the record failed quality control (flag `0x200`).
+    pub qc_fail: bool,
     /// The untouched source record, kept only when the reader passes alignments
     /// through (see [`FragmentReader::keep_alignments`]).
     pub alignment: Option<Alignment>,
@@ -722,6 +724,7 @@ impl FormatReader {
                             .collect(),
                     ),
                     tags: parse_comment_tags(record.description()),
+                    qc_fail: false,
                     alignment: None,
                 };
                 Ok(Some((input, Flags::empty())))
@@ -759,6 +762,7 @@ impl FormatReader {
                     bases,
                     quals: None,
                     tags: parse_comment_tags(comment.as_bytes()),
+                    qc_fail: false,
                     alignment: None,
                 };
                 Ok(Some((input, Flags::empty())))
@@ -963,6 +967,7 @@ fn alignment_to_input(record: &RecordBuf) -> InputRecord {
         bases,
         quals,
         tags: Some(tags),
+        qc_fail: record.flags().is_qc_fail(),
         alignment: None,
     }
 }
