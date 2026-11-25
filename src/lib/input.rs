@@ -2286,6 +2286,213 @@ mod tests {
         assert_eq!(count, 2);
     }
 
+    const PAIRED_SAM: &[u8] = b"@HD\tVN:1.6\n\
+        a\t77\t*\t0\t0\t*\t*\t0\t0\tAAAA\tIIII\n\
+        a\t141\t*\t0\t0\t*\t*\t0\t0\tCCCC\tIIII\n\
+        b\t77\t*\t0\t0\t*\t*\t0\t0\tGGGG\tIIII\n\
+        b\t141\t*\t0\t0\t*\t*\t0\t0\tTTTT\tIIII\n";
+
+    /// The pairs of [`PAIRED_SAM`] among supplementary and secondary records.
+    const PAIRED_AMONG_OTHERS_SAM: &[u8] = b"@HD\tVN:1.6\n\
+        a\t2125\t*\t0\t0\t*\t*\t0\t0\tNNNN\tIIII\n\
+        a\t77\t*\t0\t0\t*\t*\t0\t0\tAAAA\tIIII\n\
+        a\t141\t*\t0\t0\t*\t*\t0\t0\tCCCC\tIIII\n\
+        b\t77\t*\t0\t0\t*\t*\t0\t0\tGGGG\tIIII\n\
+        b\t397\t*\t0\t0\t*\t*\t0\t0\tNNNN\tIIII\n\
+        b\t141\t*\t0\t0\t*\t*\t0\t0\tTTTT\tIIII\n";
+
+    /// The records of SAM text as BAM bytes and as CRAM bytes.
+    fn bam_and_cram(sam: &[u8]) -> (Vec<u8>, Vec<u8>) {
+        use noodles::sam::alignment::io::Write as _;
+        let mut reader = sam::io::Reader::new(sam);
+        let header = reader.read_header().unwrap();
+        let records: Vec<RecordBuf> = reader
+            .record_bufs(&header)
+            .collect::<std::io::Result<_>>()
+            .unwrap();
+        let mut bam_bytes = Vec::new();
+        {
+            let mut writer = bam::io::Writer::new(&mut bam_bytes);
+            writer.write_header(&header).unwrap();
+            for record in &records {
+                writer.write_alignment_record(&header, record).unwrap();
+            }
+            writer.try_finish().unwrap();
+        }
+        let mut cram_bytes = Vec::new();
+        {
+            let mut writer = cram::io::Writer::new(&mut cram_bytes);
+            writer.write_header(&header).unwrap();
+            for record in &records {
+                writer.write_alignment_record(&header, record).unwrap();
+            }
+            writer.try_finish(&header).unwrap();
+        }
+        (bam_bytes, cram_bytes)
+    }
+
+    /// The bases of each fragment's records, for one input read on `threads` decode workers.
+    fn fragment_bases(bytes: &[u8], per_record: bool, threads: usize) -> Result<Vec<Vec<String>>> {
+        let file = temp_with(bytes);
+        let path = file.path().to_path_buf();
+        let mut reader =
+            FragmentReader::open_with_threads(&[path], per_record, None, |_| vec![threads])?;
+        let bases = |record: &InputRecord| String::from_utf8_lossy(&record.bases).into_owned();
+        let mut fragments = Vec::new();
+        while let Some(fragment) = reader.next_fragment()? {
+            assert_eq!(fragment.records.len(), reader.fragment_width());
+            fragments.push(fragment.records.iter().map(bases).collect());
+        }
+        Ok(fragments)
+    }
+
+    #[test]
+    fn test_paired_sam_bam_and_cram_yield_two_record_fragments() {
+        for sam in [PAIRED_SAM, PAIRED_AMONG_OTHERS_SAM] {
+            let (bam, cram) = bam_and_cram(sam);
+            for bytes in [sam.to_vec(), bam, cram] {
+                for threads in [0, 3] {
+                    assert_eq!(
+                        fragment_bases(&bytes, false, threads).unwrap(),
+                        vec![vec!["AAAA", "CCCC"], vec!["GGGG", "TTTT"]]
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_pairs_stay_together_across_cram_containers_and_bgzf_blocks() {
+        let pairs = 15_000;
+        let mut sam = String::from("@HD\tVN:1.6\n");
+        for i in 0..pairs {
+            sam.push_str(&format!("r{i}\t77\t*\t0\t0\t*\t*\t0\t0\tAAAA\tIIII\n"));
+            if i % 7 == 0 {
+                sam.push_str(&format!("r{i}\t333\t*\t0\t0\t*\t*\t0\t0\tNNNN\tIIII\n"));
+            }
+            sam.push_str(&format!("r{i}\t141\t*\t0\t0\t*\t*\t0\t0\tCCCC\tIIII\n"));
+        }
+        let (bam, cram) = bam_and_cram(sam.as_bytes());
+        for bytes in [bam, cram] {
+            for threads in [0, 3] {
+                let fragments = fragment_bases(&bytes, false, threads).unwrap();
+                assert_eq!(fragments.len(), pairs);
+                assert!(fragments.iter().all(|bases| bases == &["AAAA", "CCCC"]));
+            }
+        }
+    }
+
+    #[test]
+    fn test_paired_bam_mates_stay_raw_until_decoded() {
+        let (bam, _) = bam_and_cram(PAIRED_SAM);
+        let file = temp_with(&bam);
+        let mut reader = FragmentReader::open(&[file.path().to_path_buf()], false).unwrap();
+        let first = reader.next_pending_fragment().unwrap().unwrap();
+        let second = reader.next_pending_fragment().unwrap().unwrap();
+        assert!(reader.next_pending_fragment().unwrap().is_none());
+        assert!(second
+            .records
+            .iter()
+            .all(|record| matches!(record, PendingRecord::Bam { keep: false, .. })));
+        let mut bases: Vec<Vec<Vec<u8>>> = Vec::new();
+        for pending in [first, second] {
+            let fragment = pending.decode(&mut RecordBuf::default()).unwrap();
+            assert!(fragment.records.iter().all(|r| r.alignment.is_none()));
+            bases.push(fragment.records.into_iter().map(|r| r.bases).collect());
+        }
+        let expected: Vec<Vec<Vec<u8>>> = vec![
+            vec![b"AAAA".to_vec(), b"CCCC".to_vec()],
+            vec![b"GGGG".to_vec(), b"TTTT".to_vec()],
+        ];
+        assert_eq!(bases, expected);
+    }
+
+    #[test]
+    fn test_unpairable_alignment_records_are_errors() {
+        let mates_error = |flags: &str| {
+            format!(
+                "adjacent records `a` have flags {flags}, not those of a first mate (0x40) then a \
+                 last mate (0x80) (mates out of order); sort the input by read name"
+            )
+        };
+        let cases: [(&[(&str, u16)], String); 9] = [
+            (
+                &[("a", 77), ("b", 77), ("a", 141), ("b", 141)],
+                "paired record `a` is followed by `b`, not its mate; sort the input".to_string(),
+            ),
+            (
+                &[("a", 77), ("a", 141), ("b", 77)],
+                "paired record `b` ends the input without its mate; sort the input".to_string(),
+            ),
+            (
+                &[("a", 77), ("a", 141), ("b", 4)],
+                "input mixes paired and unpaired records (`b` is unpaired".to_string(),
+            ),
+            (
+                &[("a", 4), ("b", 77), ("b", 141)],
+                "input mixes paired and unpaired records (`b` is paired".to_string(),
+            ),
+            (&[("a", 141), ("a", 77)], mates_error("141 and 77")),
+            (&[("a", 77), ("a", 77)], mates_error("77 and 77")),
+            (&[("a", 77), ("a", 4)], mates_error("77 and 4")),
+            (&[("a", 13), ("a", 141)], mates_error("13 and 141")),
+            (&[("a", 205), ("a", 141)], mates_error("205 and 141")),
+        ];
+        for (records, expected) in cases {
+            let mut sam = String::from("@HD\tVN:1.6\n");
+            for (name, flags) in records {
+                sam.push_str(&format!("{name}\t{flags}\t*\t0\t0\t*\t*\t0\t0\tA\tI\n"));
+            }
+            let error = match fragment_bases(sam.as_bytes(), false, 0) {
+                Ok(fragments) => panic!("expected `{expected}`, read {fragments:?}"),
+                Err(error) => format!("{error:#}"),
+            };
+            assert!(error.contains(&expected), "{error}");
+            assert!(error.contains("--per-record"), "{error}");
+        }
+    }
+
+    #[test]
+    fn test_per_record_reads_paired_alignments_one_per_fragment() {
+        let (bam, cram) = bam_and_cram(PAIRED_SAM);
+        for bytes in [PAIRED_SAM.to_vec(), bam, cram] {
+            assert_eq!(
+                fragment_bases(&bytes, true, 0).unwrap(),
+                vec![vec!["AAAA"], vec!["CCCC"], vec!["GGGG"], vec!["TTTT"]]
+            );
+        }
+    }
+
+    #[test]
+    fn test_keep_alignments_reads_paired_records_one_per_fragment_in_input_order() {
+        let (bam, cram) = bam_and_cram(PAIRED_AMONG_OTHERS_SAM);
+        for bytes in [PAIRED_AMONG_OTHERS_SAM.to_vec(), bam, cram] {
+            let file = temp_with(&bytes);
+            let mut reader = FragmentReader::open(&[file.path().to_path_buf()], false).unwrap();
+            reader.keep_alignments();
+            assert_eq!(reader.fragment_width(), 1);
+            let mut flags = Vec::new();
+            while let Some(fragment) = reader.next_fragment().unwrap() {
+                assert_eq!(fragment.records.len(), 1);
+                let alignment = fragment.records[0].alignment.as_ref().unwrap();
+                flags.push(u16::from(alignment.flags()));
+            }
+            assert_eq!(flags, vec![2125, 77, 141, 77, 397, 141]);
+        }
+    }
+
+    #[test]
+    fn test_unreadable_first_alignment_record_fails_the_first_read_not_the_open() {
+        let file = temp_with(b"@HD\tVN:1.6\na\t77\t*\tx\t0\t*\t*\t0\t0\tAAAA\tIIII\n");
+        let mut reader = FragmentReader::open(&[file.path().to_path_buf()], false).unwrap();
+        assert_eq!(reader.fragment_width(), 1);
+        let error = reader.next_fragment().unwrap_err();
+        assert!(
+            format!("{error:#}").contains("failed to read SAM record"),
+            "{error:#}"
+        );
+    }
+
     #[test]
     fn test_multi_file_name_mismatch_is_error() {
         // Two inputs whose record names disagree would silently mispair; the

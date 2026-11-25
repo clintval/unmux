@@ -110,7 +110,8 @@ Feature: Split an aligned input by read group, keeping alignments
     And a file "out/sampleA.bam" does not exist
 
   Scenario: a --template on an aligned split into FASTQ still works
-    When I run `unmux in.sam --group sm=@RG::SM --sample-from-group sm --extract head=0:0:4 --template head --out out/%sample.fq`
+    # The mates of this coordinate-sorted input are apart, so each record is read on its own.
+    When I run `unmux in.sam --per-record --group sm=@RG::SM --sample-from-group sm --extract head=0:0:4 --template head --out out/%sample.fq`
     Then the exit code is 0
     And the file "out/sampleA.fq" contains "ACGT"
 

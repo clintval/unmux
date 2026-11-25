@@ -3438,6 +3438,8 @@ mod tests {
             args.groups = vec!["rg=@RG".to_string()];
             args.sample_from_group = Some("rg".to_string());
             args.out = Some(format!("{}/%sample.{ext}", out.display()));
+            // FASTQ output is not a pass-through, and these paired records have no mates.
+            args.per_record = ext == "fq";
             run_demux(args).unwrap();
             out
         };
