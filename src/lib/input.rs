@@ -1473,20 +1473,22 @@ impl FragmentReader {
             );
         }
         let segment = Flags::SEGMENTED | Flags::FIRST_SEGMENT | Flags::LAST_SEGMENT;
-        if flags & segment != Flags::SEGMENTED | Flags::FIRST_SEGMENT
-            || mate_flags & segment != Flags::SEGMENTED | Flags::LAST_SEGMENT
-        {
+        let is_first = |flags: Flags| flags & segment == Flags::SEGMENTED | Flags::FIRST_SEGMENT;
+        let is_last = |flags: Flags| flags & segment == Flags::SEGMENTED | Flags::LAST_SEGMENT;
+        let records = if is_first(flags) && is_last(mate_flags) {
+            smallvec::smallvec![first, second]
+        } else if is_last(flags) && is_first(mate_flags) {
+            smallvec::smallvec![second, first]
+        } else {
             bail!(
-                "adjacent records `{}` have flags {} and {}, not those of a first mate (0x40) \
-                 then a last mate (0x80) (mates out of order); {REGROUP_HINT}",
+                "adjacent records `{}` have flags {} and {}, not those of one first mate (0x40) \
+                 and one last mate (0x80); pass --per-record to read each record on its own",
                 name(&first),
                 u16::from(flags),
                 u16::from(mate_flags)
             );
-        }
-        Ok(PendingFragment {
-            records: smallvec::smallvec![first, second],
-        })
+        };
+        Ok(PendingFragment { records })
     }
 
     /// The next record from the first input with its `FLAG` field, draining

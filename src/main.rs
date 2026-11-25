@@ -494,7 +494,7 @@ struct DemuxCmd {
     /// Disable auto pair-detection. Treat each record as single-end, even
     /// when one input looks interleaved (mate-name pairing) or holds paired
     /// SAM/BAM/CRAM records (flag 0x1). Both are otherwise auto-detected,
-    /// and each SAM/BAM/CRAM mate pair must be adjacent, first mate first
+    /// and SAM/BAM/CRAM mates must be adjacent and are ordered by their flags
     /// (except in an aligned read-group split, which keeps records whole).
     #[arg(long, verbatim_doc_comment)]
     per_record: bool,
