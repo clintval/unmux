@@ -166,8 +166,9 @@ struct DemuxCmd {
     /// are SAM/BAM/CRAM-only; FASTX puts `--tag` values in the record-name
     /// comment. Missing parent dirs are created. Placeholders fan-out the
     /// pool into multiple files including `%pool`, `%sample`, `%sub_sample`,
-    /// and `%ordinal`. Outputs whose paths differ only in case are refused, as
-    /// they are one file on a case-insensitive file system.
+    /// and `%ordinal`. Outputs that would be one file are refused: paths
+    /// differing only in case (one file on a case-insensitive file system),
+    /// two spellings of one file, or a metrics file on another output's path.
     ///
     ///   --out out.bam                   one file with all assigned records
     ///   --out %sample.bam               one file per sample

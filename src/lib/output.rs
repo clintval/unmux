@@ -740,9 +740,12 @@ fn lexical(path: &Path) -> PathBuf {
     out
 }
 
-/// Lowercase `text` for comparing paths.
+/// Fold case per character through upper case, so `ß`/`ss`, `ſ`/`s` and `ς`/`σ` compare equal.
 fn fold(text: &str) -> String {
-    text.to_lowercase()
+    text.chars()
+        .flat_map(char::to_uppercase)
+        .flat_map(char::to_lowercase)
+        .collect()
 }
 
 #[cfg(test)]
@@ -1493,6 +1496,23 @@ mod tests {
             ];
             let error = check_output_collisions(&outputs).unwrap_err().to_string();
             assert!(error.contains("are the same file"), "{a} and {b}: {error}");
+        }
+    }
+
+    #[test]
+    fn test_collision_full_case_folding_is_refused() {
+        for (a, b) in [
+            ("o/\u{df}.fq", "o/ss.fq"),
+            ("o/\u{17f}.fq", "o/s.fq"),
+            ("o/\u{fb01}.fq", "o/fi.fq"),
+            ("o/x\u{3a3}", "o/x\u{3c3}"),
+        ] {
+            let error = collision(&[
+                (a, OutputOrigin::Records("--unassigned".to_string())),
+                (b, OutputOrigin::Records("--remove grp".to_string())),
+            ])
+            .unwrap_or_else(|| panic!("{a} and {b} were accepted"));
+            assert!(error.contains("differ only in case"), "{error}");
         }
     }
 
