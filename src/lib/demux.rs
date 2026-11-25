@@ -1835,7 +1835,7 @@ fn prepare(engine: &Engine, fragment: &Fragment, fmatch: FragmentMatch) -> Resul
                 }
             }
         }
-        Disposition::Assigned(target) => {
+        Disposition::Assigned(target, _) => {
             let (denom, unext) = frac_bases(engine, &segments, &hits)?;
             match prepare_body(engine, Some(target), &hits, &segments, fragment)? {
                 BodyOutcome::Assembled(writes) => (

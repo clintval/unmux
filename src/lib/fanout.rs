@@ -74,8 +74,9 @@ pub struct RemoveTarget {
 /// What the router decided for one record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Disposition<'a> {
-    /// Routed to a fan-out target.
-    Assigned(&'a Target),
+    /// Routed to a fan-out target by the route at this index, which for a sample
+    /// sheet is its data row less one.
+    Assigned(&'a Target, usize),
     /// Matched a `--remove` rule; removed and tallied as `removed`, and written
     /// to the rule's pattern when it has one.
     Removed(&'a RemoveTarget),
@@ -137,13 +138,13 @@ impl Routing {
         if !self.demux {
             return Disposition::PassThrough;
         }
-        for route in &self.routes {
+        for (index, route) in self.routes.iter().enumerate() {
             if route
                 .terms
                 .iter()
                 .all(|term| term_satisfied(hits, term.group, term.members.as_deref()))
             {
-                return Disposition::Assigned(&route.target);
+                return Disposition::Assigned(&route.target, index);
             }
         }
         Disposition::Unassigned
@@ -767,17 +768,23 @@ mod tests {
 
         assert_eq!(
             routing.route(&matched(&index, &[("grp", 0)])),
-            Disposition::Assigned(&Target {
-                sample: "dna01".to_string(),
-                sub_sample: None
-            })
+            Disposition::Assigned(
+                &Target {
+                    sample: "dna01".to_string(),
+                    sub_sample: None
+                },
+                0
+            )
         );
         assert_eq!(
             routing.route(&matched(&index, &[("grp", 2)])),
-            Disposition::Assigned(&Target {
-                sample: "dna02".to_string(),
-                sub_sample: None
-            })
+            Disposition::Assigned(
+                &Target {
+                    sample: "dna02".to_string(),
+                    sub_sample: None
+                },
+                1
+            )
         );
         // A group that did not match routes to no sample.
         assert_eq!(
@@ -801,7 +808,7 @@ mod tests {
         let (routing, index) = compile(&samples, &[], &tag_sets, "p", true, false).unwrap();
 
         let both = matched(&index, &[("grp_x", 0), ("grp_y", 0)]);
-        assert!(matches!(routing.route(&both), Disposition::Assigned(_)));
+        assert!(matches!(routing.route(&both), Disposition::Assigned(_, _)));
         // Only one of the two groups matched: unassigned.
         assert_eq!(
             routing.route(&matched(&index, &[("grp_x", 0)])),
@@ -823,11 +830,11 @@ mod tests {
 
         assert!(matches!(
             routing.route(&matched(&index, &[("grp", 0)])),
-            Disposition::Assigned(_)
+            Disposition::Assigned(_, _)
         ));
         assert!(matches!(
             routing.route(&matched(&index, &[("grp", 1)])),
-            Disposition::Assigned(_)
+            Disposition::Assigned(_, _)
         ));
         assert_eq!(
             routing.route(&matched(&index, &[])),
@@ -856,10 +863,13 @@ mod tests {
         // routes to sy.
         assert_eq!(
             routing.route(&matched_no_span(&index, "gy", 0)),
-            Disposition::Assigned(&Target {
-                sample: "sy".to_string(),
-                sub_sample: None
-            }),
+            Disposition::Assigned(
+                &Target {
+                    sample: "sy".to_string(),
+                    sub_sample: None
+                },
+                1
+            ),
             "a span=None (match=) hit still routes; the absent gx does not claim it"
         );
         // Neither group matched: nothing claims the read.
@@ -889,7 +899,7 @@ mod tests {
         let (routing, index) = compile(&samples, &[], &tag_sets, "p", true, false).unwrap();
         assert!(matches!(
             routing.route(&matched(&index, &[("grp", 0)])),
-            Disposition::Assigned(_)
+            Disposition::Assigned(_, _)
         ));
     }
 
@@ -928,11 +938,11 @@ mod tests {
         assert_eq!(routing.targets().len(), 1);
         assert!(matches!(
             routing.route(&matched(&index, &[("grp", 0)])),
-            Disposition::Assigned(_)
+            Disposition::Assigned(_, _)
         ));
         assert!(matches!(
             routing.route(&matched(&index, &[("grp", 1)])),
-            Disposition::Assigned(_)
+            Disposition::Assigned(_, _)
         ));
     }
 
@@ -996,7 +1006,7 @@ mod tests {
         ));
         assert!(matches!(
             routing.route(&matched(&index, &[("grp", 0)])),
-            Disposition::Assigned(_)
+            Disposition::Assigned(_, _)
         ));
     }
 
@@ -1248,10 +1258,13 @@ mod tests {
         let (routing, index) = compile(&samples, &[], &tag_sets, "p", true, false).unwrap();
         assert_eq!(
             routing.route(&matched(&index, &[("grp", 0)])),
-            Disposition::Assigned(&Target {
-                sample: "dna01".to_string(),
-                sub_sample: None
-            })
+            Disposition::Assigned(
+                &Target {
+                    sample: "dna01".to_string(),
+                    sub_sample: None
+                },
+                0
+            )
         );
     }
 
