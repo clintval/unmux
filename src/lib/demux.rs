@@ -2350,9 +2350,10 @@ fn drive_parallel(
 /// pass-through whose whole record is the output, so nothing is unextracted.
 ///
 /// Known limitation: a routed `@a..@b` between-anchors stream that resolves to
-/// an empty stream (one anchor unmatched) contributes no range, so its file is
-/// not added to the denominator. This is a rare diagnostic-metric edge; file
-/// spans and matched `@grp` anchors (the common cases) are exact.
+/// an empty stream (an anchor unmatched, or the anchors bounding no region)
+/// contributes no range, so its file is not added to the denominator. This is a
+/// rare diagnostic-metric edge; file spans and matched `@grp` anchors (the
+/// common cases) are exact.
 fn frac_bases(engine: &Engine, segments: &[Segment], hits: &GroupHits) -> Result<(u64, u64)> {
     let plan = engine.plan;
     if plan.templates.is_empty() {

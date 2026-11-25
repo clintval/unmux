@@ -242,6 +242,10 @@ struct DemuxCmd {
     /// (full record length); negatives count from the record end. The
     /// anchored `@grp` forms take a `LENGTH` as the trailing number instead.
     ///
+    /// The `@grpA..@grpB` form is the bases from the end of `grpA`'s match to
+    /// the start of `grpB`'s. It is empty, but still present, where a group
+    /// is unmatched or `grpB` does not follow `grpA` in the same input file.
+    ///
     /// The `@grp::COLUMN` form is the matched tag's text in a column of the
     /// group's tag file, where a blank means the tag's `seq`. Header case is
     /// ignored unless two headers differ only by case, and a header character

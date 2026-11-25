@@ -15,7 +15,7 @@
 
 use std::collections::HashMap;
 
-use anyhow::{bail, Result};
+use anyhow::Result;
 
 use crate::grammar::{AnchorLen, Span, SpanBody};
 
@@ -142,9 +142,9 @@ impl Extracted {
 ///
 /// Returns `Ok(None)` when an anchored span references a group that did not
 /// match (the stream is absent); `Ok(Some(_))` otherwise, including a
-/// possibly-empty stream for a degenerate window or a between-anchors region
-/// whose endpoints touch. A column span has no source range, so it also resolves
-/// to `Ok(None)` here; the engine looks its text up by the matched tag.
+/// possibly-empty stream for a degenerate window or an empty between-anchors
+/// region. A column span has no source range, so it also resolves to `Ok(None)`
+/// here; the engine looks its text up by the matched tag.
 pub fn extract(
     span: &Span,
     segments: &[Segment],
@@ -155,8 +155,7 @@ pub fn extract(
         SpanRange::Bounded { file, start, end } => {
             Some(slice(segment_at(segments, file)?, start, end))
         }
-        // A between-anchors region with a missing anchor is an empty (but
-        // present) stream.
+        // No region between the anchors: the stream is empty but present.
         SpanRange::EmptyPresent => Some(Extracted {
             bases: Vec::new(),
             quals: segments.first().and_then(|s| s.quals.map(|_| Vec::new())),
@@ -186,7 +185,7 @@ pub fn span_range(
 }
 
 /// Where a span resolves: a concrete byte range, an empty-but-present stream (a
-/// between-anchors region with a missing endpoint), or absent (an `@grp` whose
+/// between-anchors span that bounds no region), or absent (an `@grp` whose
 /// group did not match).
 enum SpanRange {
     /// A concrete `[start, end)` byte range in input file `file`.
@@ -198,8 +197,9 @@ enum SpanRange {
         /// 0-based exclusive end offset.
         end: usize,
     },
-    /// The stream exists but is empty (a between-anchors region whose anchor
-    /// did not match).
+    /// The stream exists but is empty: a between-anchors span with an unmatched
+    /// anchor, or whose anchors overlap, are out of order, or lie in different
+    /// input files.
     EmptyPresent,
     /// The stream is absent (an `@grp` whose group did not match).
     Absent,
@@ -273,25 +273,11 @@ fn resolve_range(
         },
         SpanBody::Between { from, to } => {
             match (anchor_span(from, hits, index), anchor_span(to, hits, index)) {
-                (Some(a), Some(b)) => {
-                    if a.file != b.file {
-                        bail!(
-                        "between-anchors span `@{from}..@{to}` spans two input files ({} and {})",
-                        a.file,
-                        b.file
-                    );
-                    }
-                    if b.start < a.end {
-                        bail!(
-                        "between-anchors span `@{from}..@{to}` is empty or out of order (anchor `{to}` starts before anchor `{from}` ends)"
-                    );
-                    }
-                    SpanRange::Bounded {
-                        file: a.file,
-                        start: a.end,
-                        end: b.start,
-                    }
-                }
+                (Some(a), Some(b)) if a.file == b.file && a.end <= b.start => SpanRange::Bounded {
+                    file: a.file,
+                    start: a.end,
+                    end: b.start,
+                },
                 _ => SpanRange::EmptyPresent,
             }
         }

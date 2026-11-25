@@ -2070,6 +2070,22 @@ fn validate_plan(plan: &DemuxPlan) -> Result<()> {
                 );
             }
         }
+        if let SpanBody::Between { from, to } = &extract.span.body {
+            let pinned_file = |name: &str| {
+                let group = plan.groups.iter().find(|g| g.name == name)?;
+                Some(group.attrs.loc.as_ref()?.file)
+            };
+            if let (Some(from_file), Some(to_file)) = (pinned_file(from), pinned_file(to)) {
+                if from_file != to_file {
+                    bail!(
+                        "extract `{}` anchors on `@{from}..@{to}`, but `loc` pins `{from}` to input \
+                         file {from_file} and `{to}` to input file {to_file}; a between-anchors \
+                         region lies within one input file",
+                        extract.name
+                    );
+                }
+            }
+        }
         if let SpanBody::Column { group, column } = &extract.span.body {
             let source = plan
                 .groups
