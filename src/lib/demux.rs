@@ -37,8 +37,8 @@ use crate::extract::{
     extract, span_range, Corrected, Extracted, GroupHit, GroupHits, MatchSpan, Segment,
 };
 use crate::fanout::{
-    compile_routing, expand_from_group, load_sample_sheet, Disposition, RemoveTarget, Routing,
-    Target,
+    compile_routing, expand_from_group, load_sample_sheet_columns, Disposition, RemoveTarget,
+    Route, Routing, SheetColumn, SheetColumns, Target,
 };
 use crate::grammar::{
     column_tag_qualities, default_qual_tag, Anchor, DemuxPlan, Endpoint, GroupSource, MatchMode,
@@ -58,7 +58,7 @@ use crate::output::{
     ConstituentReadGroups, MultiWriter, OutputOrigin, PathContext,
 };
 use crate::qc::{removed_slug, routed_slug, unassigned_slug, Unassigned};
-use crate::tags::{load_tag_file_columns, TagColumns, TagSet};
+use crate::tags::{is_column_value, load_tag_file_columns, TagColumns, TagSet};
 use crate::writer::{encode_fragment, output_format, OutputFormat, OutputRead, StagedOutputs};
 
 /// Resolved arguments for the `unmux` demux command.
@@ -637,21 +637,35 @@ fn longest_common_prefix(strings: &[String]) -> String {
 
 /// Build the routing table from the plan's fan-out source (`--sample` inline, a
 /// `--sample-sheet`, or `--sample-from-group`) plus the `--remove` rules,
-/// sharing the already-loaded tag sets.
+/// sharing the already-loaded tag sets. Also returns the sheet columns that
+/// `%sample::COLUMN` extracts read.
 fn build_routing(
     plan: &DemuxPlan,
     tag_sets: &HashMap<String, TagSet>,
     group_index: &HashMap<String, usize>,
     pool: &str,
     resolved: &HashMap<String, crate::ResolvedReadGroup>,
-) -> Result<Routing> {
+) -> Result<(Routing, SheetColumns)> {
+    let mut sheet_columns = SheetColumns::new();
     let (samples, demux) = match &plan.samples {
         SampleSpec::None => (Vec::new(), false),
         SampleSpec::Inline(samples) => (samples.clone(), true),
         SampleSpec::Sheet(path, ignore) => {
             let declared: HashSet<&str> = plan.groups.iter().map(|g| g.name.as_str()).collect();
             let ignored: HashSet<&str> = ignore.iter().map(String::as_str).collect();
-            (load_sample_sheet(path, &declared, &ignored)?, true)
+            let reads: Vec<(&str, &str)> = plan
+                .extracts
+                .iter()
+                .filter_map(|extract| match &extract.span.body {
+                    SpanBody::SampleColumn { column } => {
+                        Some((extract.name.as_str(), column.as_str()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            let (samples, columns) = load_sample_sheet_columns(path, &declared, &ignored, &reads)?;
+            sheet_columns = columns;
+            (samples, true)
         }
         SampleSpec::FromGroup(group) => match resolved.get(group) {
             Some(r) => (r.samples.clone(), true),
@@ -663,7 +677,7 @@ fn build_routing(
             }
         },
     };
-    compile_routing(
+    let routing = compile_routing(
         &samples,
         &plan.remove,
         tag_sets,
@@ -671,7 +685,101 @@ fn build_routing(
         pool,
         demux,
         plan.require_samples_explain_all_tags,
-    )
+    )?;
+    Ok((routing, sheet_columns))
+}
+
+/// Store each `%sample::COLUMN` stream's value per route on the routes, where
+/// `None` is a blank cell. Fails on a value that cannot be a SAM tag or on two
+/// sheet rows that route one record to one target with different values.
+fn attach_sample_columns(
+    plan: &DemuxPlan,
+    routing: &mut Routing,
+    sheet_columns: &SheetColumns,
+) -> Result<()> {
+    let is_sheet = matches!(plan.samples, SampleSpec::Sheet(..));
+    let mut names = Vec::new();
+    let mut columns = Vec::new();
+    let mut has_cells = false;
+    for extract in &plan.extracts {
+        let SpanBody::SampleColumn { column } = &extract.span.body else {
+            continue;
+        };
+        let read = match sheet_columns.get(column) {
+            Some(read) => read.clone(),
+            None if column.eq_ignore_ascii_case("sub_sample") => SheetColumn::SubSample,
+            None => SheetColumn::Sample,
+        };
+        let values: Vec<Option<String>> = match read {
+            SheetColumn::Sample => routing
+                .route_targets()
+                .map(|target| Some(target.sample.clone()))
+                .collect(),
+            SheetColumn::SubSample => routing
+                .route_targets()
+                .map(|target| target.sub_sample.clone())
+                .collect(),
+            SheetColumn::Cells(values) => {
+                has_cells = true;
+                values
+            }
+        };
+        for (route, value) in values.iter().enumerate() {
+            let Some(value) = value.as_deref().filter(|value| !is_column_value(value)) else {
+                continue;
+            };
+            if is_sheet {
+                bail!(
+                    "sample sheet row {}: value {value:?} in column {column:?} may hold only \
+                     printable ASCII and spaces",
+                    route + 1
+                );
+            }
+            bail!(
+                "extract `{}` reads {column:?}, but value {value:?} may hold only printable ASCII \
+                 and spaces",
+                extract.name
+            );
+        }
+        log_blank_sample_column(plan, &extract.name, column, &values);
+        names.push(column.as_str());
+        columns.push(values);
+    }
+    routing.set_columns(columns)?;
+    if has_cells {
+        routing.check_column_conflicts(&names)?;
+    }
+    Ok(())
+}
+
+/// Log how many routes have no value for a `%sample::COLUMN` stream, and the
+/// tags their records go without.
+fn log_blank_sample_column(
+    plan: &DemuxPlan,
+    stream: &str,
+    column: &str,
+    values: &[Option<String>],
+) {
+    let blank = values.iter().filter(|value| value.is_none()).count();
+    let tags: Vec<&str> = plan
+        .tags
+        .iter()
+        .filter(|tag| tag.streams.iter().any(|s| s.name == stream))
+        .map(|tag| tag.tag.as_str())
+        .collect();
+    if blank == 0 || tags.is_empty() {
+        return;
+    }
+    let rows = match &plan.samples {
+        SampleSpec::Sheet(..) => "sheet rows".to_string(),
+        SampleSpec::FromGroup(group) => format!("tags of group `{group}`"),
+        _ => "samples".to_string(),
+    };
+    log::info!(
+        "column {column:?} is blank in {blank} of {} {rows}; records they route get no {} tag",
+        values.len(),
+        tags.join(" or ")
+    );
 }
 
 /// Build the static `Target -> constituent original @RG maps` table for an
@@ -1270,7 +1378,9 @@ fn run_engine(plan: &DemuxPlan, command_line: Option<&str>) -> Result<()> {
     let column_streams = resolve_column_streams(plan, &tag_columns, &group_index);
     let column_tag_qualities = column_tag_qualities(plan);
     let pool = pool_id(plan);
-    let routing = build_routing(plan, &tag_sets, &group_index, &pool, &resolved)?;
+    let (mut routing, sheet_columns) =
+        build_routing(plan, &tag_sets, &group_index, &pool, &resolved)?;
+    attach_sample_columns(plan, &mut routing, &sheet_columns)?;
 
     // An `@RG`-split run (`--sample-from-group` over an `@RG` source) is faithful
     // to the input header: each output file lists its constituent original `@RG`
@@ -1887,12 +1997,12 @@ fn prepare(engine: &Engine, fragment: &Fragment, fmatch: FragmentMatch) -> Resul
                 }
             }
         }
-        Disposition::Assigned(target) => {
+        Disposition::Assigned(route) => {
             let (denom, unext) = frac_bases(engine, &segments, &hits)?;
-            match prepare_body(engine, Some(target), &hits, &segments, fragment)? {
+            match prepare_body(engine, Some(route), &hits, &segments, fragment)? {
                 BodyOutcome::Assembled(writes) => (
                     Tally::Assigned {
-                        target: target.clone(),
+                        target: route.target().clone(),
                         denom,
                         unext,
                     },
@@ -2565,17 +2675,18 @@ fn column_value<'a>(engine: &'a Engine, hits: &GroupHits, stream: &str) -> Optio
     column.values.get(hit.tag_idx).map(String::as_str)
 }
 
-/// Assemble the output body for an assigned (`target = Some`) or pass-through
-/// (`target = None`) record into owned [`PreparedWrite`]s: resolve its
-/// extraction streams, build the `--template` bodies and the `--tag` data,
-/// attach the `@RG` read group on SAM/BAM, and resolve the `--out`
+/// Assemble the output body for an assigned (`route = Some`) or pass-through
+/// (`route = None`) record into owned
+/// [`PreparedWrite`]s: resolve its extraction streams, build the `--template`
+/// bodies and the `--tag` data (leaving out a tag with a blank `%sample::COLUMN`
+/// stream), attach the `@RG` read group on SAM/BAM, and resolve the `--out`
 /// destination(s). Returns [`BodyOutcome::MissingStream`] when a `--template`
 /// references a stream whose group did not match (the caller reroutes it to the
 /// `--unassigned` bin and tallies it unassigned). Pure (no writer, no metrics),
 /// so it runs on the worker.
 fn prepare_body(
     engine: &Engine,
-    target: Option<&Target>,
+    route: Option<&Route>,
     hits: &GroupHits,
     segments: &[Segment],
     fragment: &Fragment,
@@ -2583,8 +2694,18 @@ fn prepare_body(
     let plan = engine.plan;
     let pool = engine.pool;
     let input_formats = engine.input_formats;
+    let target = route.map(Route::target);
     let mut streams: HashMap<&str, Extracted> = HashMap::new();
+    let mut slot = 0;
     for spec in &plan.extracts {
+        if matches!(spec.span.body, SpanBody::SampleColumn { .. }) {
+            let value = route.and_then(|route| route.column(slot));
+            slot += 1;
+            if let Some(value) = value {
+                streams.insert(spec.name.as_str(), Extracted::from_text(value));
+            }
+            continue;
+        }
         if matches!(spec.span.body, SpanBody::Column { .. }) {
             if let Some(value) = column_value(engine, hits, &spec.name) {
                 streams.insert(spec.name.as_str(), Extracted::from_text(value));
@@ -5830,6 +5951,86 @@ mod tests {
             assert_eq!(text(record, *b"CB").as_deref(), cell, "record {i}");
             assert_eq!(text(record, *b"xi").as_deref(), id, "record {i}");
             assert_eq!(text(record, *b"CY"), None, "record {i}");
+        }
+    }
+
+    #[test]
+    fn test_sample_columns_are_per_row_and_identical_across_threads() {
+        let dir = tempfile::tempdir().unwrap();
+        let sheet = write_file(
+            dir.path(),
+            "sheet.tsv",
+            b"sample\ta\tb\tnucleus\ns1\ta1\tb1\tN1\ns1\ta1\tb2\tN2+N3\ns2\ta2\tb1\t\ns2\ta2\tb2\t007\n",
+        );
+        let mut fq = Vec::new();
+        for i in 0..3000 {
+            let bc = ["AAAAGGGG", "AAAATTTT", "CCCCGGGG", "CCCCTTTT", "GAGAGGGG"][i % 5];
+            fq.extend_from_slice(format!("@r{i}\n{bc}ACGTACGT\n+\nABCDEFGHIJKLMNOP\n").as_bytes());
+        }
+        let input = write_file(dir.path(), "in.fq", &fq);
+        let run = |threads: usize, ext: &str| {
+            let out = dir.path().join(format!("{threads}.{ext}"));
+            let mut args = base_args();
+            args.threads = threads;
+            args.inputs = vec![format!("0={}", input.display())];
+            args.groups = [
+                "a={a1=AAAA,a2=CCCC}",
+                "a::loc=0:0:4",
+                "b={b1=GGGG,b2=TTTT}",
+                "b::loc=0:4:8",
+            ]
+            .map(String::from)
+            .to_vec();
+            args.extracts = [
+                "nuc=%sample::nucleus",
+                "sm=%sample::sample",
+                "ba=@a",
+                "bb=@b",
+                "r=0:8:end",
+            ]
+            .map(String::from)
+            .to_vec();
+            args.templates = vec!["r".to_string()];
+            args.tags = ["nu=nuc+ba+bb", "xn=nuc", "xs=sm", "CB=ba+bb"]
+                .map(String::from)
+                .to_vec();
+            args.sample_sheet = Some(sheet.clone());
+            args.pool = Some("p".to_string());
+            args.out = Some(out.display().to_string());
+            run_demux(args).unwrap();
+            out
+        };
+        for ext in ["sam", "bam", "cram", "fq", "fq.gz"] {
+            let serial = read_back(&run(1, ext));
+            assert_eq!(serial.len(), 2400);
+            for threads in [2, 8] {
+                assert!(
+                    serial == read_back(&run(threads, ext)),
+                    "{ext} with {threads} threads"
+                );
+            }
+        }
+        let records = read_back(&dir.path().join("1.sam"));
+        let text = |record: &InputRecord, tag: [u8; 2]| match record.tags.as_ref()?.get(&tag) {
+            Some(Value::String(value)) => Some(value.to_string()),
+            _ => None,
+        };
+        for (i, record) in records.iter().enumerate() {
+            let (nu, xn, xs, cb) = [
+                (Some("N1-AAAA-GGGG"), Some("N1"), "s1", "AAAA-GGGG"),
+                (Some("N2+N3-AAAA-TTTT"), Some("N2+N3"), "s1", "AAAA-TTTT"),
+                (None, None, "s2", "CCCC-GGGG"),
+                (Some("007-CCCC-TTTT"), Some("007"), "s2", "CCCC-TTTT"),
+            ][i % 4];
+            assert_eq!(text(record, *b"nu").as_deref(), nu, "record {i}");
+            assert_eq!(text(record, *b"xn").as_deref(), xn, "record {i}");
+            assert_eq!(text(record, *b"xs").as_deref(), Some(xs), "record {i}");
+            assert_eq!(text(record, *b"CB").as_deref(), Some(cb), "record {i}");
+            assert_eq!(
+                text(record, *b"CY").as_deref(),
+                Some("ABCD EFGH"),
+                "record {i}"
+            );
         }
     }
 

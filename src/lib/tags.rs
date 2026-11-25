@@ -240,6 +240,18 @@ fn find_wanted_column(header: &str, name: &str, id_col: usize, seq_col: usize) -
         .split('\t')
         .map(str::trim)
         .collect();
+    match find_header(&columns, name)? {
+        Some(index) => Ok(index),
+        None => bail!(
+            "no column {name:?}; the columns are: {}",
+            known_columns(&columns)
+        ),
+    }
+}
+
+/// Find the one header that is `name` exactly, or else regardless of case.
+/// `Ok(None)` when none matches; an error when more than one does.
+pub(crate) fn find_header(columns: &[&str], name: &str) -> Result<Option<usize>> {
     let positions = |matches: &dyn Fn(&str) -> bool| -> Vec<usize> {
         (0..columns.len())
             .filter(|&index| matches(columns[index]))
@@ -250,17 +262,20 @@ fn find_wanted_column(header: &str, name: &str, id_col: usize, seq_col: usize) -
         found = positions(&|column| column.to_lowercase() == name.to_lowercase());
     }
     match found.as_slice() {
-        [index] => Ok(*index),
-        [] => {
-            let known: Vec<String> = columns
-                .iter()
-                .filter(|column| !column.is_empty())
-                .map(|column| column.escape_debug().to_string())
-                .collect();
-            bail!("no column {name:?}; the columns are: {}", known.join(", "))
-        }
+        [index] => Ok(Some(*index)),
+        [] => Ok(None),
         _ => bail!("more than one column {name:?}"),
     }
+}
+
+/// The non-empty headers, escaped and comma-joined, for an error message.
+pub(crate) fn known_columns(columns: &[&str]) -> String {
+    columns
+        .iter()
+        .filter(|column| !column.is_empty())
+        .map(|column| column.escape_debug().to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Find the one column whose lowercased header matches an accepted alias.

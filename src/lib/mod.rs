@@ -28,7 +28,7 @@ pub use demux::{run_demux, DemuxArgs};
 pub use extract::{extract, Extracted, MatchSpan, Segment};
 pub use fanout::{
     compile_routing, expand_from_group, load_sample_sheet, parse_sample_sheet, Disposition,
-    RemoveTarget, Routing, Target,
+    RemoveTarget, Route, Routing, Target,
 };
 pub use grammar::{parse_demux, DemuxPlan};
 pub use input::{sniff_bytes, sniff_input, Fragment, FragmentReader, InputRecord, SniffedFormat};

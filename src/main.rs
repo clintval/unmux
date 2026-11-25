@@ -106,6 +106,7 @@ pub(crate) const CARGO_STYLING: Styles = Styles::styled()
 ///                    COLUMN, or an output path (`%20`=space, `%2C`=comma).
 ///   %pool            the pool ID (see `--pool`).
 ///   %sample          the sample ID (`--out` only)
+///   %sample::COLUMN  the routing sheet row's value in COLUMN (`--extract` only).
 ///   %sub_sample      the sub-sample ID (`@RG LB`) (`--out` only).
 ///   %ordinal         1-based read ordinal (R`%ordinal` → R1, R2) (`--out` only).
 ///   %source          0-based input file idx (`--unassigned` or `--remove` only).
@@ -250,6 +251,13 @@ struct DemuxCmd {
     /// streams have no qualities, so only `--tag` takes them, and a tag built
     /// from one has no quality tag. A `match=` group has columns but no span.
     ///
+    /// The `%sample::COLUMN` form is the text in a `--sample-sheet` column of
+    /// the row that routed the record, so rows of one sample may differ, e.g.
+    /// `nuc=%sample::same_cell`. Where that cell is blank, every tag built
+    /// from the stream is left out. `sample` and `sub_sample` work with any
+    /// sample flag, e.g. `sm=%sample::sample`. Headers and values follow the
+    /// `@grp::COLUMN` rules.
+    ///
     ///   r=0:9:end          file 0, base 9 to the end
     ///   bc=1:0:8           file 1, bases [0,8)
     ///   tail=0:-10:end     last 10 bases of file 0
@@ -293,10 +301,11 @@ struct DemuxCmd {
     /// A tag is written only when every stream in it is present; otherwise
     /// the tag, its quality tag, and any input copies of them are left out.
     ///
-    /// A tag built from an `@grp::COLUMN` stream has no quality tag, since
-    /// qualities could not line up with its text: the default one is left out
-    /// (a carried one is dropped), and setting `qual=TAG` is an error. Such a
-    /// stream cannot take `~`, and `raw` does not change it.
+    /// A tag built from an `@grp::COLUMN` or `%sample::COLUMN` stream has no
+    /// quality tag, since qualities could not line up with its text: the
+    /// default one is left out (a carried one is dropped), and setting
+    /// `qual=TAG` is an error. Such a stream cannot take `~`, and `raw` does
+    /// not change it.
     ///
     ///   --tag RX=umi             UMI tag (auto quality tag `QX`)
     ///   --tag CB=bc1+bc2+bc3     join three barcode streams
@@ -354,9 +363,9 @@ struct DemuxCmd {
     /// same row are AND'd (a match is needed in each). Below, s1 needs i7 `a`
     /// AND i5 `b`; s2 pools (i7 `c` AND i5 `d`) OR (i7 `e` AND i5 `f`).
     ///
-    /// Every other column must name a group; skip extra metadata columns
-    /// with `--sample-sheet-ignore`. Exclusive with `--sample` and
-    /// `--sample-from-group`.
+    /// Every other column must be a group or be read by a `%sample::COLUMN`
+    /// extract; skip extra metadata columns with `--sample-sheet-ignore`.
+    /// Exclusive with `--sample` and `--sample-from-group`.
     ///
     ///   --sample-sheet samples.tsv
     ///

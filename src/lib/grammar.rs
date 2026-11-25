@@ -257,6 +257,13 @@ pub enum SpanBody {
         /// The column, percent-decoded.
         column: String,
     },
+    /// `%sample::COLUMN`: the text in a sample-sheet column of the row that routed
+    /// the record, without base qualities. `sample` and `sub_sample` are the
+    /// routed target's IDs in every sample mode.
+    SampleColumn {
+        /// The column, percent-decoded.
+        column: String,
+    },
     /// `@group+offset:len` (rightward) or `@group-offset:len` (leftward): `len`
     /// bases offset from the group's match. With `+` (`before` = false) the
     /// span starts `offset` bases past the matched END. With `-` (`before` =
@@ -1127,6 +1134,8 @@ pub fn parse_span(value: &str) -> Result<Span> {
     }
     let body = if let Some(rest) = value.strip_prefix('@') {
         parse_anchor_body(rest)?
+    } else if let Some(body) = parse_sample_column_span(value)? {
+        body
     } else {
         parse_file_span(value)?
     };
@@ -1192,10 +1201,45 @@ fn parse_anchor_body(rest: &str) -> Result<SpanBody> {
     })
 }
 
+/// Whether a character may appear unescaped in a COLUMN of a column span.
+fn is_column_char(c: char) -> bool {
+    is_ident_char(c) || matches!(c, '-' | '.' | '%')
+}
+
+/// Parse `%sample::COLUMN`, or fail with a hint on another placeholder. `None`
+/// when the span does not start with a placeholder.
+fn parse_sample_column_span(value: &str) -> Result<Option<SpanBody>> {
+    let Some(rest) = value.strip_prefix('%') else {
+        return Ok(None);
+    };
+    let Some(column) = rest.strip_prefix("sample::") else {
+        let hint = match rest.split("::").next().unwrap_or_default() {
+            "sample" => {
+                "use `%sample::sample` for the sample ID or `%sample::COLUMN` for a sheet column"
+            }
+            "sub_sample" => "use `%sample::sub_sample`",
+            "pool" | "ordinal" | "source" => {
+                "use `%sample::COLUMN` (or `--rg-tag` for read-group fields)"
+            }
+            _ => return Ok(None),
+        };
+        bail!("`{value}` is not an `--extract` source; {hint}");
+    };
+    let column = column.trim();
+    if column.is_empty() || column.contains("..") || !column.chars().all(is_column_char) {
+        bail!(
+            "a sample-sheet column span is `%sample::COLUMN` with no offset (in COLUMN, \
+             percent-escape every character but letters, digits, `_`, `-`, `.`), got `{value}`"
+        );
+    }
+    Ok(Some(SpanBody::SampleColumn {
+        column: decode_percent(column)?,
+    }))
+}
+
 /// Parse `@group::COLUMN`, where `@group::seq` is `@group` itself. Offsets and a
 /// second anchor are rejected, and a `%XX` escape in COLUMN is decoded.
 fn parse_column_span(group: &str, column: &str, rest: &str) -> Result<SpanBody> {
-    let is_column_char = |c: char| is_ident_char(c) || matches!(c, '-' | '.' | '%');
     if column.is_empty()
         || group.contains(['+', '-', '.'])
         || column.contains("..")
@@ -2055,6 +2099,9 @@ fn validate_plan(plan: &DemuxPlan) -> Result<()> {
                 _ => {}
             }
         }
+        if let SpanBody::SampleColumn { column } = &extract.span.body {
+            validate_sample_column(&plan.samples, &extract.name, column)?;
+        }
     }
 
     // Template and tag stream references.
@@ -2157,22 +2204,77 @@ fn validate_plan(plan: &DemuxPlan) -> Result<()> {
     Ok(())
 }
 
+/// Whether a `%sample::COLUMN` reads the routed target's `sample` or
+/// `sub_sample`, which every sample mode has.
+pub(crate) fn is_reserved_sample_column(column: &str) -> bool {
+    column.eq_ignore_ascii_case("sample") || column.eq_ignore_ascii_case("sub_sample")
+}
+
+/// A column as written in a column span, percent-escaping every character but
+/// letters, digits, `_`, `-`, and `.`.
+pub(crate) fn escape_column(column: &str) -> String {
+    let mut out = String::new();
+    for c in column.chars() {
+        if is_ident_char(c) || matches!(c, '-' | '.') {
+            out.push(c);
+        } else {
+            let mut buf = [0; 4];
+            for byte in c.encode_utf8(&mut buf).bytes() {
+                out.push_str(&format!("%{byte:02X}"));
+            }
+        }
+    }
+    out
+}
+
+/// Check that the sample mode can supply a `%sample::COLUMN` stream. A sheet's
+/// header is checked when the sheet is loaded.
+fn validate_sample_column(samples: &SampleSpec, extract: &str, column: &str) -> Result<()> {
+    let escaped = escape_column(column);
+    match samples {
+        SampleSpec::None if is_reserved_sample_column(column) => bail!(
+            "`--extract` uses `%sample::{escaped}` but no samples are defined; add `--sample`, \
+             `--sample-sheet`, or `--sample-from-group` (or remove the extract)"
+        ),
+        SampleSpec::None => bail!(
+            "`--extract` uses `%sample::{escaped}` but no samples are defined; add \
+             `--sample-sheet` (or remove the extract)"
+        ),
+        _ if is_reserved_sample_column(column) => Ok(()),
+        SampleSpec::Inline(_) => bail!(
+            "extract `{extract}` reads sample-sheet column {column:?}, but no `--sample-sheet` is \
+             given (only `sample` and `sub_sample` work with `--sample`)"
+        ),
+        SampleSpec::FromGroup(group) => bail!(
+            "extract `{extract}` reads sample-sheet column {column:?}; with `--sample-from-group \
+             {group}` the row is a tag, so use `@{group}::{escaped}`"
+        ),
+        SampleSpec::Sheet(..) => Ok(()),
+    }
+}
+
 /// The groups an extraction span body anchors on.
 pub(crate) fn anchor_groups(body: &SpanBody) -> Vec<&str> {
     match body {
         SpanBody::File { .. } => Vec::new(),
         SpanBody::AnchorMatch { group } => vec![group.as_str()],
         SpanBody::Column { group, .. } => vec![group.as_str()],
+        SpanBody::SampleColumn { .. } => Vec::new(),
         SpanBody::AnchorOffset { group, .. } => vec![group.as_str()],
         SpanBody::Between { from, to } => vec![from.as_str(), to.as_str()],
     }
 }
 
-/// The names of the extract streams that read a tag-file column.
+/// The names of the extract streams that read a tag-file or sample-sheet column.
 fn column_streams(extracts: &[Extract]) -> HashSet<&str> {
     extracts
         .iter()
-        .filter(|extract| matches!(extract.span.body, SpanBody::Column { .. }))
+        .filter(|extract| {
+            matches!(
+                extract.span.body,
+                SpanBody::Column { .. } | SpanBody::SampleColumn { .. }
+            )
+        })
         .map(|extract| extract.name.as_str())
         .collect()
 }
@@ -3954,5 +4056,167 @@ mod tests {
         assert_eq!(warnings(&["CB=cell", "RX=cell"]).len(), 2);
         assert!(warnings(&["CB=cell", "CB::qual=none"]).is_empty());
         assert!(warnings(&["CB=u", "xc=cell"]).is_empty());
+    }
+
+    #[test]
+    fn test_parse_span_sample_column() {
+        for (span, column) in [
+            ("%sample::same_cell", "same_cell"),
+            ("%sample::Same-Cell.1", "Same-Cell.1"),
+            ("%sample::sample", "sample"),
+            ("%sample::sub_sample", "sub_sample"),
+            ("%sample::seq", "seq"),
+            ("%sample::a%20b", "a b"),
+            ("%sample::p%25", "p%"),
+        ] {
+            assert_eq!(
+                parse_span(span).unwrap().body,
+                SpanBody::SampleColumn {
+                    column: column.to_string()
+                },
+                "{span}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_span_sample_column_rejects_bare_placeholders_and_slices() {
+        for (span, hint) in [
+            ("%sample", "use `%sample::sample` for the sample ID"),
+            ("%sub_sample", "use `%sample::sub_sample`"),
+            (
+                "%pool",
+                "use `%sample::COLUMN` (or `--rg-tag` for read-group fields)",
+            ),
+            ("%ordinal", "use `%sample::COLUMN`"),
+            ("%source", "use `%sample::COLUMN`"),
+            ("%sub_sample::x", "use `%sample::sub_sample`"),
+            ("%pool::x", "use `%sample::COLUMN`"),
+        ] {
+            let err = parse_span(span).unwrap_err().to_string();
+            assert!(
+                err.contains(&format!("`{span}` is not an `--extract` source; {hint}")),
+                "{err}"
+            );
+        }
+        for span in [
+            "%sample::",
+            "%sample::cell+1:4",
+            "%sample::cell-1:4",
+            "%sample::a..b",
+            "%sample::a::b",
+            "%sample::a b",
+            "%sample::a,b",
+        ] {
+            let err = parse_span(span).unwrap_err().to_string();
+            assert!(
+                err.contains("is `%sample::COLUMN` with no offset"),
+                "{span}: {err}"
+            );
+        }
+        for span in ["%foo", "%samples::x", "%"] {
+            assert_eq!(
+                parse_span(span).unwrap_err().to_string(),
+                parse_file_span(span).unwrap_err().to_string()
+            );
+        }
+    }
+
+    #[test]
+    fn test_escape_column_round_trips_through_a_span() {
+        for column in ["same_cell", "a b", "a+b::c", "p%", "\u{b5}"] {
+            let span = format!("%sample::{}", escape_column(column));
+            assert_eq!(
+                parse_span(&span).unwrap().body,
+                SpanBody::SampleColumn {
+                    column: column.to_string()
+                }
+            );
+        }
+        assert_eq!(escape_column("a b+c"), "a%20b%2Bc");
+    }
+
+    fn sample_column_args(column: &str) -> DemuxArgs {
+        let mut a = args();
+        a.groups = vec!["bc={a=ACGT,b=TTTT}".to_string()];
+        a.extracts = vec![format!("v=%sample::{column}"), "u=0:0:4".to_string()];
+        a.tags = vec!["xv=v+u".to_string()];
+        a
+    }
+
+    #[test]
+    fn test_sample_column_needs_a_mode_that_has_it() {
+        let parse = |column: &str, mode: &dyn Fn(&mut DemuxArgs)| {
+            let mut a = sample_column_args(column);
+            mode(&mut a);
+            parse_demux(&a).map(|_| ()).map_err(|err| err.to_string())
+        };
+        let none = |_: &mut DemuxArgs| {};
+        let inline = |a: &mut DemuxArgs| a.samples = vec!["s1=bc::a".to_string()];
+        let from_group = |a: &mut DemuxArgs| a.sample_from_group = Some("bc".to_string());
+        let sheet = |a: &mut DemuxArgs| a.sample_sheet = Some(PathBuf::from("sheet.tsv"));
+
+        for column in ["sample", "sub_sample", "SAMPLE", "Sub_Sample"] {
+            parse(column, &inline).unwrap();
+            parse(column, &from_group).unwrap();
+            parse(column, &sheet).unwrap();
+            let err = parse(column, &none).unwrap_err();
+            assert!(
+                err.contains("add `--sample`, `--sample-sheet`, or `--sample-from-group`"),
+                "{err}"
+            );
+        }
+        parse("same_cell", &sheet).unwrap();
+        assert_eq!(
+            parse("same_cell", &none).unwrap_err(),
+            "`--extract` uses `%sample::same_cell` but no samples are defined; add \
+             `--sample-sheet` (or remove the extract)"
+        );
+        assert_eq!(
+            parse("same_cell", &inline).unwrap_err(),
+            "extract `v` reads sample-sheet column \"same_cell\", but no `--sample-sheet` is \
+             given (only `sample` and `sub_sample` work with `--sample`)"
+        );
+        assert_eq!(
+            parse("same_cell", &from_group).unwrap_err(),
+            "extract `v` reads sample-sheet column \"same_cell\"; with `--sample-from-group \
+             bc` the row is a tag, so use `@bc::same_cell`"
+        );
+        assert!(parse("a%20b", &from_group)
+            .unwrap_err()
+            .ends_with("so use `@bc::a%20b`"));
+    }
+
+    #[test]
+    fn test_sample_column_stream_is_text() {
+        let mut a = sample_column_args("same_cell");
+        a.samples = vec!["s1=bc::a".to_string()];
+        a.extracts[0] = "v=%sample::sample".to_string();
+        a.tags = vec!["CB=v+u".to_string(), "xv=v".to_string()];
+        let plan = parse_demux(&a).unwrap();
+        assert_eq!(plan.tags[0].qual, QualTag::Omitted);
+        assert_eq!(plan.tags[1].qual, QualTag::Omitted);
+        assert_eq!(column_tag_qualities(&plan), vec![("CB", "CY")]);
+
+        for (tags, templates, message) in [
+            (vec!["CB=v", "CB::qual=CY"], vec![], "has no base qualities"),
+            (
+                vec!["xv=~v"],
+                vec![],
+                "reverse-complements column stream `v`",
+            ),
+            (vec![], vec!["v"], "template #1 uses column stream `v`"),
+        ] {
+            let mut b = a.clone();
+            b.tags = tags.into_iter().map(String::from).collect();
+            b.templates = templates.into_iter().map(String::from).collect();
+            let err = parse_demux(&b).unwrap_err().to_string();
+            assert!(err.contains(message), "{err}");
+        }
+        let mut b = a.clone();
+        b.groups.push("g={ACGT}".to_string());
+        b.groups.push("g::match=u+v".to_string());
+        let err = parse_demux(&b).unwrap_err().to_string();
+        assert!(err.contains("match= uses column stream `v`"), "{err}");
     }
 }
