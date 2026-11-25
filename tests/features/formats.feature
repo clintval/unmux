@@ -144,6 +144,84 @@ Feature: Input and output format handling
     And a file "output.cram" exists
     And the file "output.cram" does not contain "ACGTACGTAACCGGTTACGT"
 
+  Scenario Outline: FASTA converts to CRAM, which reads back with no qualities
+    Given a file "reads.fa" containing:
+      """
+      >r1
+      ACGTACGTAACCGGTTACGT
+      >r2 XY:Z:hello
+      TTTTGGGG
+      """
+    When I run `unmux reads.fa --pool p --threads <threads> --out out.cram`
+    Then the exit code is 0
+    When I run `unmux out.cram --pool p --out back.sam`
+    Then the exit code is 0
+    And the records of "back.sam" are:
+      """
+      r1	4	*	0	255	*	*	0	0	ACGTACGTAACCGGTTACGT	*	RG:Z:p
+      r2	4	*	0	255	*	*	0	0	TTTTGGGG	*	XY:Z:hello	RG:Z:p
+      """
+    When I run `unmux out.cram --out back.fa`
+    Then the exit code is 0
+    And the file "back.fa" is:
+      """
+      >r1 RG:Z:p
+      ACGTACGTAACCGGTTACGT
+      >r2 XY:Z:hello	RG:Z:p
+      TTTTGGGG
+      """
+
+    Examples:
+      | threads |
+      | 1       |
+      | 2       |
+      | 8       |
+
+  Scenario Outline: SAM and BAM records with no qualities convert to CRAM and back
+    Given a file "unmapped.sam" containing:
+      """
+      @HD	VN:1.6
+      r1	4	*	0	0	*	*	0	0	ACGTACGTAACCGGTTACGT	*	XY:Z:hello
+      r2	4	*	0	0	*	*	0	0	TTTTGGGG	*
+      """
+    When I run `unmux unmapped.sam --out in.<ext>`
+    Then the exit code is 0
+    When I run `unmux in.<ext> --out out.cram`
+    Then the exit code is 0
+    When I run `unmux out.cram --pool p --out back.sam`
+    Then the exit code is 0
+    And the records of "back.sam" are:
+      """
+      r1	4	*	0	255	*	*	0	0	ACGTACGTAACCGGTTACGT	*	XY:Z:hello	RG:Z:p
+      r2	4	*	0	255	*	*	0	0	TTTTGGGG	*	RG:Z:p
+      """
+
+    Examples:
+      | ext |
+      | sam |
+      | bam |
+
+  Scenario: A CRAM output holds records with and without qualities
+    Given a file "mixed.sam" containing:
+      """
+      @HD	VN:1.6
+      r1	4	*	0	0	*	*	0	0	ACGTACGT	ABCDEFGH	XY:Z:hello
+      r2	4	*	0	0	*	*	0	0	GGGGCCCC	*
+      r3	4	*	0	0	*	*	0	0	TTTTAAAA	IIIIJJJJ
+      r4	4	*	0	0	*	*	0	0	CC	*	XZ:i:7
+      """
+    When I run `unmux mixed.sam --out out.cram`
+    Then the exit code is 0
+    When I run `unmux out.cram --pool p --out back.sam`
+    Then the exit code is 0
+    And the records of "back.sam" are:
+      """
+      r1	4	*	0	255	*	*	0	0	ACGTACGT	ABCDEFGH	XY:Z:hello	RG:Z:p
+      r2	4	*	0	255	*	*	0	0	GGGGCCCC	*	RG:Z:p
+      r3	4	*	0	255	*	*	0	0	TTTTAAAA	IIIIJJJJ	RG:Z:p
+      r4	4	*	0	255	*	*	0	0	CC	*	XZ:i:7	RG:Z:p
+      """
+
   Scenario: --threads 1 runs fully serially and still demultiplexes
     Given a file "reads.fq" containing:
       """
