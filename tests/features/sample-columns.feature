@@ -106,6 +106,29 @@ Feature: Sample-sheet column streams
       | 2       |
       | 8       |
 
+  Scenario: two extracts may read one column
+    When I run `unmux reads.fq --group a={a1=AAAA,a2=CCCC} --group a::loc=0:0:4 --group b={b1=GGGG,b2=TTTT} --group b::loc=0:4:8 --extract n=%sample::nucleus --extract m=%sample::nucleus --extract s=%sample::sample --extract r=0:8:end --tag xn=n --tag xs=s --tag xm=m --template r --sample-sheet sheet.tsv --out out.fq`
+    Then the exit code is 0
+    And the file "out.fq" is:
+      """
+      @r1 xn:Z:N1	xs:Z:s1	xm:Z:N1
+      ACGTACGT
+      +
+      IJKLMNOP
+      @r2 xn:Z:N2+N3	xs:Z:s1	xm:Z:N2+N3
+      ACGTACGT
+      +
+      IJKLMNOP
+      @r3 xs:Z:s2
+      ACGTACGT
+      +
+      IJKLMNOP
+      @r4 xn:Z:N4	xs:Z:s2	xm:Z:N4
+      ACGTACGT
+      +
+      IJKLMNOP
+      """
+
   Scenario: unassigned and removed records get no tag
     When I run `unmux reads.fq --group a={a1=AAAA,a2=CCCC} --group a::loc=0:0:4 --group b={b1=GGGG,b2=TTTT} --group b::loc=0:4:8 --extract nuc=%sample::nucleus --extract sm=%sample::sample --tag nu=nuc --tag xs=sm --sample-sheet sheet.tsv --remove a::a2=rm.fq --unassigned un.fq --out out.fq`
     Then the exit code is 0
