@@ -483,6 +483,33 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_between_adjacent_anchors_is_empty() {
+        let segments = segs(b"AACCGGTTAC", b"0123456789");
+        let span = sp("@a..@b");
+        let (hits, index) = anchors(&[
+            (
+                "a",
+                MatchSpan {
+                    file: 0,
+                    start: 0,
+                    end: 2,
+                },
+            ),
+            (
+                "b",
+                MatchSpan {
+                    file: 0,
+                    start: 2,
+                    end: 4,
+                },
+            ),
+        ]);
+        let got = extract(&span, &segments, &hits, &index).unwrap().unwrap();
+        assert!(got.bases.is_empty());
+        assert_eq!(got.quals.unwrap(), b"");
+    }
+
+    #[test]
     fn test_extract_between_missing_anchor_is_empty() {
         let segments = segs(b"AACCGGTTAC", b"0123456789");
         let span = sp("@a..@b");
@@ -499,8 +526,48 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_between_out_of_order_is_error() {
+    fn test_extract_between_out_of_order_is_empty() {
         let segments = segs(b"AACCGGTTAC", b"0123456789");
+        let span = sp("@a..@b");
+        // Anchor `b` nested in `a`, wholly before it, and overlapping its end.
+        for (a, b) in [((0, 8), (2, 4)), ((6, 8), (0, 2)), ((2, 6), (4, 8))] {
+            let (hits, index) = anchors(&[
+                (
+                    "a",
+                    MatchSpan {
+                        file: 0,
+                        start: a.0,
+                        end: a.1,
+                    },
+                ),
+                (
+                    "b",
+                    MatchSpan {
+                        file: 0,
+                        start: b.0,
+                        end: b.1,
+                    },
+                ),
+            ]);
+            let got = extract(&span, &segments, &hits, &index).unwrap().unwrap();
+            assert!(got.bases.is_empty(), "a={a:?} b={b:?}");
+            assert_eq!(got.quals.unwrap(), b"", "a={a:?} b={b:?}");
+            assert_eq!(span_range(&span, &segments, &hits, &index).unwrap(), None);
+        }
+    }
+
+    #[test]
+    fn test_extract_between_different_files_is_empty() {
+        let segments = [
+            Segment {
+                bases: b"AACCGGTTAC",
+                quals: Some(b"0123456789"),
+            },
+            Segment {
+                bases: b"TTGGCCAATG",
+                quals: Some(b"abcdefghij"),
+            },
+        ];
         let span = sp("@a..@b");
         let (hits, index) = anchors(&[
             (
@@ -508,20 +575,22 @@ mod tests {
                 MatchSpan {
                     file: 0,
                     start: 0,
-                    end: 8,
+                    end: 2,
                 },
             ),
             (
                 "b",
                 MatchSpan {
-                    file: 0,
-                    start: 2,
-                    end: 4,
+                    file: 1,
+                    start: 6,
+                    end: 8,
                 },
             ),
         ]);
-        let err = extract(&span, &segments, &hits, &index).unwrap_err();
-        assert!(err.to_string().contains("out of order"), "{err}");
+        let got = extract(&span, &segments, &hits, &index).unwrap().unwrap();
+        assert!(got.bases.is_empty());
+        assert_eq!(got.quals.unwrap(), b"");
+        assert_eq!(span_range(&span, &segments, &hits, &index).unwrap(), None);
     }
 
     #[test]

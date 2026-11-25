@@ -3674,6 +3674,29 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_plan_between_anchors_pinned_to_different_files_is_error() {
+        let between = |from_attrs: &str, to_attrs: &str| {
+            let mut a = args();
+            a.inputs = vec!["0=r1.fq".to_string(), "1=r2.fq".to_string()];
+            a.extracts = vec!["ins=@g1..@g2".to_string()];
+            a.groups = vec![
+                "g1={AAAA}".to_string(),
+                "g2={TTTT}".to_string(),
+                format!("g1::{from_attrs}"),
+                format!("g2::{to_attrs}"),
+            ];
+            parse_demux(&a)
+        };
+        let err = between("loc=0:0:4", "loc=1:0:4").unwrap_err().to_string();
+        assert!(err.contains("extract `ins`"), "{err}");
+        assert!(err.contains("`g1` to input file 0"), "{err}");
+        assert!(err.contains("`g2` to input file 1"), "{err}");
+        assert!(between("loc=1:0:4", "loc=1:8:12").is_ok());
+        assert!(between("loc=0:0:4", "dist=1").is_ok());
+        assert!(between("dist=1", "loc=1:0:4").is_ok());
+    }
+
+    #[test]
     fn test_validate_plan_downstream_loc_with_relative_next_is_error() {
         // The relative `next` window replaces g2's loc; g2 may not also pin an
         // absolute loc.
