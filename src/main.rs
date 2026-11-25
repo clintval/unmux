@@ -181,7 +181,8 @@ struct DemuxCmd {
     ///
     /// `NAME=SOURCE` is the UMI/barcode/adapter set; `NAME::ATTRS` constrains
     /// matching. Tags may use IUPAC codes. A matched `@grp` span is
-    /// error-corrected by default. Each tag in a set needs its own ID.
+    /// error-corrected by default. Each tag in a set needs its own ID; pool
+    /// several tags into one sample with `--sample NAME=GROUP::ID1,ID2`.
     ///
     /// Sources (`NAME::SOURCE`):
     ///

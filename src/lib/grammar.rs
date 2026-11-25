@@ -809,7 +809,8 @@ fn parse_group_source(value: &str, group: &str) -> Result<GroupSource> {
             if let Some(first) = id_positions.insert(tag.id.clone(), index + 1) {
                 bail!(
                     "inline tag set for group `{group}`: entry {} repeats tag ID {id:?} from \
-                     entry {first}; each tag needs its own ID",
+                     entry {first}; each tag needs its own ID (pool tags with \
+                     `--sample NAME={group}::ID1,ID2`)",
                     index + 1
                 );
             }
@@ -3054,7 +3055,10 @@ mod tests {
             let err = parse_groups(&[format!("bc={source}")]).unwrap_err();
             assert_eq!(
                 err.to_string(),
-                format!("inline tag set for group `bc`: {entries}; each tag needs its own ID")
+                format!(
+                    "inline tag set for group `bc`: {entries}; each tag needs its own ID (pool \
+                     tags with `--sample NAME=bc::ID1,ID2`)"
+                )
             );
         }
     }

@@ -184,7 +184,10 @@ fn parse_tag_table(text: &str, wanted: &[&str]) -> Result<(TagSet, TagColumns)> 
             bail!("line {line} has an empty id or sequence");
         }
         if let Some(first) = id_lines.insert(id, line) {
-            bail!("line {line} repeats tag ID {id:?} from line {first}; each tag needs its own ID");
+            bail!(
+                "line {line} repeats tag ID {id:?} from line {first}; each tag needs its own ID \
+                 (pool tags with `--sample NAME=GROUP::ID1,ID2`)"
+            );
         }
         let sub_sample = sub_sample_col
             .and_then(|c| cell(&cells, c))
@@ -516,7 +519,8 @@ mod tests {
         let err = parse_tag_table("id\tseq\ns1\tAAAA\ns1\tCCCC\ns2\tGGGG\n", &[]).unwrap_err();
         assert_eq!(
             err.to_string(),
-            "line 3 repeats tag ID \"s1\" from line 2; each tag needs its own ID"
+            "line 3 repeats tag ID \"s1\" from line 2; each tag needs its own ID (pool tags \
+             with `--sample NAME=GROUP::ID1,ID2`)"
         );
         let table = "# note\n\nid\tseq\tcell\n# inner\ns1\tAAAA\tx\n\ns2\tGGGG\ty\ns1\tCCCC\tz\n";
         for wanted in [&[][..], &["cell"], &["id"]] {
@@ -552,7 +556,7 @@ mod tests {
         std::fs::write(&path, "id\tseq\ns1\tAAAA\ns1\tCCCC\n").unwrap();
         let err = format!("{:#}", load_tag_file(&path).unwrap_err());
         assert!(
-            err.ends_with("line 3 repeats tag ID \"s1\" from line 2; each tag needs its own ID"),
+            err.ends_with("line 3 repeats tag ID \"s1\" from line 2; each tag needs its own ID (pool tags with `--sample NAME=GROUP::ID1,ID2`)"),
             "{err}"
         );
     }

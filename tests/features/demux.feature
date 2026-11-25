@@ -230,7 +230,7 @@ Feature: Demux parsing and sample fan-out
     When I run `unmux reads.fq --group bc=tags.tsv --group bc::loc=0:0:4 <use> --out out.fq`
     Then the exit code is 1
     And stderr contains "failed to load tag set for group `bc`"
-    And stderr contains "line 6 repeats tag ID "s1" from line 4; each tag needs its own ID"
+    And stderr contains "line 6 repeats tag ID "s1" from line 4; each tag needs its own ID (pool tags with `--sample NAME=GROUP::ID1,ID2`)"
     And a file "out.fq" does not exist
 
     Examples:
@@ -245,7 +245,7 @@ Feature: Demux parsing and sample fan-out
   Scenario: an inline set that repeats an ID is an error
     When I run `unmux reads.fq --group bc={s1=AAAA,s2=GGGG,s1=CCCC} --sample-from-group bc --out out.fq`
     Then the exit code is 1
-    And stderr contains "inline tag set for group `bc`: entry 3 repeats tag ID "s1" from entry 1; each tag needs its own ID"
+    And stderr contains "inline tag set for group `bc`: entry 3 repeats tag ID "s1" from entry 1; each tag needs its own ID (pool tags with `--sample NAME=bc::ID1,ID2`)"
     And a file "out.fq" does not exist
 
   Scenario: tag IDs that differ only by case are distinct
