@@ -25,6 +25,52 @@ Feature: Tag groups and sequential matching across multiple groups
     And stdout contains "PY:Z:TTTT"
     And stdout does not contain "PY:Z:AAGG"
 
+  Scenario: an anchor=5p target of a relative next= window judges each read by the base past the window
+    Given a file "reads.fq" containing:
+      """
+      @hit1
+      TTTTACGGTACGTAAAA
+      +
+      IIIIIIIIIIIIIIIII
+      @miss1
+      TTTTACGGTACGAAAAA
+      +
+      IIIIIIIIIIIIIIIII
+      @miss2
+      TTTTACGTAACGAAAAA
+      +
+      IIIIIIIIIIIIIIIII
+      @hit2
+      TTTTACGTAACGTAAAA
+      +
+      IIIIIIIIIIIIIIIII
+      """
+    # Each pair agrees over the relative window [4,12); the inserted base makes base 12 decide the match.
+    When I run `unmux reads.fq --threads 1 --group up={u=TTTT} --group up::loc=0:0:4,next=bc:0-8 --group bc={a=ACGTACGT} --group bc::dist=0:1:1,anchor=5p --sample s1=bc::a --out %sample.fq --unassigned un.fq`
+    Then the exit code is 0
+    And the file "s1.fq" is:
+      """
+      @hit1
+      TTTTACGGTACGTAAAA
+      +
+      IIIIIIIIIIIIIIIII
+      @hit2
+      TTTTACGTAACGTAAAA
+      +
+      IIIIIIIIIIIIIIIII
+      """
+    And the file "un.fq" is:
+      """
+      @miss1
+      TTTTACGGTACGAAAAA
+      +
+      IIIIIIIIIIIIIIIII
+      @miss2
+      TTTTACGTAACGAAAAA
+      +
+      IIIIIIIIIIIIIIIII
+      """
+
   Scenario: prev=GROUP makes an upstream match a prerequisite for searching the downstream group
     Given a file "reads.fq" containing:
       """

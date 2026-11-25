@@ -1196,6 +1196,180 @@ mod tests {
         assert_eq!((both.subs, both.indels), (1, 1));
     }
 
+    /// An `anchor=5p` group over `tags` with a `loc` of `[0, end)` in file 0.
+    fn anchored5p(tags: &[&str], end: usize, dist: Dist) -> CompiledGroup {
+        let mut g = group(tags);
+        g.anchor = Some(Anchor::FivePrime);
+        g.dist = dist;
+        g.loc = Some(Location {
+            file: 0,
+            start: Endpoint::FromStart(0),
+            end: Some(Endpoint::FromStart(end)),
+        });
+        g
+    }
+
+    /// A best match as `(tag, start, end)`, or `None` for an unmatched read.
+    type Best = Option<(usize, usize, usize)>;
+
+    /// Assert each read's best match from one warm `Scratch`, in both orders.
+    fn assert_best_in_both_orders(group: &CompiledGroup, expected: &[(&str, Best)]) {
+        let mut order = expected.to_vec();
+        for _ in 0..2 {
+            let mut warm = Scratch::new();
+            let found: Vec<(&str, Best)> = order
+                .iter()
+                .map(|&(read, _)| {
+                    let best = match_group(group, &mut warm, &[read.as_bytes()]).best;
+                    (read, best.map(|m| (m.tag_idx, m.start, m.end)))
+                })
+                .collect();
+            assert_eq!(found, order);
+            order.reverse();
+        }
+    }
+
+    #[test]
+    fn test_anchor5p_indel_budget_outcome_ignores_earlier_reads() {
+        let indel = Dist {
+            mismatch: 0,
+            indel: 1,
+            total: 1,
+        };
+        // The reads differ at base 8, which the inserted G pulls into the tag.
+        assert_best_in_both_orders(
+            &anchored5p(&["ACGTACGT"], 8, indel),
+            &[("ACGGTACGTAAAA", Some((0, 0, 9))), ("ACGGTACGAAAAA", None)],
+        );
+    }
+
+    #[test]
+    fn test_anchor5p_tag_past_window_end_outcome_ignores_earlier_reads() {
+        assert_best_in_both_orders(
+            &anchored5p(&["AAAAAACC", "AAAAAAGG"], 6, Dist::default()),
+            &[
+                ("AAAAAACCTTTT", Some((0, 0, 8))),
+                ("AAAAAAGGTTTT", Some((1, 0, 8))),
+            ],
+        );
+    }
+
+    #[test]
+    fn test_anchor5p_short_read_outcome_ignores_earlier_reads() {
+        assert_best_in_both_orders(
+            &anchored5p(&["AAAAAACC"], 6, Dist::default()),
+            &[
+                ("AAAAAACC", Some((0, 0, 8))),
+                ("AAAAAAC", None),
+                ("AAAAAA", None),
+            ],
+        );
+        let indel = Dist {
+            mismatch: 0,
+            indel: 1,
+            total: 1,
+        };
+        assert_best_in_both_orders(
+            &anchored5p(&["ACGTACGT"], 8, indel),
+            &[("ACGGTACGT", Some((0, 0, 9))), ("ACGGTACG", None)],
+        );
+    }
+
+    /// Every read over `alphabet` of up to `max_len` bases, shortest first.
+    fn reads_up_to(alphabet: &str, max_len: usize) -> Vec<String> {
+        let mut reads = vec![String::new()];
+        let mut longest = 0..1;
+        for _ in 0..max_len {
+            for index in longest.clone() {
+                for base in alphabet.chars() {
+                    reads.push(format!("{}{base}", reads[index]));
+                }
+            }
+            longest = longest.end..reads.len();
+        }
+        reads
+    }
+
+    /// Assert a warm `Scratch` gives each read its fresh-`Scratch` outcome.
+    fn assert_warm_scratch_matches_fresh(group: &CompiledGroup, reads: &[String]) {
+        let fresh: Vec<GroupOutcome> = reads.iter().map(|read| outcome(group, read)).collect();
+        let mut order: Vec<usize> = (0..reads.len()).collect();
+        for _ in 0..2 {
+            let mut warm = Scratch::new();
+            for &index in &order {
+                assert_eq!(
+                    match_group(group, &mut warm, &[reads[index].as_bytes()]),
+                    fresh[index],
+                    "read {:?} with {:?}, {:?}",
+                    reads[index],
+                    group.loc,
+                    group.dist
+                );
+            }
+            order.reverse();
+        }
+    }
+
+    /// Sweep `loc` windows, `(mismatch, indel)` budgets, and every short read.
+    fn assert_sweep_matches_fresh(anchor: Option<Anchor>, budgets: &[(usize, usize)]) {
+        let reads = reads_up_to("AC", 8);
+        let windows = [
+            (Endpoint::FromStart(0), Some(Endpoint::FromStart(2))),
+            (Endpoint::FromStart(0), Some(Endpoint::FromStart(4))),
+            (Endpoint::FromStart(1), Some(Endpoint::FromStart(3))),
+            (Endpoint::FromStart(2), None),
+            (Endpoint::FromEnd(4), Some(Endpoint::ReadEnd)),
+            (Endpoint::FromStart(0), Some(Endpoint::FromEnd(2))),
+        ];
+        for (start, end) in windows {
+            for &(mismatch, indel) in budgets {
+                let mut g = group(&["ACA", "CCAC", "AACCA"]);
+                g.anchor = anchor;
+                g.dist = Dist {
+                    mismatch,
+                    indel,
+                    total: mismatch + indel,
+                };
+                g.loc = Some(Location {
+                    file: 0,
+                    start,
+                    end,
+                });
+                assert_warm_scratch_matches_fresh(&g, &reads);
+            }
+        }
+    }
+
+    #[test]
+    fn test_anchor5p_warm_scratch_matches_fresh_scratch() {
+        assert_sweep_matches_fresh(
+            Some(Anchor::FivePrime),
+            &[(0, 0), (1, 0), (0, 1), (1, 1), (0, 2)],
+        );
+    }
+
+    #[test]
+    fn test_anchor3p_warm_scratch_matches_fresh_scratch() {
+        assert_sweep_matches_fresh(Some(Anchor::ThreePrime), &[(0, 0), (1, 0)]);
+    }
+
+    #[test]
+    fn test_sliding_window_warm_scratch_matches_fresh_scratch() {
+        assert_sweep_matches_fresh(None, &[(0, 0), (1, 1)]);
+    }
+
+    #[test]
+    fn test_joined_stream_warm_scratch_matches_fresh_scratch() {
+        let mut g = group(&["ACA", "CCAC", "AACCA"]);
+        g.match_streams = Some(vec!["i7".to_string(), "i5".to_string()]);
+        g.dist = Dist {
+            mismatch: 1,
+            indel: 1,
+            total: 2,
+        };
+        assert_warm_scratch_matches_fresh(&g, &reads_up_to("AC", 8));
+    }
+
     #[test]
     fn test_match_group_exact_required_rejects_mismatch() {
         // dist defaults to exact, so a one-base substitution does not match.
