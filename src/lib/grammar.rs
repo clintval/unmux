@@ -796,20 +796,17 @@ fn parse_group_source(value: &str, group: &str) -> Result<GroupSource> {
             if entry.is_empty() {
                 continue;
             }
-            let tag = match entry.split_once('=') {
-                Some((id, seq)) => InlineTag {
-                    id: id.trim().to_string(),
-                    seq: seq.trim().to_string(),
-                },
-                // No id given: the sequence doubles as the id (splitcode
-                // behavior).
-                None => InlineTag {
-                    id: entry.to_string(),
-                    seq: entry.to_string(),
-                },
+            // With no id (`SEQ` or `=SEQ`), the sequence doubles as the id.
+            let (id, seq) = match entry.split_once('=') {
+                Some((id, seq)) if !id.trim().is_empty() => (id.trim(), seq.trim()),
+                Some((_, seq)) => (seq.trim(), seq.trim()),
+                None => (entry, entry),
             };
-            let id = if tag.id.is_empty() { &tag.seq } else { &tag.id };
-            if let Some(first) = id_positions.insert(id.clone(), index + 1) {
+            let tag = InlineTag {
+                id: id.to_string(),
+                seq: seq.to_string(),
+            };
+            if let Some(first) = id_positions.insert(tag.id.clone(), index + 1) {
                 bail!(
                     "inline tag set for group `{group}`: entry {} repeats tag ID {id:?} from \
                      entry {first}; each tag needs its own ID",
@@ -3060,6 +3057,20 @@ mod tests {
                 format!("inline tag set for group `bc`: {entries}; each tag needs its own ID")
             );
         }
+    }
+
+    #[test]
+    fn test_parse_groups_inline_set_empty_id_is_the_sequence() {
+        let groups = parse_groups(&["bc={=AAAA, =CCCC,x=GGGG}".to_string()]).unwrap();
+        let GroupSource::Inline(tags) = &groups[0].source else {
+            panic!("expected inline source");
+        };
+        let ids: Vec<&str> = tags.iter().map(|tag| tag.id.as_str()).collect();
+        assert_eq!(ids, ["AAAA", "CCCC", "x"]);
+        let err = parse_groups(&["bc={=AAAA,AAAA=CCCC}".to_string()]).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("entry 2 repeats tag ID \"AAAA\" from entry 1"));
     }
 
     #[test]

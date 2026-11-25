@@ -270,3 +270,26 @@ Feature: Demux parsing and sample fan-out
     Then the exit code is 0
     And stdout contains "@r1 xi:Z:s1"
     And stdout contains "@r2 xi:Z:S1"
+
+  Scenario: an inline tag with an empty ID takes its sequence as the ID
+    Given a file "reads.fq" containing:
+      """
+      @r1
+      AAAA
+      +
+      IIII
+      @r2
+      CCCC
+      +
+      IIII
+      @r3
+      GGGG
+      +
+      IIII
+      """
+    When I run `unmux reads.fq --group bc={=AAAA,=CCCC} --group bc::loc=0:0:4 --sample-from-group bc --out out.%sample.fq --unassigned un.fq`
+    Then the exit code is 0
+    And the file "out.AAAA.fq" contains "@r1"
+    And the file "out.CCCC.fq" contains "@r2"
+    And the file "un.fq" contains "@r3"
+    And a file "out..fq" does not exist
