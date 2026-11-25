@@ -331,6 +331,81 @@ Feature: Input and output format handling
       read2	4	*	0	255	*	*	0	0	CCCCAAAA	IIIIIIII	RX:Z:GGGG	QX:Z:JJJJ	RG:Z:p
       """
 
+  Scenario Outline: The QC-fail flag of a <format> pair is kept on <threads> threads
+    Given a file "in.sam" containing:
+      """
+      @HD	VN:1.6
+      read1	589	*	0	0	*	*	0	0	ACGTACGT	IIIIIIII
+      read1	653	*	0	0	*	*	0	0	TTTTGGGG	JJJJJJJJ
+      read2	77	*	0	0	*	*	0	0	CCCCAAAA	IIIIIIII
+      read2	141	*	0	0	*	*	0	0	GGGGTTTT	JJJJJJJJ
+      """
+    When I run `unmux in.sam --pool p --out in.<format>`
+    Then the exit code is 0
+    When I run `unmux in.<format> --pool p --threads <threads> --out out.sam`
+    Then the exit code is 0
+    And the records of "out.sam" are:
+      """
+      read1	589	*	0	255	*	*	0	0	ACGTACGT	IIIIIIII	RG:Z:p
+      read1	653	*	0	255	*	*	0	0	TTTTGGGG	JJJJJJJJ	RG:Z:p
+      read2	77	*	0	255	*	*	0	0	CCCCAAAA	IIIIIIII	RG:Z:p
+      read2	141	*	0	255	*	*	0	0	GGGGTTTT	JJJJJJJJ	RG:Z:p
+      """
+
+    Examples:
+      | format | threads |
+      | sam    | 1       |
+      | sam    | 8       |
+      | bam    | 1       |
+      | bam    | 8       |
+      | cram   | 1       |
+      | cram   | 8       |
+
+  Scenario: The QC-fail flag is kept in a sample, an unassigned bin, and a removed bin
+    Given a file "in.sam" containing:
+      """
+      @HD	VN:1.6
+      a	516	*	0	0	*	*	0	0	AAAACCCCGGGG	IIIIIIIIIIII
+      b	516	*	0	0	*	*	0	0	CCCCGGGGTTTT	IIIIIIIIIIII
+      c	516	*	0	0	*	*	0	0	GGGGTTTTAAAA	IIIIIIIIIIII
+      d	4	*	0	0	*	*	0	0	AAAACCCCGGGG	IIIIIIIIIIII
+      """
+    When I run `unmux in.sam --pool p --group bc={s1=AAAA,phix=GGGG} --group bc::loc=0:0:4 --sample s1=bc::s1 --remove bc::phix=rm.sam --unassigned un.sam --out %sample.sam`
+    Then the exit code is 0
+    And the records of "s1.sam" are:
+      """
+      a	516	*	0	255	*	*	0	0	AAAACCCCGGGG	IIIIIIIIIIII	RG:Z:s1
+      d	4	*	0	255	*	*	0	0	AAAACCCCGGGG	IIIIIIIIIIII	RG:Z:s1
+      """
+    And the records of "un.sam" are:
+      """
+      b	516	*	0	255	*	*	0	0	CCCCGGGGTTTT	IIIIIIIIIIII	RG:Z:p
+      """
+    And the records of "rm.sam" are:
+      """
+      c	516	*	0	255	*	*	0	0	GGGGTTTTAAAA	IIIIIIIIIIII	RG:Z:p
+      """
+
+  Scenario: A templated read fails QC when any record of its fragment does
+    Given a file "in.sam" containing:
+      """
+      @HD	VN:1.6
+      both	589	*	0	0	*	*	0	0	ACGTACGT	IIIIIIII
+      both	653	*	0	0	*	*	0	0	TTTTGGGG	JJJJJJJJ
+      last	77	*	0	0	*	*	0	0	CCCCAAAA	IIIIIIII
+      last	653	*	0	0	*	*	0	0	GGGGTTTT	JJJJJJJJ
+      none	77	*	0	0	*	*	0	0	GGGGAAAA	IIIIIIII
+      none	141	*	0	0	*	*	0	0	TTTTCCCC	JJJJJJJJ
+      """
+    When I run `unmux in.sam --pool p --extract r1=0:0:end --extract umi=1:0:4 --template r1 --tag RX=umi --out out.sam`
+    Then the exit code is 0
+    And the records of "out.sam" are:
+      """
+      both	516	*	0	255	*	*	0	0	ACGTACGT	IIIIIIII	RX:Z:TTTT	QX:Z:JJJJ	RG:Z:p
+      last	516	*	0	255	*	*	0	0	CCCCAAAA	IIIIIIII	RX:Z:GGGG	QX:Z:JJJJ	RG:Z:p
+      none	4	*	0	255	*	*	0	0	GGGGAAAA	IIIIIIII	RX:Z:TTTT	QX:Z:JJJJ	RG:Z:p
+      """
+
   Scenario: --per-record reads each mate of a paired SAM input on its own
     Given a file "paired.sam" containing:
       """
