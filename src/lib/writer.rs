@@ -1487,6 +1487,102 @@ mod tests {
         assert!(err.contains("CRAM"), "{err}");
     }
 
+    /// Write `fragments` to a CRAM and read its records back as SAM text.
+    fn cram_round_trip(fragments: &[Vec<OutputRead>]) -> String {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out.cram");
+        let mut writer = OutputWriter::create(Some(&out), OutputFormat::Cram, 0).unwrap();
+        for fragment in fragments {
+            writer.write_fragment(fragment).unwrap();
+        }
+        writer.finish().unwrap();
+
+        let mut reader = cram::io::Reader::new(File::open(&out).unwrap());
+        let header = reader.read_header().unwrap();
+        let mut text = sam::io::Writer::new(Vec::new());
+        for record in reader.records(&header) {
+            text.write_alignment_record(&header, &record.unwrap())
+                .unwrap();
+        }
+        String::from_utf8(text.into_inner()).unwrap()
+    }
+
+    fn output_read<'a>(
+        name: &'a [u8],
+        bases: &'a [u8],
+        quals: Option<&'a [u8]>,
+        tags: Option<&'a Data>,
+    ) -> OutputRead<'a> {
+        OutputRead {
+            name,
+            bases,
+            quals,
+            tags,
+            read_group: None,
+            alignment: None,
+        }
+    }
+
+    #[test]
+    fn test_cram_round_trips_records_without_qualities() {
+        let mut tags = Data::default();
+        tags.insert(Tag::new(b'X', b'Y'), Value::from("hello"));
+        let fragments = [
+            vec![output_read(b"r1", b"ACGTACGT", None, Some(&tags))],
+            vec![output_read(b"r2", b"TTTT", None, None)],
+        ];
+        assert_eq!(
+            cram_round_trip(&fragments),
+            "r1\t4\t*\t0\t255\t*\t*\t0\t0\tACGTACGT\t*\tXY:Z:hello\n\
+             r2\t4\t*\t0\t255\t*\t*\t0\t0\tTTTT\t*\n"
+        );
+    }
+
+    #[test]
+    fn test_cram_round_trips_records_with_and_without_qualities() {
+        let mut tags = Data::default();
+        tags.insert(Tag::new(b'X', b'Y'), Value::from("hello"));
+        let fragments = [
+            vec![output_read(b"r1", b"ACGTACGT", Some(&[30; 8]), Some(&tags))],
+            vec![output_read(b"r2", b"GGGG", None, Some(&tags))],
+            vec![
+                output_read(b"r3", b"TTTTAA", Some(&[0, 1, 2, 3, 4, 5]), None),
+                output_read(b"r3", b"CC", None, None),
+            ],
+            vec![
+                output_read(b"r4", b"AAAA", None, None),
+                output_read(b"r4", b"CCCC", Some(&[40; 4]), None),
+            ],
+        ];
+        assert_eq!(
+            cram_round_trip(&fragments),
+            "r1\t4\t*\t0\t255\t*\t*\t0\t0\tACGTACGT\t????????\tXY:Z:hello\n\
+             r2\t4\t*\t0\t255\t*\t*\t0\t0\tGGGG\t*\tXY:Z:hello\n\
+             r3\t77\t*\t0\t255\t*\t*\t0\t0\tTTTTAA\t!\"#$%&\n\
+             r3\t141\t*\t0\t255\t*\t*\t0\t0\tCC\t*\n\
+             r4\t77\t*\t0\t255\t*\t*\t0\t0\tAAAA\t*\n\
+             r4\t141\t*\t0\t255\t*\t*\t0\t0\tCCCC\tIIII\n"
+        );
+    }
+
+    #[test]
+    fn test_cram_round_trips_a_kept_alignment_without_qualities() {
+        let text = b"@HD\tVN:1.6\nr1\t4\t*\t0\t0\t*\t*\t0\t0\tACGT\t*\tXY:Z:hello\n";
+        let mut reader = sam::io::Reader::new(&text[..]);
+        let header = reader.read_header().unwrap();
+        let mut record = RecordBuf::default();
+        reader.read_record_buf(&header, &mut record).unwrap();
+        let alignment = Alignment::Record(record);
+        let read = OutputRead {
+            alignment: Some(&alignment),
+            ..output_read(b"", b"", None, None)
+        };
+        assert_eq!(
+            cram_round_trip(&[vec![read]]),
+            "r1\t4\t*\t0\t255\t*\t*\t0\t0\tACGT\t*\tXY:Z:hello\n"
+        );
+    }
+
     #[test]
     fn test_more_than_two_reads_per_fragment_is_rejected() {
         // SAM/BAM/CRAM holds at most two segments (a pair) per template.
