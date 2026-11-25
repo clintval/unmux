@@ -22,7 +22,7 @@ use std::fs::File;
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use anyhow::{anyhow, bail, Context, Result};
 use noodles::sam::alignment::io::Write as AlignmentWrite;
@@ -757,6 +757,60 @@ pub(crate) fn create_output_file(path: &Path) -> Result<File> {
     File::create(path).with_context(|| format!("failed to create output file: {}", path.display()))
 }
 
+/// The first write error among the files behind a BGZF pool, which the pool itself does not report.
+#[derive(Debug, Default)]
+pub(crate) struct PoolFailure(OnceLock<(PathBuf, io::Error)>);
+
+impl PoolFailure {
+    /// Fail with the first write error, if a file behind the pool has had one.
+    pub(crate) fn check(&self) -> Result<()> {
+        let Some((path, error)) = self.0.get() else {
+            return Ok(());
+        };
+        Err(io::Error::new(error.kind(), error.to_string()))
+            .with_context(|| format!("failed to write output file: {}", path.display()))
+    }
+}
+
+/// A file behind a BGZF pool, keeping in [`PoolFailure`] the write errors that the pool drops.
+pub(crate) struct PooledFile<W> {
+    file: W,
+    path: PathBuf,
+    failure: Arc<PoolFailure>,
+}
+
+impl<W: Write> PooledFile<W> {
+    /// Wrap `file`, the staged file of output `path`, to keep its write errors in `failure`.
+    pub(crate) fn new(file: W, path: &Path, failure: &Arc<PoolFailure>) -> Self {
+        Self {
+            file,
+            path: path.to_path_buf(),
+            failure: Arc::clone(failure),
+        }
+    }
+
+    /// Run `step` on the file unless a file behind the pool has failed, keeping an error it gives.
+    fn attempt(&mut self, step: impl FnOnce(&mut W) -> io::Result<()>) {
+        if self.failure.0.get().is_none() {
+            if let Err(error) = step(&mut self.file) {
+                let _ = self.failure.0.set((self.path.clone(), error));
+            }
+        }
+    }
+}
+
+impl<W: Write> Write for PooledFile<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.attempt(|file| file.write_all(buf));
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.attempt(W::flush);
+        Ok(())
+    }
+}
+
 /// Wrap a buffered stream in a gzip encoder when `gzip` is set, else leave it
 /// plain.
 fn sink_writer(buffered: BufWriter<Box<dyn Write>>, gzip: bool, compression: u8) -> SinkWriter {
@@ -1175,6 +1229,86 @@ mod tests {
         staged.stage([PathBuf::from("/dev/null")]);
         assert_eq!(staged.path(Path::new("/dev/null")), Path::new("/dev/null"));
         staged.commit().unwrap();
+    }
+
+    /// A writer with room for this many more bytes, which fails any write that needs more.
+    struct Full(usize);
+
+    impl Write for Full {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            match self.0.checked_sub(buf.len()) {
+                Some(room) => {
+                    self.0 = room;
+                    Ok(buf.len())
+                }
+                None => Err(io::Error::new(io::ErrorKind::StorageFull, "disk full")),
+            }
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn test_pooled_file_keeps_the_first_write_error_and_skips_later_writes() {
+        let failure = Arc::new(PoolFailure::default());
+        let mut sound = PooledFile::new(Vec::new(), Path::new("o/a.bam"), &failure);
+        let mut full = PooledFile::new(Full(4), Path::new("o/b.bam"), &failure);
+        sound.write_all(b"kept").unwrap();
+        full.write_all(b"fits").unwrap();
+        failure.check().unwrap();
+
+        full.write_all(b"does not").unwrap();
+        sound.write_all(b"skipped").unwrap();
+        assert_eq!(sound.file, b"kept");
+        let error = failure.check().unwrap_err();
+        assert_eq!(
+            format!("{error:#}"),
+            "failed to write output file: o/b.bam: disk full"
+        );
+        let cause = error.downcast_ref::<io::Error>().unwrap();
+        assert_eq!(cause.kind(), io::ErrorKind::StorageFull);
+    }
+
+    #[test]
+    fn test_pooled_file_keeps_an_error_from_flushing_buffered_bytes() {
+        let failure = Arc::new(PoolFailure::default());
+        let buffered = BufWriter::new(Full(0));
+        let mut file = PooledFile::new(buffered, Path::new("o/a.fq.gz"), &failure);
+        file.write_all(b"buffered").unwrap();
+        failure.check().unwrap();
+
+        file.flush().unwrap();
+        let error = failure.check().unwrap_err();
+        assert_eq!(
+            format!("{error:#}"),
+            "failed to write output file: o/a.fq.gz: disk full"
+        );
+    }
+
+    #[test]
+    fn test_a_write_error_leaves_the_bgzf_pool_running_until_it_is_stopped() {
+        use pooled_writer::{bgzf::BgzfCompressor, PoolBuilder};
+
+        let failure = Arc::new(PoolFailure::default());
+        let mut builder = PoolBuilder::<PooledFile<Full>, BgzfCompressor>::new()
+            .threads(1)
+            .queue_size(2);
+        let file = PooledFile::new(Full(1 << 10), Path::new("o/a.fq.gz"), &failure);
+        let mut pooled = builder.exchange(file);
+        let mut pool = builder.build().unwrap();
+        // Many more blocks than the queue holds, each at least 28 bytes once compressed.
+        for _ in 0..64 {
+            pooled.write_all(&[b'A'; 1 << 16]).unwrap();
+        }
+        pooled.close().unwrap();
+        pool.stop_pool().unwrap();
+        let error = failure.check().unwrap_err();
+        assert_eq!(
+            format!("{error:#}"),
+            "failed to write output file: o/a.fq.gz: disk full"
+        );
     }
 
     #[test]

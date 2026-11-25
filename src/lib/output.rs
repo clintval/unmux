@@ -17,6 +17,7 @@
 
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{bail, Result};
 use noodles::sam;
@@ -35,7 +36,7 @@ use crate::grammar::{
     default_qual_tag, OutputPattern, PatternSegment, Placeholder, QualTag, TagBinding,
 };
 use crate::input::{SniffedFormat, PHRED_OFFSET};
-use crate::writer::{file_id, output_format, FileId, OutputRead, OutputWriter};
+use crate::writer::{file_id, output_format, FileId, OutputRead, OutputWriter, PoolFailure};
 
 /// A non-standard read-group field tag (e.g. `SM`/`LB`/`CN`), as the
 /// `Map<ReadGroup>` builder takes.
@@ -470,6 +471,8 @@ pub struct MultiWriter {
     /// Populated by [`set_pooled`]; the pool itself is owned and stopped by the
     /// engine after every writer is finalized.
     pooled: HashMap<Dest, PooledWriter>,
+    /// The first write error among the files behind the pool, which fails every later write.
+    pool_failure: Arc<PoolFailure>,
     input_formats: Vec<SniffedFormat>,
     compression: u8,
     /// Header for any destination absent from `headers` (pass-through `--out`,
@@ -501,6 +504,7 @@ impl MultiWriter {
             writers: HashMap::new(),
             headers,
             pooled: HashMap::new(),
+            pool_failure: Arc::default(),
             input_formats,
             compression,
             default_header,
@@ -524,6 +528,11 @@ impl MultiWriter {
             .collect();
     }
 
+    /// Fail every write that follows a write error kept in `failure` by a file behind the pool.
+    pub(crate) fn set_pool_failure(&mut self, failure: Arc<PoolFailure>) {
+        self.pool_failure = failure;
+    }
+
     /// Eagerly create the writer for each directed file `path`, so a directed
     /// output file always exists even when it receives no records (it is
     /// finalized to a valid empty file). A path that is later written to reuses
@@ -543,6 +552,7 @@ impl MultiWriter {
     /// Write `reads` to the destination `path` (stdout when `None`), opening
     /// its writer on first use.
     pub fn write(&mut self, path: Option<&Path>, reads: &[OutputRead]) -> Result<()> {
+        self.pool_failure.check()?;
         let dest = Dest::from_path(path);
         if !self.writers.contains_key(&dest) {
             let writer = self.open(path)?;
@@ -556,6 +566,7 @@ impl MultiWriter {
     /// writer on first use exactly as [`write`] does. The bytes are
     /// byte-identical to what [`write`] would have encoded inline.
     pub fn write_encoded(&mut self, path: Option<&Path>, bytes: &[u8]) -> Result<()> {
+        self.pool_failure.check()?;
         let dest = Dest::from_path(path);
         if !self.writers.contains_key(&dest) {
             let writer = self.open(path)?;
@@ -1285,6 +1296,54 @@ mod tests {
         };
         assert_eq!(names(&a), vec![b"ra".to_vec(), b"ra2".to_vec()]);
         assert_eq!(names(&b), vec![b"rb".to_vec()]);
+    }
+
+    #[test]
+    fn test_multiwriter_refuses_to_write_once_a_file_behind_the_pool_has_failed() {
+        use std::io::Write;
+
+        use crate::writer::PooledFile;
+
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("a.fq");
+        let mut writer = MultiWriter::new(
+            HashMap::new(),
+            provenance_header(None),
+            vec![SniffedFormat::Fastq],
+            5,
+        );
+        let failure = Arc::new(PoolFailure::default());
+        writer.set_pool_failure(Arc::clone(&failure));
+        let read = OutputRead {
+            name: b"r",
+            bases: b"ACGT",
+            quals: Some(&[30, 30, 30, 30]),
+            tags: None,
+            read_group: None,
+            alignment: None,
+        };
+        let encoded = b"@r\nACGT\n+\n????\n";
+        writer
+            .write(Some(&out), std::slice::from_ref(&read))
+            .unwrap();
+        writer.write_encoded(Some(&out), encoded).unwrap();
+
+        let no_room = std::io::Cursor::new(Box::<[u8]>::default());
+        PooledFile::new(no_room, Path::new("o/b.fq.gz"), &failure)
+            .write_all(b"lost")
+            .unwrap();
+        for refused in [
+            writer.write(Some(&out), std::slice::from_ref(&read)),
+            writer.write_encoded(Some(&out), encoded),
+        ] {
+            let error = format!("{:#}", refused.unwrap_err());
+            assert!(
+                error.starts_with("failed to write output file: o/b.fq.gz: "),
+                "{error}"
+            );
+        }
+        writer.finish().unwrap();
+        assert_eq!(std::fs::read(&out).unwrap(), encoded.repeat(2));
     }
 
     fn sample(sample: &str, sub_sample: Option<&str>) -> OutputOrigin {
