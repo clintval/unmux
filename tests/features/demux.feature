@@ -198,3 +198,75 @@ Feature: Demux parsing and sample fan-out
     And the file "POOL.dna01.lib9.R2.fq" contains "GGGGGGGG"
     And the file "unassigned.POOL.0.fq" contains "TTTTTTTTGGGGGGGG"
     And the file "unassigned.POOL.1.fq" contains "AAAAAAAA"
+
+  Scenario Outline: a tag file that repeats an ID is an error, however the run uses the group
+    Given a file "reads.fq" containing:
+      """
+      @r1
+      AAAA
+      +
+      IIII
+      @r2
+      CCCC
+      +
+      IIII
+      """
+    And a file "tags.tsv" containing:
+      """
+      # two rows share an ID
+      id	seq
+
+      s1	AAAA
+      s2	GGGG
+      s1	CCCC
+      """
+    And a file "sheet.tsv" containing:
+      """
+      sample	bc
+      x	s1
+      y	s2
+      """
+    # The error gives the physical lines of both rows, counting the comment and blank lines.
+    When I run `unmux reads.fq --group bc=tags.tsv --group bc::loc=0:0:4 <use> --out out.fq`
+    Then the exit code is 1
+    And stderr contains "failed to load tag set for group `bc`"
+    And stderr contains "line 6 repeats tag ID "s1" from line 4; each tag needs its own ID"
+    And a file "out.fq" does not exist
+
+    Examples:
+      | use                                                                            |
+      | --sample-from-group bc                                                         |
+      | --sample x=bc::s1 --sample y=bc::s2                                            |
+      | --sample x=bc::s1 --sample y=bc::s2 --require-samples-explain-all-tags         |
+      | --sample-sheet sheet.tsv                                                       |
+      | --remove bc::s1                                                                |
+      | --extract i=@bc::id --tag xi=i                                                 |
+
+  Scenario: an inline set that repeats an ID is an error
+    When I run `unmux reads.fq --group bc={s1=AAAA,s2=GGGG,s1=CCCC} --sample-from-group bc --out out.fq`
+    Then the exit code is 1
+    And stderr contains "inline tag set for group `bc`: entry 3 repeats tag ID "s1" from entry 1; each tag needs its own ID"
+    And a file "out.fq" does not exist
+
+  Scenario: tag IDs that differ only by case are distinct
+    Given a file "reads.fq" containing:
+      """
+      @r1
+      AAAA
+      +
+      IIII
+      @r2
+      CCCC
+      +
+      IIII
+      """
+    And a file "tags.tsv" containing:
+      """
+      id	seq
+      s1	AAAA
+      S1	CCCC
+      """
+    When I run `unmux reads.fq --group bc=tags.tsv --group bc::loc=0:0:4 --extract i=@bc::id --tag xi=i`
+    Then the exit code is 0
+    And stdout contains "@r1 xi:Z:s1"
+    And stdout contains "@r2 xi:Z:S1"
