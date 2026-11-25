@@ -731,9 +731,9 @@ fn align_ending_at(tag: &[u8], text: &[u8], end: usize, dist: &Dist) -> Option<A
     if dist.indel == 0 {
         return anchored_hamming(tag, text, end.checked_sub(tag.len())?, dist.mismatch);
     }
-    let reach = (tag.len() + dist.indel).min(end);
-    let reversed = |seq: &[u8]| seq.iter().rev().copied().collect::<Vec<u8>>();
-    anchored_align(&reversed(tag), &reversed(&text[end - reach..end]), dist)
+    align_from_edge(tag.len(), end, dist, |j, i| {
+        iupac_overlap(text[end - 1 - i], tag[tag.len() - 1 - j])
+    })
 }
 
 /// For each 4-bit IUPAC mask, the bit set of text positions that match it.
@@ -986,74 +986,76 @@ fn anchored_hamming(
 }
 
 /// The best anchored edit-distance alignment of `tag` against `window` (the
-/// record bases from the anchor onward, already bounded to `len(tag) +
-/// indel_budget`), with the tag's 5' base pinned at `window[0]` (no free
-/// text-start) and the 3' end floating by the indel budget. A 3-D DP,
-/// `subs[j][i][d]` = the fewest substitutions aligning `tag[0..j]` to
-/// `window[0..i]` with exactly `d` indels (deletions of a tag base or
-/// insertions of a record base each cost one indel), so the substitution and
-/// indel counts are tracked separately for the `dist=mismatch:indel:total`
-/// caps. Returns the lowest-cost accepted alignment (then fewest indels, then
-/// the 3' end closest to the nominal tag length), or `None` if none fits the
-/// budgets. Small by construction (`len(tag) ≤ ~64`, indel budget ≤ a few), so
-/// the DP is sub-microsecond; only walked when indels are allowed.
-#[allow(clippy::needless_range_loop)] // the 3-D DP genuinely indexes cells by (j, i, d)
+/// record bases from the anchor onward), with the tag's 5' base pinned at
+/// `window[0]` (no free text-start) and the 3' end floating by the indel
+/// budget. Returns the lowest-cost alignment within the
+/// `dist=mismatch:indel:total` caps (then fewest indels, then the 3' end
+/// closest to the nominal tag length, then the shortest span), or `None` if
+/// none fits the caps.
 fn anchored_align(tag: &[u8], window: &[u8], dist: &Dist) -> Option<AnchoredHit> {
-    const INF: usize = usize::MAX / 4;
-    let m = tag.len();
-    let n = window.len();
-    let ki = dist.indel;
-    // subs[j][i][d]: min substitutions to align tag[0..j] to window[0..i] using
-    // exactly d indels.
-    let mut subs = vec![vec![vec![INF; ki + 1]; n + 1]; m + 1];
-    subs[0][0][0] = 0;
-    for j in 0..=m {
-        for i in 0..=n {
-            for d in 0..=ki {
-                let cur = subs[j][i][d];
-                if cur == INF {
+    align_from_edge(tag.len(), window.len(), dist, |j, i| {
+        iupac_overlap(window[i], tag[j])
+    })
+}
+
+/// The best alignment from a pinned edge; `overlap(j, i)` compares tag base `j` and text base `i`.
+fn align_from_edge(
+    tag_len: usize,
+    text_len: usize,
+    dist: &Dist,
+    overlap: impl Fn(usize, usize) -> bool,
+) -> Option<AnchoredHit> {
+    const UNREACHED: usize = usize::MAX;
+    let mismatch = dist.mismatch.min(tag_len);
+    // Deleting the whole tag costs `tag_len` indels, so the best alignment never has more.
+    let indel = dist.indel.min(tag_len);
+    let within = |subs: usize, indels: usize| subs <= mismatch && subs + indels <= dist.total;
+
+    // Fewest substitutions by count of deleted tag bases (row) and inserted text bases (column).
+    let width = indel + 1;
+    let mut cells = SmallVec::<[usize; 16]>::from_elem(UNREACHED, width * width);
+    let fewest = cells.as_mut_slice();
+    fewest[0] = 0;
+    for j in 0..tag_len {
+        let mut alive = false;
+        for del in (0..=indel).rev() {
+            for ins in 0..=indel - del {
+                let at = del * width + ins;
+                let subs = std::mem::replace(&mut fewest[at], UNREACHED);
+                if !within(subs, del + ins) {
                     continue;
                 }
-                // Diagonal: consume a tag base and a read base (a match or a
-                // substitution).
-                if j < m && i < n {
-                    let cost = cur + usize::from(!iupac_overlap(window[i], tag[j]));
-                    if cost < subs[j + 1][i + 1][d] {
-                        subs[j + 1][i + 1][d] = cost;
+                alive = true;
+                let i = j + ins - del;
+                if i < text_len {
+                    fewest[at] = subs + usize::from(!overlap(j, i));
+                }
+                if del + ins < indel {
+                    fewest[at + width] = fewest[at + width].min(subs);
+                    if i < text_len {
+                        fewest[at + 1] = fewest[at + 1].min(subs);
                     }
                 }
-                // Deletion: a tag base with no read base (the read is shorter
-                // than the tag here).
-                if j < m && d < ki && cur < subs[j + 1][i][d + 1] {
-                    subs[j + 1][i][d + 1] = cur;
-                }
-                // Insertion: a read base with no tag base (an extra base within
-                // the anchored span).
-                if i < n && d < ki && cur < subs[j][i + 1][d + 1] {
-                    subs[j][i + 1][d + 1] = cur;
-                }
             }
         }
-    }
-    let mut best: Option<AnchoredHit> = None;
-    for i in 0..=n {
-        for d in 0..=ki {
-            let s = subs[m][i][d];
-            if s > dist.mismatch || s + d > dist.total {
-                continue;
-            }
-            let cand = AnchoredHit {
-                subs: s,
-                indels: d,
-                end: i,
-            };
-            let rank = |h: &AnchoredHit| (h.subs + h.indels, h.indels, h.end.abs_diff(m));
-            if best.as_ref().is_none_or(|b| rank(&cand) < rank(b)) {
-                best = Some(cand);
-            }
+        if !alive {
+            return None;
         }
     }
-    best
+
+    (0..=indel)
+        .flat_map(|del| (0..=indel - del).map(move |ins| (del, ins)))
+        .map(|(del, ins)| (fewest[del * width + ins], del, ins))
+        .filter(|&(subs, del, ins)| within(subs, del + ins))
+        .map(|(subs, del, ins)| AnchoredHit {
+            subs,
+            indels: del + ins,
+            end: tag_len + ins - del,
+        })
+        .min_by_key(|hit| {
+            let shift = hit.end.abs_diff(tag_len);
+            (hit.subs + hit.indels, hit.indels, shift, hit.end)
+        })
 }
 
 /// Map a `sassy` strand to our [`MatchStrand`].
