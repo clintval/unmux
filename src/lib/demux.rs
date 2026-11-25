@@ -53,9 +53,9 @@ use crate::matcher::{
 };
 use crate::metrics::Metrics;
 use crate::output::{
-    alignment_header, build_tag_data, default_read_group_header, insert_string_tag, qual_tag_name,
-    read_group_header, resolve_metrics_path, resolve_pattern, ConstituentReadGroups, MultiWriter,
-    PathContext,
+    alignment_header, build_tag_data, check_output_collisions, default_read_group_header,
+    insert_string_tag, qual_tag_name, read_group_header, resolve_metrics_path, resolve_pattern,
+    ConstituentReadGroups, MultiWriter, OutputOrigin, PathContext,
 };
 use crate::qc::{removed_slug, routed_slug, unassigned_slug, Unassigned};
 use crate::tags::{load_tag_file_columns, TagColumns, TagSet};
@@ -769,15 +769,27 @@ fn enumerate_dests(
     input_formats: &[SniffedFormat],
     fragment_width: usize,
 ) -> Result<Vec<PathBuf>> {
-    let mut paths: Vec<PathBuf> = Vec::new();
     let mut seen: HashSet<PathBuf> = HashSet::new();
-    let add = |path: Option<PathBuf>, seen: &mut HashSet<PathBuf>, paths: &mut Vec<PathBuf>| {
-        if let Some(path) = path {
-            if seen.insert(path.clone()) {
-                paths.push(path);
-            }
-        }
-    };
+    Ok(
+        labeled_dests(plan, routing, pool, input_formats, fragment_width)?
+            .into_iter()
+            .map(|(path, _)| path)
+            .filter(|path| seen.insert(path.clone()))
+            .collect(),
+    )
+}
+
+/// Every directed output file path, before deduplication, with what writes it.
+fn labeled_dests(
+    plan: &DemuxPlan,
+    routing: &Routing,
+    pool: &str,
+    input_formats: &[SniffedFormat],
+    fragment_width: usize,
+) -> Result<Vec<(PathBuf, OutputOrigin)>> {
+    use crate::grammar::RemoveSelector;
+
+    let mut paths: Vec<(PathBuf, OutputOrigin)> = Vec::new();
 
     // `--out`: one set of paths per assigned target (a `%sample` pattern fans
     // out; a plain pattern dedups to one). A pure pass-through run (no targets)
@@ -791,12 +803,12 @@ fn enumerate_dests(
         let targets = routing.targets();
         if targets.is_empty() {
             for path in out_paths(pattern, pool, None, body_count, input_formats)? {
-                add(Some(path), &mut seen, &mut paths);
+                paths.push((path, OutputOrigin::Records("--out".to_string())));
             }
         }
         for target in targets {
             for path in out_paths(pattern, pool, Some(target), body_count, input_formats)? {
-                add(Some(path), &mut seen, &mut paths);
+                paths.push((path, OutputOrigin::Target(target.clone())));
             }
         }
     }
@@ -804,17 +816,45 @@ fn enumerate_dests(
     // over the input files).
     if let Some(pattern) = &plan.unassigned {
         for path in bin_paths(pattern, pool, plan.inputs.len()) {
-            add(Some(path), &mut seen, &mut paths);
+            paths.push((path, OutputOrigin::Records("--unassigned".to_string())));
         }
     }
     for rule in &plan.remove {
         if let Some(pattern) = &rule.pattern {
+            let selector = match &rule.selector {
+                RemoveSelector::Group(group) => group.clone(),
+                RemoveSelector::GroupTag { group, id } => format!("{group}::{id}"),
+            };
             for path in bin_paths(pattern, pool, plan.inputs.len()) {
-                add(Some(path), &mut seen, &mut paths);
+                paths.push((path, OutputOrigin::Records(format!("--remove {selector}"))));
             }
         }
     }
     Ok(paths)
+}
+
+/// Refuse outputs that would be one file, before any is created.
+fn check_outputs(
+    plan: &DemuxPlan,
+    routing: &Routing,
+    pool: &str,
+    input_formats: &[SniffedFormat],
+    fragment_width: usize,
+) -> Result<()> {
+    let mut outputs = labeled_dests(plan, routing, pool, input_formats, fragment_width)?;
+    for (pattern, option) in [
+        (&plan.metrics_per_sample, "--metrics-per-sample"),
+        (&plan.metrics_summary, "--metrics-summary"),
+        (&plan.metrics_unassigned, "--metrics-unassigned"),
+    ] {
+        if let Some(pattern) = pattern {
+            outputs.push((
+                resolve_metrics_path(pattern, pool),
+                OutputOrigin::Metrics(option),
+            ));
+        }
+    }
+    check_output_collisions(&outputs)
 }
 
 /// The `--out` file path(s) for one target (or `None` for a pure pass-through),
@@ -1326,22 +1366,27 @@ fn run_engine(plan: &DemuxPlan, command_line: Option<&str>) -> Result<()> {
         &input_formats,
         reader.fragment_width(),
     )?;
+    check_outputs(
+        plan,
+        &routing,
+        &pool,
+        &input_formats,
+        reader.fragment_width(),
+    )?;
     log_run_shape(plan, &input_formats, &dests);
     if let Some(reference) = &reference {
         reader.check_reference(&plan.inputs, reference)?;
     }
-    staged.stage(
-        dests.iter().cloned().chain(
-            [
-                &plan.metrics_per_sample,
-                &plan.metrics_summary,
-                &plan.metrics_unassigned,
-            ]
-            .into_iter()
-            .flatten()
-            .map(|pattern| resolve_metrics_path(pattern, &pool)),
-        ),
-    );
+    let metrics_paths: Vec<PathBuf> = [
+        &plan.metrics_per_sample,
+        &plan.metrics_summary,
+        &plan.metrics_unassigned,
+    ]
+    .into_iter()
+    .flatten()
+    .map(|pattern| resolve_metrics_path(pattern, &pool))
+    .collect();
+    staged.stage(dests.iter().chain(&metrics_paths).cloned());
     writer.write_files_to(staged.temporaries());
 
     // Route poolable destinations (gzipped FASTX and BAM) through a shared BGZF
@@ -1459,6 +1504,13 @@ fn run_engine(plan: &DemuxPlan, command_line: Option<&str>) -> Result<()> {
     // error.
     let run_result = (|| -> Result<()> {
         writer.create_all(&dests)?;
+        for path in &metrics_paths {
+            let temporary = staged.path(path);
+            if temporary != path.as_path() {
+                crate::writer::create_output_file(temporary)?;
+            }
+        }
+        crate::writer::refuse_shared_files(&staged, dests.iter().chain(&metrics_paths))?;
         match threads {
             1 => drive_serial(&engine, reader, &mut writer, &mut metrics),
             2 => drive_pipelined(&engine, reader, &mut writer, &mut metrics),
