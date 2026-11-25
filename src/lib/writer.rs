@@ -872,10 +872,26 @@ fn render_array(array: &Array) -> String {
     }
 }
 
+/// The quality that BAM and CRAM store per base for a record without qualities.
+const MISSING_QUALITY: u8 = 0xFF;
+
+trait AlignmentSink: AlignmentWrite {
+    const NEEDS_MISSING_QUALITIES_FILLED: bool = false;
+}
+
+impl<W: Write> AlignmentSink for sam::io::Writer<W> {}
+
+impl<W: Write> AlignmentSink for bam::io::Writer<W> {}
+
+/// The noodles CRAM writer flags every record as storing a quality per base, even one with none.
+impl<W: Write> AlignmentSink for cram::io::Writer<W> {
+    const NEEDS_MISSING_QUALITIES_FILLED: bool = true;
+}
+
 /// Write a fragment's records as SAM/BAM alignment records, setting
 /// paired-segment flags for a multi-record fragment. SAM/BAM holds at most two
 /// records per template (a pair).
-fn write_alignments<W: AlignmentWrite>(
+fn write_alignments<W: AlignmentSink>(
     writer: &mut W,
     header: &sam::Header,
     reads: &[OutputRead],
@@ -887,18 +903,25 @@ fn write_alignments<W: AlignmentWrite>(
         );
     }
     for (index, read) in reads.iter().enumerate() {
-        let written = match read.alignment {
-            Some(alignment) => {
-                writer.write_alignment_record(header, alignment.to_record_buf()?.as_ref())
-            }
-            None => {
-                let record = build_record(read, segment_flags(index, reads.len()));
-                writer.write_alignment_record(header, &record)
-            }
+        let mut record = match read.alignment {
+            Some(alignment) => alignment.to_record_buf()?,
+            None => std::borrow::Cow::Owned(build_record(read, segment_flags(index, reads.len()))),
         };
-        written.context("failed to write SAM/BAM/CRAM record")?;
+        if W::NEEDS_MISSING_QUALITIES_FILLED {
+            fill_missing_qualities(&mut record);
+        }
+        writer
+            .write_alignment_record(header, record.as_ref())
+            .context("failed to write SAM/BAM/CRAM record")?;
     }
     Ok(())
+}
+
+fn fill_missing_qualities(record: &mut std::borrow::Cow<'_, RecordBuf>) {
+    let bases = record.sequence().len();
+    if bases > 0 && record.quality_scores().is_empty() {
+        *record.to_mut().quality_scores_mut() = QualityScores::from(vec![MISSING_QUALITY; bases]);
+    }
 }
 
 /// Build an unmapped alignment record, carrying tags through, adding the `RG`
@@ -1581,6 +1604,23 @@ mod tests {
             cram_round_trip(&[vec![read]]),
             "r1\t4\t*\t0\t255\t*\t*\t0\t0\tACGT\t*\tXY:Z:hello\n"
         );
+    }
+
+    #[test]
+    fn test_fill_missing_qualities_needs_bases_and_no_qualities() {
+        use std::borrow::Cow;
+        let record = |bases: &[u8], quals: Option<&[u8]>| {
+            build_record(&output_read(b"r1", bases, quals, None), Flags::UNMAPPED)
+        };
+        let mut filled = Cow::Owned(record(b"ACGT", None));
+        fill_missing_qualities(&mut filled);
+        assert_eq!(filled.quality_scores().as_ref(), [MISSING_QUALITY; 4]);
+
+        for kept in [record(b"ACGT", Some(&[1, 2, 3, 4])), record(b"", None)] {
+            let mut record = Cow::Borrowed(&kept);
+            fill_missing_qualities(&mut record);
+            assert!(matches!(record, Cow::Borrowed(_)));
+        }
     }
 
     #[test]
