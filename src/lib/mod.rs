@@ -28,7 +28,7 @@ pub use demux::{run_demux, DemuxArgs};
 pub use extract::{extract, Extracted, MatchSpan, Segment};
 pub use fanout::{
     compile_routing, expand_from_group, load_sample_sheet, load_sample_sheet_columns,
-    parse_sample_sheet, parse_sample_sheet_columns, Disposition, RemoveTarget, Routing,
+    parse_sample_sheet, parse_sample_sheet_columns, Disposition, RemoveTarget, Route, Routing,
     SheetColumn, SheetColumns, Target,
 };
 pub use grammar::{parse_demux, DemuxPlan};

@@ -38,7 +38,7 @@ use crate::extract::{
 };
 use crate::fanout::{
     compile_routing, expand_from_group, load_sample_sheet_columns, Disposition, RemoveTarget,
-    Routing, SheetColumn, SheetColumns, Target,
+    Route, Routing, SheetColumn, SheetColumns, Target,
 };
 use crate::grammar::{
     column_tag_qualities, Anchor, DemuxPlan, Endpoint, GroupSource, MatchMode, OutputPattern,
@@ -689,16 +689,18 @@ fn build_routing(
     Ok((routing, sheet_columns))
 }
 
-/// Each `%sample::COLUMN` stream's value per route, keyed by stream name, where
+/// Store each `%sample::COLUMN` stream's value per route on the routes, where
 /// `None` is a blank cell. Fails on a value that cannot be a SAM tag or on two
 /// sheet rows that route one record to one target with different values.
-fn resolve_sample_columns<'a>(
-    plan: &'a DemuxPlan,
-    routing: &Routing,
+fn attach_sample_columns(
+    plan: &DemuxPlan,
+    routing: &mut Routing,
     sheet_columns: &SheetColumns,
-) -> Result<HashMap<&'a str, Vec<Option<String>>>> {
+) -> Result<()> {
     let is_sheet = matches!(plan.samples, SampleSpec::Sheet(..));
-    let mut streams = HashMap::new();
+    let mut names = Vec::new();
+    let mut columns = Vec::new();
+    let mut has_cells = false;
     for extract in &plan.extracts {
         let SpanBody::SampleColumn { column } = &extract.span.body else {
             continue;
@@ -718,7 +720,7 @@ fn resolve_sample_columns<'a>(
                 .map(|target| target.sub_sample.clone())
                 .collect(),
             SheetColumn::Cells(values) => {
-                routing.check_row_values(column, &values)?;
+                has_cells = true;
                 values
             }
         };
@@ -740,9 +742,14 @@ fn resolve_sample_columns<'a>(
             );
         }
         log_blank_sample_column(plan, &extract.name, column, &values);
-        streams.insert(extract.name.as_str(), values);
+        names.push(column.as_str());
+        columns.push(values);
     }
-    Ok(streams)
+    routing.set_columns(columns)?;
+    if has_cells {
+        routing.check_column_conflicts(&names)?;
+    }
+    Ok(())
 }
 
 /// Log how many routes have no value for a `%sample::COLUMN` stream, and the
@@ -1255,8 +1262,6 @@ struct Engine<'a> {
     /// Every tag that has a column stream and a default quality tag, with that
     /// quality tag.
     column_tag_qualities: &'a [(&'a str, &'a str)],
-    /// Every `%sample::COLUMN` extract stream's value per route, by stream name.
-    sample_columns: &'a HashMap<&'a str, Vec<Option<String>>>,
     routing: &'a Routing,
     pool: &'a str,
     input_formats: &'a [SniffedFormat],
@@ -1333,8 +1338,9 @@ fn run_engine(plan: &DemuxPlan, command_line: Option<&str>) -> Result<()> {
     let column_streams = resolve_column_streams(plan, &tag_columns, &group_index);
     let column_tag_qualities = column_tag_qualities(plan);
     let pool = pool_id(plan);
-    let (routing, sheet_columns) = build_routing(plan, &tag_sets, &group_index, &pool, &resolved)?;
-    let sample_columns = resolve_sample_columns(plan, &routing, &sheet_columns)?;
+    let (mut routing, sheet_columns) =
+        build_routing(plan, &tag_sets, &group_index, &pool, &resolved)?;
+    attach_sample_columns(plan, &mut routing, &sheet_columns)?;
 
     // An `@RG`-split run (`--sample-from-group` over an `@RG` source) is faithful
     // to the input header: each output file lists its constituent original `@RG`
@@ -1540,7 +1546,6 @@ fn run_engine(plan: &DemuxPlan, command_line: Option<&str>) -> Result<()> {
         group_index: &group_index,
         column_streams: &column_streams,
         column_tag_qualities: &column_tag_qualities,
-        sample_columns: &sample_columns,
         routing: &routing,
         pool: &pool,
         input_formats: &input_formats,
@@ -1940,12 +1945,12 @@ fn prepare(engine: &Engine, fragment: &Fragment, fmatch: FragmentMatch) -> Resul
                 }
             }
         }
-        Disposition::Assigned(target, route) => {
+        Disposition::Assigned(route) => {
             let (denom, unext) = frac_bases(engine, &segments, &hits)?;
-            match prepare_body(engine, Some((target, route)), &hits, &segments, fragment)? {
+            match prepare_body(engine, Some(route), &hits, &segments, fragment)? {
                 BodyOutcome::Assembled(writes) => (
                     Tally::Assigned {
-                        target: target.clone(),
+                        target: route.target().clone(),
                         denom,
                         unext,
                     },
@@ -2618,8 +2623,8 @@ fn column_value<'a>(engine: &'a Engine, hits: &GroupHits, stream: &str) -> Optio
     column.values.get(hit.tag_idx).map(String::as_str)
 }
 
-/// Assemble the output body for an assigned (`routed` holds its target and
-/// route index) or pass-through (`routed = None`) record into owned
+/// Assemble the output body for an assigned (`route = Some`) or pass-through
+/// (`route = None`) record into owned
 /// [`PreparedWrite`]s: resolve its extraction streams, build the `--template`
 /// bodies and the `--tag` data (leaving out a tag with a blank `%sample::COLUMN`
 /// stream), attach the `@RG` read group on SAM/BAM, and resolve the `--out`
@@ -2629,7 +2634,7 @@ fn column_value<'a>(engine: &'a Engine, hits: &GroupHits, stream: &str) -> Optio
 /// so it runs on the worker.
 fn prepare_body(
     engine: &Engine,
-    routed: Option<(&Target, usize)>,
+    route: Option<&Route>,
     hits: &GroupHits,
     segments: &[Segment],
     fragment: &Fragment,
@@ -2637,13 +2642,14 @@ fn prepare_body(
     let plan = engine.plan;
     let pool = engine.pool;
     let input_formats = engine.input_formats;
-    let target = routed.map(|(target, _)| target);
+    let target = route.map(Route::target);
     let mut streams: HashMap<&str, Extracted> = HashMap::new();
     let mut blank: SmallVec<[&str; 2]> = SmallVec::new();
+    let mut slot = 0;
     for spec in &plan.extracts {
         if matches!(spec.span.body, SpanBody::SampleColumn { .. }) {
-            let value = routed
-                .and_then(|(_, route)| engine.sample_columns[spec.name.as_str()][route].as_deref());
+            let value = route.and_then(|route| route.column(slot));
+            slot += 1;
             match value {
                 Some(value) => {
                     streams.insert(spec.name.as_str(), Extracted::from_text(value));

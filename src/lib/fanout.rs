@@ -75,9 +75,9 @@ pub struct RemoveTarget {
 /// What the router decided for one record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Disposition<'a> {
-    /// Routed to a fan-out target by the route at this index, which for a sample
-    /// sheet is its data row less one.
-    Assigned(&'a Target, usize),
+    /// Routed to a fan-out target by this route, which for a sample sheet is one
+    /// of its rows.
+    Assigned(&'a Route),
     /// Matched a `--remove` rule; removed and tallied as `removed`, and written
     /// to the rule's pattern when it has one.
     Removed(&'a RemoveTarget),
@@ -91,19 +91,37 @@ pub enum Disposition<'a> {
 /// One AND term of a route: the record's best match in `group` (the group's
 /// canonical index) must be one of `members`, or any tag of the group when
 /// `members` is `None` (a bare-group selector).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct Term {
     group: usize,
     members: Option<Vec<usize>>,
 }
 
 /// One fan-out route: a target plus the AND-joined terms a record must satisfy
-/// to reach it.
-#[derive(Debug, Clone)]
-struct Route {
+/// to reach it, and the value of each `%sample::COLUMN` stream for the records
+/// it routes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Route {
     target: Target,
     terms: Vec<Term>,
+    columns: Vec<Option<String>>,
 }
+
+impl Route {
+    /// The fan-out target this route assigns records to.
+    pub fn target(&self) -> &Target {
+        &self.target
+    }
+
+    /// The value of the `slot`th `%sample::COLUMN` stream, in extract order, or
+    /// `None` when the cell is blank.
+    pub(crate) fn column(&self, slot: usize) -> Option<&str> {
+        self.columns.get(slot)?.as_deref()
+    }
+}
+
+/// The sorted groups a set of routes fills, and those routes' indices.
+type Shape = (Vec<usize>, Vec<usize>);
 
 /// The compiled routing table consumed by the engine: an ordered set of routes,
 /// the resolved remove rules, and the distinct fan-out targets (for the writer
@@ -139,13 +157,13 @@ impl Routing {
         if !self.demux {
             return Disposition::PassThrough;
         }
-        for (index, route) in self.routes.iter().enumerate() {
+        for route in &self.routes {
             if route
                 .terms
                 .iter()
                 .all(|term| term_satisfied(hits, term.group, term.members.as_deref()))
             {
-                return Disposition::Assigned(&route.target, index);
+                return Disposition::Assigned(route);
             }
         }
         Disposition::Unassigned
@@ -162,60 +180,85 @@ impl Routing {
         self.routes.iter().map(|route| &route.target)
     }
 
+    /// Store the `%sample::COLUMN` stream values on the routes, one list per
+    /// stream in extract order, each holding one value per route.
+    pub(crate) fn set_columns(&mut self, columns: Vec<Vec<Option<String>>>) -> Result<()> {
+        if let Some(values) = columns.iter().find(|v| v.len() != self.routes.len()) {
+            bail!(
+                "a sample column has {} values for {} routes",
+                values.len(),
+                self.routes.len()
+            );
+        }
+        for route in &mut self.routes {
+            route.columns.clear();
+        }
+        for values in columns {
+            for (route, value) in self.routes.iter_mut().zip(values) {
+                route.columns.push(value);
+            }
+        }
+        Ok(())
+    }
+
     /// Fail when two sample-sheet rows can route one record to the same target
-    /// but hold different `values` in `column`, one value per route. A sheet row
-    /// selects one tag per filled group cell, so two rows can route one record
-    /// when they select the same tags in the groups both fill.
-    pub fn check_row_values(&self, column: &str, values: &[Option<String>]) -> Result<()> {
-        let mut shapes: Vec<(&Target, Vec<usize>, Vec<usize>)> = Vec::new();
+    /// but hold different values in a `%sample::COLUMN` stream, whose column
+    /// headers are `names` in extract order. A sheet row selects one tag per
+    /// filled group cell, so two rows can route one record when they select the
+    /// same tags in the groups both fill. Rows whose overlap an earlier row of
+    /// another sample always claims first are still reported.
+    pub(crate) fn check_column_conflicts(&self, names: &[&str]) -> Result<()> {
+        let mut shapes: HashMap<(&Target, Vec<usize>), Vec<usize>> = HashMap::new();
         for (index, route) in self.routes.iter().enumerate() {
             let mut groups: Vec<usize> = route.terms.iter().map(|term| term.group).collect();
             groups.sort_unstable();
-            match shapes
-                .iter_mut()
-                .find(|(target, shape, _)| **target == route.target && *shape == groups)
-            {
-                Some((_, _, rows)) => rows.push(index),
-                None => shapes.push((&route.target, groups, vec![index])),
-            }
+            shapes
+                .entry((&route.target, groups))
+                .or_default()
+                .push(index);
         }
+        let mut by_target: HashMap<&Target, Vec<Shape>> = HashMap::new();
+        for ((target, groups), rows) in shapes {
+            by_target.entry(target).or_default().push((groups, rows));
+        }
+        let values = |index: usize| &self.routes[index].columns;
         let mut conflict: Option<(usize, usize)> = None;
-        for (i, (target, first, first_rows)) in shapes.iter().enumerate() {
-            for (other, second, second_rows) in &shapes[i..] {
-                if target != other {
-                    continue;
-                }
-                let shared: Vec<usize> = first
-                    .iter()
-                    .filter(|group| second.contains(group))
-                    .copied()
-                    .collect();
-                let key = |index: usize| -> Vec<Option<&[usize]>> {
-                    let terms = &self.routes[index].terms;
-                    shared
+        for shapes in by_target.values_mut() {
+            shapes.sort_unstable_by_key(|(_, rows)| rows[0]);
+            for (i, (first, first_rows)) in shapes.iter().enumerate() {
+                for (second, second_rows) in &shapes[i..] {
+                    let shared: Vec<usize> = first
                         .iter()
-                        .map(|group| {
-                            terms
-                                .iter()
-                                .find(|term| term.group == *group)
-                                .and_then(|term| term.members.as_deref())
-                        })
-                        .collect()
-                };
-                let mut seen: HashMap<Vec<Option<&[usize]>>, Vec<usize>> = HashMap::new();
-                for &index in second_rows {
-                    let rows = seen.entry(key(index)).or_default();
-                    if rows.len() < 2 && rows.iter().all(|&row| values[row] != values[index]) {
-                        rows.push(index);
-                    }
-                }
-                for &index in first_rows {
-                    let Some(rows) = seen.get(&key(index)) else {
-                        continue;
+                        .filter(|group| second.contains(group))
+                        .copied()
+                        .collect();
+                    let key = |index: usize| -> Vec<Option<&[usize]>> {
+                        let terms = &self.routes[index].terms;
+                        shared
+                            .iter()
+                            .map(|group| {
+                                terms
+                                    .iter()
+                                    .find(|term| term.group == *group)
+                                    .and_then(|term| term.members.as_deref())
+                            })
+                            .collect()
                     };
-                    if let Some(&row) = rows.iter().find(|&&row| values[row] != values[index]) {
-                        let pair = (row.min(index), row.max(index));
-                        conflict = Some(conflict.map_or(pair, |found| found.min(pair)));
+                    let mut seen: HashMap<Vec<Option<&[usize]>>, Vec<usize>> = HashMap::new();
+                    for &index in second_rows {
+                        let rows = seen.entry(key(index)).or_default();
+                        if rows.len() < 2 && rows.iter().all(|&row| values(row) != values(index)) {
+                            rows.push(index);
+                        }
+                    }
+                    for &index in first_rows {
+                        let Some(rows) = seen.get(&key(index)) else {
+                            continue;
+                        };
+                        if let Some(&row) = rows.iter().find(|&&row| values(row) != values(index)) {
+                            let pair = (row.min(index), row.max(index));
+                            conflict = Some(conflict.map_or(pair, |found| found.min(pair)));
+                        }
                     }
                 }
             }
@@ -223,18 +266,21 @@ impl Routing {
         let Some((first, second)) = conflict else {
             return Ok(());
         };
+        let (a, b) = (values(first), values(second));
+        let slot = (0..a.len()).find(|&slot| a[slot] != b[slot]).unwrap_or(0);
         let quote = |value: &Option<String>| match value {
             Some(value) => format!("{value:?}"),
             None => "a blank cell".to_string(),
         };
         bail!(
-            "sample sheet rows {} and {} can both route a record to `{}` but disagree on {column:?} \
+            "sample sheet rows {} and {} can both route a record to `{}` but disagree on {:?} \
              ({} vs {})",
             first + 1,
             second + 1,
             self.routes[first].target.label(),
-            quote(&values[first]),
-            quote(&values[second])
+            names.get(slot).copied().unwrap_or_default(),
+            quote(&a[slot]),
+            quote(&b[slot])
         )
     }
 }
@@ -307,7 +353,11 @@ pub fn compile_routing(
                 }
             }
         }
-        routes.push(Route { target, terms });
+        routes.push(Route {
+            target,
+            terms,
+            columns: Vec::new(),
+        });
     }
 
     if require_samples_explain_all_tags {
@@ -804,6 +854,14 @@ mod tests {
     use crate::grammar::{PatternSegment, Placeholder};
     use crate::tags::TagEntry;
 
+    /// The target a record was assigned to, if any.
+    fn assigned(disposition: Disposition<'_>) -> Option<&Target> {
+        match disposition {
+            Disposition::Assigned(route) => Some(route.target()),
+            _ => None,
+        }
+    }
+
     /// Build a tag set from `(id, seq)` pairs (no sub_samples).
     fn tagset(pairs: &[(&str, &str)]) -> TagSet {
         TagSet {
@@ -946,24 +1004,18 @@ mod tests {
         let (routing, index) = compile(&samples, &[], &tag_sets, "pool1", true, false).unwrap();
 
         assert_eq!(
-            routing.route(&matched(&index, &[("grp", 0)])),
-            Disposition::Assigned(
-                &Target {
-                    sample: "dna01".to_string(),
-                    sub_sample: None
-                },
-                0
-            )
+            assigned(routing.route(&matched(&index, &[("grp", 0)]))),
+            Some(&Target {
+                sample: "dna01".to_string(),
+                sub_sample: None
+            })
         );
         assert_eq!(
-            routing.route(&matched(&index, &[("grp", 2)])),
-            Disposition::Assigned(
-                &Target {
-                    sample: "dna02".to_string(),
-                    sub_sample: None
-                },
-                1
-            )
+            assigned(routing.route(&matched(&index, &[("grp", 2)]))),
+            Some(&Target {
+                sample: "dna02".to_string(),
+                sub_sample: None
+            })
         );
         // A group that did not match routes to no sample.
         assert_eq!(
@@ -987,7 +1039,7 @@ mod tests {
         let (routing, index) = compile(&samples, &[], &tag_sets, "p", true, false).unwrap();
 
         let both = matched(&index, &[("grp_x", 0), ("grp_y", 0)]);
-        assert!(matches!(routing.route(&both), Disposition::Assigned(_, _)));
+        assert!(matches!(routing.route(&both), Disposition::Assigned(_)));
         // Only one of the two groups matched: unassigned.
         assert_eq!(
             routing.route(&matched(&index, &[("grp_x", 0)])),
@@ -1009,11 +1061,11 @@ mod tests {
 
         assert!(matches!(
             routing.route(&matched(&index, &[("grp", 0)])),
-            Disposition::Assigned(_, _)
+            Disposition::Assigned(_)
         ));
         assert!(matches!(
             routing.route(&matched(&index, &[("grp", 1)])),
-            Disposition::Assigned(_, _)
+            Disposition::Assigned(_)
         ));
         assert_eq!(
             routing.route(&matched(&index, &[])),
@@ -1041,14 +1093,11 @@ mod tests {
         // is NOT satisfied, and gy's `match=`-style hit (span=None) still
         // routes to sy.
         assert_eq!(
-            routing.route(&matched_no_span(&index, "gy", 0)),
-            Disposition::Assigned(
-                &Target {
-                    sample: "sy".to_string(),
-                    sub_sample: None
-                },
-                1
-            ),
+            assigned(routing.route(&matched_no_span(&index, "gy", 0))),
+            Some(&Target {
+                sample: "sy".to_string(),
+                sub_sample: None
+            }),
             "a span=None (match=) hit still routes; the absent gx does not claim it"
         );
         // Neither group matched: nothing claims the read.
@@ -1078,7 +1127,7 @@ mod tests {
         let (routing, index) = compile(&samples, &[], &tag_sets, "p", true, false).unwrap();
         assert!(matches!(
             routing.route(&matched(&index, &[("grp", 0)])),
-            Disposition::Assigned(_, _)
+            Disposition::Assigned(_)
         ));
     }
 
@@ -1117,11 +1166,11 @@ mod tests {
         assert_eq!(routing.targets().len(), 1);
         assert!(matches!(
             routing.route(&matched(&index, &[("grp", 0)])),
-            Disposition::Assigned(_, _)
+            Disposition::Assigned(_)
         ));
         assert!(matches!(
             routing.route(&matched(&index, &[("grp", 1)])),
-            Disposition::Assigned(_, _)
+            Disposition::Assigned(_)
         ));
     }
 
@@ -1185,7 +1234,7 @@ mod tests {
         ));
         assert!(matches!(
             routing.route(&matched(&index, &[("grp", 0)])),
-            Disposition::Assigned(_, _)
+            Disposition::Assigned(_)
         ));
     }
 
@@ -1436,14 +1485,11 @@ mod tests {
         let tag_sets = sets(&[("grp", tagset(&[("cbt01", "AAAA"), ("cbt02", "CCCC")]))]);
         let (routing, index) = compile(&samples, &[], &tag_sets, "p", true, false).unwrap();
         assert_eq!(
-            routing.route(&matched(&index, &[("grp", 0)])),
-            Disposition::Assigned(
-                &Target {
-                    sample: "dna01".to_string(),
-                    sub_sample: None
-                },
-                0
-            )
+            assigned(routing.route(&matched(&index, &[("grp", 0)]))),
+            Some(&Target {
+                sample: "dna01".to_string(),
+                sub_sample: None
+            })
         );
     }
 
@@ -1676,17 +1722,75 @@ mod tests {
 
     /// Compile a two-group sheet and check `values` of column `v` for conflicts.
     fn check_rows(sheet: &str, values: &[Option<&str>]) -> std::result::Result<(), String> {
+        check_columns(sheet, &[("v", values)])
+    }
+
+    /// Compile a two-group sheet and check its `(column, values)` for conflicts.
+    fn check_columns(
+        sheet: &str,
+        columns: &[(&str, &[Option<&str>])],
+    ) -> std::result::Result<(), String> {
         let groups: HashSet<&str> = ["a", "b"].into_iter().collect();
         let samples = parse_sample_sheet(sheet, &groups, &HashSet::new()).unwrap();
         let tag_sets = sets(&[
             ("a", tagset(&[("a1", "AAAA"), ("a2", "CCCC")])),
             ("b", tagset(&[("b1", "GGGG"), ("b2", "TTTT")])),
         ]);
-        let (routing, _) = compile(&samples, &[], &tag_sets, "p", true, false).unwrap();
-        let values: Vec<Option<String>> = values.iter().map(|v| v.map(str::to_string)).collect();
+        let (mut routing, _) = compile(&samples, &[], &tag_sets, "p", true, false).unwrap();
+        let names: Vec<&str> = columns.iter().map(|(name, _)| *name).collect();
+        let values = columns
+            .iter()
+            .map(|(_, values)| values.iter().map(|v| v.map(str::to_string)).collect())
+            .collect();
+        routing.set_columns(values).unwrap();
         routing
-            .check_row_values("v", &values)
+            .check_column_conflicts(&names)
             .map_err(|err| err.to_string())
+    }
+
+    #[test]
+    fn test_check_column_conflicts_compares_every_distinct_value_of_an_overlap() {
+        let sheet = "sample\ta\tb\ns1\ta1\t\ns1\ta1\tb1\ns1\ta1\tb2\n";
+        assert_eq!(
+            check_rows(sheet, &[Some("x"), Some("x"), Some("y")]).unwrap_err(),
+            "sample sheet rows 1 and 3 can both route a record to `s1` but disagree on \"v\" \
+             (\"x\" vs \"y\")"
+        );
+        let reversed = "sample\ta\tb\ns1\ta1\tb2\ns1\ta1\tb1\ns1\ta1\t\n";
+        assert_eq!(
+            check_rows(reversed, &[Some("y"), Some("x"), Some("x")]).unwrap_err(),
+            "sample sheet rows 1 and 3 can both route a record to `s1` but disagree on \"v\" \
+             (\"y\" vs \"x\")"
+        );
+    }
+
+    #[test]
+    fn test_check_column_conflicts_checks_every_column_at_once() {
+        let sheet = "sample\ta\tb\ns1\ta1\tb1\ns1\ta1\tb1\ns2\ta2\tb2\n";
+        let same: &[Option<&str>] = &[Some("x"), Some("x"), Some("z")];
+        let differ: &[Option<&str>] = &[Some("p"), Some("q"), Some("z")];
+        assert_eq!(check_columns(sheet, &[("u", same), ("w", same)]), Ok(()));
+        let err = check_columns(sheet, &[("u", same), ("w", differ)]).unwrap_err();
+        assert!(err.ends_with("disagree on \"w\" (\"p\" vs \"q\")"), "{err}");
+    }
+
+    #[test]
+    fn test_set_columns_needs_one_value_per_route() {
+        let groups: HashSet<&str> = ["a"].into_iter().collect();
+        let samples =
+            parse_sample_sheet("sample\ta\ns1\ta1\ns2\ta2\n", &groups, &HashSet::new()).unwrap();
+        let tag_sets = sets(&[("a", tagset(&[("a1", "AAAA"), ("a2", "CCCC")]))]);
+        let (mut routing, index) = compile(&samples, &[], &tag_sets, "p", true, false).unwrap();
+        assert!(routing.set_columns(vec![vec![None]]).is_err());
+        let values = vec![
+            vec![Some("x".to_string()), None],
+            vec![Some("s1".to_string()), Some("s2".to_string())],
+        ];
+        routing.set_columns(values).unwrap();
+        let Disposition::Assigned(route) = routing.route(&matched(&index, &[("a", 1)])) else {
+            panic!("not assigned");
+        };
+        assert_eq!((route.column(0), route.column(1)), (None, Some("s2")));
     }
 
     #[test]
@@ -1728,7 +1832,7 @@ mod tests {
     }
 
     #[test]
-    fn test_route_reports_the_index_of_the_route_that_matched() {
+    fn test_route_reports_the_route_that_matched() {
         let groups: HashSet<&str> = ["a", "b"].into_iter().collect();
         let sheet = "sample\ta\tb\ns1\ta1\tb1\ns1\ta1\tb2\ns2\ta2\t\n";
         let samples = parse_sample_sheet(sheet, &groups, &HashSet::new()).unwrap();
@@ -1738,7 +1842,14 @@ mod tests {
         ]);
         let (routing, index) = compile(&samples, &[], &tag_sets, "p", true, false).unwrap();
         let route = |pairs: &[(&str, usize)]| match routing.route(&matched(&index, pairs)) {
-            Disposition::Assigned(target, route) => Some((target.sample.clone(), route)),
+            Disposition::Assigned(route) => Some((
+                route.target().sample.clone(),
+                routing
+                    .routes
+                    .iter()
+                    .position(|r| std::ptr::eq(r, route))
+                    .unwrap(),
+            )),
             _ => None,
         };
         assert_eq!(route(&[("a", 0), ("b", 0)]), Some(("s1".to_string(), 0)));
