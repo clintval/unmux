@@ -596,6 +596,31 @@ impl MultiWriter {
     }
 }
 
+/// What writes one output file, reported when two outputs would be one file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OutputOrigin {
+    /// An `--out` file of one fan-out target.
+    Target(Target),
+    /// Records written through one writer per path, such as `--unassigned` or `--remove grp`.
+    Records(String),
+    /// A metrics TSV written on its own after the run, such as `--metrics-summary`.
+    Metrics(&'static str),
+}
+
+impl std::fmt::Display for OutputOrigin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Target(Target {
+                sample,
+                sub_sample: Some(sub_sample),
+            }) => write!(f, "sample {sample}, sub_sample {sub_sample}"),
+            Self::Target(target) => write!(f, "sample {}", target.sample),
+            Self::Records(option) => f.write_str(option),
+            Self::Metrics(option) => f.write_str(option),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

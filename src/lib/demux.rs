@@ -55,7 +55,7 @@ use crate::metrics::Metrics;
 use crate::output::{
     alignment_header, build_tag_data, default_read_group_header, insert_string_tag, qual_tag_name,
     read_group_header, resolve_metrics_path, resolve_pattern, ConstituentReadGroups, MultiWriter,
-    PathContext,
+    OutputOrigin, PathContext,
 };
 use crate::qc::{removed_slug, routed_slug, unassigned_slug, Unassigned};
 use crate::tags::{load_tag_file_columns, TagColumns, TagSet};
@@ -769,15 +769,27 @@ fn enumerate_dests(
     input_formats: &[SniffedFormat],
     fragment_width: usize,
 ) -> Result<Vec<PathBuf>> {
-    let mut paths: Vec<PathBuf> = Vec::new();
     let mut seen: HashSet<PathBuf> = HashSet::new();
-    let add = |path: Option<PathBuf>, seen: &mut HashSet<PathBuf>, paths: &mut Vec<PathBuf>| {
-        if let Some(path) = path {
-            if seen.insert(path.clone()) {
-                paths.push(path);
-            }
-        }
-    };
+    Ok(
+        labeled_dests(plan, routing, pool, input_formats, fragment_width)?
+            .into_iter()
+            .map(|(path, _)| path)
+            .filter(|path| seen.insert(path.clone()))
+            .collect(),
+    )
+}
+
+/// Every directed output file path, before deduplication, with what writes it.
+fn labeled_dests(
+    plan: &DemuxPlan,
+    routing: &Routing,
+    pool: &str,
+    input_formats: &[SniffedFormat],
+    fragment_width: usize,
+) -> Result<Vec<(PathBuf, OutputOrigin)>> {
+    use crate::grammar::RemoveSelector;
+
+    let mut paths: Vec<(PathBuf, OutputOrigin)> = Vec::new();
 
     // `--out`: one set of paths per assigned target (a `%sample` pattern fans
     // out; a plain pattern dedups to one). A pure pass-through run (no targets)
@@ -791,12 +803,12 @@ fn enumerate_dests(
         let targets = routing.targets();
         if targets.is_empty() {
             for path in out_paths(pattern, pool, None, body_count, input_formats)? {
-                add(Some(path), &mut seen, &mut paths);
+                paths.push((path, OutputOrigin::Records("--out".to_string())));
             }
         }
         for target in targets {
             for path in out_paths(pattern, pool, Some(target), body_count, input_formats)? {
-                add(Some(path), &mut seen, &mut paths);
+                paths.push((path, OutputOrigin::Target(target.clone())));
             }
         }
     }
@@ -804,13 +816,17 @@ fn enumerate_dests(
     // over the input files).
     if let Some(pattern) = &plan.unassigned {
         for path in bin_paths(pattern, pool, plan.inputs.len()) {
-            add(Some(path), &mut seen, &mut paths);
+            paths.push((path, OutputOrigin::Records("--unassigned".to_string())));
         }
     }
     for rule in &plan.remove {
         if let Some(pattern) = &rule.pattern {
+            let selector = match &rule.selector {
+                RemoveSelector::Group(group) => group.clone(),
+                RemoveSelector::GroupTag { group, id } => format!("{group}::{id}"),
+            };
             for path in bin_paths(pattern, pool, plan.inputs.len()) {
-                add(Some(path), &mut seen, &mut paths);
+                paths.push((path, OutputOrigin::Records(format!("--remove {selector}"))));
             }
         }
     }
