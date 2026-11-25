@@ -14,7 +14,9 @@
 //! (so `@grp` anchoring is reproducible). The `dist=mismatch:indel:total`
 //! budget is enforced by passing `total` as sassy's `k` and then post-filtering
 //! each alignment's CIGAR so the substitution and indel counts stay within
-//! their own caps.
+//! their own caps. The search reports one alignment per local minimum of the
+//! edit cost over the end positions, so wherever that filter drops an alignment,
+//! the tag is searched again for alignments within the caps.
 //!
 //! The sequential orchestration (`next`/`prev`), `match=` over joined streams,
 //! `partial5`/`partial3` overhang, and the canonicalization (corrected-form)
@@ -22,7 +24,9 @@
 //! ([`CompiledGroup::prereq`]) and calls [`match_group_at`] with a per-record
 //! window when a relative `next` link locates a downstream group.
 
-use std::cmp::Ordering;
+use std::borrow::Cow;
+use std::cell::LazyCell;
+use std::cmp::{Ordering, Reverse};
 
 use ahash::{AHashMap, AHashSet};
 use pa_types::CigarOp;
@@ -586,6 +590,8 @@ pub fn match_group_at(
         // match coordinates still map back to the read.
         let masked: Vec<u8> = text.iter().map(|&base| mask_no_call(base)).collect();
         let text = masked.as_slice();
+        let window_first = accepted.len();
+        let mut dropped: SmallVec<[(usize, MatchStrand); 32]> = SmallVec::new();
 
         // Batched path: equal-length tag batches searched together across SIMD
         // lanes. Only populated for forward-strand non-overhang groups (see
@@ -595,11 +601,13 @@ pub fn match_group_at(
         for batch in &group.encoded {
             for m in searcher.search_encoded_patterns(&batch.encoded, text, group.dist.total) {
                 let (subs, indels) = count_edits(m);
+                let tag_idx = batch.tag_indices[m.pattern_idx];
                 if subs > group.dist.mismatch || indels > group.dist.indel {
+                    dropped.push((tag_idx, strand_of(m.strand)));
                     continue;
                 }
                 accepted.push(TagMatch {
-                    tag_idx: batch.tag_indices[m.pattern_idx],
+                    tag_idx,
                     file,
                     start: win_start + m.text_start,
                     end: win_start + m.text_end,
@@ -620,6 +628,7 @@ pub fn match_group_at(
             for m in searcher.search(tag, text, search_budget(group, tag.len())) {
                 let (subs, indels) = count_edits(&m);
                 if !accept_match(group, tag.len(), &m, subs, indels) {
+                    dropped.push((tag_idx, strand_of(m.strand)));
                     continue;
                 }
                 accepted.push(TagMatch {
@@ -634,10 +643,237 @@ pub fn match_group_at(
                 });
             }
         }
+
+        if !dropped.is_empty() {
+            accept_hidden_matches(
+                group,
+                (file, win_start),
+                text,
+                &mut dropped,
+                window_first,
+                &mut accepted,
+            );
+        }
     }
 
     let best = select_best(&accepted, group);
     GroupOutcome { accepted, best }
+}
+
+/// Accept the cheapest alignment within the caps in each edit-cost valley that has no match.
+fn accept_hidden_matches(
+    group: &CompiledGroup,
+    origin: (usize, usize),
+    text: &[u8],
+    dropped: &mut SmallVec<[(usize, MatchStrand); 32]>,
+    window_first: usize,
+    accepted: &mut Vec<TagMatch>,
+) {
+    let (file, win_start) = origin;
+    dropped.sort_unstable_by_key(|&(tag_idx, strand)| (strand_rank(strand), tag_idx));
+    dropped.dedup();
+    for of_strand in dropped.chunk_by(|a, b| a.1 == b.1) {
+        let strand = of_strand[0].1;
+        let mut oriented = Cow::Borrowed(text);
+        if strand == MatchStrand::ReverseComplement {
+            crate::iupac::reverse_complement(oriented.to_mut());
+        }
+        let flip = |start: usize, end: usize| match strand {
+            MatchStrand::Forward => (start, end),
+            MatchStrand::ReverseComplement => (text.len() - end, text.len() - start),
+        };
+        let sites = base_sites(&oriented);
+        let mut capped = EndSearch::new(&sites, text.len(), capped_states(&group.dist));
+        for &(tag_idx, _) in of_strand {
+            let tag = &group.tags[tag_idx];
+            let mut hidden = capped.end_costs(tag);
+            if hidden.is_empty() {
+                continue;
+            }
+            let mut found: SmallVec<[(usize, usize); 4]> = accepted[window_first..]
+                .iter()
+                .filter(|m| m.tag_idx == tag_idx && m.strand == strand)
+                .map(|m| (flip(m.start - win_start, m.end - win_start).1, m.cost))
+                .collect();
+            hidden.retain(|known| !found.contains(known));
+            hidden.sort_unstable_by_key(|&(end, cost)| (cost, Reverse(end)));
+            let edit_costs = LazyCell::new(|| {
+                let states = edit_states(search_budget(group, tag.len()));
+                EndSearch::new(&sites, text.len(), states).end_costs(tag)
+            });
+            for (end, cost) in hidden {
+                let mut cheaper = found.iter().filter(|other| other.1 <= cost);
+                if cheaper.any(|other| share_valley(&edit_costs, other.0, end)) {
+                    continue;
+                }
+                let Some(hit) = align_ending_at(tag, &oriented, end, &group.dist) else {
+                    continue;
+                };
+                found.push((end, cost));
+                let (start, end) = flip(end - hit.end, end);
+                accepted.push(TagMatch {
+                    tag_idx,
+                    file,
+                    start: win_start + start,
+                    end: win_start + end,
+                    cost,
+                    subs: hit.subs,
+                    indels: hit.indels,
+                    strand,
+                });
+            }
+        }
+    }
+}
+
+/// The best alignment of the tag that ends at `end`; the hit's `end` counts the bases it spans.
+fn align_ending_at(tag: &[u8], text: &[u8], end: usize, dist: &Dist) -> Option<AnchoredHit> {
+    if dist.indel == 0 {
+        return anchored_hamming(tag, text, end.checked_sub(tag.len())?, dist.mismatch);
+    }
+    let reach = (tag.len() + dist.indel).min(end);
+    let reversed = |seq: &[u8]| seq.iter().rev().copied().collect::<Vec<u8>>();
+    anchored_align(&reversed(tag), &reversed(&text[end - reach..end]), dist)
+}
+
+/// For each 4-bit IUPAC mask, the bit set of text positions that match it.
+fn base_sites(text: &[u8]) -> Vec<u64> {
+    let words = text.len() / 64 + 1;
+    let mut sites = vec![0u64; 16 * words];
+    for (w, chunk) in text.chunks(64).enumerate() {
+        for (bit, &base) in chunk.iter().enumerate() {
+            let mask = crate::iupac::mask(base) as usize;
+            sites[mask * words + w] |= 1 << bit;
+        }
+        sites[w] = 0;
+        for mask in 1..16 {
+            let rest = mask & (mask - 1);
+            sites[mask * words + w] = sites[rest * words + w] | sites[(mask ^ rest) * words + w];
+        }
+    }
+    sites
+}
+
+/// One [`EndSearch`] state: its cost, and the states it extends by one more edit.
+struct EditState {
+    cost: usize,
+    substitute: Option<usize>,
+    indel: Option<usize>,
+}
+
+/// The states for every count of substitutions and indels within the caps.
+fn capped_states(dist: &Dist) -> Vec<EditState> {
+    let mut states = Vec::new();
+    let mut fewer_subs = 0;
+    for s in 0..=dist.mismatch.min(dist.total) {
+        let first = states.len();
+        for d in 0..=dist.indel.min(dist.total - s) {
+            states.push(EditState {
+                cost: s + d,
+                substitute: (s > 0).then(|| fewer_subs + d),
+                indel: (d > 0).then(|| first + d - 1),
+            });
+        }
+        fewer_subs = first;
+    }
+    states
+}
+
+/// The states that allow up to `0..=total` edits of any type.
+fn edit_states(total: usize) -> Vec<EditState> {
+    let state = |cost: usize| EditState {
+        cost,
+        substitute: cost.checked_sub(1),
+        indel: cost.checked_sub(1),
+    };
+    (0..=total).map(state).collect()
+}
+
+/// An exact search for where a tag's alignments end, bit-parallel over the text offsets.
+struct EndSearch<'a> {
+    sites: &'a [u64],
+    text_len: usize,
+    states: Vec<EditState>,
+    rows: Vec<u64>,
+}
+
+impl<'a> EndSearch<'a> {
+    fn new(sites: &'a [u64], text_len: usize, states: Vec<EditState>) -> Self {
+        let rows = vec![0; (2 * states.len() + 1) * (sites.len() / 16)];
+        Self {
+            sites,
+            text_len,
+            states,
+            rows,
+        }
+    }
+
+    /// The `(end, cost)` of the cheapest alignment at each end that has one, in end order.
+    fn end_costs(&mut self, tag: &[u8]) -> Vec<(usize, usize)> {
+        let words = self.sites.len() / 16;
+        let (none, rows) = self.rows.split_at_mut(words);
+        let (mut row, mut next) = rows.split_at_mut(self.states.len() * words);
+        row.fill(!0);
+        for &base in tag {
+            let mask = crate::iupac::mask(base) as usize;
+            let same = &self.sites[mask * words..][..words];
+            for (i, state) in self.states.iter().enumerate() {
+                let (done, out) = next.split_at_mut(i * words);
+                let out = &mut out[..words];
+                let matched = &row[i * words..][..words];
+                let substituted = match state.substitute {
+                    Some(from) => &row[from * words..][..words],
+                    None => &none[..words],
+                };
+                let (deleted, inserted) = match state.indel {
+                    Some(from) => (
+                        &row[from * words..][..words],
+                        &done[from * words..][..words],
+                    ),
+                    None => (&none[..words], &none[..words]),
+                };
+                let mut carry = 0;
+                for w in 0..words {
+                    let step = (matched[w] & same[w]) | substituted[w] | inserted[w];
+                    out[w] = step << 1 | carry | deleted[w];
+                    carry = step >> 63;
+                }
+            }
+            std::mem::swap(&mut row, &mut next);
+        }
+
+        let mut costs = Vec::new();
+        for w in 0..words {
+            let states = || self.states.iter().zip(row[w..].iter().step_by(words));
+            let in_text = !0 >> (64 - (self.text_len + 1 - w * 64).min(64));
+            let mut ends = states().fold(0, |ends, (_, row)| ends | row) & in_text;
+            while ends != 0 {
+                let bit = ends.trailing_zeros();
+                ends &= ends - 1;
+                let within = states().filter(|(_, row)| *row >> bit & 1 == 1);
+                let cost = within.map(|(state, _)| state.cost).min();
+                costs.extend(cost.map(|cost| (w * 64 + bit as usize, cost)));
+            }
+        }
+        costs
+    }
+}
+
+/// Whether the edit cost, given in end order, has no peak between the ends `a` and `b`.
+fn share_valley(costs: &[(usize, usize)], a: usize, b: usize) -> bool {
+    let index = |end| costs.binary_search_by_key(&end, |&(e, _)| e);
+    let (Ok(i), Ok(j)) = (index(a.min(b)), index(a.max(b))) else {
+        return false;
+    };
+    let mut steps = costs[i..=j]
+        .windows(2)
+        .map(|pair| pair[0].1.cmp(&pair[1].1));
+    let mut rising = false;
+    j - i == a.abs_diff(b)
+        && steps.all(|step| {
+            rising |= step == Ordering::Less;
+            !(rising && step == Ordering::Greater)
+        })
 }
 
 /// The best anchored alignment of one tag: its substitution and indel counts
@@ -1416,6 +1652,37 @@ mod tests {
                     String::from_utf8_lossy(tag),
                     String::from_utf8_lossy(&read)
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn test_hidden_matches_add_at_most_one_find_per_edit_cost_minimum() {
+        let mut rng = Rng(0xf1d5);
+        let mut searcher = Searcher::<Iupac>::new_fwd();
+        for trial in 0..400 {
+            let mut g = CompiledGroup::new("g", vec![rng.sample(8, b"AC")]);
+            g.dist = [
+                substitutions(1),
+                substitutions(2),
+                Dist {
+                    mismatch: 1,
+                    indel: 1,
+                    total: 2,
+                },
+            ][trial % 3];
+            let read = rng.sample(40, b"AC");
+            let result = outcome(&g, std::str::from_utf8(&read).unwrap());
+            let reported = searcher.search(&g.tags[0], &read, g.dist.total);
+            assert!(result.accepted.len() <= reported.len(), "{g:?} {result:?}");
+            for m in &reported {
+                let (subs, indels) = count_edits(m);
+                if subs <= g.dist.mismatch && indels <= g.dist.indel {
+                    assert!(result
+                        .accepted
+                        .iter()
+                        .any(|a| (a.start, a.end) == (m.text_start, m.text_end)));
+                }
             }
         }
     }
