@@ -103,6 +103,7 @@ struct Term {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Route {
     target: Target,
+    target_index: usize,
     terms: Vec<Term>,
     columns: Vec<Option<String>>,
 }
@@ -111,6 +112,11 @@ impl Route {
     /// The fan-out target this route assigns records to.
     pub fn target(&self) -> &Target {
         &self.target
+    }
+
+    /// The position of this route's target in [`Routing::targets`].
+    pub fn target_index(&self) -> usize {
+        self.target_index
     }
 
     /// The value of the `slot`th `%sample::COLUMN` stream, in extract order, or
@@ -173,6 +179,11 @@ impl Routing {
     /// each).
     pub fn targets(&self) -> &[Target] {
         &self.targets
+    }
+
+    /// The `--remove` rules, in the order they are checked.
+    pub(crate) fn removes(&self) -> &[RemoveTarget] {
+        &self.removes
     }
 
     /// Each route's target, in route order.
@@ -333,9 +344,13 @@ pub fn compile_routing(
 
     for sample in samples {
         let target = resolve_target(sample, pool);
-        if !targets.contains(&target) {
-            targets.push(target.clone());
-        }
+        let target_index = match targets.iter().position(|known| *known == target) {
+            Some(index) => index,
+            None => {
+                targets.push(target.clone());
+                targets.len() - 1
+            }
+        };
         let terms = compile_terms(&sample.selector, tag_sets, group_index)?;
         for unit in claim_units(&sample.selector, &terms, tag_sets) {
             match claims.get(&unit) {
@@ -355,6 +370,7 @@ pub fn compile_routing(
         }
         routes.push(Route {
             target,
+            target_index,
             terms,
             columns: Vec::new(),
         });

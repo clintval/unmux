@@ -23,7 +23,7 @@ use std::fs::File;
 use std::io::BufWriter;
 use std::sync::Arc;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, bail, ensure, Context, Result};
 use noodles::sam::alignment::record::data::field::Tag;
 use noodles::sam::alignment::record_buf::data::field::Value;
 use noodles::sam::alignment::record_buf::Data;
@@ -56,7 +56,7 @@ use crate::metrics::Metrics;
 use crate::output::{
     alignment_header, build_tag_data, check_output_collisions, default_read_group_header,
     insert_string_tag, is_header_text, qual_tag_name, read_group_header, resolve_metrics_path,
-    resolve_pattern, ConstituentReadGroups, MultiWriter, OutputOrigin, PathContext,
+    resolve_pattern, ConstituentReadGroups, Destination, MultiWriter, OutputOrigin, PathContext,
 };
 use crate::qc::{removed_slug, routed_slug, unassigned_slug, Unassigned};
 use crate::tags::{is_column_value, load_tag_file_columns, TagColumns, TagSet};
@@ -1100,6 +1100,190 @@ fn bin_paths(pattern: &OutputPattern, pool: &str, num_sources: usize) -> Vec<Pat
     paths
 }
 
+/// The destinations of a run, by index, and where each kind of write goes.
+struct DestinationTable {
+    /// Every destination, stdout included when a write can go there.
+    list: Arc<[Destination]>,
+    /// The `--out` layout of each fan-out target, by [`Route::target_index`].
+    targets: Vec<OutLayout>,
+    /// The `--out` layout of a record passed through with no fan-out target.
+    pass_through: Option<OutLayout>,
+    /// The `--unassigned` bin.
+    unassigned: Option<BinLayout>,
+    /// The bin of each `--remove` rule, in rule order.
+    removes: Vec<Option<BinLayout>>,
+}
+
+/// Where the bodies of a record bound for `--out` go.
+struct OutLayout {
+    /// Whether the bodies are written as SAM, BAM, or CRAM records.
+    is_alignment: bool,
+    /// The destinations, or why a record cannot be written to `--out`.
+    dests: std::result::Result<OutDests, String>,
+    /// The `@RG` id of a SAM, BAM, or CRAM record.
+    read_group: Option<String>,
+}
+
+/// The `--out` destination of every body, or of each body by `%ordinal`.
+enum OutDests {
+    Single(usize),
+    PerOrdinal(Vec<usize>),
+}
+
+/// The bin destination of every raw segment, or of each by `%source`.
+enum BinLayout {
+    Single(usize),
+    PerSource(Vec<usize>),
+}
+
+/// Destinations gathered by path, each listed once in the order first seen.
+struct DestinationList<'a> {
+    list: Vec<Destination>,
+    index: HashMap<Option<PathBuf>, usize>,
+    input_formats: &'a [SniffedFormat],
+    headers: &'a HashMap<Option<PathBuf>, Header>,
+    default_header: &'a Header,
+}
+
+impl DestinationList<'_> {
+    /// The index of the destination at `path` (stdout when `None`), added if new.
+    fn add(&mut self, path: Option<PathBuf>) -> Result<usize> {
+        if let Some(&at) = self.index.get(&path) {
+            return Ok(at);
+        }
+        let dest = Destination::new(
+            path.clone(),
+            self.input_formats,
+            self.headers,
+            self.default_header,
+        )?;
+        self.list.push(dest);
+        self.index.insert(path, self.list.len() - 1);
+        Ok(self.list.len() - 1)
+    }
+}
+
+/// Resolve every destination a run writes and the layout of each kind of
+/// write, in the order [`labeled_dests`] lists the files. A record with no
+/// sample carries the `read_group` id.
+fn destination_table(
+    plan: &DemuxPlan,
+    routing: &Routing,
+    pool: &str,
+    read_group: &str,
+    body_count: usize,
+    list: &mut DestinationList,
+) -> Result<DestinationTable> {
+    let targets = routing.targets();
+    let pass_through = match targets.is_empty() {
+        true => Some(out_layout(plan, pool, read_group, None, body_count, list)?),
+        false => None,
+    };
+    let targets = targets
+        .iter()
+        .map(|target| out_layout(plan, pool, read_group, Some(target), body_count, list))
+        .collect::<Result<_>>()?;
+    let unassigned = plan
+        .unassigned
+        .as_ref()
+        .map(|pattern| bin_layout(pattern, pool, plan.inputs.len(), list))
+        .transpose()?;
+    let removes = routing
+        .removes()
+        .iter()
+        .map(|remove| {
+            let pattern = remove.pattern.as_ref();
+            pattern
+                .map(|pattern| bin_layout(pattern, pool, plan.inputs.len(), list))
+                .transpose()
+        })
+        .collect::<Result<_>>()?;
+    Ok(DestinationTable {
+        list: std::mem::take(&mut list.list).into(),
+        targets,
+        pass_through,
+        unassigned,
+        removes,
+    })
+}
+
+/// The `--out` layout of the bodies of a record routed to `target` (`None`
+/// for a pass-through record, which carries the `read_group` id), mirroring
+/// [`out_paths`].
+fn out_layout(
+    plan: &DemuxPlan,
+    pool: &str,
+    read_group: &str,
+    target: Option<&Target>,
+    body_count: usize,
+    list: &mut DestinationList,
+) -> Result<OutLayout> {
+    let sample = target.map(|t| t.sample.as_str());
+    let sub_sample = target.and_then(|t| t.sub_sample.as_deref());
+    let path = |ordinal: Option<usize>| {
+        let ctx = PathContext {
+            pool,
+            sample,
+            sub_sample,
+            ordinal,
+            source: None,
+        };
+        plan.out.as_ref().and_then(|p| resolve_pattern(p, &ctx))
+    };
+    let format = output_format(path(Some(1)).as_deref(), list.input_formats)?;
+    let is_alignment = matches!(
+        format,
+        OutputFormat::Sam | OutputFormat::Bam | OutputFormat::Cram
+    );
+    let multi_fastx = plan
+        .out
+        .as_ref()
+        .filter(|_| !is_alignment && body_count > 1);
+    let dests = match multi_fastx {
+        Some(pattern) if !pattern.uses(Placeholder::Ordinal) => Err(format!(
+            "unmux: multi-read FASTX output needs the %ordinal placeholder in --out to \
+             separate the {body_count} template reads"
+        )),
+        Some(_) => Ok(OutDests::PerOrdinal(
+            (1..=body_count)
+                .map(|ordinal| list.add(path(Some(ordinal))))
+                .collect::<Result<_>>()?,
+        )),
+        None => Ok(OutDests::Single(
+            list.add(path((body_count == 1).then_some(1)))?,
+        )),
+    };
+    Ok(OutLayout {
+        is_alignment,
+        dests,
+        read_group: target
+            .map(Target::label)
+            .or_else(|| Some(read_group.to_string())),
+    })
+}
+
+/// The layout of a `--unassigned` or `--remove` bin, mirroring [`bin_paths`].
+fn bin_layout(
+    pattern: &OutputPattern,
+    pool: &str,
+    num_sources: usize,
+    list: &mut DestinationList,
+) -> Result<BinLayout> {
+    let path = |source: usize| {
+        let ctx = PathContext {
+            pool,
+            source: Some(source),
+            ..Default::default()
+        };
+        resolve_pattern(pattern, &ctx)
+    };
+    if num_sources > 1 && pattern.uses(Placeholder::Source) {
+        let dests = (0..num_sources).map(|source| list.add(path(source)));
+        return Ok(BinLayout::PerSource(dests.collect::<Result<_>>()?));
+    }
+    Ok(BinLayout::Single(list.add(path(0))?))
+}
+
 /// Precompute the `@RG`-bearing SAM/BAM header for each distinct `--out`
 /// destination, so a per-sample file lists its own read groups and a
 /// single-file `--out` lists every target's. FASTX destinations and the raw
@@ -1447,7 +1631,7 @@ pub fn partition_threads(
 /// The static per-run engine context shared across fragments: the parsed plan,
 /// the compiled groups (in dependency order), the canonical `name -> index` map
 /// (for resolving `@grp` anchor names to positional slots), the routing table,
-/// the resolved pool id, and the input formats.
+/// the read group of a record with no sample, and the destinations.
 struct Engine<'a> {
     plan: &'a DemuxPlan,
     groups: &'a [CompiledGroup],
@@ -1458,10 +1642,8 @@ struct Engine<'a> {
     /// quality tag.
     column_tag_qualities: &'a [(&'a str, &'a str)],
     routing: &'a Routing,
-    pool: &'a str,
     /// The read group id of a record with no sample (see [`pool_read_group`]).
     pool_read_group: &'a str,
-    input_formats: &'a [SniffedFormat],
     /// Extract-stream names referenced exactly once across all `--template`s
     /// and `--tag`s. A single-stream template whose stream is movable is the
     /// sole consumer of that extract, so the assembled body can MOVE the
@@ -1474,16 +1656,10 @@ struct Engine<'a> {
     /// Plan-invariant, so it is built once here rather than rebuilt for every
     /// retained record in [`frac_bases`].
     routed_streams: &'a HashSet<&'a str>,
-    /// Per-destination SAM/BAM headers (`@RG` lines), keyed by output path
-    /// (`None` = stdout), shared read-only so a worker can encode SAM/BAM
-    /// records (encode-on-workers) with the exact header the consumer's writer
-    /// was opened with. FASTX ignores it.
-    headers: &'a HashMap<Option<PathBuf>, Header>,
-    /// The fallback header for a destination absent from `headers` (the raw
-    /// `--unassigned`/`--remove` bins, or a non-demux run): the minimal `@HD` +
-    /// `@PG`-provenance header, matching `MultiWriter::open`'s fallback so
-    /// worker-encoded bytes stay byte-identical.
-    default_header: &'a Header,
+    /// Every destination with its format and header, shared read-only so a
+    /// worker encodes SAM/BAM records with the exact header the consumer's
+    /// writer was opened with, and where each kind of write goes.
+    destinations: &'a DestinationTable,
     /// Whether this is an `@RG`-split run (`--sample-from-group` over an `@RG`
     /// source). When set, an assigned record keeps its original `RG:Z` (its
     /// `@RG` line is carried verbatim by the header, see [`build_constituent_rgs`])
@@ -1625,12 +1801,6 @@ fn run_engine(plan: &DemuxPlan, command_line: Option<&str>) -> Result<()> {
     // pool is stopped would panic. The explicit shutdown below also enforces
     // this order; the declaration order is the belt-and-suspenders guarantee.
     let mut writer_pool: Option<Pool> = None;
-    let mut writer = MultiWriter::new(
-        headers.clone(),
-        default_header.clone(),
-        input_formats.clone(),
-        plan.compression,
-    );
     // Every directed output file, created up front so a directed file always
     // exists, even empty.
     let dests = enumerate_dests(
@@ -1647,6 +1817,19 @@ fn run_engine(plan: &DemuxPlan, command_line: Option<&str>) -> Result<()> {
         &input_formats,
         reader.fragment_width(),
     )?;
+    let body_count = match plan.templates.len() {
+        0 => reader.fragment_width(),
+        templates => templates,
+    };
+    let mut list = DestinationList {
+        list: Vec::new(),
+        index: HashMap::new(),
+        input_formats: &input_formats,
+        headers: &headers,
+        default_header: &default_header,
+    };
+    let destinations = destination_table(plan, &routing, &pool, read_group, body_count, &mut list)?;
+    let mut writer = MultiWriter::new(Arc::clone(&destinations.list), plan.compression);
     log_run_shape(plan, &input_formats, &dests);
     if let Some(reference) = &reference {
         reader.check_reference(&plan.inputs, reference)?;
@@ -1759,13 +1942,10 @@ fn run_engine(plan: &DemuxPlan, command_line: Option<&str>) -> Result<()> {
         column_streams: &column_streams,
         column_tag_qualities: &column_tag_qualities,
         routing: &routing,
-        pool: &pool,
         pool_read_group: read_group,
-        input_formats: &input_formats,
         movable_streams: &movable_streams,
         routed_streams: &routed_streams,
-        headers: &headers,
-        default_header: &default_header,
+        destinations: &destinations,
         is_read_group_split,
     };
     let mut metrics = Metrics::new(pool.clone(), routing.targets());
@@ -1782,7 +1962,7 @@ fn run_engine(plan: &DemuxPlan, command_line: Option<&str>) -> Result<()> {
     // pool (which can come as late as the pool's last write), then a finalize
     // error, then a pool-stop error.
     let run_result = (|| -> Result<()> {
-        writer.create_all(&dests)?;
+        writer.create_all()?;
         for path in &metrics_paths {
             let temporary = staged.path(path);
             if temporary != path.as_path() {
@@ -1906,17 +2086,16 @@ enum WritePayload {
     Records(Vec<PreparedRead>),
 }
 
-/// One write the consumer must issue: a destination (`None` is stdout) and its
-/// payload, in the exact order the inline `write_body` / `write_raw_bin`
-/// emitted them.
+/// One write the consumer must issue: the index of its destination and its
+/// payload, in the order the record's writes are issued.
 struct PreparedWrite {
-    path: Option<PathBuf>,
+    dest: usize,
     payload: WritePayload,
 }
 
-/// The metrics tally for one fragment, owned (`Target` is `Clone`) so it
-/// crosses the worker boundary. Commutative integer sums, applied on the
-/// consumer in input order (order is irrelevant to the sums).
+/// The metrics tally for one fragment, owned so it crosses the worker
+/// boundary. Commutative integer sums, applied on the consumer in input order
+/// (order is irrelevant to the sums).
 enum Tally {
     Unassigned(Unassigned),
     Removed,
@@ -1925,7 +2104,7 @@ enum Tally {
         unext: u64,
     },
     Assigned {
-        target: Target,
+        target: usize,
         denom: u64,
         unext: u64,
     },
@@ -2060,13 +2239,10 @@ fn process_fragment(
     let mut prepared = prepare(engine, fragment, fmatch)?;
     if is_non_primary(fragment) {
         prepared.tally = Tally::NonPrimary;
-        let mut kept = Vec::with_capacity(prepared.writes.len());
-        for write in prepared.writes {
-            if is_alignment_format(output_format(write.path.as_deref(), engine.input_formats)?) {
-                kept.push(write);
-            }
-        }
-        prepared.writes = kept;
+        let destinations = &engine.destinations.list;
+        prepared
+            .writes
+            .retain(|write| is_alignment_format(destinations[write.dest].format));
     }
     encode_writes(engine, &mut prepared.writes)?;
     Ok(prepared)
@@ -2096,28 +2272,23 @@ fn is_alignment_format(format: OutputFormat) -> bool {
 /// input order rather than running the per-record SAM/BAM/FASTX encode itself.
 /// CRAM stays structured (its records are container/slice-coded, not
 /// independent per-fragment byte slices) and is encoded by the consumer. The
-/// format and header are resolved exactly as the consumer's `MultiWriter::open`
-/// does (per path, falling back to the provenance default), so the appended
-/// bytes match what the consumer would encode, except that a raw BAM record
-/// keeps its input bytes.
+/// format and header are the destination's, which the consumer's writer opens
+/// with, so the appended bytes match what the consumer would encode, except
+/// that a raw BAM record keeps its input bytes.
 fn encode_writes(engine: &Engine, writes: &mut [PreparedWrite]) -> Result<()> {
     for write in writes {
-        let format = output_format(write.path.as_deref(), engine.input_formats)?;
+        let destination = &engine.destinations.list[write.dest];
         // CRAM is container/slice-coded, so it cannot be pre-encoded per fragment.
-        if matches!(format, OutputFormat::Cram) {
+        if matches!(destination.format, OutputFormat::Cram) {
             continue;
         }
         let bytes = {
             let WritePayload::Records(reads) = &write.payload else {
                 continue;
             };
-            let header = engine
-                .headers
-                .get(&write.path)
-                .unwrap_or(engine.default_header);
             let outputs: SmallVec<[OutputRead; 2]> =
                 reads.iter().map(PreparedRead::as_output).collect();
-            encode_fragment(format, header, &outputs)?
+            encode_fragment(destination.format, &destination.header, &outputs)?
         };
         write.payload = WritePayload::Encoded(bytes);
     }
@@ -2174,7 +2345,7 @@ fn prepare(engine: &Engine, fragment: &Fragment, fmatch: FragmentMatch) -> Resul
             match prepare_body(engine, Some(route), &hits, &segments, fragment)? {
                 BodyOutcome::Assembled(writes) => (
                     Tally::Assigned {
-                        target: route.target().clone(),
+                        target: route.target_index(),
                         denom,
                         unext,
                     },
@@ -2224,19 +2395,19 @@ fn apply_prepared(
             target,
             denom,
             unext,
-        } => metrics.record_assigned(target, *denom, *unext),
+        } => metrics.record_assigned(*target, *denom, *unext),
         Tally::NonPrimary => metrics.record_non_primary(),
     }
     for write in &prepared.writes {
         match &write.payload {
             // Encoded on the worker: the consumer only appends the bytes (the
             // merge-point lever).
-            WritePayload::Encoded(bytes) => writer.write_encoded(write.path.as_deref(), bytes)?,
+            WritePayload::Encoded(bytes) => writer.write_encoded(write.dest, bytes)?,
             // CRAM fallback: the consumer encodes the structured reads.
             WritePayload::Records(reads) => {
                 let outputs: SmallVec<[OutputRead; 2]> =
                     reads.iter().map(PreparedRead::as_output).collect();
-                writer.write(write.path.as_deref(), &outputs)?;
+                writer.write(write.dest, &outputs)?;
             }
         }
     }
@@ -2703,7 +2874,13 @@ fn prepare_removed(
     remove: &RemoveTarget,
     hits: &GroupHits,
 ) -> Result<Vec<PreparedWrite>> {
-    let Some(pattern) = &remove.pattern else {
+    let rule = engine
+        .routing
+        .removes()
+        .iter()
+        .position(|rule| std::ptr::eq(rule, remove));
+    let layout = rule.and_then(|rule| engine.destinations.removes[rule].as_ref());
+    let Some(layout) = layout else {
         return Ok(Vec::new());
     };
     let slug = engine.plan.qc_tag.as_ref().map(|tag| {
@@ -2725,10 +2902,8 @@ fn prepare_removed(
         )
     });
     prepare_raw_bin(
-        pattern,
-        engine.pool,
+        layout,
         engine.pool_read_group,
-        engine.plan.inputs.len(),
         fragment,
         slug.as_ref().map(|(tag, value)| (*tag, value.as_str())),
     )
@@ -2743,8 +2918,8 @@ fn prepare_unassigned(
     reason: &Unassigned,
     hits: &GroupHits,
 ) -> Result<Vec<PreparedWrite>> {
-    match &engine.plan.unassigned {
-        Some(pattern) => {
+    match &engine.destinations.unassigned {
+        Some(layout) => {
             let slug = engine.plan.qc_tag.as_ref().map(|tag| {
                 let base_segments: Vec<&[u8]> = fragment
                     .records
@@ -2757,10 +2932,8 @@ fn prepare_unassigned(
                 )
             });
             prepare_raw_bin(
-                pattern,
-                engine.pool,
+                layout,
                 engine.pool_read_group,
-                engine.plan.inputs.len(),
                 fragment,
                 slug.as_ref().map(|(tag, value)| (*tag, value.as_str())),
             )
@@ -2773,44 +2946,29 @@ fn prepare_unassigned(
 /// With `%source` over multiple `--in` files the segments fan out one file per
 /// input file (record `i` came from file `i`); a single input (whether plain or
 /// auto-detected interleaved) is one `%source` (0), so its mates stay together.
-/// Without `%source`, every segment lands in one file.
+/// Without `%source`, every segment goes to one file.
 fn prepare_raw_bin(
-    pattern: &OutputPattern,
-    pool: &str,
+    layout: &BinLayout,
     read_group: &str,
-    num_sources: usize,
     fragment: &Fragment,
     slug: Option<(&str, &str)>,
 ) -> Result<Vec<PreparedWrite>> {
-    if num_sources > 1 && pattern.uses(Placeholder::Source) {
-        fragment
+    match layout {
+        BinLayout::PerSource(dests) => fragment
             .records
             .iter()
-            .enumerate()
-            .map(|(source, record)| {
-                let ctx = PathContext {
-                    pool,
-                    source: Some(source),
-                    ..Default::default()
-                };
+            .zip(dests)
+            .map(|(record, &dest)| {
                 Ok(PreparedWrite {
-                    path: resolve_pattern(pattern, &ctx),
+                    dest,
                     payload: WritePayload::Records(vec![prepared_raw_read(
                         record, read_group, slug,
                     )?]),
                 })
             })
-            .collect()
-    } else {
-        // A single source: `%source` (if present) is always 0, and every
-        // segment lands together.
-        let ctx = PathContext {
-            pool,
-            source: Some(0),
-            ..Default::default()
-        };
-        Ok(vec![PreparedWrite {
-            path: resolve_pattern(pattern, &ctx),
+            .collect(),
+        &BinLayout::Single(dest) => Ok(vec![PreparedWrite {
+            dest,
             payload: WritePayload::Records(
                 fragment
                     .records
@@ -2818,7 +2976,7 @@ fn prepare_raw_bin(
                     .map(|record| prepared_raw_read(record, read_group, slug))
                     .collect::<Result<_>>()?,
             ),
-        }])
+        }]),
     }
 }
 
@@ -2905,8 +3063,6 @@ fn prepare_body(
     fragment: &Fragment,
 ) -> Result<BodyOutcome> {
     let plan = engine.plan;
-    let pool = engine.pool;
-    let input_formats = engine.input_formats;
     let target = route.map(Route::target);
     let mut streams: HashMap<&str, Extracted> = HashMap::new();
     let mut slot = 0;
@@ -2945,21 +3101,15 @@ fn prepare_body(
 
     let sample = target.map(|t| t.sample.as_str());
     let sub_sample = target.and_then(|t| t.sub_sample.as_deref());
-    // The format is fixed by the path extension (or the stdout mirror),
-    // independent of the ordinal.
-    let probe = PathContext {
-        pool,
-        sample,
-        sub_sample,
-        ordinal: Some(1),
-        source: None,
+    let layout = match route {
+        Some(route) => &engine.destinations.targets[route.target_index()],
+        None => engine
+            .destinations
+            .pass_through
+            .as_ref()
+            .context("internal error: no --out layout for a record without a sample")?,
     };
-    let probe_path = plan.out.as_ref().and_then(|p| resolve_pattern(p, &probe));
-    let format = output_format(probe_path.as_deref(), input_formats)?;
-    let is_alignment = matches!(
-        format,
-        OutputFormat::Sam | OutputFormat::Bam | OutputFormat::Cram
-    );
+    let is_alignment = layout.is_alignment;
 
     let bodies = match assemble_bodies(
         plan,
@@ -2983,12 +3133,9 @@ fn prepare_body(
     // keeps its carried original `RG:Z` instead (already in `read.tags` via
     // `merge_data`); `None` leaves it untouched, since `writer::build_record`
     // only inserts `RG:Z` when a read group is set.
-    let read_group = if engine.is_read_group_split {
-        None
-    } else {
-        target
-            .map(Target::label)
-            .or_else(|| Some(engine.pool_read_group.to_string()))
+    let read_group = match engine.is_read_group_split {
+        true => None,
+        false => layout.read_group.clone(),
     };
 
     let mut datas: Vec<Data> = bodies
@@ -3021,67 +3168,53 @@ fn prepare_body(
     // Multi-read FASTX to a file fans out one file per `%ordinal`; SAM/BAM (a
     // pair in one file), single-read FASTX, and stdout all write every read to
     // one destination.
-    let multi_fastx = (!is_alignment && bodies.len() > 1)
-        .then_some(plan.out.as_ref())
-        .flatten();
-    let writes = if let Some(pattern) = multi_fastx {
-        if !pattern.uses(Placeholder::Ordinal) {
-            bail!(
-                "unmux: multi-read FASTX output needs the %ordinal placeholder in --out to \
-                 separate the {} template reads",
-                bodies.len()
+    let dests = layout
+        .dests
+        .as_ref()
+        .map_err(|message| anyhow!("{message}"))?;
+    let writes = match dests {
+        OutDests::PerOrdinal(dests) => {
+            ensure!(
+                dests.len() == bodies.len(),
+                "internal error: {} bodies for {} --out ordinals",
+                bodies.len(),
+                dests.len()
             );
-        }
-        bodies
-            .into_iter()
-            .zip(datas)
-            .enumerate()
-            .map(|(index, (body, data))| {
-                let ctx = PathContext {
-                    pool,
-                    sample,
-                    sub_sample,
-                    ordinal: Some(index + 1),
-                    source: None,
-                };
-                PreparedWrite {
-                    path: resolve_pattern(pattern, &ctx),
+            bodies
+                .into_iter()
+                .zip(datas)
+                .zip(dests)
+                .map(|((body, data), &dest)| PreparedWrite {
+                    dest,
                     payload: WritePayload::Records(vec![prepared_body_read(body, data, None)]),
-                }
-            })
-            .collect()
-    } else {
-        let ctx = PathContext {
-            pool,
-            sample,
-            sub_sample,
-            ordinal: (bodies.len() == 1).then_some(1),
-            source: None,
-        };
-        let path = plan.out.as_ref().and_then(|p| resolve_pattern(p, &ctx));
-        let reads = bodies
-            .into_iter()
-            .zip(datas)
-            .map(|(mut body, data)| match body.alignment.take() {
-                Some(record) => passed_through_read(
-                    record,
-                    &tag_data,
-                    slug.as_ref().map(|(tag, value)| (*tag, value.as_str())),
-                ),
-                None => {
-                    let read_group = if is_alignment {
-                        read_group.clone()
-                    } else {
-                        None
-                    };
-                    Ok(prepared_body_read(body, data, read_group))
-                }
-            })
-            .collect::<Result<_>>()?;
-        vec![PreparedWrite {
-            path,
-            payload: WritePayload::Records(reads),
-        }]
+                })
+                .collect()
+        }
+        &OutDests::Single(dest) => {
+            let reads = bodies
+                .into_iter()
+                .zip(datas)
+                .map(|(mut body, data)| match body.alignment.take() {
+                    Some(record) => passed_through_read(
+                        record,
+                        &tag_data,
+                        slug.as_ref().map(|(tag, value)| (*tag, value.as_str())),
+                    ),
+                    None => {
+                        let read_group = if is_alignment {
+                            read_group.clone()
+                        } else {
+                            None
+                        };
+                        Ok(prepared_body_read(body, data, read_group))
+                    }
+                })
+                .collect::<Result<_>>()?;
+            vec![PreparedWrite {
+                dest,
+                payload: WritePayload::Records(reads),
+            }]
+        }
     };
     Ok(BodyOutcome::Assembled(writes))
 }
