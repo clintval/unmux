@@ -234,12 +234,27 @@ fn join_with(segments: &[Vec<u8>], sep: &[u8]) -> Vec<u8> {
 /// Build the `@PG` program provenance record (`PN:unmux VN:<version>
 /// CL:<command line>`); the `ID` is the `add_program` key and `CL` is omitted
 /// when no command line was captured.
+/// Whether a SAM header field can hold `text` as it is.
+pub(crate) fn is_header_text(text: &str) -> bool {
+    !text.is_empty() && text.chars().all(|c| matches!(c, ' '..='~'))
+}
+
+/// `text` with every character that a SAM header field cannot hold escaped.
+fn header_text(text: &str) -> String {
+    text.chars()
+        .map(|c| match c {
+            ' '..='~' => c.to_string(),
+            _ => c.escape_default().to_string(),
+        })
+        .collect()
+}
+
 fn program_record(command_line: Option<&str>) -> Map<Program> {
     let mut builder = Map::<Program>::builder()
         .insert(program_tag::NAME, "unmux")
         .insert(program_tag::VERSION, env!("CARGO_PKG_VERSION"));
     if let Some(command_line) = command_line {
-        builder = builder.insert(program_tag::COMMAND_LINE, command_line);
+        builder = builder.insert(program_tag::COMMAND_LINE, header_text(command_line));
     }
     builder
         .build()
@@ -1240,6 +1255,16 @@ mod tests {
             rg1_pos < rg3_pos,
             "expected ID:rg1 before ID:rg3 in header text, got:\n{text}"
         );
+    }
+
+    #[test]
+    fn test_header_text_escapes_what_a_sam_header_cannot_hold() {
+        assert_eq!(header_text("a b ~ \\x"), "a b ~ \\x");
+        assert_eq!(header_text("\u{e4}\t\n"), "\\u{e4}\\t\\n");
+        assert!(is_header_text("a b~"));
+        for text in ["", "\u{e4}", "a\tb", "a\u{7f}"] {
+            assert!(!is_header_text(text), "{text:?}");
+        }
     }
 
     #[test]
