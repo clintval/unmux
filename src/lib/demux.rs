@@ -21,6 +21,7 @@ use std::path::PathBuf;
 
 use std::fs::File;
 use std::io::BufWriter;
+use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Context, Result};
 use noodles::sam::alignment::record::data::field::Tag;
@@ -59,7 +60,10 @@ use crate::output::{
 };
 use crate::qc::{removed_slug, routed_slug, unassigned_slug, Unassigned};
 use crate::tags::{is_column_value, load_tag_file_columns, TagColumns, TagSet};
-use crate::writer::{encode_fragment, output_format, OutputFormat, OutputRead, StagedOutputs};
+use crate::writer::{
+    encode_fragment, output_format, OutputFormat, OutputRead, PoolFailure, PooledFile,
+    StagedOutputs,
+};
 
 /// Resolved arguments for the `unmux` demux command.
 #[derive(Debug, Clone)]
@@ -1544,15 +1548,17 @@ fn run_engine(plan: &DemuxPlan, command_line: Option<&str>) -> Result<()> {
         ),
     }
 
+    let pool_failure = Arc::new(PoolFailure::default());
     if writer_threads > 0 {
-        let mut builder = PoolBuilder::<BufWriter<File>, BgzfCompressor>::new()
+        let mut builder = PoolBuilder::<PooledFile<BufWriter<File>>, BgzfCompressor>::new()
             .threads(budget.writer)
             .compression_level(plan.compression)
             .map_err(|e| anyhow!("invalid --compression {} for BGZF: {e}", plan.compression))?;
         let mut exchanged: HashMap<PathBuf, PooledWriter> = HashMap::new();
         for path in &poolable {
             let file = crate::writer::create_output_file(staged.path(path))?;
-            exchanged.insert(path.clone(), builder.exchange(BufWriter::new(file)));
+            let file = PooledFile::new(BufWriter::new(file), path, &pool_failure);
+            exchanged.insert(path.clone(), builder.exchange(file));
         }
         writer_pool = Some(
             builder
@@ -1560,6 +1566,7 @@ fn run_engine(plan: &DemuxPlan, command_line: Option<&str>) -> Result<()> {
                 .map_err(|e| anyhow!("failed to start the BGZF writer pool: {e}"))?,
         );
         writer.set_pooled(exchanged);
+        writer.set_pool_failure(Arc::clone(&pool_failure));
     }
 
     // Streams referenced exactly once across templates + tags can be MOVED into
@@ -1610,8 +1617,9 @@ fn run_engine(plan: &DemuxPlan, command_line: Option<&str>) -> Result<()> {
     // panic. `MultiWriter::finish` finalizes every writer even when one errors,
     // so the pool is always safe to stop once it returns; we stop it
     // unconditionally (its threads never leak) and surface the most actionable
-    // error first: the run error, then a finalize error, then a pool-stop
-    // error.
+    // error first: the run error, then a write error on a file behind the
+    // pool (which can come as late as the pool's last write), then a finalize
+    // error, then a pool-stop error.
     let run_result = (|| -> Result<()> {
         writer.create_all(&dests)?;
         for path in &metrics_paths {
@@ -1635,6 +1643,7 @@ fn run_engine(plan: &DemuxPlan, command_line: Option<&str>) -> Result<()> {
         None => Ok(()),
     };
     run_result?;
+    pool_failure.check()?;
     finished?;
     stopped?;
 
