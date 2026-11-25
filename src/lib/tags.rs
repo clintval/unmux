@@ -114,29 +114,31 @@ pub(crate) fn is_column_value(value: &str) -> bool {
 }
 
 /// Parse a tag table that may start with a UTF-8 byte order mark. The mark is
-/// part of the first header cell for a table that parses with it, since stripping
-/// it there could change which columns are the id, sequence, and sub_sample.
+/// part of the first header cell for a table whose header resolves with it, since
+/// stripping it there could change which columns are the id, sequence, and
+/// sub_sample.
 fn parse_marked_tag_table(text: &str, wanted: &[&str]) -> Result<(TagSet, TagColumns)> {
+    let header_resolves = table_rows(text)
+        .next()
+        .is_some_and(|(_, header)| header_columns(header).is_ok());
     match text.strip_prefix(BYTE_ORDER_MARK) {
-        Some(unmarked) if parse_tag_table(text, &[]).is_err() => parse_tag_table(unmarked, wanted),
+        Some(unmarked) if !header_resolves => parse_tag_table(unmarked, wanted),
         _ => parse_tag_table(text, wanted),
     }
 }
 
-/// Parse the text of a tag table (headered TSV; blank lines and `#` comments
-/// skipped), keeping the values of its `wanted` columns. Each row must have its
-/// own ID.
-fn parse_tag_table(text: &str, wanted: &[&str]) -> Result<(TagSet, TagColumns)> {
-    let mut rows = text
-        .lines()
+/// The rows of a tag table with their file line numbers, skipping blank lines
+/// and `#` comments.
+fn table_rows(text: &str) -> impl Iterator<Item = (usize, &str)> {
+    text.lines()
         .map(|line| line.trim_end_matches('\r'))
         .enumerate()
         .map(|(index, line)| (index + 1, line))
-        .filter(|(_, line)| !line.trim().is_empty() && !line.trim_start().starts_with('#'));
+        .filter(|(_, line)| !line.trim().is_empty() && !line.trim_start().starts_with('#'))
+}
 
-    let (_, header) = rows
-        .next()
-        .context("tag file is empty (a header row is required)")?;
+/// The id, sequence, and optional sub_sample column indices of a header row.
+fn header_columns(header: &str) -> Result<(usize, usize, Option<usize>)> {
     let columns: Vec<String> = header
         .split('\t')
         .map(|c| c.trim().to_lowercase())
@@ -150,6 +152,18 @@ fn parse_tag_table(text: &str, wanted: &[&str]) -> Result<(TagSet, TagColumns)> 
     let seq_col = find_column(&columns, SEQ_COLUMNS)?
         .context("tag file has no sequence column (expected one of: seq, sequence, barcode)")?;
     let sub_sample_col = find_column(&columns, &["sub_sample"])?;
+    Ok((id_col, seq_col, sub_sample_col))
+}
+
+/// Parse the text of a tag table (headered TSV; blank lines and `#` comments
+/// skipped), keeping the values of its `wanted` columns. Each row must have its
+/// own ID.
+fn parse_tag_table(text: &str, wanted: &[&str]) -> Result<(TagSet, TagColumns)> {
+    let mut rows = table_rows(text);
+    let (_, header) = rows
+        .next()
+        .context("tag file is empty (a header row is required)")?;
+    let (id_col, seq_col, sub_sample_col) = header_columns(header)?;
     let mut values = wanted
         .iter()
         .map(|&name| {
@@ -514,6 +528,12 @@ mod tests {
         }
         let err = parse_marked_tag_table("\u{feff}id\tseq\ns1\tAAAA\ns1\tCCCC\n", &[]);
         assert!(err.unwrap_err().to_string().starts_with("line 3 repeats"));
+        let table = "\u{feff}id\tname\tseq\nx\tt1\tAAAA\ny\tt1\tCCCC\n";
+        let err = parse_marked_tag_table(table, &[]).unwrap_err().to_string();
+        assert!(
+            err.starts_with("line 3 repeats tag ID \"t1\" from line 2"),
+            "{err}"
+        );
     }
 
     #[test]
