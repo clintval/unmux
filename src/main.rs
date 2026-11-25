@@ -203,7 +203,7 @@ struct DemuxCmd {
     ///   bc::dist=1               allow 1 substitution (default: 0)
     ///   bc::dist=1:1:2           1 sub + 1 indel, total ≤ 2
     ///   bc::mode=nearest         keep best only if it beats runner-up...
-    ///   bc::delta=2              ...by ≥ 2 (needs mode=nearest)
+    ///   bc::delta=2              ...by ≥ 2 (default: 1; needs mode=nearest)
     ///   bc::next=bc3:0-4         bc3 follows, 0-4 bp past this match
     ///   bc::prev=bc1             require bc1 to have matched earlier
     ///   bc::minFindsPerGroup=1   group matches ≥ once (keeplist)

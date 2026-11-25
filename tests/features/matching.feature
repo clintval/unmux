@@ -163,6 +163,20 @@ Feature: Tag matching with distance tolerance and error handling
     Then the exit code is 0
     And stdout does not contain "BC:Z:AATT"
 
+  Scenario: Nearest mode without a delta leaves an equidistant tie unassigned
+    Given a file "reads.fq" containing:
+      """
+      @r
+      AATTCCCCDDDD
+      +
+      IIIIIIIIIIII
+      """
+    # The read AATT is 2 mismatches from both AAAA and TTTT, and with no delta the required gap is 1.
+    When I run `unmux reads.fq --group g={s1=AAAA,s2=TTTT} --group g::loc=0:0:4,dist=2,mode=nearest --extract bc=@g --tag BC=bc --template bc`
+    Then the exit code is 0
+    And stdout does not contain "BC:Z:"
+    And stderr contains "mode=nearest leaves ambiguous reads unassigned"
+
   Scenario: An ambiguous barcode pair under mode=all is rejected by the collision guard
     Given a file "reads.fq" containing:
       """
@@ -190,6 +204,44 @@ Feature: Tag matching with distance tolerance and error handling
     When I run `unmux reads.fq --group g={s1=TGAGC,s2=TGAGA} --group g::loc=0:0:5,dist=1,mode=nearest,delta=2 --extract bc=@g --tag BC=bc --template bc`
     Then the exit code is 0
     And stdout does not contain "BC:Z:"
+
+  Scenario: An anchored nearest-mode group without a delta keeps a one-gap winner and drops a tie
+    Given a file "reads.fq" containing:
+      """
+      @win
+      TGAGCCCCCDDDD
+      +
+      IIIIIIIIIIIII
+      @tie
+      TGAGTCCCCDDDD
+      +
+      IIIIIIIIIIIII
+      """
+    # The @win read is 0 and 1 substitutions from the two tags (a gap of 1); @tie is 1 from both.
+    When I run `unmux reads.fq --group g={s1=TGAGC,s2=TGAGA} --group g::loc=0:0:5,dist=1,mode=nearest,anchor=5p --extract bc=@g --tag BC=bc --template bc`
+    Then the exit code is 0
+    And stdout contains "@win BC:Z:TGAGC"
+    And stdout does not contain "@tie"
+
+  Scenario: A match= nearest-mode group without a delta keeps a one-gap winner and drops a tie
+    Given a file "reads.fq" containing:
+      """
+      @win
+      ACGGACTT
+      +
+      IIIIIIII
+      @tie
+      ACGGATTT
+      +
+      IIIIIIII
+      """
+    # The x+y join is bases [0,2) and [4,6): ACAC for @win (costs 0 and 1) and ACAT for @tie (1 and 1).
+    When I run `unmux reads.fq --extract x=0:0:2 --extract y=0:4:6 --group pair={s1=ACAC,s2=ACAG} --group pair::match=x+y,dist=1,mode=nearest --sample-from-group pair --out %sample.fq --unassigned un.fq`
+    Then the exit code is 0
+    And the file "s1.fq" contains "@win"
+    And the file "un.fq" contains "@tie"
+    And the file "s1.fq" does not contain "@tie"
+    And the file "s2.fq" does not contain "@tie"
 
   Scenario: IUPAC ambiguity in the tag definition matches any base at the N positions
     Given a file "reads.fq" containing:

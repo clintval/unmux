@@ -432,7 +432,7 @@ fn compile_groups(
             loc: attrs.loc.clone(),
             revcomp: attrs.revcomp.unwrap_or(false),
             mode,
-            delta: attrs.delta.unwrap_or(0),
+            delta: attrs.delta.unwrap_or(1),
             min_finds_per_tag: attrs.min_finds_per_tag,
             max_finds_per_tag: attrs.max_finds_per_tag,
             min_finds_per_group: attrs.min_finds_per_group,
@@ -4403,6 +4403,36 @@ mod tests {
         );
         assert_eq!(rg.dist, crate::grammar::Dist::default());
         assert!(rg.loc.is_none());
+    }
+
+    #[test]
+    fn test_compile_groups_defaults_nearest_delta_to_one() {
+        let mut args = base_args();
+        args.inputs = vec!["0=/dev/null".to_string()];
+        args.groups = vec![
+            "g={s1=TGAGC,s2=TGAGA}".to_string(),
+            "g::loc=0:0:5,dist=1,mode=nearest".to_string(),
+        ];
+        let plan = crate::grammar::parse_demux(&args).unwrap();
+        let resolved = HashMap::new();
+        let (tag_sets, _) = load_tag_sets(&plan, &resolved).unwrap();
+        let (compiled, _index) = compile_groups(&plan, &tag_sets, &resolved).unwrap();
+        let outcome = |read: &[u8]| match_group(&compiled[0], &mut Scratch::new(), &[read]);
+        let matched_tags = |result: &GroupOutcome| -> BTreeSet<usize> {
+            result.accepted.iter().map(|hit| hit.tag_idx).collect()
+        };
+
+        let winner = outcome(b"TGAGCCCC");
+        assert_eq!(matched_tags(&winner), BTreeSet::from([0, 1]));
+        assert_eq!(
+            winner.best.map(|hit| (hit.tag_idx, hit.cost)),
+            Some((0, 0)),
+            "a one-cost gap over the runner-up meets the default delta"
+        );
+
+        let tie = outcome(b"TGAGTCCC");
+        assert_eq!(matched_tags(&tie), BTreeSet::from([0, 1]));
+        assert_eq!(tie.best, None, "a tie is left unmatched with no delta");
     }
 
     #[test]

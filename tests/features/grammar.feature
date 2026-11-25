@@ -28,6 +28,11 @@ Feature: grammar parsing and structural validation
     Then the exit code is 1
     And stderr contains "both"
 
+  Scenario: a nearest-mode group with delta=0 is an error
+    When I run `unmux a.fq --group g=f.tsv --group g::mode=nearest,delta=0`
+    Then the exit code is 1
+    And stderr contains "delta must be at least 1"
+
   Scenario: a boolean attribute rejects numeric values
     When I run `unmux a.fq --group g=f.tsv --group g::bothStrands=1`
     Then the exit code is 1

@@ -102,8 +102,8 @@ pub struct Partial {
 pub enum MatchMode {
     /// Keep every match within `dist`.
     All,
-    /// Require the best match to beat the runner-up by `delta`, else leave the
-    /// record unmatched.
+    /// Require the best match to beat the runner-up by `delta` (default 1),
+    /// else leave the record unmatched.
     Nearest,
 }
 
@@ -179,8 +179,8 @@ pub struct GroupAttrs {
     pub loc: Option<Location>,
     /// `dist=`: the error budget (default: exact).
     pub dist: Option<Dist>,
-    /// `delta=`: the min best-vs-runner-up gap (only meaningful with
-    /// `mode=nearest`).
+    /// `delta=`: the min best-vs-runner-up gap (default 1; only meaningful
+    /// with `mode=nearest`, where it must be at least 1).
     pub delta: Option<usize>,
     /// `mode=`: match acceptance (default `all`).
     pub mode: Option<MatchMode>,
@@ -1923,6 +1923,12 @@ fn validate_plan(plan: &DemuxPlan) -> Result<()> {
                 group.name
             );
         }
+        if attrs.mode == Some(MatchMode::Nearest) && attrs.delta == Some(0) {
+            bail!(
+                "group `{}` sets delta=0 with mode=nearest, but delta must be at least 1 (the default), as mode=nearest leaves a tie unassigned",
+                group.name
+            );
+        }
         if let Some(anchor) = attrs.anchor {
             // An anchored placement fixes each tag's anchored edge at a loc
             // boundary and matches over the tag's own length via a direct
@@ -3568,6 +3574,28 @@ mod tests {
         ];
         let err = parse_demux(&a).unwrap_err();
         assert!(err.to_string().contains("both `match` and `loc`"), "{err}");
+    }
+
+    #[test]
+    fn test_validate_plan_nearest_with_zero_delta_is_error() {
+        let parse = |attrs: &[&str]| {
+            let mut a = args();
+            a.groups = vec!["g={ACGT}".to_string()];
+            a.groups
+                .extend(attrs.iter().map(|attr| format!("g::{attr}")));
+            parse_demux(&a)
+        };
+        let err = parse(&["mode=nearest,delta=0"]).unwrap_err();
+        assert!(
+            err.to_string().contains("delta must be at least 1"),
+            "{err}"
+        );
+        assert!(
+            parse(&["delta=0", "mode=nearest"]).is_err(),
+            "the two attributes conflict across separate flags too"
+        );
+        assert!(parse(&["mode=nearest"]).is_ok());
+        assert!(parse(&["mode=nearest,delta=1"]).is_ok());
     }
 
     #[test]
