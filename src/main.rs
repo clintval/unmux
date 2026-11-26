@@ -250,6 +250,10 @@ struct DemuxCmd {
     /// where the tag matches the same bases in a record and its reverse
     /// complement, the two give the same spans and windowed targets.
     ///
+    /// A `match=` group joins each stream as a `--tag` without `raw=true`
+    /// writes it: an `@grp` stream error-corrected, and any other stream,
+    /// such as `1:0:8`, as the observed bases.
+    ///
     /// An `@RG` source reads the input header's read groups instead of
     /// matching sequences (SAM/BAM/CRAM only; no barcode attributes, no
     /// `@`-span). Pair with `--sample-from-group` to write one file per
