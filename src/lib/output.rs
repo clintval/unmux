@@ -607,17 +607,12 @@ pub fn check_outputs_over_inputs(
 ) -> Result<()> {
     let files: Vec<_> = inputs
         .iter()
-        .filter(|(path, origin)| {
-            !matches!(
-                (origin, path.to_str()),
-                (InputOrigin::Reads(_), Some("-" | "/dev/stdin"))
-            )
-        })
         .filter_map(|(path, origin)| {
-            let metadata = std::fs::metadata(path)
-                .ok()
-                .filter(std::fs::Metadata::is_file)?;
-            Some((path, origin, resolve(path, &mut 0), file_id(&metadata)))
+            if matches!(origin, InputOrigin::Reads(_)) && path.as_os_str() == "-" {
+                return Some(("<stdin>".to_string(), origin, None, Some(stdin_file()?)));
+            }
+            let (real, file) = read_file(path)?;
+            Some((path.display().to_string(), origin, Some(real), file))
         })
         .collect();
     if files.is_empty() {
@@ -630,18 +625,44 @@ pub fn check_outputs_over_inputs(
             Ok(metadata) => file_id(&metadata),
             Err(_) => None,
         };
-        let Some((input, input_origin, ..)) = files
-            .iter()
-            .find(|(_, _, input, id)| *input == real || id.is_some_and(|id| file == Some(id)))
-        else {
+        let Some((input, input_origin, ..)) = files.iter().find(|(_, _, input, id)| {
+            input.as_ref() == Some(&real) || id.is_some_and(|id| file == Some(id))
+        }) else {
             continue;
         };
-        let (output, input) = (path.display(), input.display());
+        let output = path.display();
         bail!(
             "output \"{output}\" ({origin}) is {input_origin} ({input}); give it a distinct path"
         );
     }
     Ok(())
+}
+
+/// The resolved path and file of a regular file the run reads, or `None` for a pipe or device.
+fn read_file(path: &Path) -> Option<(PathBuf, Option<FileId>)> {
+    let metadata = std::fs::metadata(path)
+        .ok()
+        .filter(std::fs::Metadata::is_file)?;
+    // An open descriptor gives the device of a file behind /dev/fd, which stat does not on macOS.
+    let opened = std::fs::File::open(path)
+        .and_then(|file| file.metadata())
+        .ok();
+    let file = opened.as_ref().map_or_else(|| file_id(&metadata), file_id);
+    Some((resolve(path, &mut 0), file))
+}
+
+/// The file standard input reads, when it is a regular file.
+#[cfg(unix)]
+fn stdin_file() -> Option<FileId> {
+    use std::os::fd::AsFd;
+    let stdin = std::io::stdin().as_fd().try_clone_to_owned().ok()?;
+    let metadata = std::fs::File::from(stdin).metadata().ok()?;
+    file_id(&metadata).filter(|_| metadata.is_file())
+}
+
+#[cfg(not(unix))]
+fn stdin_file() -> Option<FileId> {
+    None
 }
 
 /// The case-folded absolute path `path` writes and its existing file, or `None` if not regular.
@@ -1510,10 +1531,9 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn test_over_inputs_standard_input_and_devices_are_exempt() {
-        let inputs = ["-", "/dev/stdin", "/dev/null"].map(PathBuf::from);
-        let outputs = ["-", "/dev/stdin", "/dev/stdout", "/dev/null"].map(PathBuf::from);
-        assert_eq!(over_inputs(&outputs, &inputs), None);
+    fn test_over_inputs_devices_are_exempt() {
+        let null = [PathBuf::from("/dev/null")];
+        assert_eq!(over_inputs(&null, &null), None);
     }
 
     #[test]
