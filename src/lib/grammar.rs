@@ -4175,6 +4175,164 @@ mod tests {
         assert!(warnings(&["CB=u", "xc=cell"]).is_empty());
     }
 
+    fn tag_args(tags: &[&str], qc_tag: Option<&str>) -> DemuxArgs {
+        let mut a = column_args();
+        a.extracts.push("v=0:4:8".to_string());
+        a.tags = tags.iter().map(|tag| tag.to_string()).collect();
+        a.qc_tag = qc_tag.map(str::to_string);
+        a
+    }
+
+    #[test]
+    fn test_a_tag_that_two_writers_would_set_is_an_error() {
+        let refusal = |tag: &str, first: &str, second: &str| {
+            format!(
+                "tag `{tag}` would be written twice, by `{first}` and by `{second}`; choose \
+                 another tag for one of them"
+            )
+        };
+        let read_group = |first: &str| {
+            format!(
+                "tag `RG` would be written twice, by `{first}` and by unmux as the read group of \
+                 each SAM/BAM/CRAM record; choose another tag"
+            )
+        };
+        for (tags, qc_tag, message) in [
+            (
+                &["ZS=cell+u"][..],
+                Some("ZS"),
+                refusal("ZS", "--tag ZS=cell+u", "--qc-tag=ZS"),
+            ),
+            (
+                &["XA=u", "XA::qual=XA"],
+                None,
+                refusal("XA", "--tag XA=u", "--tag XA::qual=XA"),
+            ),
+            (
+                &["XA=u", "XB=v", "XB::qual=XA"],
+                None,
+                refusal("XA", "--tag XA=u", "--tag XB::qual=XA"),
+            ),
+            (
+                &["XA=u", "XA::qual=XQ", "XB=v", "XB::qual=XQ"],
+                None,
+                refusal("XQ", "--tag XA::qual=XQ", "--tag XB::qual=XQ"),
+            ),
+            (
+                &["RX=u", "RX::qual=ZS"],
+                Some("ZS"),
+                refusal("ZS", "--tag RX::qual=ZS", "--qc-tag=ZS"),
+            ),
+            (&["RG=u"], None, read_group("--tag RG=u")),
+            (
+                &["XA=~u", "XA::qual=RG"],
+                None,
+                read_group("--tag XA::qual=RG"),
+            ),
+        ] {
+            let err = parse_demux(&tag_args(tags, qc_tag))
+                .unwrap_err()
+                .to_string();
+            assert_eq!(err, message, "{tags:?}");
+        }
+    }
+
+    #[test]
+    fn test_a_default_quality_tag_that_another_writer_sets_is_an_error_with_a_hint() {
+        let by = |spec: &str| format!("by `--tag {spec}`");
+        let default_of = |spec: &str| format!("as the default quality tag of `--tag {spec}`");
+        let refusal = |tag: &str, first: String, second: String, defaulting: &str| {
+            format!(
+                "tag `{tag}` would be written twice, {first} and {second}; set \
+                 `{defaulting}::qual=none` or `{defaulting}::qual=<TAG>`"
+            )
+        };
+        for (tags, message) in [
+            (
+                &["CY=u", "CB=v"][..],
+                refusal("CY", by("CY=u"), default_of("CB=v"), "CB"),
+            ),
+            (
+                &["CB=v", "CY=u"],
+                refusal("CY", default_of("CB=v"), by("CY=u"), "CB"),
+            ),
+            (
+                &["CB=u", "CB::qual=CY", "CR=v"],
+                refusal("CY", by("CB::qual=CY"), default_of("CR=v"), "CR"),
+            ),
+            (
+                &["CB=u", "CR=v", "CR::qual=CY"],
+                refusal("CY", default_of("CB=u"), by("CR::qual=CY"), "CB"),
+            ),
+            (
+                &["CB=u", "CR=v", "CY=cell"],
+                refusal("CY", default_of("CR=v"), by("CY=cell"), "CR"),
+            ),
+            (
+                &["BC=u+~v", "QT=v"],
+                refusal("QT", default_of("BC=u+~v"), by("QT=v"), "BC"),
+            ),
+            (
+                &["xa=u", "xa::qual=QX", "RX=v"],
+                refusal("QX", by("xa::qual=QX"), default_of("RX=v"), "RX"),
+            ),
+        ] {
+            let err = parse_demux(&tag_args(tags, None)).unwrap_err().to_string();
+            assert_eq!(err, message, "{tags:?}");
+        }
+    }
+
+    #[test]
+    fn test_tags_with_one_writer_each_are_ok() {
+        for (tags, qc_tag) in [
+            (&["CB=u+v", "CB::qual=CY", "RX=u", "RX::qual=QX"][..], None),
+            (&["CB=u", "CB::qual=none", "CY=v"], None),
+            (&["CB=u", "CB::qual=XC", "CY=v"], None),
+            (&["CB=cell", "CY=u"], None),
+            (&["RX=u", "RX::qual=ZQ", "OX=v"], Some("ZS")),
+            (&["rg=u", "XA=v"], Some("XB")),
+        ] {
+            let parsed = parse_demux(&tag_args(tags, qc_tag));
+            assert!(parsed.is_ok(), "{tags:?}: {parsed:?}");
+        }
+    }
+
+    #[test]
+    fn test_cb_beside_cr_on_default_quality_tags_leaves_cy_to_cr() {
+        let qualities = |tags: &[&str]| -> Vec<String> {
+            let plan = parse_demux(&tag_args(tags, None)).unwrap();
+            plan.tags
+                .iter()
+                .map(|tag| {
+                    let qual = crate::output::qual_tag_name(tag).unwrap_or("-");
+                    format!("{}>{qual}", tag.tag)
+                })
+                .collect()
+        };
+        assert_eq!(qualities(&["CB=u", "CR=v"]), ["CB>-", "CR>CY"]);
+        assert_eq!(qualities(&["CR=v", "CB=u"]), ["CR>CY", "CB>-"]);
+        assert_eq!(
+            qualities(&["CB=u+v", "CR=u+v", "CR::raw=true"]),
+            ["CB>-", "CR>CY"]
+        );
+        assert_eq!(qualities(&["CB=u"]), ["CB>CY"]);
+        assert_eq!(qualities(&["CR=v"]), ["CR>CY"]);
+        assert_eq!(
+            qualities(&["CB=u", "CR=v", "CR::qual=none"]),
+            ["CB>CY", "CR>-"]
+        );
+        assert_eq!(
+            qualities(&["CB=u", "CB::qual=none", "CR=v"]),
+            ["CB>-", "CR>CY"]
+        );
+        assert_eq!(
+            qualities(&["CB=u", "CR=v", "CR::qual=XY"]),
+            ["CB>CY", "CR>XY"]
+        );
+        assert_eq!(qualities(&["CB=u", "CR=cell"]), ["CB>CY", "CR>-"]);
+        assert_eq!(qualities(&["CB=cell", "CR=v"]), ["CB>-", "CR>CY"]);
+    }
+
     #[test]
     fn test_parse_span_sample_column() {
         for (span, column) in [

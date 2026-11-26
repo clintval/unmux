@@ -3,8 +3,9 @@ Feature: SAM tag emission with quality tag pairing and separators
   override. A tag binding two or more streams joins them with `sep` (default `-`); when it also
   emits a quality tag the qualities join with `qual-sep` (default a single space). A single-stream
   tag needs neither. Streams concatenate with `+` (`CB=cbt+cb2+cb3`); a comma is an error. Default
-  seq->qual map: CB/CY, RX/QX, BC/QT, OX/BZ. With no --out, tags render into the FASTQ read-name
-  comment as `TAG:Z:VALUE`, so these scenarios assert on stdout.
+  seq->qual map: CB/CY, CR/CY, RX/QX, BC/QT, OX/BZ. A tag that two writers would set is an error,
+  except that CB leaves CY to CR when both would write it by default. With no --out, tags render
+  into the FASTQ read-name comment as `TAG:Z:VALUE`, so most of these scenarios assert on stdout.
 
   Scenario: CB tag from multiple streams with no quality tag
     Given a file "test.fq" containing:
@@ -174,3 +175,74 @@ Feature: SAM tag emission with quality tag pairing and separators
     When I run `unmux test.fq --qc-tag=SC`
     Then the exit code is 1
     And stderr contains "local-use"
+
+  Scenario Outline: a tag that two writers would set is an error
+    Given a file "test.fq" containing:
+      """
+      @r1
+      AAAACCCCGGGG
+      +
+      IIII5555????
+      """
+    When I run `unmux test.fq --extract u=0:0:4 --extract v=0:4:8 <flags> --out out.sam`
+    Then the exit code is 1
+    And stderr contains "<message>"
+    And a file "out.sam" does not exist
+
+    Examples:
+      | flags                                   | message                                                                                                               |
+      | --tag ZS=u --qc-tag                     | tag `ZS` would be written twice, by `--tag ZS=u` and by `--qc-tag=ZS`; choose another tag for one of them              |
+      | --tag XA=u --tag XA::qual=XA            | tag `XA` would be written twice, by `--tag XA=u` and by `--tag XA::qual=XA`; choose another tag for one of them        |
+      | --tag XA=u --tag XB=v --tag XB::qual=XA | tag `XA` would be written twice, by `--tag XA=u` and by `--tag XB::qual=XA`; choose another tag for one of them        |
+      | --tag RX=u --tag RX::qual=ZS --qc-tag   | tag `ZS` would be written twice, by `--tag RX::qual=ZS` and by `--qc-tag=ZS`; choose another tag for one of them       |
+      | --tag RG=u                              | tag `RG` would be written twice, by `--tag RG=u` and by unmux as the read group of each SAM/BAM/CRAM record             |
+      | --tag XA=u --tag XA::qual=RG            | tag `RG` would be written twice, by `--tag XA::qual=RG` and by unmux as the read group of each SAM/BAM/CRAM record     |
+      | --tag CY=u --tag CB=v                   | tag `CY` would be written twice, by `--tag CY=u` and as the default quality tag of `--tag CB=v`; set `CB::qual=none`   |
+      | --tag CB=u --tag CB::qual=CY --tag CR=v | tag `CY` would be written twice, by `--tag CB::qual=CY` and as the default quality tag of `--tag CR=v`; set `CR::qual=none` |
+      | --tag CB=u --tag CR=v --tag CY=u        | tag `CY` would be written twice, as the default quality tag of `--tag CR=v` and by `--tag CY=u`; set `CR::qual=none`   |
+
+  Scenario Outline: CY holds the CR qualities when CB and CR both default to it, in either order
+    Given a file "test.fq" containing:
+      """
+      @r1
+      AAAACCCCGGGG
+      +
+      IIII5555????
+      """
+    When I run `unmux test.fq --pool p --extract u=0:0:4 --extract v=0:4:8 <flags> --out out.sam`
+    Then the exit code is 0
+    And the records of "out.sam" are:
+      """
+      r1	4	*	0	255	*	*	0	0	AAAACCCCGGGG	IIII5555????	<tags>	RG:Z:p
+      """
+
+    Examples:
+      | flags                                     | tags                            |
+      | --tag CB=u --tag CR=v                     | CB:Z:AAAA	CR:Z:CCCC	CY:Z:5555 |
+      | --tag CR=v --tag CB=u                     | CR:Z:CCCC	CY:Z:5555	CB:Z:AAAA |
+      | --tag CB=u                                | CB:Z:AAAA	CY:Z:IIII           |
+      | --tag CB=u --tag CR=v --tag CR::qual=none | CB:Z:AAAA	CY:Z:IIII	CR:Z:CCCC |
+      | --tag CB=u --tag CB::qual=none --tag CR=v | CB:Z:AAAA	CR:Z:CCCC	CY:Z:5555 |
+
+  Scenario Outline: a corrected CB and a raw CR of one barcode keep the observed qualities in CY
+    Given a file "test.fq" containing:
+      """
+      @r1
+      GGGGGGGGGGCACGATAAAA
+      +
+      IIIIIIIIII56789:IIII
+      """
+    # CACGAT is one substitution from the reverse complement of AACGTG, so the corrected qualities
+    # of CB run in reverse (:98765) while CR and its CY keep the observed order.
+    When I run `unmux test.fq --pool p --group g={AACGTG} --group g::loc=0:10:16,bothStrands=true,dist=1 --extract bc=@g <flags> --out out.sam`
+    Then the exit code is 0
+    And the records of "out.sam" are:
+      """
+      r1	4	*	0	255	*	*	0	0	GGGGGGGGGGCACGATAAAA	IIIIIIIIII56789:IIII	<tags>	RG:Z:p
+      """
+
+    Examples:
+      | flags                                      | tags                                  |
+      | --tag CB=bc --tag CR=bc --tag CR::raw=true | CB:Z:AACGTG	CR:Z:CACGAT	CY:Z:56789: |
+      | --tag CR=bc --tag CR::raw=true --tag CB=bc | CR:Z:CACGAT	CY:Z:56789:	CB:Z:AACGTG |
+      | --tag CB=bc                                | CB:Z:AACGTG	CY:Z::98765             |

@@ -6105,7 +6105,7 @@ mod tests {
 
     #[test]
     fn test_passes_alignments_through_refuses_tags_it_would_overwrite() {
-        for tag in ["RG", "NM", "MD", "MC", "SA"] {
+        for tag in ["NM", "MD", "MC", "SA"] {
             let mut args = base_args();
             args.inputs = vec!["0=in.bam".to_string()];
             args.extracts = vec!["head=0:0:4".to_string()];

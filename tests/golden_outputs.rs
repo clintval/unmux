@@ -504,7 +504,7 @@ const CELLS: &str = "--group b1={in}/bc.tsv --group b1::loc=0:0:13 --group b1::d
     --tag xc=c+x --sample-sheet {in}/sheet.tsv --out %sample.cram --rg-tag PL=ILLUMINA {METRICS}"
 )]
 #[case::cells_to_bam(
-    "3020ca779bbbaa1f51543f7b1f30f896",
+    "26653bb641274e1c92d9a8ba758bd21a",
     "{in}/sc1.fq {in}/sc2.fq {CELLS} \
     --group b1::minFindsPerGroup=1 --template cdna --tag CB=c1+c2 --tag CR=c1+c2 \
     --tag CR::raw=true --tag RX=umi --tag xg=gap --tag xn=name --out out.bam --unassigned un.bam \
@@ -526,7 +526,7 @@ const CELLS: &str = "--group b1={in}/bc.tsv --group b1::loc=0:0:13 --group b1::d
     {METRICS}"
 )]
 #[case::anywhere_with_indels(
-    "25cee929a2301ce5f9eaeab14b9b21d4",
+    "26d1b69e4370eaf3a1c6bf203d55ef0c",
     "{in}/any.fq \
     --group bc={in}/bc.tsv --group bc::dist=1:1:2 --group bc::mode=nearest --group bc::delta=1 \
     --extract s=@bc --extract r=@bc+0:end --template r --tag CB=s --tag CR=s --tag CR::raw=true \
