@@ -511,8 +511,13 @@ pub enum OutputOrigin {
     Target(Target),
     /// Records sharing the `--out` writer: `--out` with no target, or a bin given the same pattern.
     Records(String),
-    /// A bin such as `--unassigned` or `--remove grp` given a pattern of its own.
-    Bin(String),
+    /// A bin given a pattern of its own.
+    Bin {
+        /// The option that writes it, such as `--unassigned` or `--remove grp`.
+        option: String,
+        /// Whether it could take the `--out` pattern itself to share the `--out` file.
+        could_share: bool,
+    },
     /// A metrics TSV written on its own after the run, such as `--metrics-summary`.
     Metrics(&'static str),
 }
@@ -525,7 +530,7 @@ impl std::fmt::Display for OutputOrigin {
                 sub_sample: Some(sub_sample),
             }) => write!(f, "sample {sample}, sub_sample {sub_sample}"),
             Self::Target(target) => write!(f, "sample {}", target.sample),
-            Self::Records(option) | Self::Bin(option) => f.write_str(option),
+            Self::Records(option) | Self::Bin { option, .. } => f.write_str(option),
             Self::Metrics(option) => f.write_str(option),
         }
     }
@@ -572,17 +577,37 @@ pub fn check_output_collisions(outputs: &[(PathBuf, OutputOrigin)]) -> Result<()
         } else {
             "are the same file"
         };
+        let share = shareable_bin(first_origin, origin).map_or(String::new(), |option| {
+            format!(", or give {option} the --out pattern itself to share the file")
+        });
         let (a, b) = (first.display(), path.display());
-        bail!("outputs \"{a}\" ({first_origin}) and \"{b}\" ({origin}) {reason}; {advice}");
+        bail!("outputs \"{a}\" ({first_origin}) and \"{b}\" ({origin}) {reason}; {advice}{share}");
     }
     Ok(())
 }
 
 /// Whether two outputs on one path share its writer: both on the `--out` writer, or both bins.
 fn shares_writer(a: &OutputOrigin, b: &OutputOrigin) -> bool {
-    let out = |o: &OutputOrigin| matches!(o, OutputOrigin::Target(_) | OutputOrigin::Records(_));
-    let bin = |o: &OutputOrigin| matches!(o, OutputOrigin::Bin(_));
-    (out(a) && out(b)) || (bin(a) && bin(b))
+    let bin = |o: &OutputOrigin| matches!(o, OutputOrigin::Bin { .. });
+    (on_out_writer(a) && on_out_writer(b)) || (bin(a) && bin(b))
+}
+
+/// Whether records go through the `--out` writer of their path.
+fn on_out_writer(origin: &OutputOrigin) -> bool {
+    matches!(origin, OutputOrigin::Target(_) | OutputOrigin::Records(_))
+}
+
+/// The option of a bin beside an `--out` file that it could share by taking the `--out` pattern.
+fn shareable_bin<'a>(a: &'a OutputOrigin, b: &'a OutputOrigin) -> Option<&'a str> {
+    [(a, b), (b, a)]
+        .into_iter()
+        .find_map(|(bin, out)| match bin {
+            OutputOrigin::Bin {
+                option,
+                could_share: true,
+            } if on_out_writer(out) => Some(option.as_str()),
+            _ => None,
+        })
 }
 
 /// A file the run reads, reported when an output would replace it.
@@ -1312,6 +1337,13 @@ mod tests {
         })
     }
 
+    fn bin(option: &str, could_share: bool) -> OutputOrigin {
+        OutputOrigin::Bin {
+            option: option.to_string(),
+            could_share,
+        }
+    }
+
     fn collision(outputs: &[(&str, OutputOrigin)]) -> Option<String> {
         let outputs: Vec<(PathBuf, OutputOrigin)> = outputs
             .iter()
@@ -1385,12 +1417,12 @@ mod tests {
 
     #[test]
     fn test_collision_bin_given_its_own_pattern_may_not_share_an_out_path() {
-        let bin = OutputOrigin::Bin("--unassigned".to_string());
+        let unassigned = bin("--unassigned", false);
         for out in [
             sample("a", None),
             OutputOrigin::Records("--out".to_string()),
         ] {
-            for (first, second) in [(&out, &bin), (&bin, &out)] {
+            for (first, second) in [(&out, &unassigned), (&unassigned, &out)] {
                 let error = collision(&[("o/a.fq", first.clone()), ("o/a.fq", second.clone())]);
                 assert_eq!(
                     error,
@@ -1404,11 +1436,47 @@ mod tests {
     }
 
     #[test]
+    fn test_collision_bin_that_could_take_the_out_pattern_is_told_how_to_share() {
+        let share = ", or give --unassigned the --out pattern itself to share the file";
+        let case =
+            "differ only in case, so they would be one file on a case-insensitive file system";
+        for (path, reason) in [
+            ("o//all.fq", "are the same file"),
+            ("o/./all.fq", "are the same file"),
+            ("o/all.fq/", "are the same file"),
+            ("o/ALL.fq", case),
+        ] {
+            let error = collision(&[
+                ("o/all.fq", sample("a", None)),
+                (path, bin("--unassigned", true)),
+            ]);
+            assert_eq!(
+                error,
+                Some(format!(
+                    "outputs \"o/all.fq\" (sample a) and \"{path}\" (--unassigned) {reason}; give \
+                     them distinct paths{share}"
+                ))
+            );
+        }
+        let error = collision(&[
+            ("o/lib.fq", bin("--remove grp", true)),
+            ("o/lib.fq", OutputOrigin::Records("--out".to_string())),
+        ]);
+        assert!(
+            error.as_deref().is_some_and(|error| error.ends_with(
+                "give them distinct paths, or give --remove grp the --out pattern itself to share \
+                 the file"
+            )),
+            "{error:?}"
+        );
+    }
+
+    #[test]
     fn test_collision_bins_given_their_own_patterns_share_one_writer() {
         assert_eq!(
             collision(&[
-                ("o/bins.fq", OutputOrigin::Bin("--unassigned".to_string())),
-                ("o/bins.fq", OutputOrigin::Bin("--remove grp".to_string())),
+                ("o/bins.fq", bin("--unassigned", false)),
+                ("o/bins.fq", bin("--remove grp", true)),
             ]),
             None
         );

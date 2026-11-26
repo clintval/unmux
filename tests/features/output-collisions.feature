@@ -58,19 +58,32 @@ Feature: Outputs that would be one file are refused
     Then the exit code is 1
     And stderr contains "outputs "o/a.fq" (sample a) and "./o/a.fq" (--unassigned) are the same file; give them distinct paths"
 
-  Scenario Outline: a bin that shares an --out file only once placeholders expand is refused
-    When I run `unmux reads.fq --pool lib --group bc={A=AAAAAAAA,T=TTTTTTTT} <outputs>`
+  Scenario Outline: a bin that shares a sample's own file only once %sample expands is refused
+    When I run `unmux reads.fq --pool lib --group bc={A=AAAAAAAA,T=TTTTTTTT} --sample a=bc::A --out o/%sample.fq <bin>`
     Then the exit code is 1
-    And stderr contains "outputs "<path>" (<out>) and "<path>" (<bin>) are the same file; give them distinct paths"
+    And stderr contains "outputs "o/a.fq" (sample a) and "o/a.fq" (<option>) are the same file; give them distinct paths"
+    And stderr does not contain "the --out pattern itself"
     And a file "o" does not exist
 
     Examples:
-      | outputs                                                   | path     | out      | bin            |
-      | --sample a=bc::A --out o/%sample.fq --unassigned o/a.fq   | o/a.fq   | sample a | --unassigned   |
-      | --sample a=bc::A --out o/%sample.fq --remove bc::T=o/a.fq | o/a.fq   | sample a | --remove bc::T |
-      | --sample a=bc::A --out o/%pool.fq --unassigned o/lib.fq   | o/lib.fq | sample a | --unassigned   |
-      | --sample a=bc::A --out o/lib.fq --unassigned o/%pool.fq   | o/lib.fq | sample a | --unassigned   |
-      | --out o/%pool.fq --remove bc::T=o/lib.fq                  | o/lib.fq | --out    | --remove bc::T |
+      | bin                   | option         |
+      | --unassigned o/a.fq   | --unassigned   |
+      | --remove bc::T=o/a.fq | --remove bc::T |
+
+  Scenario Outline: a bin given another path to the one --out file is refused with the way to share it
+    When I run `unmux reads.fq --pool lib --group bc={A=AAAAAAAA,T=TTTTTTTT} <outputs>`
+    Then the exit code is 1
+    And stderr contains "outputs "<out_path>" (<out>) and "<bin_path>" (<option>) are the same file; give them distinct paths, or give <option> the --out pattern itself to share the file"
+    And a file "o" does not exist
+
+    Examples:
+      | outputs                                                 | out_path | out      | bin_path   | option         |
+      | --sample a=bc::A --out o/%pool.fq --unassigned o/lib.fq | o/lib.fq | sample a | o/lib.fq   | --unassigned   |
+      | --sample a=bc::A --out o/lib.fq --unassigned o/%pool.fq | o/lib.fq | sample a | o/lib.fq   | --unassigned   |
+      | --out o/%pool.fq --remove bc::T=o/lib.fq                | o/lib.fq | --out    | o/lib.fq   | --remove bc::T |
+      | --sample a=bc::A --out o/all.fq --unassigned o//all.fq  | o/all.fq | sample a | o//all.fq  | --unassigned   |
+      | --sample a=bc::A --out o/all.fq --unassigned o/./all.fq | o/all.fq | sample a | o/./all.fq | --unassigned   |
+      | --sample a=bc::A --out o/all.fq --unassigned o/all.fq/  | o/all.fq | sample a | o/all.fq/  | --unassigned   |
 
   Scenario Outline: a bin given the --out pattern itself shares the --out file
     When I run `unmux reads.fq --pool lib --group bc={A=AAAAAAAA,T=TTTTTTTT} --sample a=bc::A <outputs>`

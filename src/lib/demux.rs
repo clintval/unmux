@@ -1005,11 +1005,19 @@ fn labeled_dests(
         }
     }
     // The `--unassigned` and `--remove` bins, which share the `--out` writer when given its pattern.
+    let could_share = plan.out.as_ref().is_some_and(|out| {
+        !(out.uses(Placeholder::Sample)
+            || out.uses(Placeholder::SubSample)
+            || out.uses(Placeholder::Ordinal))
+    });
     let bin = |pattern: &OutputPattern, option: String| {
         if plan.out.as_ref() == Some(pattern) {
             OutputOrigin::Records(option)
         } else {
-            OutputOrigin::Bin(option)
+            OutputOrigin::Bin {
+                option,
+                could_share,
+            }
         }
     };
     if let Some(pattern) = &plan.unassigned {
