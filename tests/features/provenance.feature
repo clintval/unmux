@@ -227,6 +227,20 @@ Feature: BAM/CRAM provenance headers and demux statistics
     Then the exit code is 0
     And the file "out.fq" contains "@r2"
 
+  Scenario: the pool read group is checked on stdout that a bin shares, but not on /dev/null
+    Given a file "in.sam" containing:
+      """
+      @HD	VN:1.6
+      r1	4	*	0	0	*	*	0	0	AAAAAAAACCCCGGGG	IIIIIIIIIIIIIIII
+      r2	4	*	0	0	*	*	0	0	TTTTTTTTGGCCATGC	IIIIIIIIIIIIIIII
+      """
+    When I run `unmux in.sam --pool s1 --group bc={A=AAAAAAAA,T=TTTTTTTT} --sample s1=bc::A --out - --unassigned -`
+    Then the exit code is 1
+    And stderr contains "--unassigned records would share read group "s1" with a sample on stdout; set --pool to another name"
+    # /dev/null keeps nothing, so its read groups are not checked.
+    When I run `unmux in.sam --pool s1 --group bc={A=AAAAAAAA,T=TTTTTTTT} --sample s1=bc::A --out /dev/null --unassigned /dev/null`
+    Then the exit code is 0
+
   Scenario: a pass-through FASTQ carries no read group (FASTX has no @RG concept)
     Given a file "reads.fq" containing:
       """

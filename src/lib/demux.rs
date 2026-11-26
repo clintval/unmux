@@ -1245,7 +1245,7 @@ impl DestinationList<'_> {
     fn add_bin(&mut self, path: Option<PathBuf>, option: &str) -> Result<usize> {
         let at = self.add(path)?;
         let dest = &mut self.list[at];
-        if !is_alignment_format(dest.format) {
+        if !is_alignment_format(dest.format) || is_dev_null(dest.path.as_deref()) {
             return Ok(at);
         }
         for (id, read_group) in self.default_header.read_groups() {
