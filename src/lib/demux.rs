@@ -4203,6 +4203,32 @@ mod tests {
     }
 
     #[test]
+    fn test_match_joins_the_corrected_form_of_a_grp_stream() {
+        // The observed ACGTACGA is corrected to ACGTACGT, which the exact cell join matches.
+        let dir = tempfile::tempdir().unwrap();
+        let input = write_file(dir.path(), "in.fq", b"@r\nACGTACGAGGGG\n+\nIIIIIIIIIIII\n");
+        let unassigned = dir.path().join("un.fq");
+        let mut args = base_args();
+        args.inputs = vec![format!("0={}", input.display())];
+        args.groups = vec![
+            "bc={x=ACGTACGT}".to_string(),
+            "bc::loc=0:0:8,dist=1".to_string(),
+            "cell={c1=ACGTACGT}".to_string(),
+            "cell::match=b".to_string(),
+        ];
+        args.extracts = vec!["b=@bc".to_string()];
+        args.sample_from_group = Some("cell".to_string());
+        args.out = Some(format!("{}/%sample.fq", dir.path().display()));
+        args.unassigned = Some(unassigned.display().to_string());
+        run_demux(args).unwrap();
+
+        let c1 = read_back(&dir.path().join("c1.fq"));
+        assert_eq!(c1.len(), 1, "the read routed to cell c1");
+        assert_eq!(c1[0].name, b"r");
+        assert!(read_back(&unassigned).is_empty(), "nothing unassigned");
+    }
+
+    #[test]
     fn test_corrected_by_default_in_tag_and_body() {
         // A matched keeplist `@grp` stream is error-corrected by default
         // (raw=false) everywhere it is emitted: both the SAM tag and the
