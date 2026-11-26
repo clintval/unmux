@@ -1614,6 +1614,111 @@ mod tests {
         );
     }
 
+    /// Write `fragments` as BAM or CRAM and read back each record's name (`*` when it has none)
+    /// and bases with noodles.
+    fn names_and_bases(
+        format: OutputFormat,
+        fragments: &[Vec<OutputRead>],
+    ) -> Vec<(String, String)> {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out");
+        let mut writer = OutputWriter::create(Some(&out), format, 0).unwrap();
+        for fragment in fragments {
+            writer.write_fragment(fragment).unwrap();
+        }
+        writer.finish().unwrap();
+
+        let file = File::open(&out).unwrap();
+        let records: Vec<RecordBuf> = if format == OutputFormat::Cram {
+            let mut reader = cram::io::Reader::new(file);
+            let header = reader.read_header().unwrap();
+            reader.records(&header).collect::<io::Result<_>>().unwrap()
+        } else {
+            let mut reader = bam::io::Reader::new(file);
+            let header = reader.read_header().unwrap();
+            reader
+                .record_bufs(&header)
+                .collect::<io::Result<_>>()
+                .unwrap()
+        };
+        records
+            .iter()
+            .map(|record| {
+                let name = record
+                    .name()
+                    .map_or("*".to_string(), |name| name.to_string());
+                let bases = String::from_utf8(record.sequence().as_ref().to_vec()).unwrap();
+                (name, bases)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_cram_keeps_each_name_with_its_record_around_nameless_records() {
+        let text = b"@HD\tVN:1.6\n*\t4\t*\t0\t0\t*\t*\t0\t0\tACGT\t*\n";
+        let mut reader = sam::io::Reader::new(&text[..]);
+        let header = reader.read_header().unwrap();
+        let mut record = RecordBuf::default();
+        reader.read_record_buf(&header, &mut record).unwrap();
+        let kept = Alignment::Record(record);
+        let quals = [30; 4];
+        let fragments = [
+            vec![output_read(b"n1", b"AAAA", Some(&quals), None)],
+            vec![output_read(b"", b"CCCC", Some(&quals), None)],
+            vec![OutputRead {
+                alignment: Some(&kept),
+                ..output_read(b"", b"", None, None)
+            }],
+            vec![output_read(b"n3", b"GGGG", Some(&quals), None)],
+            vec![output_read(b"n4", b"TTTT", Some(&quals), None)],
+        ];
+        let expected = [
+            ("n1", "AAAA"),
+            ("*", "CCCC"),
+            ("*", "ACGT"),
+            ("n3", "GGGG"),
+            ("n4", "TTTT"),
+        ]
+        .map(|(name, bases)| (name.to_string(), bases.to_string()));
+        assert_eq!(names_and_bases(OutputFormat::Bam, &fragments), expected);
+        assert_eq!(names_and_bases(OutputFormat::Cram, &fragments), expected);
+    }
+
+    #[test]
+    fn test_cram_refuses_the_read_names_bam_refuses_with_the_same_error() {
+        let write = |format: OutputFormat, name: &[u8]| {
+            let dir = tempfile::tempdir().unwrap();
+            let out = dir.path().join("out");
+            let mut writer = OutputWriter::create(Some(&out), format, 0).unwrap();
+            writer
+                .write_fragment(&[output_read(name, b"ACGT", Some(&[30; 4]), None)])
+                .map_err(|e| format!("{e:#}"))
+        };
+        let longest = [b'r'; 254];
+        let too_long = [b'r'; 255];
+        assert!(write(OutputFormat::Cram, &longest).is_ok());
+        assert_eq!(
+            write(OutputFormat::Cram, &too_long).unwrap_err(),
+            "failed to write SAM/BAM/CRAM record: invalid name: invalid length: expected 1 <= n <= 254, got 256"
+        );
+        for name in [
+            &longest[..],
+            &too_long,
+            &[b'r'; 300],
+            b"r@1",
+            b"r 1",
+            b"*",
+            "r\u{e9}".as_bytes(),
+        ] {
+            assert_eq!(
+                write(OutputFormat::Cram, name),
+                write(OutputFormat::Bam, name),
+                "{}",
+                String::from_utf8_lossy(name)
+            );
+        }
+    }
+
     #[test]
     fn test_fill_missing_qualities_needs_bases_and_no_qualities() {
         use std::borrow::Cow;

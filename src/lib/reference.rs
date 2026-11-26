@@ -979,9 +979,14 @@ mod tests {
 
     /// Decode a test CRAM against `reference`, as [`decode_all`] does.
     fn decode_with(name: &str, reference: Option<Reference>) -> (Vec<RecordBuf>, usize) {
-        let mut reader = cram::io::Reader::new(Recorder::new(File::open(test_data(name)).unwrap()));
+        decode_file(&test_data(name), reference)
+    }
+
+    /// Decode the CRAM at `path` against `reference`, as [`decode_all`] does.
+    fn decode_file(path: &Path, reference: Option<Reference>) -> (Vec<RecordBuf>, usize) {
+        let mut reader = cram::io::Reader::new(Recorder::new(File::open(path).unwrap()));
         let header = reader.read_header().unwrap();
-        let decoder = CramDecoder::new(reference, &test_data(name), &header);
+        let decoder = CramDecoder::new(reference, path, &header);
         let mut container = cram::io::reader::Container::default();
         let mut records = Vec::new();
         let mut most = 0;
@@ -994,6 +999,39 @@ mod tests {
             most = most.max(decoder.read().unwrap().len());
         }
         (records, most)
+    }
+
+    #[test]
+    fn test_the_name_star_decodes_as_a_missing_name() {
+        use noodles::sam::alignment::io::Write as _;
+        use noodles::sam::alignment::record::Flags;
+        use noodles::sam::alignment::record_buf::{QualityScores, Sequence};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("star.cram");
+        let header = sam::Header::default();
+        let mut writer = cram::io::Writer::new(File::create(&path).unwrap());
+        writer.write_header(&header).unwrap();
+        for name in ["n1", "*", "n3"] {
+            let record = RecordBuf::builder()
+                .set_name(name)
+                .set_flags(Flags::UNMAPPED)
+                .set_sequence(Sequence::from(b"ACGT".to_vec()))
+                .set_quality_scores(QualityScores::from(vec![30; 4]))
+                .build();
+            writer.write_alignment_record(&header, &record).unwrap();
+        }
+        writer.try_finish(&header).unwrap();
+
+        let (records, _) = decode_file(&path, None);
+        let names: Vec<Option<String>> = records
+            .iter()
+            .map(|record| record.name().map(ToString::to_string))
+            .collect();
+        assert_eq!(
+            names,
+            [Some("n1".to_string()), None, Some("n3".to_string())]
+        );
     }
 
     #[test]
