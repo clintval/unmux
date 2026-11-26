@@ -3516,16 +3516,19 @@ struct Body {
     alignment: Option<Alignment>,
 }
 
-/// SAM tags tied to a read's exact bases: modifications, per-base qualities, kinetics, moves.
-const PER_BASE_TAGS: [[u8; 2]; 25] = [
+/// SAM tags tied to a read's exact bases or pulses: modifications, qualities, kinetics, moves.
+const PER_BASE_TAGS: [[u8; 2]; 38] = [
     *b"MM", *b"ML", *b"MN", *b"OQ", *b"BQ", *b"E2", *b"U2", *b"CQ", *b"CS", *b"FZ", *b"PT", *b"BI",
     *b"BD", *b"ip", *b"pw", *b"fi", *b"fp", *b"ri", *b"rp", *b"dq", *b"dt", *b"iq", *b"mq", *b"sq",
-    *b"mv",
+    *b"sa", *b"sx", *b"pc", *b"pq", *b"pg", *b"pa", *b"pm", *b"pd", *b"px", *b"pe", *b"sf", *b"bs",
+    *b"pb", *b"mv",
 ];
+
+const _: () = assert!(PER_BASE_TAGS.len() <= u64::BITS as usize);
 
 /// A set of [`PER_BASE_TAGS`], one bit per tag.
 #[derive(Clone, Copy, Default)]
-struct PerBaseTags(u32);
+struct PerBaseTags(u64);
 
 impl PerBaseTags {
     fn is_empty(self) -> bool {
