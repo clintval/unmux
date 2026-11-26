@@ -2071,6 +2071,17 @@ mod tests {
     }
 
     #[test]
+    fn test_read_sam_empty_read_has_empty_qualities() {
+        let sam = b"@HD\tVN:1.6\n\
+                    trimmed\t4\t*\t0\t0\t*\t*\t0\t0\t*\t*\n\
+                    unscored\t4\t*\t0\t0\t*\t*\t0\t0\tACGT\t*\n";
+        let file = temp_with(sam);
+        let fragments = read_all(&file);
+        assert_eq!(fragments[0].records[0].quals.as_deref(), Some(&[][..]));
+        assert_eq!(fragments[1].records[0].quals, None);
+    }
+
+    #[test]
     fn test_read_cram_round_trip_reverse_and_secondary() {
         use noodles::sam::alignment::io::Write as _;
         use noodles::sam::alignment::record::Flags;
