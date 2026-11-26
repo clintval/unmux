@@ -1,7 +1,7 @@
 Feature: Edge cases of an aligned read-group split
   Regression cases for the alignment-preserving `@RG` split: odd `@PG` chains,
-  secondary and supplementary records next to FASTX outputs, `--tag` bindings
-  that would overwrite kept tags, and records CRAM output cannot hold.
+  FASTX outputs beside SAM/BAM ones, `--tag` bindings that would overwrite kept
+  tags, and records CRAM output cannot hold.
 
   Scenario: a dangling @PG PP link does not crash the split
     Given a file "in.sam" containing:
@@ -47,24 +47,143 @@ Feature: Edge cases of an aligned read-group split
     And the file "out/rg1.sam" contains "@PG	ID:unmux.1	PN:unmux"
     And the file "out/rg1.sam" contains "PP:unmux-x"
 
-  Scenario: FASTQ outputs stay primary-only when only a bin is SAM/BAM/CRAM
+  Scenario Outline: FASTX beside SAM/BAM is refused before any file is written: <outputs>
     Given a file "in.sam" containing:
       """
-      @HD	VN:1.6	SO:coordinate
+      @HD	VN:1.6	SO:unsorted	GO:query
       @SQ	SN:chr1	LN:1000
       @RG	ID:rg1	SM:sampleA
-      p1	0	chr1	100	60	8M	*	0	0	AAAAAAAA	IIIIIIII	RG:Z:rg1
-      p1	256	chr1	300	0	8M	*	0	0	*	*	RG:Z:rg1
-      p1	2048	chr1	500	9	4H4M	*	0	0	AAAA	IIII	RG:Z:rg1
+      q1	99	chr1	100	60	8M	=	150	58	ACGTACGT	ABCDEFGH	RG:Z:rg1
+      q1	147	chr1	150	60	8M	=	100	-58	GGGGTTTT	HGFEDCBA	RG:Z:rg1
       """
-    When I run `unmux in.sam --group rg=@RG --sample-from-group rg --out out/%sample.fq --unassigned out/unassigned.bam`
+    When I run `unmux in.sam --group rg=@RG --sample-from-group rg <outputs>`
+    Then the exit code is 1
+    And stderr contains "this aligned @RG split cannot write both SAM/BAM, which keeps each record whole, and FASTX, which pairs mates: it writes SAM/BAM to <sam_bam> and FASTX to <fastx>; make every output SAM/BAM, or every output FASTX"
+    And the directory "." holds exactly "in.sam"
+
+    Examples:
+      | outputs                                                                  | sam_bam                                            | fastx                          |
+      | --out out/%sample.R%ordinal.fq --unassigned out/un.bam                   | "out/un.bam" (--unassigned)                        | "out/rg1.R1.fq" (--out)        |
+      | --out out/%sample.sam --unassigned out/un.fq                             | "out/rg1.sam" (--out)                              | "out/un.fq" (--unassigned)     |
+      | --out out/%sample.bam --remove rg=out/removed.fq                         | "out/rg1.bam" (--out)                              | "out/removed.fq" (--remove rg) |
+      | --out out/%sample.sam --unassigned out/un.bam --remove rg=out/removed.fa | "out/rg1.sam" (--out), "out/un.bam" (--unassigned) | "out/removed.fa" (--remove rg) |
+      | --unassigned out/un.fq                                                   | stdout                                             | "out/un.fq" (--unassigned)     |
+      | --out - --unassigned out/un.fq                                           | stdout                                             | "out/un.fq" (--unassigned)     |
+      | --out out/%sample.R%ordinal.fq --unassigned -                            | stdout                                             | "out/rg1.R1.fq" (--out)        |
+
+  Scenario: FASTQ outputs and a FASTQ bin pair the mates and keep primary records only
+    Given a file "in.sam" containing:
+      """
+      @HD	VN:1.6	SO:unsorted	GO:query
+      @SQ	SN:chr1	LN:1000
+      @RG	ID:rg1	SM:sampleA
+      q1	99	chr1	100	60	8M	=	150	58	ACGTACGT	ABCDEFGH	RG:Z:rg1
+      q1	355	chr1	300	0	8M	=	150	0	*	*	RG:Z:rg1
+      q1	2145	chr1	500	9	4H4M	=	150	0	ACGT	ABCD	RG:Z:rg1
+      q1	147	chr1	150	60	8M	=	100	-58	GGGGTTTT	HGFEDCBA	RG:Z:rg1
+      q2	77	*	0	0	*	*	0	0	CCCCAAAA	IIIIIIII
+      q2	141	*	0	0	*	*	0	0	TTTTGGGG	JJJJJJJJ
+      """
+    When I run `unmux in.sam --group rg=@RG --sample-from-group rg --out out/%sample.R%ordinal.fq --unassigned out/un.fq`
     Then the exit code is 0
-    And the file "out/rg1.fq" is:
+    And the file "out/rg1.R1.fq" is:
       """
-      @p1 RG:Z:rg1
-      AAAAAAAA
+      @q1 RG:Z:rg1
+      ACGTACGT
+      +
+      ABCDEFGH
+      """
+    And the file "out/rg1.R2.fq" is:
+      """
+      @q1 RG:Z:rg1
+      AAAACCCC
+      +
+      ABCDEFGH
+      """
+    And the file "out/un.fq" is:
+      """
+      @q2
+      CCCCAAAA
       +
       IIIIIIII
+      @q2
+      TTTTGGGG
+      +
+      JJJJJJJJ
+      """
+
+  Scenario: A bin sent to /dev/null beside FASTQ outputs is not SAM/BAM, so the mates stay paired
+    Given a file "in.sam" containing:
+      """
+      @HD	VN:1.6	SO:unsorted	GO:query
+      @SQ	SN:chr1	LN:1000
+      @RG	ID:rg1	SM:sampleA
+      q1	99	chr1	100	60	8M	=	150	58	ACGTACGT	ABCDEFGH	RG:Z:rg1
+      q1	147	chr1	150	60	8M	=	100	-58	GGGGTTTT	HGFEDCBA	RG:Z:rg1
+      q2	77	*	0	0	*	*	0	0	CCCCAAAA	IIIIIIII
+      q2	141	*	0	0	*	*	0	0	TTTTGGGG	JJJJJJJJ
+      """
+    When I run `unmux in.sam --group rg=@RG --sample-from-group rg --out out/%sample.R%ordinal.fq --unassigned /dev/null`
+    Then the exit code is 0
+    And the file "out/rg1.R2.fq" is:
+      """
+      @q1 RG:Z:rg1
+      AAAACCCC
+      +
+      ABCDEFGH
+      """
+
+  Scenario: An --out sent to /dev/null beside a FASTQ bin is not SAM/BAM, so the bin holds pairs
+    Given a file "in.sam" containing:
+      """
+      @HD	VN:1.6	SO:unsorted	GO:query
+      @SQ	SN:chr1	LN:1000
+      @RG	ID:rg1	SM:sampleA
+      q1	99	chr1	100	60	8M	=	150	58	ACGTACGT	ABCDEFGH	RG:Z:rg1
+      q1	147	chr1	150	60	8M	=	100	-58	GGGGTTTT	HGFEDCBA	RG:Z:rg1
+      q2	77	*	0	0	*	*	0	0	CCCCAAAA	IIIIIIII
+      q2	141	*	0	0	*	*	0	0	TTTTGGGG	JJJJJJJJ
+      """
+    When I run `unmux in.sam --group rg=@RG --sample-from-group rg --out /dev/null --unassigned out/un.fq`
+    Then the exit code is 0
+    And the file "out/un.fq" is:
+      """
+      @q2
+      CCCCAAAA
+      +
+      IIIIIIII
+      @q2
+      TTTTGGGG
+      +
+      JJJJJJJJ
+      """
+
+  Scenario: SAM and BAM outputs together keep every record whole
+    Given a file "in.sam" containing:
+      """
+      @HD	VN:1.6	SO:unsorted	GO:query
+      @SQ	SN:chr1	LN:1000
+      @RG	ID:rg1	SM:sampleA
+      q1	99	chr1	100	60	8M	=	150	58	ACGTACGT	ABCDEFGH	RG:Z:rg1
+      q1	355	chr1	300	0	8M	=	150	0	*	*	RG:Z:rg1
+      q1	2145	chr1	500	9	4H4M	=	150	0	ACGT	ABCD	RG:Z:rg1
+      q1	147	chr1	150	60	8M	=	100	-58	GGGGTTTT	HGFEDCBA	RG:Z:rg1
+      q2	77	*	0	0	*	*	0	0	CCCCAAAA	IIIIIIII
+      q2	141	*	0	0	*	*	0	0	TTTTGGGG	JJJJJJJJ
+      """
+    When I run `unmux in.sam --group rg=@RG --sample-from-group rg --out out/%sample.sam --unassigned out/un.bam`
+    Then the exit code is 0
+    And the records of "out/rg1.sam" are:
+      """
+      q1	99	chr1	100	60	8M	=	150	58	ACGTACGT	ABCDEFGH	RG:Z:rg1
+      q1	355	chr1	300	0	8M	=	150	0	*	*	RG:Z:rg1
+      q1	2145	chr1	500	9	4H4M	=	150	0	ACGT	ABCD	RG:Z:rg1
+      q1	147	chr1	150	60	8M	=	100	-58	GGGGTTTT	HGFEDCBA	RG:Z:rg1
+      """
+    And the records of "out/un.bam" are:
+      """
+      q2	77	*	0	0	*	*	0	0	CCCCAAAA	IIIIIIII
+      q2	141	*	0	0	*	*	0	0	TTTTGGGG	JJJJJJJJ
       """
 
   Scenario: mates next to each other still pass through one record at a time, in input order

@@ -17,7 +17,7 @@
 //! parallelized while the writer stays on the consumer thread.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use std::fs::File;
 use std::io::BufWriter;
@@ -1139,6 +1139,7 @@ fn alignment_formats(
 ) -> Result<Vec<OutputFormat>> {
     let mut formats: Vec<OutputFormat> = out_destinations(plan, routing, pool, input_formats)?
         .into_iter()
+        .filter(|(path, _, _)| !is_dev_null(path.as_deref()))
         .map(|(_, _, format)| format)
         .collect();
     if plan.out.is_none() {
@@ -1155,7 +1156,9 @@ fn alignment_formats(
             ..Default::default()
         };
         let path = resolve_pattern(pattern, &ctx);
-        formats.push(output_format(path.as_deref(), input_formats)?);
+        if !is_dev_null(path.as_deref()) {
+            formats.push(output_format(path.as_deref(), input_formats)?);
+        }
     }
     formats.retain(|format| {
         matches!(
@@ -1257,6 +1260,85 @@ fn passes_alignments_through(
         );
     }
     Ok(true)
+}
+
+/// Whether `path` discards what is written to it, so its format does not matter.
+fn is_dev_null(path: Option<&Path>) -> bool {
+    path == Some(Path::new("/dev/null"))
+}
+
+/// Refuse FASTX outputs in a run that keeps aligned records whole for its SAM/BAM outputs.
+fn refuse_mixed_outputs(
+    plan: &DemuxPlan,
+    routing: &Routing,
+    pool: &str,
+    input_formats: &[SniffedFormat],
+) -> Result<()> {
+    use crate::grammar::RemoveSelector;
+
+    let mut outputs = Vec::new();
+    match &plan.out {
+        Some(pattern) => {
+            for target in routing.targets() {
+                let ctx = PathContext {
+                    pool,
+                    sample: Some(&target.sample),
+                    sub_sample: target.sub_sample.as_deref(),
+                    ordinal: Some(1),
+                    source: None,
+                };
+                outputs.push(("--out".to_string(), resolve_pattern(pattern, &ctx)));
+            }
+        }
+        None => outputs.push(("--out".to_string(), None)),
+    }
+    let bin = PathContext {
+        pool,
+        source: Some(0),
+        ..Default::default()
+    };
+    if let Some(pattern) = &plan.unassigned {
+        outputs.push(("--unassigned".to_string(), resolve_pattern(pattern, &bin)));
+    }
+    for rule in &plan.remove {
+        if let Some(pattern) = &rule.pattern {
+            let option = match &rule.selector {
+                RemoveSelector::Group(group) => format!("--remove {group}"),
+                RemoveSelector::GroupTag { group, id } => format!("--remove {group}::{id}"),
+            };
+            outputs.push((option, resolve_pattern(pattern, &bin)));
+        }
+    }
+    let mut seen = HashSet::new();
+    let (mut alignments, mut fastx) = (Vec::new(), Vec::new());
+    for (option, path) in outputs {
+        if is_dev_null(path.as_deref()) {
+            continue;
+        }
+        let keeps_whole = is_alignment_format(output_format(path.as_deref(), input_formats)?);
+        if !seen.insert((keeps_whole, option.clone())) {
+            continue;
+        }
+        let output = match path {
+            Some(path) => format!("\"{}\" ({option})", path.display()),
+            None => "stdout".to_string(),
+        };
+        if keeps_whole {
+            alignments.push(output);
+        } else {
+            fastx.push(output);
+        }
+    }
+    if !fastx.is_empty() {
+        bail!(
+            "this aligned @RG split cannot write both SAM/BAM, which keeps each record whole, and \
+             FASTX, which pairs mates: it writes SAM/BAM to {} and FASTX to {}; make every output \
+             SAM/BAM, or every output FASTX",
+            alignments.join(", "),
+            fastx.join(", ")
+        );
+    }
+    Ok(())
 }
 
 /// A validated two-character SAM tag name as bytes.
@@ -1482,6 +1564,7 @@ fn run_engine(plan: &DemuxPlan, command_line: Option<&str>) -> Result<()> {
         &alignment_formats,
     )?;
     if keep_alignments {
+        refuse_mixed_outputs(plan, &routing, &pool, &input_formats)?;
         log::info!(
             "input is aligned (@SQ present); records pass through unchanged with their alignments"
         );

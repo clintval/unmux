@@ -5,8 +5,8 @@ Feature: Split an aligned input by read group, keeping alignments
   the input header (`@HD` with its sort order, `@SQ`, `@PG`, `@CO`) with only
   its own `@RG` lines and an unmux `@PG`, and records keep their input order.
   A `--template`, a `--tag`, a sequence-matching group, aligned CRAM output,
-  and several inputs are refused. For unmapped records, run `samtools reset`
-  on the outputs.
+  FASTX outputs beside SAM/BAM ones, and several inputs are refused. For
+  unmapped records, run `samtools reset` on the outputs.
 
   Background:
     Given a file "in.sam" containing:
