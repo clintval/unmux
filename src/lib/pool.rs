@@ -12,7 +12,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
 
-use anyhow::{anyhow, Context, Error, Result};
+use anyhow::{anyhow, Error, Result};
 
 /// The stages a [`run`] drives. The pool reads each stream on one worker at a
 /// time and merges and finishes on one worker at a time; the other stages run
@@ -289,10 +289,13 @@ impl<S: Stages> Pool<'_, S> {
 
     /// Fail the run and wake every worker, as a worker unwinds from a panic.
     fn abandon(&self) {
+        self.fail(anyhow!("internal error: a worker thread panicked"));
+    }
+
+    /// Stop every worker with `error`, unless the run has already failed.
+    fn fail(&self, error: anyhow::Error) {
         let mut state = self.lock();
-        state
-            .error
-            .get_or_insert_with(|| anyhow!("internal error: a worker thread panicked"));
+        state.error.get_or_insert(error);
         self.wake.notify_all();
     }
 }
@@ -340,7 +343,7 @@ pub(crate) fn run<S: Stages>(stages: &S, workers: usize) -> Result<()> {
     std::thread::scope(|scope| -> Result<()> {
         for index in 0..workers {
             let pool = &pool;
-            std::thread::Builder::new()
+            let spawned = std::thread::Builder::new()
                 .name(format!("unmux-worker-{index}"))
                 .stack_size(WORKER_STACK_BYTES)
                 .spawn_scoped(scope, move || {
@@ -349,8 +352,11 @@ pub(crate) fn run<S: Stages>(stages: &S, workers: usize) -> Result<()> {
                     while let Some(job) = pool.next_job() {
                         pool.run(&mut worker, job);
                     }
-                })
-                .context("failed to start a worker thread")?;
+                });
+            if let Err(error) = spawned {
+                pool.fail(Error::new(error).context("failed to start a worker thread"));
+                break;
+            }
         }
         Ok(())
     })?;
