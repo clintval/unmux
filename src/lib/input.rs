@@ -2480,6 +2480,25 @@ mod tests {
     }
 
     #[test]
+    fn test_read_fastq_lifts_floats_in_the_sam_grammar() {
+        for (text, expected) in [
+            ("1.5", 1.5),
+            ("-2", -2.0),
+            ("+.5", 0.5),
+            ("1E5", 1e5),
+            ("-1.5e-3", -1.5e-3),
+            ("3e+2", 300.0),
+            ("1e-50", 0.0),
+            ("340000000000000000000000000000000000000", 3.4e38),
+        ] {
+            let data = fastq_comment_tags(&format!("xf:f:{text}\txF:B:f,{text}"));
+            assert_eq!(data.get(b"xf"), Some(&Value::Float(expected)), "{text}");
+            let array = Value::Array(Array::Float(vec![expected]));
+            assert_eq!(data.get(b"xF"), Some(&array), "{text}");
+        }
+    }
+
+    #[test]
     fn test_read_fastq_lifts_hex_and_array_tags_of_every_subtype() {
         use noodles::sam::alignment::record_buf::data::field::value::Array;
         let data = fastq_comment_tags(
@@ -2536,7 +2555,21 @@ mod tests {
             "xh:H:cafe",
             "xa:A:ab",
             "xa:A:",
+            "xa:A:\u{1}",
+            "CO:Z:café",
+            "CO:Z:a\u{1}b",
+            "CO:Z:\u{7f}",
             "xf:f:abc",
+            "xf:f:nan",
+            "xf:f:NaN",
+            "xf:f:inf",
+            "xf:f:-inf",
+            "xf:f:1e40",
+            "xf:f:1.",
+            "xf:f:1e",
+            "xF:B:f,1.5,nan",
+            "xF:B:f,1e40",
+            "xF:B:f,1.",
         ] {
             let tag = &field[..4];
             for (kind, text) in [

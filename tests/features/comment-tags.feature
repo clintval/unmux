@@ -144,3 +144,6 @@ Feature: Lifting SAM tags from FASTX read-name comments
       | ML:B:C,1,x       | ML:B |
       | ML:B:Q,1         | ML:B |
       | xh:H:CAF         | xh:H |
+      | CO:Z:café        | CO:Z |
+      | xf:f:nan         | xf:f |
+      | xf:f:1e40        | xf:f |
