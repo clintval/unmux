@@ -151,8 +151,8 @@ fn sniff_from_extension(path: &Path) -> SniffedFormat {
 
 /// Open an input source: a file, or stdin when `path` is `-`. The returned
 /// reader is a 1 MiB [`BufReader`], large enough to hold any single BGZF block
-/// plus headroom for the format peek, and is `Send` so it can move to the
-/// read-ahead thread. stdin uses the [`std::io::Stdin`] handle (which is
+/// plus headroom for the format peek, and is `Send` so any worker can read it.
+/// stdin uses the [`std::io::Stdin`] handle (which is
 /// `Send + 'static`, unlike a borrowed `StdinLock`); only one `-` input is
 /// allowed (enforced by the grammar), so holding the process-wide stdin is
 /// unambiguous.
@@ -520,7 +520,7 @@ fn raw_bam_name(raw: &[u8]) -> &[u8] {
 }
 
 /// One input record as read, before decoding. A BAM record stays raw so its
-/// decode runs on the matcher workers instead of the single read-ahead thread.
+/// decode runs on the workers that match it, in parallel, not as it is read.
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)] // boxing would add an allocation per FASTX record
 pub enum PendingRecord {

@@ -17,10 +17,12 @@ pub mod iupac;
 pub mod matcher;
 pub mod metrics;
 pub mod output;
+mod pool;
 pub mod qc;
 pub mod readgroup;
 pub mod reference;
 mod reference_check;
+mod sink;
 pub mod tags;
 pub mod writer;
 

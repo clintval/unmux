@@ -92,6 +92,44 @@ impl Metrics {
         }
     }
 
+    /// An empty tally over `targets` fan-out targets, for one batch of records
+    /// to add to the metrics of the run with [`Metrics::absorb`].
+    pub fn tally(targets: usize) -> Self {
+        let mut tally = Self::new(String::new(), &[]);
+        tally.per_target = vec![TargetTally::default(); targets];
+        tally
+    }
+
+    /// Add the counts of `batch`, a [`Metrics::tally`] over the same targets.
+    pub fn absorb(&mut self, batch: &Self) {
+        for (tally, more) in self.per_target.iter_mut().zip(&batch.per_target) {
+            tally.reads += more.reads;
+            tally.denominator_bases += more.denominator_bases;
+            tally.unextracted_bases += more.unextracted_bases;
+        }
+        self.total += batch.total;
+        self.pass_through += batch.pass_through;
+        self.unassigned += batch.unassigned;
+        for (reason, reads) in &batch.unassigned_by_reason {
+            *self.unassigned_by_reason.entry(reason.clone()).or_default() += reads;
+        }
+        self.removed += batch.removed;
+        self.non_primary += batch.non_primary;
+        self.retain_bases(
+            batch.retained_denominator_bases,
+            batch.retained_unextracted_bases,
+        );
+        let inputs = batch.input_len_sums.len();
+        if self.input_len_sums.len() < inputs {
+            self.input_len_sums.resize(inputs, 0);
+            self.input_len_counts.resize(inputs, 0);
+        }
+        for input in 0..inputs {
+            self.input_len_sums[input] += batch.input_len_sums[input];
+            self.input_len_counts[input] += batch.input_len_counts[input];
+        }
+    }
+
     /// Count one processed fragment (every record, before routing).
     pub fn record_processed(&mut self) {
         self.total += 1;
