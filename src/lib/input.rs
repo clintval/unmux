@@ -373,6 +373,97 @@ impl BufRead for CheckedBgzf {
     }
 }
 
+/// The empty block that ends a well-formed BGZF stream.
+const BGZF_EOF: [u8; 28] = [
+    0x1f, 0x8b, 0x08, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0x06, 0x00, 0x42, 0x43, 0x02, 0x00,
+    0x1b, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
+/// The length of a BGZF block header, through its `BSIZE` field.
+const BGZF_HEADER: usize = 18;
+
+/// Whether `bytes` start with a BGZF block header.
+fn is_bgzf(bytes: &[u8]) -> bool {
+    bytes.len() >= BGZF_HEADER && bytes[..4] == BGZF_EOF[..4] && bytes[10..16] == BGZF_EOF[10..16]
+}
+
+/// A BGZF input's compressed bytes, checked for a cut inside a block and for the closing EOF block.
+struct BgzfSource<R> {
+    inner: R,
+    path: PathBuf,
+    /// The current block's first bytes, enough to hold its header or an EOF block.
+    block: [u8; BGZF_EOF.len()],
+    block_read: usize,
+    block_len: usize,
+    ends_with_eof_block: bool,
+    all_bgzf: bool,
+    warned: bool,
+}
+
+impl<R> BgzfSource<R> {
+    fn new(inner: R, path: &Path) -> Self {
+        Self {
+            inner,
+            path: path.to_path_buf(),
+            block: [0; BGZF_EOF.len()],
+            block_read: 0,
+            block_len: BGZF_HEADER,
+            ends_with_eof_block: false,
+            all_bgzf: true,
+            warned: false,
+        }
+    }
+
+    /// Follow the block boundaries through `bytes`, the next bytes of the stream.
+    fn track(&mut self, mut bytes: &[u8]) {
+        while self.all_bgzf && !bytes.is_empty() {
+            let end = if self.block_read < BGZF_HEADER {
+                BGZF_HEADER
+            } else {
+                self.block_len
+            };
+            let n = (end - self.block_read).min(bytes.len());
+            let start = self.block_read.min(self.block.len());
+            let kept = n.min(self.block.len() - start);
+            self.block[start..start + kept].copy_from_slice(&bytes[..kept]);
+            self.block_read += n;
+            bytes = &bytes[n..];
+            if self.block_read == BGZF_HEADER {
+                self.all_bgzf = is_bgzf(&self.block);
+                let size = u16::from_le_bytes([self.block[16], self.block[17]]);
+                self.block_len = (usize::from(size) + 1).max(BGZF_HEADER);
+            }
+            if self.block_read == self.block_len {
+                self.ends_with_eof_block = self.block == BGZF_EOF;
+                self.block_read = 0;
+            }
+        }
+    }
+}
+
+impl<R: Read> Read for BgzfSource<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.track(&buf[..n]);
+        if n == 0 && !buf.is_empty() && self.all_bgzf {
+            if self.block_read > 0 {
+                return Err(truncated(
+                    &self.path,
+                    "BGZF stream ends partway through a block",
+                ));
+            }
+            if !self.ends_with_eof_block && !self.warned {
+                self.warned = true;
+                log::warn!(
+                    "the BGZF EOF marker is absent from {}; the input may be truncated",
+                    self.path.display()
+                );
+            }
+        }
+        Ok(n)
+    }
+}
+
 /// Read one raw BAM record, `block_size` prefix included, or `None` at end of
 /// input. Rejects a record too short to hold its fixed fields and read name.
 fn read_raw_bam(reader: &mut dyn BufRead) -> Result<Option<Vec<u8>>> {
@@ -975,10 +1066,40 @@ fn kept_alignment(record: RecordBuf) -> InputRecord {
     input
 }
 
+/// The error for an input at `path` whose compressed stream is `cut` short.
+fn truncated(path: &Path, cut: &str) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!("{} is truncated: its {cut}", path.display()),
+    )
+}
+
+/// A gzip decoder that reports a stream cut short as truncated, not as a clean end of file.
+struct CheckedGzip<R> {
+    inner: R,
+    path: PathBuf,
+}
+
+impl<R: Read> Read for CheckedGzip<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.inner.read(buf).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                truncated(&self.path, "gzip stream ends partway through a member")
+            } else {
+                e
+            }
+        })
+    }
+}
+
 /// Wrap a sniffed text stream for reading, transparently decoding a plain-gzip
 /// layer. BAM is BGZF and decodes inside its own reader, so it never passes
 /// through here.
-fn text_bufread(reader: Box<dyn BufRead + Send>, gzipped: bool) -> Box<dyn BufRead + Send> {
+fn text_bufread(
+    path: &Path,
+    reader: Box<dyn BufRead + Send>,
+    gzipped: bool,
+) -> Box<dyn BufRead + Send> {
     if gzipped {
         // Size the decoded-stream buffer the noodles parser refills from to 1
         // MiB (matching the raw file BufReader), not the 8 KiB stdlib-class
@@ -986,7 +1107,10 @@ fn text_bufread(reader: Box<dyn BufRead + Send>, gzipped: bool) -> Box<dyn BufRe
         // forces many short refills of the parser over the decode stream.
         Box::new(BufReader::with_capacity(
             1024 * 1024,
-            flate2::bufread::MultiGzDecoder::new(reader),
+            CheckedGzip {
+                inner: flate2::bufread::MultiGzDecoder::new(reader),
+                path: path.to_path_buf(),
+            },
         ))
     } else {
         reader
@@ -1019,21 +1143,24 @@ pub fn decode_shares(
 /// `decode_threads`, BAM inflates and CRAM decodes on that many workers.
 fn open_format_reader(
     path: &Path,
-    (format, gzipped, reader): (SniffedFormat, bool, Box<dyn BufRead + Send>),
+    (format, gzipped, mut reader): (SniffedFormat, bool, Box<dyn BufRead + Send>),
     reference: Option<&Reference>,
     decode_threads: Option<NonZero<usize>>,
 ) -> Result<FormatReader> {
+    if gzipped && is_bgzf(reader.fill_buf()?) {
+        reader = Box::new(BufReader::new(BgzfSource::new(reader, path)));
+    }
     let format_reader = match format {
         SniffedFormat::Fastq => FormatReader::Fastq {
-            reader: fastq::io::Reader::new(text_bufread(reader, gzipped)),
+            reader: fastq::io::Reader::new(text_bufread(path, reader, gzipped)),
             record: fastq::Record::default(),
         },
         SniffedFormat::Fasta => FormatReader::Fasta {
-            reader: fasta::io::Reader::new(text_bufread(reader, gzipped)),
+            reader: fasta::io::Reader::new(text_bufread(path, reader, gzipped)),
             definition: String::new(),
         },
         SniffedFormat::Sam => {
-            let mut reader = sam::io::Reader::new(text_bufread(reader, gzipped));
+            let mut reader = sam::io::Reader::new(text_bufread(path, reader, gzipped));
             let header = reader.read_header().context("failed to read SAM header")?;
             FormatReader::Sam {
                 reader,
