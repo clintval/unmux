@@ -1426,10 +1426,10 @@ fn passes_alignments_through(
         .flat_map(|binding| std::iter::once(binding.tag.as_str()).chain(qual_tag_name(binding)))
         .chain(plan.qc_tag.as_deref());
     for tag in claimed {
-        if tag == "RG" || crate::input::ALIGNMENT_TAGS.contains(&tag_bytes(tag)) {
+        if crate::input::ALIGNMENT_TAGS.contains(&tag_bytes(tag)) {
             bail!(
-                "--tag/--qc-tag `{tag}` would overwrite a read group or alignment tag of records \
-                 kept whole by this aligned @RG split; choose another tag"
+                "--tag/--qc-tag `{tag}` would overwrite an alignment tag of records kept whole by \
+                 this aligned @RG split; choose another tag"
             );
         }
     }
