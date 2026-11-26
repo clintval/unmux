@@ -4450,6 +4450,27 @@ mod tests {
     }
 
     #[test]
+    fn test_warn_once_for_a_cb_qual_sep_where_cr_writes_cy() {
+        let warnings = |tags: &[&str]| {
+            let mut warnings = plan_warnings(&parse_demux(&tag_args(tags, None)).unwrap());
+            warnings.retain(|warning| warning.contains("qual-sep"));
+            warnings
+        };
+        let warning = "tag `CB` sets `qual-sep`, which applies only to records where `CR` writes \
+                       no `CY`, since `CY` holds the `CR` qualities on the others";
+        assert_eq!(warnings(&["CB=u+v", "CB::qual-sep=_", "CR=u+v"]), [warning]);
+        assert_eq!(
+            warnings(&["CR=v|cell", "CB=u+v", "CB::qual-sep=%20"]),
+            [warning]
+        );
+        assert!(warnings(&["CB=u+v", "CR=u+v"]).is_empty());
+        assert!(warnings(&["CB=u+v", "CB::qual-sep=_"]).is_empty());
+        assert!(warnings(&["CB=u", "CB::qual-sep=_", "CR=v"]).is_empty());
+        assert!(warnings(&["CB=u+v", "CB::qual-sep=_", "CR=v", "CR::qual=none"]).is_empty());
+        assert!(warnings(&["CB=u+v", "CB::qual-sep=_", "CR=cell"]).is_empty());
+    }
+
+    #[test]
     fn test_parse_span_sample_column() {
         for (span, column) in [
             ("%sample::same_cell", "same_cell"),

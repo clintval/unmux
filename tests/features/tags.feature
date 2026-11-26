@@ -354,3 +354,19 @@ Feature: SAM tag emission with quality tag pairing and separators
       r1	4	*	0	255	*	*	0	0	AACGTGCAGGGG	ABCDEFGHIJKL	CB:Z:AACG	CR:Z:AACGTGCA	CY:Z:ABCDEFGH	RG:Z:p
       r2	4	*	0	255	*	*	0	0	TTTTTTTTGGGG	ABCDEFGHIJKL	CB:Z:TTTT	RG:Z:p
       """
+
+  Scenario: a CB qual-sep is warned about where CR writes the CY it would join
+    Given a file "test.fq" containing:
+      """
+      @r1
+      AAAACCCCGGGG
+      +
+      IIII5555????
+      """
+    When I run `unmux test.fq --pool p --extract u=0:0:4 --extract v=0:4:8 --tag CB=u+v --tag CB::qual-sep=_ --tag CR=u+v --out out.sam`
+    Then the exit code is 0
+    And stderr contains "tag `CB` sets `qual-sep`, which applies only to records where `CR` writes no `CY`, since `CY` holds the `CR` qualities on the others"
+    And the records of "out.sam" are:
+      """
+      r1	4	*	0	255	*	*	0	0	AAAACCCCGGGG	IIII5555????	CB:Z:AAAA-CCCC	CY:Z:IIII 5555	CR:Z:AAAA-CCCC	RG:Z:p
+      """
