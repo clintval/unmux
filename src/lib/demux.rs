@@ -55,8 +55,8 @@ use crate::matcher::{
 use crate::metrics::Metrics;
 use crate::output::{
     alignment_header, build_tag_data, check_output_collisions, default_read_group_header,
-    insert_string_tag, qual_tag_name, read_group_header, resolve_metrics_path, resolve_pattern,
-    ConstituentReadGroups, MultiWriter, OutputOrigin, PathContext,
+    insert_string_tag, is_header_text, qual_tag_name, read_group_header, resolve_metrics_path,
+    resolve_pattern, ConstituentReadGroups, MultiWriter, OutputOrigin, PathContext,
 };
 use crate::qc::{removed_slug, routed_slug, unassigned_slug, Unassigned};
 use crate::tags::{is_column_value, load_tag_file_columns, TagColumns, TagSet};
@@ -602,8 +602,8 @@ fn order_by_prereq(
 }
 
 /// The pool id filling `%pool`, including in `%pool` sub_samples: `--pool` when
-/// given, else the longest common prefix of the input file names (trimmed of
-/// trailing separators), else `pool`.
+/// given, else the longest common prefix of the input file names without their
+/// format extensions (trimmed of trailing separators), else `pool`.
 fn pool_id(plan: &DemuxPlan) -> String {
     if let Some(pool) = &plan.pool {
         return pool.clone();
@@ -611,7 +611,8 @@ fn pool_id(plan: &DemuxPlan) -> String {
     let names: Vec<String> = plan
         .inputs
         .iter()
-        .filter_map(|path| path.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .filter_map(|path| path.file_name())
+        .map(|name| without_format_extension(&name.to_string_lossy()).to_string())
         .collect();
     let prefix = longest_common_prefix(&names);
     let trimmed = prefix.trim_end_matches(['.', '_', '-', ' ']);
@@ -622,7 +623,22 @@ fn pool_id(plan: &DemuxPlan) -> String {
     }
 }
 
-/// The longest common prefix (by bytes) of a set of strings.
+/// The file name without the extension of a format unmux reads, or the name itself.
+fn without_format_extension(name: &str) -> &str {
+    let without = |name: &str, extension: &str| {
+        let stem = name.len().checked_sub(extension.len() + 1)?;
+        let dotted = name.get(stem..)?;
+        (dotted.starts_with('.') && dotted[1..].eq_ignore_ascii_case(extension)).then_some(stem)
+    };
+    let inner = &name[..without(name, "gz").unwrap_or(name.len())];
+    ["fq", "fastq", "fa", "fasta", "fna", "sam", "bam", "cram"]
+        .iter()
+        .find_map(|extension| without(inner, extension))
+        .filter(|&stem| stem > 0)
+        .map_or(name, |stem| &name[..stem])
+}
+
+/// The longest common prefix of a set of strings, in whole characters.
 fn longest_common_prefix(strings: &[String]) -> String {
     let Some(first) = strings.first() else {
         return String::new();
@@ -636,7 +652,35 @@ fn longest_common_prefix(strings: &[String]) -> String {
             .take_while(|(a, b)| a == b)
             .count();
     }
+    while !first.is_char_boundary(end) {
+        end -= 1;
+    }
     first[..end].to_string()
+}
+
+/// The read group id of a record with no sample: the pool, or `pool` when a SAM header cannot hold it.
+fn pool_read_group<'a>(
+    plan: &DemuxPlan,
+    pool: &'a str,
+    writes_alignments: bool,
+) -> Result<&'a str> {
+    if is_header_text(pool) {
+        return Ok(pool);
+    }
+    if writes_alignments && plan.pool.is_some() {
+        bail!(
+            "--pool `{}` cannot be written to a SAM/BAM/CRAM header; use printable ASCII",
+            pool.escape_debug()
+        );
+    }
+    if writes_alignments {
+        log::warn!(
+            "the input name `{}` cannot be a read group in a SAM/BAM/CRAM header; using `pool` \
+             instead, set --pool to choose one",
+            pool.escape_debug()
+        );
+    }
+    Ok("pool")
 }
 
 /// Build the routing table from the plan's fan-out source (`--sample` inline, a
@@ -1122,6 +1166,31 @@ fn alignment_formats(
     Ok(formats)
 }
 
+/// Whether any destination of the run is SAM/BAM/CRAM, with or without samples.
+fn writes_alignments(
+    plan: &DemuxPlan,
+    routing: &Routing,
+    pool: &str,
+    input_formats: &[SniffedFormat],
+) -> Result<bool> {
+    if !alignment_formats(plan, routing, pool, input_formats)?.is_empty() {
+        return Ok(true);
+    }
+    let Some(pattern) = &plan.out else {
+        return Ok(false);
+    };
+    let ctx = PathContext {
+        pool,
+        source: Some(0),
+        ..Default::default()
+    };
+    let path = resolve_pattern(pattern, &ctx);
+    Ok(matches!(
+        output_format(path.as_deref(), input_formats)?,
+        OutputFormat::Sam | OutputFormat::Bam | OutputFormat::Cram
+    ))
+}
+
 /// Whether an `@RG` split passes its aligned records through unchanged: the
 /// input is aligned and some destination is SAM/BAM/CRAM. Fails fast on a run
 /// that would have to drop alignments to proceed, or that cannot encode them.
@@ -1308,6 +1377,8 @@ struct Engine<'a> {
     column_tag_qualities: &'a [(&'a str, &'a str)],
     routing: &'a Routing,
     pool: &'a str,
+    /// The read group id of a record with no sample (see [`pool_read_group`]).
+    pool_read_group: &'a str,
     input_formats: &'a [SniffedFormat],
     /// Extract-stream names referenced exactly once across all `--template`s
     /// and `--tag`s. A single-stream template whose stream is movable is the
@@ -1399,10 +1470,16 @@ fn run_engine(plan: &DemuxPlan, command_line: Option<&str>) -> Result<()> {
         None
     };
 
+    let alignment_formats = alignment_formats(plan, &routing, &pool, &input_formats)?;
+    let read_group = pool_read_group(
+        plan,
+        &pool,
+        writes_alignments(plan, &routing, &pool, &input_formats)?,
+    )?;
     let keep_alignments = passes_alignments_through(
         plan,
         is_read_group_split && rg_info.has_sq,
-        &alignment_formats(plan, &routing, &pool, &input_formats)?,
+        &alignment_formats,
     )?;
     if keep_alignments {
         log::info!(
@@ -1456,7 +1533,7 @@ fn run_engine(plan: &DemuxPlan, command_line: Option<&str>) -> Result<()> {
     // would, so the bytes stay identical.
     let default_header = match &input_header {
         Some(input) => alignment_header(input, None, command_line)?,
-        None => default_read_group_header(&pool, &plan.rg_tags, command_line)?,
+        None => default_read_group_header(read_group, &plan.rg_tags, command_line)?,
     };
     // Declared first so it drops after every writer, removing what a failed run wrote.
     let mut staged = StagedOutputs::default();
@@ -1600,6 +1677,7 @@ fn run_engine(plan: &DemuxPlan, command_line: Option<&str>) -> Result<()> {
         column_tag_qualities: &column_tag_qualities,
         routing: &routing,
         pool: &pool,
+        pool_read_group: read_group,
         input_formats: &input_formats,
         movable_streams: &movable_streams,
         routed_streams: &routed_streams,
@@ -2532,6 +2610,7 @@ fn prepare_removed(
     prepare_raw_bin(
         pattern,
         engine.pool,
+        engine.pool_read_group,
         engine.plan.inputs.len(),
         fragment,
         slug.as_ref().map(|(tag, value)| (*tag, value.as_str())),
@@ -2563,6 +2642,7 @@ fn prepare_unassigned(
             prepare_raw_bin(
                 pattern,
                 engine.pool,
+                engine.pool_read_group,
                 engine.plan.inputs.len(),
                 fragment,
                 slug.as_ref().map(|(tag, value)| (*tag, value.as_str())),
@@ -2580,6 +2660,7 @@ fn prepare_unassigned(
 fn prepare_raw_bin(
     pattern: &OutputPattern,
     pool: &str,
+    read_group: &str,
     num_sources: usize,
     fragment: &Fragment,
     slug: Option<(&str, &str)>,
@@ -2597,7 +2678,9 @@ fn prepare_raw_bin(
                 };
                 Ok(PreparedWrite {
                     path: resolve_pattern(pattern, &ctx),
-                    payload: WritePayload::Records(vec![prepared_raw_read(record, pool, slug)?]),
+                    payload: WritePayload::Records(vec![prepared_raw_read(
+                        record, read_group, slug,
+                    )?]),
                 })
             })
             .collect()
@@ -2615,7 +2698,7 @@ fn prepare_raw_bin(
                 fragment
                     .records
                     .iter()
-                    .map(|record| prepared_raw_read(record, pool, slug))
+                    .map(|record| prepared_raw_read(record, read_group, slug))
                     .collect::<Result<_>>()?,
             ),
         }])
@@ -2625,11 +2708,11 @@ fn prepare_raw_bin(
 /// One raw input segment as an owned prepared record for a
 /// `--unassigned`/`--remove` bin: the record's bases/quals/name and its carried
 /// input tags, optionally augmented with the `--qc-tag` slug. Carries the
-/// default pool read group (`RG:Z:<pool>`) so a SAM/BAM/CRAM bin matches the
-/// default `@RG` in its header; FASTX output ignores the read group.
+/// default pool read group so a SAM/BAM/CRAM bin matches the default `@RG` in
+/// its header; FASTX output ignores the read group.
 fn prepared_raw_read(
     record: &InputRecord,
-    pool: &str,
+    read_group: &str,
     slug: Option<(&str, &str)>,
 ) -> Result<PreparedRead> {
     let tags = match slug {
@@ -2653,7 +2736,7 @@ fn prepared_raw_read(
         bases: record.bases.clone(),
         quals: record.quals.clone(),
         tags,
-        read_group: Some(pool.to_string()),
+        read_group: Some(read_group.to_string()),
         qc_fail: record.qc_fail,
         alignment,
     })
@@ -2786,7 +2869,9 @@ fn prepare_body(
     let read_group = if engine.is_read_group_split {
         None
     } else {
-        target.map(Target::label).or_else(|| Some(pool.to_string()))
+        target
+            .map(Target::label)
+            .or_else(|| Some(engine.pool_read_group.to_string()))
     };
 
     let mut datas: Vec<Data> = bodies
@@ -4641,6 +4726,43 @@ mod tests {
                 .starts_with("pool1\t3\t2\t0\t1\t0\t"),
             "summary: {sum}"
         );
+    }
+
+    #[test]
+    fn test_without_format_extension() {
+        for (name, stem) in [
+            ("lib1.fq", "lib1"),
+            ("lib1.fastq.gz", "lib1"),
+            ("LIB.BAM", "LIB"),
+            ("a.b.cram", "a.b"),
+            ("reads.txt", "reads.txt"),
+            ("reads.txt.gz", "reads.txt.gz"),
+            ("x.gz", "x.gz"),
+            ("fq", "fq"),
+            (".fq", ".fq"),
+            (".fq.gz", ".fq.gz"),
+            ("\u{e9}.fq", "\u{e9}"),
+            ("a\u{e9}", "a\u{e9}"),
+        ] {
+            assert_eq!(without_format_extension(name), stem, "{name}");
+        }
+    }
+
+    #[test]
+    fn test_longest_common_prefix_ends_at_a_whole_character() {
+        let prefix = |names: &[&str]| {
+            longest_common_prefix(
+                &names
+                    .iter()
+                    .map(|name| name.to_string())
+                    .collect::<Vec<_>>(),
+            )
+        };
+        assert_eq!(prefix(&["\u{e9}1", "\u{e8}1"]), "");
+        assert_eq!(prefix(&["a\u{e9}1", "a\u{e8}1", "a\u{ea}"]), "a");
+        assert_eq!(prefix(&["lib_R1", "lib_R2"]), "lib_R");
+        assert_eq!(prefix(&["solo"]), "solo");
+        assert_eq!(prefix(&[]), "");
     }
 
     #[test]

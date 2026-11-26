@@ -149,3 +149,124 @@ Feature: BAM/CRAM provenance headers and demux statistics
     When I run `unmux reads.fq --pool lib01 --out out.fq`
     Then the exit code is 0
     And the file "out.fq" does not contain "RG:Z:"
+
+  Scenario Outline: The default pool is the input file name without its format extension
+    Given a file "<input>" containing:
+      """
+      @r
+      ACGT
+      +
+      IIII
+      """
+    When I run `unmux <input> --out out.sam`
+    Then the exit code is 0
+    And the file "out.sam" contains "@RG	ID:<pool>	SM:<pool>	LB:<pool>"
+    And the file "out.sam" contains "RG:Z:<pool>"
+    When I run `unmux <input> --out %pool.out.fq`
+    Then the exit code is 0
+    And a file "<pool>.out.fq" exists
+
+    Examples:
+      | input        | pool       |
+      | lib1.fq      | lib1       |
+      | lib1.fastq   | lib1       |
+      | LIB1.FQ      | LIB1       |
+      | a.b.fq       | a.b        |
+      | reads.txt    | reads.txt  |
+      | .fq          | .fq        |
+
+  Scenario: Two inputs share a default pool without an extension and lone separators
+    Given a file "lib1_R1.fq" containing:
+      """
+      @r
+      ACGT
+      +
+      IIII
+      """
+    And a file "lib1_R2.fq" containing:
+      """
+      @r
+      TTTT
+      +
+      JJJJ
+      """
+    When I run `unmux lib1_R1.fq lib1_R2.fq --out out.sam`
+    Then the exit code is 0
+    And the file "out.sam" contains "@RG	ID:lib1_R	SM:lib1_R	LB:lib1_R"
+
+  Scenario: Input names that differ inside one character do not stop the run
+    Given a file "é.fq" containing:
+      """
+      @r
+      ACGT
+      +
+      IIII
+      """
+    And a file "è.fq" containing:
+      """
+      @r
+      TTTT
+      +
+      JJJJ
+      """
+    When I run `unmux é.fq è.fq --out out.sam`
+    Then the exit code is 0
+    And the file "out.sam" contains "@RG	ID:pool	SM:pool	LB:pool"
+
+  Scenario: A name that a SAM header cannot hold is replaced in the read group only
+    Given a file "ä.fq" containing:
+      """
+      @r
+      ACGT
+      +
+      IIII
+      """
+    When I run `unmux ä.fq --out out.sam`
+    Then the exit code is 0
+    And stderr contains "--pool"
+    And the file "out.sam" contains "@RG	ID:pool	SM:pool	LB:pool"
+    And the file "out.sam" contains "RG:Z:pool"
+    When I run `unmux ä.fq --out %pool.out.fq`
+    Then the exit code is 0
+    And a file "ä.out.fq" exists
+
+  Scenario Outline: A --pool that a SAM header cannot hold is refused before any output for <format>
+    Given a file "reads.fq" containing:
+      """
+      @r
+      ACGT
+      +
+      IIII
+      """
+    When I run `unmux reads.fq --pool données --out out.<format>`
+    Then the exit code is 1
+    And stderr contains "--pool"
+    And stderr contains "printable ASCII"
+    And a file "out.<format>" does not exist
+    When I run `unmux reads.fq --pool données --out %pool.fq`
+    Then the exit code is 0
+    And a file "données.fq" exists
+
+    Examples:
+      | format |
+      | sam    |
+      | bam    |
+      | cram   |
+
+  Scenario Outline: The command line is recorded in a header whatever its characters (<format>)
+    Given a file "ä.fq" containing:
+      """
+      @r
+      ACGT
+      +
+      IIII
+      """
+    When I run `unmux ä.fq --pool p --out out.<format>`
+    Then the exit code is 0
+    And the <what> "out.<format>" contains "\u{e4}.fq"
+    And the <what> "out.<format>" contains "PN:unmux"
+
+    Examples:
+      | format | what          |
+      | sam    | file          |
+      | bam    | BAM header of |

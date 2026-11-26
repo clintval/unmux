@@ -155,6 +155,7 @@ struct DemuxCmd {
     /// Identifier for the input pool; fills the placeholder `%pool`.
     ///
     /// Optional, and defaults to the common stem of the input filenames.
+    /// SAM/BAM/CRAM output needs it to be printable ASCII.
     ///
     ///   --pool lib01   the `%pool` placeholder is now set to 'lib01'
     #[arg(long = "pool", value_name = "ID", verbatim_doc_comment)]
@@ -795,6 +796,11 @@ fn run_demux_cmd(cmd: DemuxCmd) -> Result<()> {
         threads: cmd.threads as usize,
         reference: cmd.reference,
         skip_reference_check: cmd.skip_reference_check,
-        command_line: Some(std::env::args().collect::<Vec<_>>().join(" ")),
+        command_line: Some(
+            std::env::args_os()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join(" "),
+        ),
     })
 }
