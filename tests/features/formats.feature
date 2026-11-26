@@ -512,6 +512,323 @@ Feature: Input and output format handling
     Then the exit code is 1
     And stderr contains "cannot write FASTQ output for a record with no qualities (a FASTA input, or QUAL `*` in SAM/BAM/CRAM)"
 
+  Scenario: Two SAM inputs that each hold one mate of every pair are read as pairs
+    Given a file "r1.sam" containing:
+      """
+      @HD	VN:1.6
+      q1	77	*	0	0	*	*	0	0	ACGTACGT	IIIIIIII
+      q2	77	*	0	0	*	*	0	0	CCCCAAAA	IIIIIIII
+      """
+    And a file "r2.sam" containing:
+      """
+      @HD	VN:1.6
+      q1	141	*	0	0	*	*	0	0	TTTTGGGG	JJJJJJJJ
+      q2	141	*	0	0	*	*	0	0	GGGGTTTT	JJJJJJJJ
+      """
+    When I run `unmux r1.sam r2.sam --pool p --out pairs.sam`
+    Then the exit code is 0
+    And the records of "pairs.sam" are:
+      """
+      q1	77	*	0	255	*	*	0	0	ACGTACGT	IIIIIIII	RG:Z:p
+      q1	141	*	0	255	*	*	0	0	TTTTGGGG	JJJJJJJJ	RG:Z:p
+      q2	77	*	0	255	*	*	0	0	CCCCAAAA	IIIIIIII	RG:Z:p
+      q2	141	*	0	255	*	*	0	0	GGGGTTTT	JJJJJJJJ	RG:Z:p
+      """
+
+  Scenario: Two paired SAM inputs are refused unless --per-record reads one record from each
+    Given a file "reads.sam" containing:
+      """
+      @HD	VN:1.6
+      q1	77	*	0	0	*	*	0	0	ACGTACGT	IIIIIIII
+      q1	141	*	0	0	*	*	0	0	TTTTGGGG	JJJJJJJJ
+      q2	77	*	0	0	*	*	0	0	CCCCAAAA	IIIIIIII
+      q2	141	*	0	0	*	*	0	0	GGGGTTTT	JJJJJJJJ
+      """
+    And a file "idx.sam" containing:
+      """
+      @HD	VN:1.6
+      q1	77	*	0	0	*	*	0	0	AAAA	IIII
+      q1	141	*	0	0	*	*	0	0	CCCC	JJJJ
+      q2	77	*	0	0	*	*	0	0	GGGG	IIII
+      q2	141	*	0	0	*	*	0	0	TTTT	JJJJ
+      """
+    # A read takes one record from each input, so the first mates of both files would make one read
+    # and the last mates another, splitting the mates of every template across two reads.
+    When I run `unmux reads.sam idx.sam --pool p --out two.sam`
+    Then the exit code is 1
+    And stderr contains "input file 0 (reads.sam) holds both first (0x40) and last (0x80) mates of paired records, as of `q1`"
+    And stderr contains "would split its mates across reads"
+    And stderr contains "samtools fastq -1/-2"
+    And stderr contains "--per-record"
+    And a file "two.sam" does not exist
+    When I run `unmux reads.sam idx.sam --pool p --per-record --out two.sam`
+    Then the exit code is 0
+    And the records of "two.sam" are:
+      """
+      q1	77	*	0	255	*	*	0	0	ACGTACGT	IIIIIIII	RG:Z:p
+      q1	141	*	0	255	*	*	0	0	AAAA	IIII	RG:Z:p
+      q1	77	*	0	255	*	*	0	0	TTTTGGGG	JJJJJJJJ	RG:Z:p
+      q1	141	*	0	255	*	*	0	0	CCCC	JJJJ	RG:Z:p
+      q2	77	*	0	255	*	*	0	0	CCCCAAAA	IIIIIIII	RG:Z:p
+      q2	141	*	0	255	*	*	0	0	GGGG	IIII	RG:Z:p
+      q2	77	*	0	255	*	*	0	0	GGGGTTTT	JJJJJJJJ	RG:Z:p
+      q2	141	*	0	255	*	*	0	0	TTTT	JJJJ	RG:Z:p
+      """
+
+  Scenario: Two interleaved FASTQ inputs are refused unless --per-record reads one record from each
+    Given a file "reads.fq" containing:
+      """
+      @q1/1
+      ACGTACGT
+      +
+      IIIIIIII
+      @q1/2
+      TTTTGGGG
+      +
+      JJJJJJJJ
+      """
+    And a file "idx.fq" containing:
+      """
+      @q1/1
+      AAAA
+      +
+      IIII
+      @q1/2
+      CCCC
+      +
+      JJJJ
+      """
+    When I run `unmux reads.fq idx.fq --out out.R%ordinal.fq`
+    Then the exit code is 1
+    And stderr contains "input file 0 (reads.fq) is interleaved (`q1/1` is followed by its mate `q1/2`)"
+    And stderr contains "would split its mates across reads"
+    And stderr contains "--per-record"
+    And a file "out.R1.fq" does not exist
+    And a file "out.R2.fq" does not exist
+    When I run `unmux reads.fq idx.fq --per-record --out out.R%ordinal.fq`
+    Then the exit code is 0
+    And the file "out.R1.fq" is:
+      """
+      @q1/1
+      ACGTACGT
+      +
+      IIIIIIII
+      @q1/2
+      TTTTGGGG
+      +
+      JJJJJJJJ
+      """
+    And the file "out.R2.fq" is:
+      """
+      @q1/1
+      AAAA
+      +
+      IIII
+      @q1/2
+      CCCC
+      +
+      JJJJ
+      """
+
+  Scenario Outline: Mates that follow unpaired records in one of several inputs are refused on <threads> threads
+    Given a file "reads.sam" containing:
+      """
+      @HD	VN:1.6
+      q1	4	*	0	0	*	*	0	0	ACGTACGT	IIIIIIII
+      q2	77	*	0	0	*	*	0	0	TTTTGGGG	JJJJJJJJ
+      q2	141	*	0	0	*	*	0	0	CCCCAAAA	IIIIIIII
+      """
+    And a file "idx.sam" containing:
+      """
+      @HD	VN:1.6
+      q1	4	*	0	0	*	*	0	0	AAAA	IIII
+      q2	77	*	0	0	*	*	0	0	CCCC	JJJJ
+      q2	141	*	0	0	*	*	0	0	GGGG	IIII
+      """
+    And a file "reads.fq" containing:
+      """
+      @q1
+      ACGTACGT
+      +
+      IIIIIIII
+      @q2/1
+      TTTTGGGG
+      +
+      JJJJJJJJ
+      @q2/2
+      CCCCAAAA
+      +
+      IIIIIIII
+      """
+    And a file "idx.fq" containing:
+      """
+      @q1
+      AAAA
+      +
+      IIII
+      @q2/1
+      CCCC
+      +
+      JJJJ
+      @q2/2
+      GGGG
+      +
+      IIII
+      """
+    When I run `unmux reads.sam idx.sam --pool p --threads <threads> --out two.sam`
+    Then the exit code is 1
+    And stderr contains "input file 0 (reads.sam) holds both first (0x40) and last (0x80) mates of paired records, as of `q2`"
+    And a file "two.sam" does not exist
+    When I run `unmux reads.fq idx.fq --threads <threads> --out out.R%ordinal.fq`
+    Then the exit code is 1
+    And stderr contains "input file 0 (reads.fq) is interleaved (`q2/1` is followed by its mate `q2/2`)"
+    And a file "out.R1.fq" does not exist
+
+    Examples:
+      | threads |
+      | 1       |
+      | 2       |
+      | 8       |
+
+  Scenario Outline: Single-end FASTQ inputs are still read one record from each on <threads> threads
+    Given a file "r1.fq" containing:
+      """
+      @read1/1
+      ACGTACGT
+      +
+      IIIIIIII
+      @read2/1
+      CCCCAAAA
+      +
+      IIIIIIII
+      """
+    And a file "i1.fq" containing:
+      """
+      @read1
+      GGGG
+      +
+      IIII
+      @read2
+      TTTT
+      +
+      IIII
+      """
+    And a file "r2.fq" containing:
+      """
+      @read1/2
+      TTTTGGGG
+      +
+      JJJJJJJJ
+      @read2/2
+      GGGGTTTT
+      +
+      JJJJJJJJ
+      """
+    And a file "other.fq" containing:
+      """
+      @read1
+      GGGG
+      +
+      IIII
+      @read3
+      TTTT
+      +
+      IIII
+      """
+    And a file "short.fq" containing:
+      """
+      @read1
+      GGGG
+      +
+      IIII
+      """
+    # A /1 or /2 suffix alone does not make one of several inputs interleaved; only adjacent mates do.
+    When I run `unmux r1.fq i1.fq r2.fq --threads <threads> --out out.R%ordinal.fq`
+    Then the exit code is 0
+    And the file "out.R1.fq" is:
+      """
+      @read1/1
+      ACGTACGT
+      +
+      IIIIIIII
+      @read2/1
+      CCCCAAAA
+      +
+      IIIIIIII
+      """
+    And the file "out.R2.fq" is:
+      """
+      @read1
+      GGGG
+      +
+      IIII
+      @read2
+      TTTT
+      +
+      IIII
+      """
+    And the file "out.R3.fq" is:
+      """
+      @read1/2
+      TTTTGGGG
+      +
+      JJJJJJJJ
+      @read2/2
+      GGGGTTTT
+      +
+      JJJJJJJJ
+      """
+    When I run `unmux r1.fq other.fq --threads <threads> --out other.R%ordinal.fq`
+    Then the exit code is 1
+    And stderr contains "input segments have mismatched read names (`read2/1` vs `read3`)"
+    And a file "other.R1.fq" does not exist
+    When I run `unmux r1.fq short.fq --threads <threads> --out short.R%ordinal.fq`
+    Then the exit code is 1
+    And stderr contains "input files have unequal record counts"
+    And a file "short.R1.fq" does not exist
+
+    Examples:
+      | threads |
+      | 1       |
+      | 2       |
+      | 8       |
+
+  Scenario Outline: Single-end <format> inputs are still read one record from each on <threads> threads
+    Given a file "r1.sam" containing:
+      """
+      @HD	VN:1.6
+      read1	4	*	0	0	*	*	0	0	ACGTACGT	IIIIIIII
+      read2	4	*	0	0	*	*	0	0	CCCCAAAA	IIIIIIII
+      """
+    And a file "r2.sam" containing:
+      """
+      @HD	VN:1.6
+      read1	4	*	0	0	*	*	0	0	TTTTGGGG	JJJJJJJJ
+      read2	4	*	0	0	*	*	0	0	GGGGTTTT	JJJJJJJJ
+      """
+    When I run `unmux r1.sam --out in1.<format>`
+    Then the exit code is 0
+    When I run `unmux r2.sam --out in2.<format>`
+    Then the exit code is 0
+    When I run `unmux in1.<format> in2.<format> --pool p --threads <threads> --out pairs.sam`
+    Then the exit code is 0
+    And the records of "pairs.sam" are:
+      """
+      read1	77	*	0	255	*	*	0	0	ACGTACGT	IIIIIIII	RG:Z:p
+      read1	141	*	0	255	*	*	0	0	TTTTGGGG	JJJJJJJJ	RG:Z:p
+      read2	77	*	0	255	*	*	0	0	CCCCAAAA	IIIIIIII	RG:Z:p
+      read2	141	*	0	255	*	*	0	0	GGGGTTTT	JJJJJJJJ	RG:Z:p
+      """
+
+    Examples:
+      | format | threads |
+      | sam    | 1       |
+      | sam    | 8       |
+      | bam    | 2       |
+      | bam    | 16      |
+      | cram   | 1       |
+      | cram   | 8       |
+
   Scenario: CRAM output format by extension and SAM input
     Given a file "unmapped.sam" containing:
       """
