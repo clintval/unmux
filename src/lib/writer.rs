@@ -28,7 +28,7 @@ use noodles::sam::alignment::record_buf::data::field::value::Array;
 use noodles::sam::alignment::record_buf::data::field::Value;
 use noodles::sam::alignment::record_buf::{Data, QualityScores, Sequence};
 use noodles::sam::alignment::RecordBuf;
-use noodles::{bam, bgzf, cram, fasta, fastq, sam};
+use noodles::{bam, bgzf, cram, fasta, sam};
 
 use crate::input::{Alignment, SniffedFormat, PHRED_OFFSET};
 
@@ -214,16 +214,8 @@ impl SinkWriter {
 /// One open output sink, holding the concrete noodles writer for the chosen
 /// format.
 enum Sink {
-    /// FASTQ. The `record` buffer is reused across writes so the per-record
-    /// SEQ/QUAL Vecs are cleared and refilled in place rather than reallocated
-    /// for every output record.
-    Fastq {
-        /// The record writer.
-        writer: fastq::io::Writer<SinkWriter>,
-        /// The reused output record (its SEQ/QUAL buffers are cleared and
-        /// refilled each write).
-        record: fastq::Record,
-    },
+    /// FASTQ, written as [`encode_fastq`] encodes it.
+    Fastq(SinkWriter),
     /// FASTA.
     Fasta(fasta::io::Writer<SinkWriter>),
     /// Text SAM, plus the header written up front and reused to encode each
@@ -286,10 +278,7 @@ impl OutputWriter {
         let buffered = BufWriter::new(raw);
 
         let sink = match format {
-            OutputFormat::Fastq { gzip } => Sink::Fastq {
-                writer: fastq::io::Writer::new(sink_writer(buffered, gzip, compression)),
-                record: fastq::Record::default(),
-            },
+            OutputFormat::Fastq { gzip } => Sink::Fastq(sink_writer(buffered, gzip, compression)),
             OutputFormat::Fasta { gzip } => Sink::Fasta(fasta::io::Writer::new(sink_writer(
                 buffered,
                 gzip,
@@ -328,10 +317,14 @@ impl OutputWriter {
     /// most two (a pair).
     pub fn write_fragment(&mut self, reads: &[OutputRead]) -> Result<()> {
         match &mut self.sink {
-            Sink::Fastq { writer, record } => {
+            Sink::Fastq(writer) => {
+                let mut bytes = Vec::new();
                 for read in reads {
-                    write_fastq(writer, record, read)?;
+                    encode_fastq(&mut bytes, read)?;
                 }
+                writer
+                    .write_all(&bytes)
+                    .context("failed to write FASTQ record")?;
             }
             Sink::Fasta(writer) => {
                 for read in reads {
@@ -354,7 +347,7 @@ impl OutputWriter {
     /// callers route CRAM through `write_fragment`.
     pub fn write_encoded(&mut self, bytes: &[u8]) -> Result<()> {
         let sink: &mut dyn Write = match &mut self.sink {
-            Sink::Fastq { writer, .. } => writer.get_mut(),
+            Sink::Fastq(writer) => writer,
             Sink::Fasta(writer) => writer.get_mut(),
             Sink::Sam { writer, .. } => writer.get_mut(),
             // get_mut yields the inner `bgzf::io::Writer`, so the raw record
@@ -374,7 +367,7 @@ impl OutputWriter {
     /// is reported rather than silently produced).
     pub fn finish(self) -> Result<()> {
         match self.sink {
-            Sink::Fastq { writer, .. } => writer.into_inner().finish(),
+            Sink::Fastq(writer) => writer.finish(),
             Sink::Fasta(writer) => writer.into_inner().finish(),
             Sink::Sam { writer, .. } => writer.into_inner().finish(),
             Sink::BamInline { writer, .. } => {
@@ -701,31 +694,25 @@ pub(crate) fn default_header() -> sam::Header {
         .build()
 }
 
-/// Write one FASTQ record (qualities re-encoded to ASCII Phred+33), reusing
-/// `record`'s SEQ/QUAL buffers in place to avoid allocating a fresh Vec per
-/// output record.
-fn write_fastq<W: Write>(
-    writer: &mut fastq::io::Writer<W>,
-    record: &mut fastq::Record,
-    read: &OutputRead,
-) -> Result<()> {
+/// Append `read` to `out` as one FASTQ record, byte for byte as the noodles
+/// writer writes it: the qualities re-encoded to ASCII Phred+33, and input
+/// tags carried in the read-name comment (samtools `fastq -T` convention).
+fn encode_fastq(out: &mut Vec<u8>, read: &OutputRead) -> Result<()> {
     let quals = read
         .quals
         .context("cannot write FASTQ output for a record with no qualities (a FASTA input, or QUAL `*` in SAM/BAM/CRAM)")?;
-    let seq = record.sequence_mut();
-    seq.clear();
-    seq.extend_from_slice(read.bases);
-    let qual = record.quality_scores_mut();
-    qual.clear();
-    qual.extend(quals.iter().map(|&q| q.saturating_add(PHRED_OFFSET)));
-    // Carry input tags through in the read-name comment (samtools `fastq -T`
-    // convention). The definition is small (name + optional comment), so it is
-    // rebuilt rather than mutated in place.
-    let comment = read.tags.map(render_tags).unwrap_or_default();
-    *record.definition_mut() = fastq::record::Definition::new(read.name.to_vec(), comment);
-    writer
-        .write_record(record)
-        .context("failed to write FASTQ record")
+    out.push(b'@');
+    out.extend_from_slice(read.name);
+    if let Some(tags) = read.tags.filter(|tags| !tags.is_empty()) {
+        out.push(b' ');
+        write_tags(out, tags).context("failed to write FASTQ record")?;
+    }
+    out.push(b'\n');
+    out.extend_from_slice(read.bases);
+    out.extend_from_slice(b"\n+\n");
+    out.extend(quals.iter().map(|&q| q.saturating_add(PHRED_OFFSET)));
+    out.push(b'\n');
+    Ok(())
 }
 
 /// Write one FASTA record (no qualities), carrying input tags in the
@@ -734,6 +721,8 @@ fn write_fasta<W: Write>(writer: &mut fasta::io::Writer<W>, read: &OutputRead) -
     let comment = read
         .tags
         .map(render_tags)
+        .transpose()
+        .context("failed to write FASTA record")?
         .filter(|tags| !tags.is_empty())
         .map(Into::into);
     let record = fasta::Record::new(
@@ -748,27 +737,35 @@ fn write_fasta<W: Write>(writer: &mut fasta::io::Writer<W>, read: &OutputRead) -
 /// Render carried SAM tags as a tab-separated `TAG:TYPE:VALUE` comment (the
 /// samtools `fastq -T` convention) so FASTX output preserves them and
 /// round-trips via `samtools import` / `bwa -C`.
-fn render_tags(data: &Data) -> Vec<u8> {
-    let mut fields: Vec<String> = Vec::new();
-    for (tag, value) in data.iter() {
+fn render_tags(data: &Data) -> io::Result<Vec<u8>> {
+    let mut comment = Vec::new();
+    write_tags(&mut comment, data)?;
+    Ok(comment)
+}
+
+/// Append the comment [`render_tags`] renders for `data` to `out`.
+fn write_tags(out: &mut Vec<u8>, data: &Data) -> io::Result<()> {
+    for (i, (tag, value)) in data.iter().enumerate() {
+        if i > 0 {
+            out.push(b'\t');
+        }
         let bytes: [u8; 2] = tag.into();
         let key = String::from_utf8_lossy(&bytes);
-        let field = match value {
-            Value::Character(c) => format!("{key}:A:{}", *c as char),
-            Value::Int8(n) => format!("{key}:i:{n}"),
-            Value::UInt8(n) => format!("{key}:i:{n}"),
-            Value::Int16(n) => format!("{key}:i:{n}"),
-            Value::UInt16(n) => format!("{key}:i:{n}"),
-            Value::Int32(n) => format!("{key}:i:{n}"),
-            Value::UInt32(n) => format!("{key}:i:{n}"),
-            Value::Float(x) => format!("{key}:f:{x}"),
-            Value::String(s) => format!("{key}:Z:{s}"),
-            Value::Hex(s) => format!("{key}:H:{s}"),
-            Value::Array(array) => format!("{key}:B:{}", render_array(array)),
-        };
-        fields.push(field);
+        match value {
+            Value::Character(c) => write!(out, "{key}:A:{}", *c as char),
+            Value::Int8(n) => write!(out, "{key}:i:{n}"),
+            Value::UInt8(n) => write!(out, "{key}:i:{n}"),
+            Value::Int16(n) => write!(out, "{key}:i:{n}"),
+            Value::UInt16(n) => write!(out, "{key}:i:{n}"),
+            Value::Int32(n) => write!(out, "{key}:i:{n}"),
+            Value::UInt32(n) => write!(out, "{key}:i:{n}"),
+            Value::Float(x) => write!(out, "{key}:f:{x}"),
+            Value::String(s) => write!(out, "{key}:Z:{s}"),
+            Value::Hex(s) => write!(out, "{key}:H:{s}"),
+            Value::Array(array) => write!(out, "{key}:B:{}", render_array(array)),
+        }?;
     }
-    fields.join("\t").into_bytes()
+    Ok(())
 }
 
 /// Render a `B` array tag value as `subtype,v1,v2,...` (SAM subtype codes
@@ -889,12 +886,14 @@ pub fn encode_fragment(
 ) -> Result<Vec<u8>> {
     Ok(match format {
         OutputFormat::Fastq { .. } => {
-            let mut writer = fastq::io::Writer::new(Vec::new());
-            let mut record = fastq::Record::default();
+            let size = reads
+                .iter()
+                .map(|read| read.name.len() + 2 * read.bases.len());
+            let mut bytes = Vec::with_capacity(size.sum::<usize>() + 64 * reads.len());
             for read in reads {
-                write_fastq(&mut writer, &mut record, read)?;
+                encode_fastq(&mut bytes, read)?;
             }
-            writer.into_inner()
+            bytes
         }
         OutputFormat::Fasta { .. } => {
             let mut writer = fasta::io::Writer::new(Vec::new());
@@ -1369,7 +1368,50 @@ mod tests {
     fn render_one(tag: [u8; 2], value: Value) -> String {
         let mut data = Data::default();
         data.insert(Tag::from(tag), value);
-        String::from_utf8(render_tags(&data)).unwrap()
+        String::from_utf8(render_tags(&data).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn test_encode_fastq_matches_the_noodles_writer() {
+        let mut tags = Data::default();
+        tags.insert(Tag::from(*b"BC"), Value::String("ACGT-TTGA".into()));
+        tags.insert(Tag::from(*b"XI"), Value::Int32(-7));
+        tags.insert(Tag::from(*b"XF"), Value::Float(0.25));
+        tags.insert(Tag::from(*b"XB"), Value::Array(Array::UInt8(vec![1, 2])));
+        let empty = Data::default();
+        let quals = [0u8, 2, 30, 41, 93];
+        for (name, bases, tags) in [
+            (&b"r1"[..], &b"ACGTN"[..], None),
+            (b"r2/1", b"ACGTN", Some(&tags)),
+            (b"r3", b"ACGTN", Some(&empty)),
+            (b"", b"", None),
+        ] {
+            let read = OutputRead {
+                name,
+                bases,
+                quals: Some(&quals[..bases.len()]),
+                tags,
+                read_group: None,
+                qc_fail: false,
+                alignment: None,
+            };
+            let mut expected = noodles::fastq::io::Writer::new(Vec::new());
+            let comment = tags
+                .map(|tags| render_tags(tags).unwrap())
+                .unwrap_or_default();
+            let record = noodles::fastq::Record::new(
+                noodles::fastq::record::Definition::new(name.to_vec(), comment),
+                bases.to_vec(),
+                quals[..bases.len()]
+                    .iter()
+                    .map(|q| q + PHRED_OFFSET)
+                    .collect::<Vec<u8>>(),
+            );
+            expected.write_record(&record).unwrap();
+            let mut encoded = Vec::new();
+            encode_fastq(&mut encoded, &read).unwrap();
+            assert_eq!(encoded, expected.into_inner());
+        }
     }
 
     #[test]
