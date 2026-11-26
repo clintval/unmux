@@ -817,18 +817,9 @@ impl FormatReader {
                     .read_sequence(&mut bases)
                     .context("failed to read FASTA sequence")?;
                 let body = definition.trim_start_matches('>');
-                let name = body
-                    .split_whitespace()
-                    .next()
-                    .unwrap_or("")
-                    .as_bytes()
-                    .to_vec();
-                // Lift any SAM tags carried in the description (the definition
-                // remainder after the read name), mirroring the FASTQ path.
-                let comment = body
-                    .trim_start()
-                    .split_once([' ', '\t'])
-                    .map_or("", |(_, rest)| rest);
+                // As in FASTQ, the name ends at the first space or tab, so it may be empty.
+                let (name, comment) = body.split_once([' ', '\t']).unwrap_or((body, ""));
+                let name = name.as_bytes().to_vec();
                 let tags = parse_comment_tags(comment.as_bytes()).with_context(|| {
                     format!(
                         "malformed FASTA record `{}`",
