@@ -431,6 +431,22 @@ impl TagBinding {
     pub fn all_streams(&self) -> impl Iterator<Item = &StreamRef> {
         self.streams.iter().chain(self.fallbacks.iter().flatten())
     }
+
+    /// The streams as a `--tag` value gives them, with `|` before each fallback.
+    fn spec(&self) -> String {
+        self.streams
+            .iter()
+            .zip(&self.fallbacks)
+            .map(|(stream, fallbacks)| {
+                std::iter::once(stream)
+                    .chain(fallbacks)
+                    .map(StreamRef::to_string)
+                    .collect::<Vec<_>>()
+                    .join("|")
+            })
+            .collect::<Vec<_>>()
+            .join("+")
+    }
 }
 
 /// An optional finer fan-out level under a sample, written to read-group `LB`.
@@ -2286,35 +2302,32 @@ enum TagWriter<'a> {
     DefaultQuality(&'a TagBinding),
     /// The `--qc-tag` slug.
     Qc,
-    /// The read group unmux writes on SAM/BAM/CRAM records.
-    ReadGroup,
 }
 
 impl TagWriter<'_> {
+    /// The flag behind this writer of `tag`, as given on the command line.
+    fn flag(self, tag: &str) -> String {
+        match self {
+            TagWriter::Sequence(binding) | TagWriter::DefaultQuality(binding) => {
+                format!("`--tag {}={}`", binding.tag, binding.spec())
+            }
+            TagWriter::Quality(binding) => format!("`--tag {}::qual={tag}`", binding.tag),
+            TagWriter::Qc => format!("`--qc-tag={tag}`"),
+        }
+    }
+
     /// How an error refers to this writer of `tag`.
     fn describe(self, tag: &str) -> String {
-        let spec = |binding: &TagBinding| {
-            format!(
-                "`--tag {}={}`",
-                binding.tag,
-                join_streams(&binding.streams, "+")
-            )
-        };
         match self {
-            TagWriter::Sequence(binding) => format!("by {}", spec(binding)),
-            TagWriter::Quality(binding) => format!("by `--tag {}::qual={tag}`", binding.tag),
-            TagWriter::DefaultQuality(binding) => {
-                format!("as the default quality tag of {}", spec(binding))
+            TagWriter::DefaultQuality(_) => {
+                format!("as the default quality tag of {}", self.flag(tag))
             }
-            TagWriter::Qc => format!("by `--qc-tag={tag}`"),
-            TagWriter::ReadGroup => {
-                "by unmux as the read group of each SAM/BAM/CRAM record".to_string()
-            }
+            _ => format!("by {}", self.flag(tag)),
         }
     }
 }
 
-/// Refuse a SAM tag that two writers would set, since one would replace the other.
+/// Refuse a binding of `RG`, which unmux sets itself, and a SAM tag that two writers would set.
 fn validate_tag_writers(plan: &DemuxPlan) -> Result<()> {
     let mut writers: Vec<(&str, TagWriter)> = Vec::new();
     for binding in &plan.tags {
@@ -2329,7 +2342,13 @@ fn validate_tag_writers(plan: &DemuxPlan) -> Result<()> {
         }
     }
     writers.extend(plan.qc_tag.as_deref().map(|tag| (tag, TagWriter::Qc)));
-    writers.push(("RG", TagWriter::ReadGroup));
+    if let Some(&(tag, writer)) = writers.iter().find(|(tag, _)| *tag == "RG") {
+        bail!(
+            "tag `RG` is reserved for the read group, which unmux sets itself on SAM/BAM/CRAM \
+             output; choose another tag for {}",
+            writer.flag(tag)
+        );
+    }
     for (index, &(tag, second)) in writers.iter().enumerate() {
         let Some(&(_, first)) = writers[..index].iter().find(|(seen, _)| *seen == tag) else {
             continue;
@@ -2341,9 +2360,6 @@ fn validate_tag_writers(plan: &DemuxPlan) -> Result<()> {
         let hint = match (first, second) {
             (TagWriter::DefaultQuality(binding), _) | (_, TagWriter::DefaultQuality(binding)) => {
                 format!("set `{0}::qual=none` or `{0}::qual=<TAG>`", binding.tag)
-            }
-            (TagWriter::ReadGroup, _) | (_, TagWriter::ReadGroup) => {
-                "choose another tag".to_string()
             }
             _ => "choose another tag for one of them".to_string(),
         };
