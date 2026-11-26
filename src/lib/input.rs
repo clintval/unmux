@@ -932,8 +932,8 @@ pub(crate) const ALIGNMENT_TAGS: &[[u8; 2]] = &[
 
 /// Convert an alignment record into an [`InputRecord`], carrying its
 /// non-alignment tags through. Alignment-derived tags ([`ALIGNMENT_TAGS`]) are
-/// stripped, since the output is unmapped. An empty quality string (SAM `*`)
-/// becomes no qualities.
+/// stripped, since the output is unmapped. A read with bases and QUAL `*` has
+/// no qualities, while an empty read has an empty quality string.
 ///
 /// A reverse-strand record (flag `0x10`) stores `SEQ` as the reverse complement
 /// of the sequenced read and `QUAL` in reversed order; this restores the
@@ -942,7 +942,7 @@ pub(crate) const ALIGNMENT_TAGS: &[[u8; 2]] = &[
 fn alignment_to_input(record: &RecordBuf) -> InputRecord {
     let raw_quals = record.quality_scores().as_ref();
     let mut bases = record.sequence().as_ref().to_vec();
-    let mut quals = (!raw_quals.is_empty()).then(|| raw_quals.to_vec());
+    let mut quals = (!raw_quals.is_empty() || bases.is_empty()).then(|| raw_quals.to_vec());
     if record.flags().is_reverse_complemented() {
         bases = bases
             .iter()
@@ -2073,6 +2073,17 @@ mod tests {
             }
             other => panic!("expected RX:Z tag, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_read_sam_empty_read_has_empty_qualities() {
+        let sam = b"@HD\tVN:1.6\n\
+                    trimmed\t4\t*\t0\t0\t*\t*\t0\t0\t*\t*\n\
+                    unscored\t4\t*\t0\t0\t*\t*\t0\t0\tACGT\t*\n";
+        let file = temp_with(sam);
+        let fragments = read_all(&file);
+        assert_eq!(fragments[0].records[0].quals.as_deref(), Some(&[][..]));
+        assert_eq!(fragments[1].records[0].quals, None);
     }
 
     #[test]

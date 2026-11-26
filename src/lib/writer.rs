@@ -846,7 +846,7 @@ fn write_fastq<W: Write>(
 ) -> Result<()> {
     let quals = read
         .quals
-        .context("cannot write FASTQ output for a record with no qualities (a FASTA input)")?;
+        .context("cannot write FASTQ output for a record with no qualities (a FASTA input, or QUAL `*` in SAM/BAM/CRAM)")?;
     let seq = record.sequence_mut();
     seq.clear();
     seq.extend_from_slice(read.bases);
@@ -1784,7 +1784,11 @@ mod tests {
         fill_missing_qualities(&mut filled);
         assert_eq!(filled.quality_scores().as_ref(), [MISSING_QUALITY; 4]);
 
-        for kept in [record(b"ACGT", Some(&[1, 2, 3, 4])), record(b"", None)] {
+        for kept in [
+            record(b"ACGT", Some(&[1, 2, 3, 4])),
+            record(b"", None),
+            record(b"", Some(&[])),
+        ] {
             let mut record = Cow::Borrowed(&kept);
             fill_missing_qualities(&mut record);
             assert!(matches!(record, Cow::Borrowed(_)));

@@ -468,6 +468,50 @@ Feature: Input and output format handling
     And stderr contains "--per-record"
     And a file "out.sam" does not exist
 
+  Scenario Outline: An empty mate of a <format> pair keeps the other mate's qualities in a template
+    Given a file "trimmed.sam" containing:
+      """
+      @HD	VN:1.6
+      a	77	*	0	0	*	*	0	0	ACGTACGT	ABCDEFGH
+      a	141	*	0	0	*	*	0	0	*	*
+      """
+    # The second mate was trimmed to nothing, so its SEQ and QUAL are *. Like an empty FASTQ read, it
+    # has an empty quality string, so the template keeps the first mate's qualities and RX gets an
+    # empty QX.
+    When I run `unmux trimmed.sam --pool p --out in.<format>`
+    Then the exit code is 0
+    When I run `unmux in.<format> --pool p --extract umi=1:0:2 --extract r=0:0:8 --template r+umi --tag RX=umi --out out.sam`
+    Then the exit code is 0
+    And the records of "out.sam" are:
+      """
+      a	4	*	0	255	*	*	0	0	ACGTACGT	ABCDEFGH	RX:Z:	QX:Z:	RG:Z:p
+      """
+
+    Examples:
+      | format |
+      | sam    |
+      | bam    |
+      | cram   |
+
+  Scenario: A mate with bases and QUAL * still has no qualities
+    Given a file "unscored.sam" containing:
+      """
+      @HD	VN:1.6
+      a	77	*	0	0	*	*	0	0	ACGTACGT	ABCDEFGH
+      a	141	*	0	0	*	*	0	0	TTGG	*
+      """
+    # Only an empty read has an empty quality string. A read with bases and QUAL * has no qualities,
+    # so a template that joins it has none either, and it cannot be written as FASTQ.
+    When I run `unmux unscored.sam --pool p --extract umi=1:0:2 --extract r=0:0:8 --template r+umi --tag RX=umi --out out.sam`
+    Then the exit code is 0
+    And the records of "out.sam" are:
+      """
+      a	4	*	0	255	*	*	0	0	ACGTACGTTT	*	RX:Z:TT	RG:Z:p
+      """
+    When I run `unmux unscored.sam --pool p --out out.R%ordinal.fq`
+    Then the exit code is 1
+    And stderr contains "cannot write FASTQ output for a record with no qualities (a FASTA input, or QUAL `*` in SAM/BAM/CRAM)"
+
   Scenario: CRAM output format by extension and SAM input
     Given a file "unmapped.sam" containing:
       """
@@ -662,6 +706,46 @@ Feature: Input and output format handling
     And the file "out.fq" contains "@r1"
     And the file "out.fq" contains "ACGTACGTAACCGGTTACGT"
     And the file "out.fq" contains "IIIIIIIIIIIIIIIIIIII"
+
+  Scenario Outline: An empty read in <format> converts to FASTQ as an empty record and back
+    Given a file "trimmed.sam" containing:
+      """
+      @HD	VN:1.6
+      trimmed	4	*	0	0	*	*	0	0	*	*
+      kept	4	*	0	0	*	*	0	0	ACGT	ABCD
+      """
+    # A read trimmed to nothing is written as samtools fastq writes it: its name, an empty sequence, a
+    # +, and an empty quality line. Read back, it is empty again, with no qualities filled in.
+    When I run `unmux trimmed.sam --pool p --out in.<format>`
+    Then the exit code is 0
+    When I run `unmux in.<format> --pool p --out out.fq`
+    Then the exit code is 0
+    And the file "out.fq" is:
+      """
+      @trimmed RG:Z:p
+
+      +
+
+      @kept RG:Z:p
+      ACGT
+      +
+      ABCD
+      """
+    When I run `unmux out.fq --pool p --out back.<format>`
+    Then the exit code is 0
+    When I run `unmux back.<format> --pool p --out final.sam`
+    Then the exit code is 0
+    And the records of "final.sam" are:
+      """
+      trimmed	4	*	0	255	*	*	0	0	*	*	RG:Z:p
+      kept	4	*	0	255	*	*	0	0	ACGT	ABCD	RG:Z:p
+      """
+
+    Examples:
+      | format |
+      | sam    |
+      | bam    |
+      | cram   |
 
   Scenario: FASTQ converts to CRAM by extension
     Given a file "reads.fq" containing:
