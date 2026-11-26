@@ -1005,10 +1005,17 @@ fn labeled_dests(
         }
     }
     // The `--unassigned` and `--remove` bins (raw segments; `%source` fans out
-    // over the input files).
+    // over the input files), sharing the `--out` writer when given its pattern.
+    let bin = |pattern: &OutputPattern, option: String| {
+        if plan.out.as_ref() == Some(pattern) {
+            OutputOrigin::Records(option)
+        } else {
+            OutputOrigin::Bin(option)
+        }
+    };
     if let Some(pattern) = &plan.unassigned {
         for path in bin_paths(pattern, pool, plan.inputs.len()) {
-            paths.push((path, OutputOrigin::Records("--unassigned".to_string())));
+            paths.push((path, bin(pattern, "--unassigned".to_string())));
         }
     }
     for rule in &plan.remove {
@@ -1018,7 +1025,7 @@ fn labeled_dests(
                 RemoveSelector::GroupTag { group, id } => format!("{group}::{id}"),
             };
             for path in bin_paths(pattern, pool, plan.inputs.len()) {
-                paths.push((path, OutputOrigin::Records(format!("--remove {selector}"))));
+                paths.push((path, bin(pattern, format!("--remove {selector}"))));
             }
         }
     }
