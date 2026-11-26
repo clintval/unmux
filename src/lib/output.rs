@@ -573,6 +573,44 @@ pub fn check_output_collisions(outputs: &[(PathBuf, OutputOrigin)]) -> Result<()
     Ok(())
 }
 
+/// Refuse an output that is one of the input files under any name, which would replace that input.
+pub fn check_outputs_over_inputs(
+    outputs: &[(PathBuf, OutputOrigin)],
+    inputs: &[PathBuf],
+) -> Result<()> {
+    let real_file = |path: &Path| {
+        let file = match std::fs::metadata(path) {
+            Ok(metadata) if !metadata.is_file() => return None,
+            Ok(metadata) => file_id(&metadata),
+            Err(_) => None,
+        };
+        Some((resolve(path, &mut 0), file))
+    };
+    let files: Vec<_> = inputs
+        .iter()
+        .enumerate()
+        .filter(|(_, path)| !matches!(path.to_str(), Some("-" | "/dev/stdin")))
+        .filter_map(|(index, path)| Some((index, real_file(path)?)))
+        .collect();
+    if files.is_empty() {
+        return Ok(());
+    }
+    for (path, origin) in outputs {
+        let Some((real, file)) = real_file(path) else {
+            continue;
+        };
+        let Some((index, _)) = files
+            .iter()
+            .find(|(_, (input, id))| *input == real || id.is_some_and(|id| file == Some(id)))
+        else {
+            continue;
+        };
+        let (output, input) = (path.display(), inputs[*index].display());
+        bail!("output \"{output}\" ({origin}) is input {index} ({input}); give it a distinct path");
+    }
+    Ok(())
+}
+
 /// The case-folded absolute path `path` writes and its existing file, or `None` if not regular.
 fn file_key(path: &Path, dirs: &mut HashMap<PathBuf, PathBuf>) -> Option<(String, Option<FileId>)> {
     let resolved = match path.file_name() {
@@ -1317,6 +1355,93 @@ mod tests {
             ]),
             None
         );
+    }
+
+    fn over_inputs(outputs: &[PathBuf], inputs: &[PathBuf]) -> Option<String> {
+        let outputs: Vec<(PathBuf, OutputOrigin)> = outputs
+            .iter()
+            .map(|path| (path.clone(), OutputOrigin::Records("--unassigned".into())))
+            .collect();
+        check_outputs_over_inputs(&outputs, inputs)
+            .err()
+            .map(|e| e.to_string())
+    }
+
+    #[test]
+    fn test_over_inputs_any_spelling_of_an_input_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.fq");
+        std::fs::write(&input, "").unwrap();
+        for output in ["in.fq", "./in.fq", "missing/../in.fq"] {
+            let output = dir.path().join(output);
+            assert_eq!(
+                over_inputs(std::slice::from_ref(&output), std::slice::from_ref(&input)),
+                Some(format!(
+                    "output \"{}\" (--unassigned) is input 0 ({}); give it a distinct path",
+                    output.display(),
+                    input.display()
+                ))
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_over_inputs_links_to_an_input_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.fq");
+        std::fs::write(&input, "").unwrap();
+        std::os::unix::fs::symlink("in.fq", dir.path().join("link.fq")).unwrap();
+        std::os::unix::fs::symlink(".", dir.path().join("here")).unwrap();
+        std::fs::hard_link(&input, dir.path().join("hard.fq")).unwrap();
+        for output in ["link.fq", "here/in.fq", "hard.fq"] {
+            let error = over_inputs(&[dir.path().join(output)], std::slice::from_ref(&input));
+            assert!(
+                error.is_some_and(|e| e.contains(" is input 0 (")),
+                "{output}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_over_inputs_a_case_variant_is_refused_only_where_it_is_the_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.fq");
+        std::fs::write(&input, "").unwrap();
+        let folds_case = dir.path().join("IN.FQ").exists();
+        let error = over_inputs(&[dir.path().join("IN.FQ")], &[input]);
+        assert_eq!(error.is_some(), folds_case, "{error:?}");
+    }
+
+    #[test]
+    fn test_over_inputs_reports_the_0_based_index_of_the_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let inputs = [dir.path().join("r1.fq"), dir.path().join("r2.fq")];
+        for input in &inputs {
+            std::fs::write(input, "").unwrap();
+        }
+        let outputs = [dir.path().join("out.fq"), inputs[1].clone()];
+        let error = over_inputs(&outputs, &inputs).unwrap();
+        let expected = format!("is input 1 ({})", inputs[1].display());
+        assert!(error.contains(&expected), "{error}");
+    }
+
+    #[test]
+    fn test_over_inputs_outputs_beside_an_input_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.fq");
+        std::fs::write(&input, "").unwrap();
+        let outputs = ["in.fq.gz", "in", "o/in.fq"].map(|output| dir.path().join(output));
+        assert_eq!(over_inputs(&outputs, &[input]), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_over_inputs_standard_input_and_devices_are_exempt() {
+        let inputs = ["-", "/dev/stdin", "/dev/null"].map(PathBuf::from);
+        let outputs = ["-", "/dev/stdin", "/dev/stdout", "/dev/null"].map(PathBuf::from);
+        assert_eq!(over_inputs(&outputs, &inputs), None);
     }
 
     #[test]

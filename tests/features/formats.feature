@@ -340,9 +340,9 @@ Feature: Input and output format handling
       read2	77	*	0	0	*	*	0	0	CCCCAAAA	IIIIIIII
       read2	141	*	0	0	*	*	0	0	GGGGTTTT	JJJJJJJJ
       """
-    When I run `unmux in.sam --pool p --out in.<format>`
+    When I run `unmux in.sam --pool p --out pair.<format>`
     Then the exit code is 0
-    When I run `unmux in.<format> --pool p --threads <threads> --out out.sam`
+    When I run `unmux pair.<format> --pool p --threads <threads> --out out.sam`
     Then the exit code is 0
     And the records of "out.sam" are:
       """

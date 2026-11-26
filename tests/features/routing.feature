@@ -261,9 +261,9 @@ Feature: Read routing, removal, and fan-out primitives
       """
     # @r2 misses round b, so its CB binding is left out; the carried CB and CY would be stale, so
     # they go too, while the unbound carried RX and QX stay.
-    When I run `unmux in.sam --out in.<ext>`
+    When I run `unmux in.sam --out tagged.<ext>`
     Then the exit code is 0
-    When I run `unmux in.<ext> --pool p --group a={AAAA} --group a::loc=0:0:4 --group b=rounds.tsv --group b::loc=0:4:8 --group c=rounds.tsv --group c::loc=0:8:12 --extract a=@a --extract b=@b --extract c=@c --tag CB=a+b+c --out out.sam`
+    When I run `unmux tagged.<ext> --pool p --group a={AAAA} --group a::loc=0:0:4 --group b=rounds.tsv --group b::loc=0:4:8 --group c=rounds.tsv --group c::loc=0:8:12 --extract a=@a --extract b=@b --extract c=@c --tag CB=a+b+c --out out.sam`
     Then the exit code is 0
     And the records of "out.sam" are:
       """

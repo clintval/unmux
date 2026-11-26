@@ -1000,7 +1000,7 @@ fn labeled_dests(
     Ok(paths)
 }
 
-/// Refuse outputs that would be one file, before any is created.
+/// Refuse outputs that would be one file with each other or with an input, before any is created.
 fn check_outputs(
     plan: &DemuxPlan,
     routing: &Routing,
@@ -1021,7 +1021,8 @@ fn check_outputs(
             ));
         }
     }
-    check_output_collisions(&outputs)
+    check_output_collisions(&outputs)?;
+    crate::output::check_outputs_over_inputs(&outputs, &plan.inputs)
 }
 
 /// The `--out` file path(s) for one target (or `None` for a pure pass-through),
