@@ -209,6 +209,116 @@ mod tests {
         items.iter().map(|s| s.as_bytes().to_vec()).collect()
     }
 
+    fn check(tags: &[&str], dist: Dist, mode: MatchMode) -> Result<Vec<String>> {
+        validate_group("g", &seqs(tags), &dist, mode)
+    }
+
+    fn budget(mismatch: usize, indel: usize) -> Dist {
+        Dist {
+            mismatch,
+            indel,
+            total: mismatch + indel,
+        }
+    }
+
+    struct Rng(u64);
+
+    impl Rng {
+        fn below(&mut self, n: usize) -> usize {
+            self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            ((z ^ (z >> 31)) % n as u64) as usize
+        }
+
+        fn sample(&mut self, len: usize, letters: &[u8]) -> Vec<u8> {
+            (0..len)
+                .map(|_| letters[self.below(letters.len())])
+                .collect()
+        }
+    }
+
+    /// Random barcodes, each at least `apart` substitutions from every other.
+    fn spread_barcodes(count: usize, len: usize, apart: usize) -> Vec<Vec<u8>> {
+        let mut rng = Rng(0x2545_f491);
+        let mut tags: Vec<Vec<u8>> = Vec::new();
+        while tags.len() < count {
+            let tag = rng.sample(len, b"ACGT");
+            let far = |other: &Vec<u8>| other.iter().zip(&tag).filter(|(a, b)| a != b).count();
+            if tags.iter().all(|other| far(other) >= apart) {
+                tags.push(tag);
+            }
+        }
+        tags
+    }
+
+    #[test]
+    fn test_indel_budget_overlap_is_mode_aware() {
+        // Deleting the last base of either tag leaves ACGTA, one indel from both.
+        let tags = ["ACGTAC", "ACGTAG"];
+        let err = check(&tags, budget(0, 1), MatchMode::All)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("within dist=0:1 (the bases `ACGTA` match both)"),
+            "{err}"
+        );
+        assert!(err.contains("mode=all"), "{err}");
+        let w = check(&tags, budget(0, 1), MatchMode::Nearest).unwrap();
+        assert_eq!(w.len(), 1, "one collision warning: {w:?}");
+        assert!(
+            w[0].contains("mode=nearest leaves ambiguous reads unassigned"),
+            "{}",
+            w[0]
+        );
+    }
+
+    #[test]
+    fn test_substitution_only_budget_tells_apart_tags_differing_at_one_base() {
+        assert!(check(&["ACGTAC", "ACGTAG"], dist(0), MatchMode::All)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn test_tag_inside_a_longer_tag_is_indistinguishable() {
+        // Every read that starts with ACGTAC starts with ACGT too.
+        for tags in [["ACGT", "ACGTAC"], ["ACGTAC", "ACGT"]] {
+            for mode in [MatchMode::All, MatchMode::Nearest] {
+                let err = check(&tags, dist(0), mode).unwrap_err().to_string();
+                assert!(
+                    err.contains(
+                        "are indistinguishable (the bases `ACGTAC` match both with zero errors)"
+                    ),
+                    "{err}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_tag_near_part_of_a_longer_tag_is_mode_aware() {
+        // ACGA is one substitution from the ACGT inside TTACGTTT.
+        let tags = ["ACGA", "TTACGTTT"];
+        let err = check(&tags, dist(1), MatchMode::All)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("within dist=1"), "{err}");
+        assert!(err.contains("mode=all"), "{err}");
+        let w = check(&tags, dist(1), MatchMode::Nearest).unwrap();
+        assert_eq!(w.len(), 1, "one collision warning: {w:?}");
+        assert!(check(&tags, dist(0), MatchMode::All).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_well_separated_barcodes_pass() {
+        // No read is within one substitution of two barcodes three substitutions apart.
+        let tags = spread_barcodes(96, 8, 3);
+        let w = validate_group("g", &tags, &dist(1), MatchMode::All).unwrap();
+        assert!(w.is_empty(), "well-separated barcodes are clean: {w:?}");
+    }
+
     #[test]
     fn test_degeneracy_products() {
         assert_eq!(degeneracy(b"ACGT"), 1);
