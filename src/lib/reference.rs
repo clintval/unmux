@@ -820,6 +820,10 @@ fn owned(
     if record.flags().is_unmapped() && record.mapping_quality().is_none() {
         *record.mapping_quality_mut() = MappingQuality::new(0);
     }
+    // htslib writes a missing name to CRAM as `*`, which noodles decodes as a name.
+    if record.name().is_some_and(|name| name == "*") {
+        *record.name_mut() = None;
+    }
     record.sequence_mut().as_mut().make_ascii_uppercase();
     regenerate_md_nm(header, &mut record, reference);
     Ok(record)
