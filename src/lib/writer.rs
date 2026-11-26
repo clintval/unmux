@@ -10,19 +10,15 @@
 //! [`OutputWriter::create_with_header`]), and a multi-record fragment gets the
 //! paired-segment flags. Output is finalized explicitly via
 //! [`OutputWriter::finish`] so a failed gzip trailer / BGZF EOF / flush is
-//! reported, not silently swallowed. The per-sample fan-out over these single
-//! sinks lives in [`crate::output`]. A gzipped-FASTX or BAM sink can be a
-//! `pooled-writer` front-end ([`SinkWriter::Pooled`]) so the many-file
-//! fan-out's BGZF compression runs on a shared pool off the consumer thread;
-//! the pooled BAM writer is built via `From` so it carries no inner BGZF (the
-//! pool is the sole stage).
+//! reported, not silently swallowed. A run's gzipped FASTX and BAM outputs are
+//! instead compressed block by block on the worker pool; see `crate::sink`.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use anyhow::{anyhow, bail, Context, Result};
 use noodles::sam::alignment::io::Write as AlignmentWrite;
@@ -32,8 +28,7 @@ use noodles::sam::alignment::record_buf::data::field::value::Array;
 use noodles::sam::alignment::record_buf::data::field::Value;
 use noodles::sam::alignment::record_buf::{Data, QualityScores, Sequence};
 use noodles::sam::alignment::RecordBuf;
-use noodles::{bam, bgzf, cram, fasta, fastq, sam};
-use pooled_writer::PooledWriter;
+use noodles::{bam, bgzf, cram, fasta, sam};
 
 use crate::input::{Alignment, SniffedFormat, PHRED_OFFSET};
 
@@ -86,14 +81,9 @@ pub enum OutputFormat {
 }
 
 impl OutputFormat {
-    /// Whether this format *can* be written through the shared BGZF compressor
-    /// pool: a pure format property. Gzipped FASTX (BGZF is valid gzip; the
-    /// FASTX writer adds no compression of its own) and BAM (built via `From`,
-    /// so the bam writer adds no inner BGZF) can be, with the pool as the sole
-    /// BGZF stage. Text SAM, CRAM (own codecs), and uncompressed FASTX are not
-    /// BGZF. Whether a given destination is actually pooled is the engine's
-    /// call (only file destinations are exchanged, and `--out` SAM/BAM/CRAM
-    /// stay on the inline single-EOF path).
+    /// Whether a run writes this format as BGZF blocks compressed on the
+    /// worker pool: gzipped FASTX (BGZF is valid gzip) and BAM. Text SAM, CRAM
+    /// (its own codecs), and uncompressed FASTX are written as they merge.
     pub fn is_pooled(self) -> bool {
         matches!(
             self,
@@ -183,17 +173,10 @@ fn stdout_format(input_formats: &[SniffedFormat]) -> OutputFormat {
 enum SinkWriter {
     /// A plain buffered stream (file or stdout); BAM wraps this in its own BGZF
     /// encoder.
-    Plain(BufWriter<Box<dyn Write>>),
+    Plain(BufWriter<Box<dyn Write + Send>>),
     /// A gzip encoder over a buffered stream (FASTX.gz output); boxed as it is
     /// much larger than the plain variant.
-    Gzip(Box<flate2::write::GzEncoder<BufWriter<Box<dyn Write>>>>),
-    /// A `pooled_writer` front-end that ships blocks to a shared BGZF
-    /// compressor pool: the many-file FASTX.gz / BAM fan-out compresses off the
-    /// consumer thread. BGZF is valid gzip, so a pooled `.fq.gz`/`.fa.gz` stays
-    /// readable by any gzip reader; a pooled BAM gets its BGZF from the pool
-    /// (the bam writer adds none). The pool is owned and stopped by the engine
-    /// after every writer is finalized.
-    Pooled(PooledWriter),
+    Gzip(Box<flate2::write::GzEncoder<BufWriter<Box<dyn Write + Send>>>>),
 }
 
 impl Write for SinkWriter {
@@ -201,7 +184,6 @@ impl Write for SinkWriter {
         match self {
             SinkWriter::Plain(writer) => writer.write(buf),
             SinkWriter::Gzip(writer) => writer.write(buf),
-            SinkWriter::Pooled(writer) => writer.write(buf),
         }
     }
 
@@ -209,16 +191,13 @@ impl Write for SinkWriter {
         match self {
             SinkWriter::Plain(writer) => writer.flush(),
             SinkWriter::Gzip(writer) => writer.flush(),
-            SinkWriter::Pooled(writer) => writer.flush(),
         }
     }
 }
 
 impl SinkWriter {
     /// Finalize the stream: write the gzip trailer (if any) and flush,
-    /// propagating any error. For a pooled writer this flushes the final block
-    /// and the BGZF EOF into the pool; the pool itself is stopped by the engine
-    /// once every writer has been finalized (the mandatory order).
+    /// propagating any error.
     fn finish(self) -> Result<()> {
         match self {
             SinkWriter::Plain(mut writer) => writer.flush().context("failed to flush output"),
@@ -228,20 +207,6 @@ impl SinkWriter {
                     .context("failed to finish the gzip stream")?;
                 inner.flush().context("failed to flush output")
             }
-            // `close` flushes the final data block and the BGZF EOF,
-            // propagating any error (the point of calling it over a bare drop).
-            // It consumes the writer, so its `Drop` runs the flush once more on
-            // the now-empty buffer: the compressor still deflates the empty
-            // input into a real (non-EOF, ISIZE=0) block and then appends a
-            // second EOF. So the tail is `[...data][EOF][empty block][EOF]`,
-            // not two adjacent EOFs. This is harmless: all payload precedes the
-            // first EOF, the trailing empty member decodes to nothing, and the
-            // last 28 bytes are a canonical EOF, so noodles (and htslib) read
-            // every record then stop. A truly single-EOF
-            // stream would mean giving up `close`'s error propagation.
-            SinkWriter::Pooled(writer) => writer
-                .close()
-                .context("failed to finish the pooled BGZF stream"),
         }
     }
 }
@@ -249,16 +214,8 @@ impl SinkWriter {
 /// One open output sink, holding the concrete noodles writer for the chosen
 /// format.
 enum Sink {
-    /// FASTQ. The `record` buffer is reused across writes so the per-record
-    /// SEQ/QUAL Vecs are cleared and refilled in place rather than reallocated
-    /// for every output record.
-    Fastq {
-        /// The record writer.
-        writer: fastq::io::Writer<SinkWriter>,
-        /// The reused output record (its SEQ/QUAL buffers are cleared and
-        /// refilled each write).
-        record: fastq::Record,
-    },
+    /// FASTQ, written as [`encode_fastq`] encodes it.
+    Fastq(SinkWriter),
     /// FASTA.
     Fasta(fasta::io::Writer<SinkWriter>),
     /// Text SAM, plus the header written up front and reused to encode each
@@ -269,21 +226,12 @@ enum Sink {
         /// The header.
         header: sam::Header,
     },
-    /// BGZF BAM where the bam writer wraps its own BGZF encoder (stdout and
-    /// other non-pooled sinks), plus the header.
+    /// BGZF BAM where the bam writer wraps its own BGZF encoder, plus the
+    /// header.
     BamInline {
         /// The record writer (its inner `bgzf::io::Writer` does the
         /// compression).
         writer: bam::io::Writer<bgzf::io::Writer<SinkWriter>>,
-        /// The header.
-        header: sam::Header,
-    },
-    /// BGZF BAM whose BGZF is done by the `pooled-writer` pool: the bam writer
-    /// carries NO inner bgzf layer (built via `From`, not `new`), so the pooled
-    /// sink is the sole BGZF stage.
-    BamPooled {
-        /// The record writer, writing BAM binary straight into the pooled sink.
-        writer: bam::io::Writer<SinkWriter>,
         /// The header.
         header: sam::Header,
     },
@@ -323,17 +271,14 @@ impl OutputWriter {
         compression: u8,
         header: sam::Header,
     ) -> Result<Self> {
-        let raw: Box<dyn Write> = match out {
+        let raw: Box<dyn Write + Send> = match out {
             Some(path) => Box::new(create_output_file(path)?),
             None => Box::new(std::io::stdout()),
         };
         let buffered = BufWriter::new(raw);
 
         let sink = match format {
-            OutputFormat::Fastq { gzip } => Sink::Fastq {
-                writer: fastq::io::Writer::new(sink_writer(buffered, gzip, compression)),
-                record: fastq::Record::default(),
-            },
+            OutputFormat::Fastq { gzip } => Sink::Fastq(sink_writer(buffered, gzip, compression)),
             OutputFormat::Fasta { gzip } => Sink::Fasta(fasta::io::Writer::new(sink_writer(
                 buffered,
                 gzip,
@@ -367,46 +312,19 @@ impl OutputWriter {
         Ok(Self { sink })
     }
 
-    /// Create a writer whose sink is a `pooled_writer` front-end: records are
-    /// serialized here and BGZF-compressed on the shared pool, so the many-file
-    /// fan-out does not compress on the consumer thread. Poolable formats are
-    /// gzipped FASTX (the BGZF output is valid gzip) and BAM (built via `From`,
-    /// so the bam writer adds no inner BGZF and the pool is the sole
-    /// compressor); every other format stays on [`create_with_header`].
-    /// `header` is used for BAM and ignored for FASTX.
-    pub fn from_pooled(
-        pooled: PooledWriter,
-        format: OutputFormat,
-        header: sam::Header,
-    ) -> Result<Self> {
-        let writer = SinkWriter::Pooled(pooled);
-        let sink = match format {
-            OutputFormat::Fastq { gzip: true } => Sink::Fastq {
-                writer: fastq::io::Writer::new(writer),
-                record: fastq::Record::default(),
-            },
-            OutputFormat::Fasta { gzip: true } => Sink::Fasta(fasta::io::Writer::new(writer)),
-            OutputFormat::Bam => {
-                let mut writer = bam::io::Writer::from(writer);
-                writer
-                    .write_header(&header)
-                    .context("failed to write BAM header")?;
-                Sink::BamPooled { writer, header }
-            }
-            other => bail!("internal error: format {other:?} is not poolable"),
-        };
-        Ok(Self { sink })
-    }
-
     /// Write one logical record's output records. A multi-record fragment emits
     /// SAM/BAM paired-segment records (or interleaved FASTX); SAM/BAM allows at
     /// most two (a pair).
     pub fn write_fragment(&mut self, reads: &[OutputRead]) -> Result<()> {
         match &mut self.sink {
-            Sink::Fastq { writer, record } => {
+            Sink::Fastq(writer) => {
+                let mut bytes = Vec::new();
                 for read in reads {
-                    write_fastq(writer, record, read)?;
+                    encode_fastq(&mut bytes, read)?;
                 }
+                writer
+                    .write_all(&bytes)
+                    .context("failed to write FASTQ record")?;
             }
             Sink::Fasta(writer) => {
                 for read in reads {
@@ -415,7 +333,6 @@ impl OutputWriter {
             }
             Sink::Sam { writer, header } => write_alignments(writer, header, reads)?,
             Sink::BamInline { writer, header } => write_alignments(writer, header, reads)?,
-            Sink::BamPooled { writer, header } => write_alignments(writer, header, reads)?,
             Sink::Cram { writer, header } => write_alignments(writer, header, reads)?,
         }
         Ok(())
@@ -424,23 +341,19 @@ impl OutputWriter {
     /// Append a fragment's already-encoded record bytes (produced by
     /// [`encode_fragment`] for this sink's format, e.g. on a worker thread),
     /// after the header written at open. The bytes are injected into the sink's
-    /// underlying stream so they pass through its compression stage (gzip /
-    /// inline BGZF / the pooled BGZF) exactly as if the records had been
-    /// encoded here. CRAM is not supported (its records are
-    /// not independent per-fragment byte slices); callers route CRAM through
-    /// `write_fragment`.
+    /// underlying stream so they pass through its compression stage (gzip or
+    /// BGZF) exactly as if the records had been encoded here. CRAM is not
+    /// supported (its records are not independent per-fragment byte slices);
+    /// callers route CRAM through `write_fragment`.
     pub fn write_encoded(&mut self, bytes: &[u8]) -> Result<()> {
         let sink: &mut dyn Write = match &mut self.sink {
-            Sink::Fastq { writer, .. } => writer.get_mut(),
+            Sink::Fastq(writer) => writer,
             Sink::Fasta(writer) => writer.get_mut(),
             Sink::Sam { writer, .. } => writer.get_mut(),
             // get_mut yields the inner `bgzf::io::Writer`, so the raw record
             // bytes are BGZF-compressed here exactly as the bam writer would
             // have compressed them.
             Sink::BamInline { writer, .. } => writer.get_mut(),
-            // get_mut yields the pooled `SinkWriter`; the pool is the sole BGZF
-            // stage.
-            Sink::BamPooled { writer, .. } => writer.get_mut(),
             Sink::Cram { .. } => {
                 bail!("internal error: CRAM cannot accept pre-encoded fragment bytes")
             }
@@ -454,7 +367,7 @@ impl OutputWriter {
     /// is reported rather than silently produced).
     pub fn finish(self) -> Result<()> {
         match self.sink {
-            Sink::Fastq { writer, .. } => writer.into_inner().finish(),
+            Sink::Fastq(writer) => writer.finish(),
             Sink::Fasta(writer) => writer.into_inner().finish(),
             Sink::Sam { writer, .. } => writer.into_inner().finish(),
             Sink::BamInline { writer, .. } => {
@@ -464,10 +377,6 @@ impl OutputWriter {
                     .context("failed to finalize BGZF (BAM EOF block)")?;
                 sink.finish()
             }
-            // The pooled BAM writer has no inner BGZF layer; the pooled sink
-            // emits the BGZF EOF on close (do NOT also call the bam writer's
-            // bgzf finish - there is none).
-            Sink::BamPooled { writer, .. } => writer.into_inner().finish(),
             Sink::Cram { mut writer, header } => {
                 writer
                     .try_finish(&header)
@@ -478,11 +387,7 @@ impl OutputWriter {
     }
 }
 
-/// A BGZF writer over `inner` at the given `--compression` level (0-9). Used by
-/// the inline BAM sink so it honors `--compression` (which sets the BAM BGZF
-/// level), matching the pooled BAM bins (which pass the level to the
-/// compressor pool). `--compression` is clap-validated to 0-9, so the
-/// conversion only errors on a programmer mistake.
+/// A BGZF writer over `inner` at the `--compression` level, which clap validates to 0-9.
 fn bgzf_writer<W: Write>(inner: W, compression: u8) -> Result<bgzf::io::Writer<W>> {
     let level = bgzf::io::writer::CompressionLevel::try_from(compression)
         .map_err(|e| anyhow!("invalid --compression {compression} for BGZF: {e}"))?;
@@ -746,8 +651,7 @@ pub(crate) fn refuse_shared_files<'a>(
 }
 
 /// Create an output file, making any missing parent directories first. Shared
-/// by the inline writers and the pooled-writer exchange so both create files
-/// (and dirs) identically.
+/// by every output so each creates its file (and dirs) identically.
 pub(crate) fn create_output_file(path: &Path) -> Result<File> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -759,63 +663,13 @@ pub(crate) fn create_output_file(path: &Path) -> Result<File> {
     File::create(path).with_context(|| format!("failed to create output file: {}", path.display()))
 }
 
-/// The first write error among the files behind a BGZF pool, which the pool itself does not report.
-#[derive(Debug, Default)]
-pub(crate) struct PoolFailure(OnceLock<(PathBuf, io::Error)>);
-
-impl PoolFailure {
-    /// Fail with the first write error, if a file behind the pool has had one.
-    pub(crate) fn check(&self) -> Result<()> {
-        let Some((path, error)) = self.0.get() else {
-            return Ok(());
-        };
-        Err(io::Error::new(error.kind(), error.to_string()))
-            .with_context(|| format!("failed to write output file: {}", path.display()))
-    }
-}
-
-/// A file behind a BGZF pool, keeping in [`PoolFailure`] the write errors that the pool drops.
-pub(crate) struct PooledFile<W> {
-    file: W,
-    path: PathBuf,
-    failure: Arc<PoolFailure>,
-}
-
-impl<W: Write> PooledFile<W> {
-    /// Wrap `file`, the staged file of output `path`, to keep its write errors in `failure`.
-    pub(crate) fn new(file: W, path: &Path, failure: &Arc<PoolFailure>) -> Self {
-        Self {
-            file,
-            path: path.to_path_buf(),
-            failure: Arc::clone(failure),
-        }
-    }
-
-    /// Run `step` on the file unless a file behind the pool has failed, keeping an error it gives.
-    fn attempt(&mut self, step: impl FnOnce(&mut W) -> io::Result<()>) {
-        if self.failure.0.get().is_none() {
-            if let Err(error) = step(&mut self.file) {
-                let _ = self.failure.0.set((self.path.clone(), error));
-            }
-        }
-    }
-}
-
-impl<W: Write> Write for PooledFile<W> {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.attempt(|file| file.write_all(buf));
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.attempt(W::flush);
-        Ok(())
-    }
-}
-
 /// Wrap a buffered stream in a gzip encoder when `gzip` is set, else leave it
 /// plain.
-fn sink_writer(buffered: BufWriter<Box<dyn Write>>, gzip: bool, compression: u8) -> SinkWriter {
+fn sink_writer(
+    buffered: BufWriter<Box<dyn Write + Send>>,
+    gzip: bool,
+    compression: u8,
+) -> SinkWriter {
     if gzip {
         SinkWriter::Gzip(Box::new(flate2::write::GzEncoder::new(
             buffered,
@@ -836,31 +690,25 @@ pub(crate) fn default_header() -> sam::Header {
         .build()
 }
 
-/// Write one FASTQ record (qualities re-encoded to ASCII Phred+33), reusing
-/// `record`'s SEQ/QUAL buffers in place to avoid allocating a fresh Vec per
-/// output record.
-fn write_fastq<W: Write>(
-    writer: &mut fastq::io::Writer<W>,
-    record: &mut fastq::Record,
-    read: &OutputRead,
-) -> Result<()> {
+/// Append `read` to `out` as one FASTQ record, byte for byte as the noodles
+/// writer writes it: the qualities re-encoded to ASCII Phred+33, and input
+/// tags carried in the read-name comment (samtools `fastq -T` convention).
+fn encode_fastq(out: &mut Vec<u8>, read: &OutputRead) -> Result<()> {
     let quals = read
         .quals
         .context("cannot write FASTQ output for a record with no qualities (a FASTA input, or QUAL `*` in SAM/BAM/CRAM)")?;
-    let seq = record.sequence_mut();
-    seq.clear();
-    seq.extend_from_slice(read.bases);
-    let qual = record.quality_scores_mut();
-    qual.clear();
-    qual.extend(quals.iter().map(|&q| q.saturating_add(PHRED_OFFSET)));
-    // Carry input tags through in the read-name comment (samtools `fastq -T`
-    // convention). The definition is small (name + optional comment), so it is
-    // rebuilt rather than mutated in place.
-    let comment = read.tags.map(render_tags).unwrap_or_default();
-    *record.definition_mut() = fastq::record::Definition::new(read.name.to_vec(), comment);
-    writer
-        .write_record(record)
-        .context("failed to write FASTQ record")
+    out.push(b'@');
+    out.extend_from_slice(read.name);
+    if let Some(tags) = read.tags.filter(|tags| !tags.is_empty()) {
+        out.push(b' ');
+        write_tags(out, tags).context("failed to write FASTQ record")?;
+    }
+    out.push(b'\n');
+    out.extend_from_slice(read.bases);
+    out.extend_from_slice(b"\n+\n");
+    out.extend(quals.iter().map(|&q| q.saturating_add(PHRED_OFFSET)));
+    out.push(b'\n');
+    Ok(())
 }
 
 /// Write one FASTA record (no qualities), carrying input tags in the
@@ -869,6 +717,8 @@ fn write_fasta<W: Write>(writer: &mut fasta::io::Writer<W>, read: &OutputRead) -
     let comment = read
         .tags
         .map(render_tags)
+        .transpose()
+        .context("failed to write FASTA record")?
         .filter(|tags| !tags.is_empty())
         .map(Into::into);
     let record = fasta::Record::new(
@@ -883,27 +733,35 @@ fn write_fasta<W: Write>(writer: &mut fasta::io::Writer<W>, read: &OutputRead) -
 /// Render carried SAM tags as a tab-separated `TAG:TYPE:VALUE` comment (the
 /// samtools `fastq -T` convention) so FASTX output preserves them and
 /// round-trips via `samtools import` / `bwa -C`.
-fn render_tags(data: &Data) -> Vec<u8> {
-    let mut fields: Vec<String> = Vec::new();
-    for (tag, value) in data.iter() {
+fn render_tags(data: &Data) -> io::Result<Vec<u8>> {
+    let mut comment = Vec::new();
+    write_tags(&mut comment, data)?;
+    Ok(comment)
+}
+
+/// Append the comment [`render_tags`] renders for `data` to `out`.
+fn write_tags(out: &mut Vec<u8>, data: &Data) -> io::Result<()> {
+    for (i, (tag, value)) in data.iter().enumerate() {
+        if i > 0 {
+            out.push(b'\t');
+        }
         let bytes: [u8; 2] = tag.into();
         let key = String::from_utf8_lossy(&bytes);
-        let field = match value {
-            Value::Character(c) => format!("{key}:A:{}", *c as char),
-            Value::Int8(n) => format!("{key}:i:{n}"),
-            Value::UInt8(n) => format!("{key}:i:{n}"),
-            Value::Int16(n) => format!("{key}:i:{n}"),
-            Value::UInt16(n) => format!("{key}:i:{n}"),
-            Value::Int32(n) => format!("{key}:i:{n}"),
-            Value::UInt32(n) => format!("{key}:i:{n}"),
-            Value::Float(x) => format!("{key}:f:{x}"),
-            Value::String(s) => format!("{key}:Z:{s}"),
-            Value::Hex(s) => format!("{key}:H:{s}"),
-            Value::Array(array) => format!("{key}:B:{}", render_array(array)),
-        };
-        fields.push(field);
+        match value {
+            Value::Character(c) => write!(out, "{key}:A:{}", *c as char),
+            Value::Int8(n) => write!(out, "{key}:i:{n}"),
+            Value::UInt8(n) => write!(out, "{key}:i:{n}"),
+            Value::Int16(n) => write!(out, "{key}:i:{n}"),
+            Value::UInt16(n) => write!(out, "{key}:i:{n}"),
+            Value::Int32(n) => write!(out, "{key}:i:{n}"),
+            Value::UInt32(n) => write!(out, "{key}:i:{n}"),
+            Value::Float(x) => write!(out, "{key}:f:{x}"),
+            Value::String(s) => write!(out, "{key}:Z:{s}"),
+            Value::Hex(s) => write!(out, "{key}:H:{s}"),
+            Value::Array(array) => write!(out, "{key}:B:{}", render_array(array)),
+        }?;
     }
-    fields.join("\t").into_bytes()
+    Ok(())
 }
 
 /// Render a `B` array tag value as `subtype,v1,v2,...` (SAM subtype codes
@@ -1024,12 +882,14 @@ pub fn encode_fragment(
 ) -> Result<Vec<u8>> {
     Ok(match format {
         OutputFormat::Fastq { .. } => {
-            let mut writer = fastq::io::Writer::new(Vec::new());
-            let mut record = fastq::Record::default();
+            let size = reads
+                .iter()
+                .map(|read| read.name.len() + 2 * read.bases.len());
+            let mut bytes = Vec::with_capacity(size.sum::<usize>() + 64 * reads.len());
             for read in reads {
-                write_fastq(&mut writer, &mut record, read)?;
+                encode_fastq(&mut bytes, read)?;
             }
-            writer.into_inner()
+            bytes
         }
         OutputFormat::Fasta { .. } => {
             let mut writer = fasta::io::Writer::new(Vec::new());
@@ -1268,86 +1128,6 @@ mod tests {
         staged.commit().unwrap();
     }
 
-    /// A writer with room for this many more bytes, which fails any write that needs more.
-    struct Full(usize);
-
-    impl Write for Full {
-        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            match self.0.checked_sub(buf.len()) {
-                Some(room) => {
-                    self.0 = room;
-                    Ok(buf.len())
-                }
-                None => Err(io::Error::new(io::ErrorKind::StorageFull, "disk full")),
-            }
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-
-    #[test]
-    fn test_pooled_file_keeps_the_first_write_error_and_skips_later_writes() {
-        let failure = Arc::new(PoolFailure::default());
-        let mut sound = PooledFile::new(Vec::new(), Path::new("o/a.bam"), &failure);
-        let mut full = PooledFile::new(Full(4), Path::new("o/b.bam"), &failure);
-        sound.write_all(b"kept").unwrap();
-        full.write_all(b"fits").unwrap();
-        failure.check().unwrap();
-
-        full.write_all(b"does not").unwrap();
-        sound.write_all(b"skipped").unwrap();
-        assert_eq!(sound.file, b"kept");
-        let error = failure.check().unwrap_err();
-        assert_eq!(
-            format!("{error:#}"),
-            "failed to write output file: o/b.bam: disk full"
-        );
-        let cause = error.downcast_ref::<io::Error>().unwrap();
-        assert_eq!(cause.kind(), io::ErrorKind::StorageFull);
-    }
-
-    #[test]
-    fn test_pooled_file_keeps_an_error_from_flushing_buffered_bytes() {
-        let failure = Arc::new(PoolFailure::default());
-        let buffered = BufWriter::new(Full(0));
-        let mut file = PooledFile::new(buffered, Path::new("o/a.fq.gz"), &failure);
-        file.write_all(b"buffered").unwrap();
-        failure.check().unwrap();
-
-        file.flush().unwrap();
-        let error = failure.check().unwrap_err();
-        assert_eq!(
-            format!("{error:#}"),
-            "failed to write output file: o/a.fq.gz: disk full"
-        );
-    }
-
-    #[test]
-    fn test_a_write_error_leaves_the_bgzf_pool_running_until_it_is_stopped() {
-        use pooled_writer::{bgzf::BgzfCompressor, PoolBuilder};
-
-        let failure = Arc::new(PoolFailure::default());
-        let mut builder = PoolBuilder::<PooledFile<Full>, BgzfCompressor>::new()
-            .threads(1)
-            .queue_size(2);
-        let file = PooledFile::new(Full(1 << 10), Path::new("o/a.fq.gz"), &failure);
-        let mut pooled = builder.exchange(file);
-        let mut pool = builder.build().unwrap();
-        // Many more blocks than the queue holds, each at least 28 bytes once compressed.
-        for _ in 0..64 {
-            pooled.write_all(&[b'A'; 1 << 16]).unwrap();
-        }
-        pooled.close().unwrap();
-        pool.stop_pool().unwrap();
-        let error = failure.check().unwrap_err();
-        assert_eq!(
-            format!("{error:#}"),
-            "failed to write output file: o/a.fq.gz: disk full"
-        );
-    }
-
     #[test]
     fn test_format_from_extension() {
         let f = |p: &str| format_from_extension(Path::new(p)).unwrap().unwrap();
@@ -1584,7 +1364,50 @@ mod tests {
     fn render_one(tag: [u8; 2], value: Value) -> String {
         let mut data = Data::default();
         data.insert(Tag::from(tag), value);
-        String::from_utf8(render_tags(&data)).unwrap()
+        String::from_utf8(render_tags(&data).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn test_encode_fastq_matches_the_noodles_writer() {
+        let mut tags = Data::default();
+        tags.insert(Tag::from(*b"BC"), Value::String("ACGT-TTGA".into()));
+        tags.insert(Tag::from(*b"XI"), Value::Int32(-7));
+        tags.insert(Tag::from(*b"XF"), Value::Float(0.25));
+        tags.insert(Tag::from(*b"XB"), Value::Array(Array::UInt8(vec![1, 2])));
+        let empty = Data::default();
+        let quals = [0u8, 2, 30, 41, 93];
+        for (name, bases, tags) in [
+            (&b"r1"[..], &b"ACGTN"[..], None),
+            (b"r2/1", b"ACGTN", Some(&tags)),
+            (b"r3", b"ACGTN", Some(&empty)),
+            (b"", b"", None),
+        ] {
+            let read = OutputRead {
+                name,
+                bases,
+                quals: Some(&quals[..bases.len()]),
+                tags,
+                read_group: None,
+                qc_fail: false,
+                alignment: None,
+            };
+            let mut expected = noodles::fastq::io::Writer::new(Vec::new());
+            let comment = tags
+                .map(|tags| render_tags(tags).unwrap())
+                .unwrap_or_default();
+            let record = noodles::fastq::Record::new(
+                noodles::fastq::record::Definition::new(name.to_vec(), comment),
+                bases.to_vec(),
+                quals[..bases.len()]
+                    .iter()
+                    .map(|q| q + PHRED_OFFSET)
+                    .collect::<Vec<u8>>(),
+            );
+            expected.write_record(&record).unwrap();
+            let mut encoded = Vec::new();
+            encode_fastq(&mut encoded, &read).unwrap();
+            assert_eq!(encoded, expected.into_inner());
+        }
     }
 
     #[test]
@@ -1820,18 +1643,14 @@ mod tests {
     #[test]
     fn test_sink_writer_write_and_flush_delegate() {
         // The `Write` impl delegates to the inner stream for the plain and gzip
-        // variants (the pooled variant needs a compressor pool and is covered by
-        // the fan-out integration tests).
-        let mut plain = SinkWriter::Plain(BufWriter::new(Box::new(Vec::new()) as Box<dyn Write>));
+        // variants.
+        let buffer = || BufWriter::new(Box::new(Vec::new()) as Box<dyn Write + Send>);
+        let mut plain = SinkWriter::Plain(buffer());
         assert_eq!(plain.write(b"abc").unwrap(), 3);
         plain.flush().unwrap();
         plain.finish().unwrap();
 
-        let mut gzip = sink_writer(
-            BufWriter::new(Box::new(Vec::new()) as Box<dyn Write>),
-            true,
-            6,
-        );
+        let mut gzip = sink_writer(buffer(), true, 6);
         assert_eq!(gzip.write(b"abc").unwrap(), 3);
         gzip.flush().unwrap();
         gzip.finish().unwrap();

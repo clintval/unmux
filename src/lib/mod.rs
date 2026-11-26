@@ -7,6 +7,7 @@
 //! point, re-exported here for the binary to dispatch.
 #![warn(missing_docs)]
 
+mod chunks;
 mod cram_raw;
 pub mod demux;
 pub mod extract;
@@ -17,10 +18,12 @@ pub mod iupac;
 pub mod matcher;
 pub mod metrics;
 pub mod output;
+mod pool;
 pub mod qc;
 pub mod readgroup;
 pub mod reference;
 mod reference_check;
+mod sink;
 pub mod tags;
 pub mod writer;
 

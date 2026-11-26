@@ -1,23 +1,16 @@
 //! The demux output layer: resolve `--out`/`--unassigned`/`--remove` path
-//! patterns to concrete destinations, assemble the `--tag` SAM fields and `@RG`
-//! header for a fan-out, and fan records out to one [`OutputWriter`] per
-//! destination.
+//! patterns to concrete [`Destination`]s, and assemble the `--tag` SAM fields
+//! and `@RG` header for a fan-out.
 //!
 //! Routing decides *which* target a record belongs to (see [`crate::fanout`]);
 //! this module turns that decision into files. A pattern carries placeholders
 //! (`%pool`/`%sample`/`%sub_sample`/`%ordinal` for `--out`, `%pool`/`%source`
 //! for the raw bins); [`resolve_pattern`] expands them against a
-//! [`PathContext`]. The engine enumerates every directed destination and calls
-//! [`MultiWriter::create_all`] to create each file up front (a directed file
-//! always exists, even empty); [`MultiWriter::write`] then reuses the open
-//! writer (with a lazy fallback for any path not pre-created). Gzipped-FASTX
-//! and BAM file destinations are compressed by a shared `pooled-writer` BGZF
-//! pool, installed via [`MultiWriter::set_pooled`]; text SAM, CRAM,
-//! uncompressed FASTX, and stdout use an inline sink.
+//! [`PathContext`]. The engine enumerates every directed destination and
+//! creates each file up front, so a directed file always exists, even empty.
 
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
 
 use anyhow::{bail, Result};
 use noodles::sam;
@@ -28,7 +21,6 @@ use noodles::sam::header::record::value::map::{
     self, program::tag as program_tag, read_group::tag as rg_tag, Program, ReadGroup,
 };
 use noodles::sam::header::record::value::Map;
-use pooled_writer::PooledWriter;
 
 use crate::extract::Extracted;
 use crate::fanout::Target;
@@ -36,7 +28,7 @@ use crate::grammar::{
     default_qual_tag, OutputPattern, PatternSegment, Placeholder, QualTag, TagBinding,
 };
 use crate::input::{SniffedFormat, PHRED_OFFSET};
-use crate::writer::{file_id, output_format, FileId, OutputRead, OutputWriter, PoolFailure};
+use crate::writer::{file_id, output_format, FileId, OutputFormat};
 
 /// A non-standard read-group field tag (e.g. `SM`/`LB`/`CN`), as the
 /// `Map<ReadGroup>` builder takes.
@@ -452,176 +444,34 @@ fn rg_shared_tag(key: &str) -> Result<ReadGroupTag> {
     }
 }
 
-/// The destination key for a writer: a concrete path, or the single shared
-/// stdout sink.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-enum Dest {
-    /// stdout (the `-` / `/dev/stdout` destination).
-    Stdout,
-    /// A file path.
-    Path(PathBuf),
+/// One output of a run: a file, or stdout when `path` is `None`, in `format`,
+/// opened with `header` when it is SAM, BAM, or CRAM.
+#[derive(Debug, Clone)]
+pub struct Destination {
+    /// The output path, or `None` for stdout.
+    pub path: Option<PathBuf>,
+    /// The format the path resolves to.
+    pub format: OutputFormat,
+    /// The header of a SAM, BAM, or CRAM output.
+    pub header: sam::Header,
 }
 
-impl Dest {
-    /// Map a resolved destination (path or stdout) to a key.
-    fn from_path(path: Option<&Path>) -> Self {
-        match path {
-            Some(path) => Dest::Path(path.to_path_buf()),
-            None => Dest::Stdout,
-        }
-    }
-}
-
-/// Fans records out to one [`OutputWriter`] per destination, opening each
-/// writer lazily on first write. A SAM/BAM file is created with its precomputed
-/// per-sample `@RG` header (looked up by path); a path with no precomputed
-/// header (the pass-through `--out` and the raw `--unassigned`/`--remove` bins)
-/// gets `default_header`, which carries the `@PG` provenance plus the default
-/// pool `@RG`. stdout's format mirrors the inputs.
-pub struct MultiWriter {
-    writers: HashMap<Dest, OutputWriter>,
-    headers: HashMap<Dest, sam::Header>,
-    /// Pre-exchanged BGZF pool writers, keyed by destination: a pooled file's
-    /// writer is installed from here on open instead of creating its own file.
-    /// Populated by [`set_pooled`]; the pool itself is owned and stopped by the
-    /// engine after every writer is finalized.
-    pooled: HashMap<Dest, PooledWriter>,
-    /// The first write error among the files behind the pool, which fails every later write.
-    pool_failure: Arc<PoolFailure>,
-    input_formats: Vec<SniffedFormat>,
-    compression: u8,
-    /// Header for any destination absent from `headers` (pass-through `--out`,
-    /// the raw `--unassigned`/`--remove` bins): `@PG` provenance plus the
-    /// default pool `@RG`.
-    default_header: sam::Header,
-    /// The file each destination path is written to, when that differs from the path.
-    files: HashMap<PathBuf, PathBuf>,
-}
-
-impl MultiWriter {
-    /// Create a fan-out writer. `headers` maps a resolved destination (a path,
-    /// or `None` for stdout) to the SAM/BAM header it should be created with
-    /// (carrying its per-sample `@RG`); destinations absent from the map get
-    /// `default_header` (the `@PG` provenance plus the default pool `@RG`).
-    /// `input_formats` picks the stdout mirror format; `compression` is the
-    /// gzip/BGZF level.
+impl Destination {
+    /// The destination at `path` (stdout when `None`), with the header in
+    /// `headers` for that path or else `default_header`.
     pub fn new(
-        headers: HashMap<Option<PathBuf>, sam::Header>,
-        default_header: sam::Header,
-        input_formats: Vec<SniffedFormat>,
-        compression: u8,
-    ) -> Self {
-        let headers = headers
-            .into_iter()
-            .map(|(path, header)| (Dest::from_path(path.as_deref()), header))
-            .collect();
-        Self {
-            writers: HashMap::new(),
-            headers,
-            pooled: HashMap::new(),
-            pool_failure: Arc::default(),
-            input_formats,
-            compression,
-            default_header,
-            files: HashMap::new(),
-        }
-    }
-
-    /// Write each destination path in `files` to the file it maps to instead.
-    pub fn write_files_to(&mut self, files: HashMap<PathBuf, PathBuf>) {
-        self.files = files;
-    }
-
-    /// Install the pre-exchanged BGZF pool writers, keyed by destination path.
-    /// Each is consumed when its destination is opened ([`create_all`] /
-    /// [`write`]); the file is created by the exchange, so the pooled writer
-    /// wraps it directly instead of opening a new file.
-    pub fn set_pooled(&mut self, pooled: HashMap<PathBuf, PooledWriter>) {
-        self.pooled = pooled
-            .into_iter()
-            .map(|(path, writer)| (Dest::from_path(Some(path.as_path())), writer))
-            .collect();
-    }
-
-    /// Fail every write that follows a write error kept in `failure` by a file behind the pool.
-    pub(crate) fn set_pool_failure(&mut self, failure: Arc<PoolFailure>) {
-        self.pool_failure = failure;
-    }
-
-    /// Eagerly create the writer for each directed file `path`, so a directed
-    /// output file always exists even when it receives no records (it is
-    /// finalized to a valid empty file). A path that is later written to reuses
-    /// the writer opened here; the lazy path in [`MultiWriter::write`] still
-    /// covers any destination not listed.
-    pub fn create_all(&mut self, paths: &[PathBuf]) -> Result<()> {
-        for path in paths {
-            let dest = Dest::from_path(Some(path));
-            if !self.writers.contains_key(&dest) {
-                let writer = self.open(Some(path))?;
-                self.writers.insert(dest, writer);
-            }
-        }
-        Ok(())
-    }
-
-    /// Write `reads` to the destination `path` (stdout when `None`), opening
-    /// its writer on first use.
-    pub fn write(&mut self, path: Option<&Path>, reads: &[OutputRead]) -> Result<()> {
-        self.pool_failure.check()?;
-        let dest = Dest::from_path(path);
-        if !self.writers.contains_key(&dest) {
-            let writer = self.open(path)?;
-            self.writers.insert(dest.clone(), writer);
-        }
-        self.writers.get_mut(&dest).unwrap().write_fragment(reads)
-    }
-
-    /// Append a fragment's pre-encoded record bytes (produced on a worker by
-    /// `encode_fragment` for this destination's format) to `path`, opening its
-    /// writer on first use exactly as [`write`] does. The bytes are
-    /// byte-identical to what [`write`] would have encoded inline.
-    pub fn write_encoded(&mut self, path: Option<&Path>, bytes: &[u8]) -> Result<()> {
-        self.pool_failure.check()?;
-        let dest = Dest::from_path(path);
-        if !self.writers.contains_key(&dest) {
-            let writer = self.open(path)?;
-            self.writers.insert(dest.clone(), writer);
-        }
-        self.writers.get_mut(&dest).unwrap().write_encoded(bytes)
-    }
-
-    /// Open the writer for a destination with the right format and header. A
-    /// destination with a pre-exchanged pool writer is installed from there
-    /// (its file already created by the exchange); every other destination
-    /// opens its own file inline.
-    fn open(&mut self, path: Option<&Path>) -> Result<OutputWriter> {
-        let format = output_format(path, &self.input_formats)?;
-        let dest = Dest::from_path(path);
-        let header = self
-            .headers
-            .get(&dest)
-            .cloned()
-            .unwrap_or_else(|| self.default_header.clone());
-        if let Some(pooled) = self.pooled.remove(&dest) {
-            // The pooled BAM writer needs the @RG header; the pooled FASTX
-            // writers ignore it.
-            return OutputWriter::from_pooled(pooled, format, header);
-        }
-        let file = path.map(|path| self.files.get(path).map_or(path, PathBuf::as_path));
-        OutputWriter::create_with_header(file, format, self.compression, header)
-    }
-
-    /// Finalize every opened writer (flush, gzip trailers, BGZF EOF), returning
-    /// the first error. Every writer is finalized even when one fails, so a
-    /// single bad sink does not leave the other fan-out files truncated.
-    pub fn finish(self) -> Result<()> {
-        let mut first_error = None;
-        for (_, writer) in self.writers {
-            if let Err(error) = writer.finish() {
-                first_error.get_or_insert(error);
-            }
-        }
-        first_error.map_or(Ok(()), Err)
+        path: Option<PathBuf>,
+        input_formats: &[SniffedFormat],
+        headers: &HashMap<Option<PathBuf>, sam::Header>,
+        default_header: &sam::Header,
+    ) -> Result<Self> {
+        let format = output_format(path.as_deref(), input_formats)?;
+        let header = headers.get(&path).unwrap_or(default_header).clone();
+        Ok(Self {
+            path,
+            format,
+            header,
+        })
     }
 }
 
@@ -1282,95 +1132,6 @@ mod tests {
         let field = |tag| rg.other_fields().get(tag).map(|v| v.to_string());
         assert_eq!(field(&rg_tag::SAMPLE).as_deref(), Some("lib01"), "SM=pool");
         assert_eq!(field(&rg_tag::LIBRARY).as_deref(), Some("lib01"), "LB=pool");
-    }
-
-    #[test]
-    fn test_multiwriter_fans_out_to_separate_files() {
-        // Two destinations get their own lazily-opened writer; each holds only
-        // its reads.
-        let dir = tempfile::tempdir().unwrap();
-        let a = dir.path().join("a.fq");
-        let b = dir.path().join("b.fq");
-        let mut writer = MultiWriter::new(
-            HashMap::new(),
-            provenance_header(None),
-            vec![SniffedFormat::Fastq],
-            5,
-        );
-        let read = |name: &'static [u8]| OutputRead {
-            name,
-            bases: b"ACGT",
-            quals: Some(&[30, 30, 30, 30]),
-            tags: None,
-            read_group: None,
-            qc_fail: false,
-            alignment: None,
-        };
-        writer.write(Some(&a), &[read(b"ra")]).unwrap();
-        writer.write(Some(&b), &[read(b"rb")]).unwrap();
-        writer.write(Some(&a), &[read(b"ra2")]).unwrap();
-        writer.finish().unwrap();
-
-        let names = |path: &std::path::Path| {
-            let mut reader =
-                crate::input::FragmentReader::open(&[path.to_path_buf()], false).unwrap();
-            let mut names = Vec::new();
-            while let Some(fragment) = reader.next_fragment().unwrap() {
-                names.extend(fragment.records.into_iter().map(|r| r.name));
-            }
-            names
-        };
-        assert_eq!(names(&a), vec![b"ra".to_vec(), b"ra2".to_vec()]);
-        assert_eq!(names(&b), vec![b"rb".to_vec()]);
-    }
-
-    #[test]
-    fn test_multiwriter_refuses_to_write_once_a_file_behind_the_pool_has_failed() {
-        use std::io::Write;
-
-        use crate::writer::PooledFile;
-
-        let dir = tempfile::tempdir().unwrap();
-        let out = dir.path().join("a.fq");
-        let mut writer = MultiWriter::new(
-            HashMap::new(),
-            provenance_header(None),
-            vec![SniffedFormat::Fastq],
-            5,
-        );
-        let failure = Arc::new(PoolFailure::default());
-        writer.set_pool_failure(Arc::clone(&failure));
-        let read = OutputRead {
-            name: b"r",
-            bases: b"ACGT",
-            quals: Some(&[30, 30, 30, 30]),
-            tags: None,
-            read_group: None,
-            qc_fail: false,
-            alignment: None,
-        };
-        let encoded = b"@r\nACGT\n+\n????\n";
-        writer
-            .write(Some(&out), std::slice::from_ref(&read))
-            .unwrap();
-        writer.write_encoded(Some(&out), encoded).unwrap();
-
-        let no_room = std::io::Cursor::new(Box::<[u8]>::default());
-        PooledFile::new(no_room, Path::new("o/b.fq.gz"), &failure)
-            .write_all(b"lost")
-            .unwrap();
-        for refused in [
-            writer.write(Some(&out), std::slice::from_ref(&read)),
-            writer.write_encoded(Some(&out), encoded),
-        ] {
-            let error = format!("{:#}", refused.unwrap_err());
-            assert!(
-                error.starts_with("failed to write output file: o/b.fq.gz: "),
-                "{error}"
-            );
-        }
-        writer.finish().unwrap();
-        assert_eq!(std::fs::read(&out).unwrap(), encoded.repeat(2));
     }
 
     fn sample(sample: &str, sub_sample: Option<&str>) -> OutputOrigin {

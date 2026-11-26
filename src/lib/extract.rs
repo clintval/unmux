@@ -54,9 +54,7 @@ pub struct MatchSpan {
 /// What matching resolved for one group on one record, stored positionally by
 /// the group's canonical index (its position in the engine's group slice). The
 /// presence of a `GroupHit` in a slot IS the match predicate: an absent slot
-/// (`None`) means the group did not match. This is the single owned per-record
-/// structure that crosses the rayon -> consumer boundary, replacing the four
-/// String-keyed maps the matching path used to allocate.
+/// (`None`) means the group did not match.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GroupHit {
     /// Index of the chosen tag within the group (definition order).

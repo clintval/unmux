@@ -12,28 +12,26 @@
 //! goes to the raw `--remove` / `--unassigned` bins (with `%source` fan-out) or
 //! is dropped.
 //! The sequential group attributes (next/prev/match/partial/correct), `@PG`
-//! provenance + per-sample `@RG`, the metrics TSVs, CRAM output, and the rayon
-//! record-parallel + pooled-BGZF engine are all implemented; matching is
-//! parallelized while the writer stays on the consumer thread.
+//! provenance + per-sample `@RG`, and the metrics TSVs are all implemented.
+//! Every stage runs on one pool of workers (see `crate::pool`): batches of
+//! fragments are read, matched, and encoded in parallel, merged into the
+//! outputs in input order, and compressed block by block.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
-use std::fs::File;
-use std::io::BufWriter;
-use std::sync::Arc;
-
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, bail, ensure, Context, Result};
 use noodles::sam::alignment::record::data::field::Tag;
 use noodles::sam::alignment::record_buf::data::field::Value;
 use noodles::sam::alignment::record_buf::Data;
 use noodles::sam::alignment::RecordBuf;
 use noodles::sam::Header;
-use pooled_writer::{bgzf::BgzfCompressor, Pool, PoolBuilder, PooledWriter};
-use rayon::prelude::*;
 use smallvec::SmallVec;
 use thousands::Separable;
 
+use crate::chunks::{Chunk, FastqSource};
 use crate::extract::{
     extract, span_range, Corrected, Extracted, GroupHit, GroupHits, MatchSpan, Segment,
 };
@@ -46,24 +44,24 @@ use crate::grammar::{
     OutputPattern, Placeholder, QualTag, SampleSpec, SpanBody, TagBinding, Template,
 };
 use crate::input::{
-    Alignment, Fragment, FragmentReader, InputRecord, PendingFragment, SniffedFormat,
+    Alignment, ChunkFragments, Fragment, FragmentReader, InputRecord, PendingFragment,
+    PendingRecord, SniffedFormat,
 };
 use crate::matcher::{
-    match_group, match_group_at, window_after, CompiledGroup, GroupOutcome, MatchStrand, Prereq,
-    RelativeWindow, Scratch,
+    match_verdict, window_after, CompiledGroup, GroupVerdict, MatchStrand, Prereq, RelativeWindow,
+    Scratch,
 };
 use crate::metrics::Metrics;
 use crate::output::{
     alignment_header, build_tag_data, check_output_collisions, default_read_group_header,
     insert_string_tag, is_header_text, qual_tag_name, read_group_header, resolve_metrics_path,
-    resolve_pattern, ConstituentReadGroups, MultiWriter, OutputOrigin, PathContext,
+    resolve_pattern, ConstituentReadGroups, Destination, OutputOrigin, PathContext,
 };
+use crate::pool::{self, End, Readout};
 use crate::qc::{removed_slug, routed_slug, unassigned_slug, Unassigned};
+use crate::sink::{Block, BlockFile, Sinks};
 use crate::tags::{is_column_value, load_tag_file_columns, TagColumns, TagSet};
-use crate::writer::{
-    encode_fragment, output_format, OutputFormat, OutputRead, PoolFailure, PooledFile,
-    StagedOutputs,
-};
+use crate::writer::{encode_fragment, output_format, OutputFormat, OutputRead, StagedOutputs};
 
 /// Resolved arguments for the `unmux` demux command.
 #[derive(Debug, Clone)]
@@ -872,9 +870,7 @@ type OutDestination = (Option<PathBuf>, Vec<Target>, OutputFormat);
 /// The SAM/BAM/CRAM `--out` destinations and the fan-out targets whose records
 /// land in each (a single-file `--out` collects every target; a `%sample`
 /// pattern splits them), in first-seen order. FASTX destinations have no
-/// header, so they are excluded. Shared by the `@RG` header precompute and the
-/// pooling exclusion (the SAM/CRAM `--out` files among these stay on the inline
-/// single-EOF path; BAM `--out` is pooled).
+/// header, so they are excluded.
 fn out_destinations(
     plan: &DemuxPlan,
     routing: &Routing,
@@ -915,9 +911,8 @@ fn out_destinations(
 /// plan and routing before streaming so each can be created up front: a
 /// directed file always exists, even when it receives no records (an empty but
 /// valid file). stdout (a `None` path) is excluded; it cannot be pre-created
-/// and is a single sink. This mirrors the path resolution in `write_body` /
-/// `write_raw_bin`; the lazy fallback in `MultiWriter::write` covers any path
-/// this misses, so a mismatch never drops a record.
+/// and is a single sink. [`destination_table`] resolves the same paths for
+/// the writes of each record.
 fn enumerate_dests(
     plan: &DemuxPlan,
     routing: &Routing,
@@ -1098,6 +1093,190 @@ fn bin_paths(pattern: &OutputPattern, pool: &str, num_sources: usize) -> Vec<Pat
         }
     }
     paths
+}
+
+/// The destinations of a run, by index, and where each kind of write goes.
+struct DestinationTable {
+    /// Every destination, stdout included when a write can go there.
+    list: Arc<[Destination]>,
+    /// The `--out` layout of each fan-out target, by [`Route::target_index`].
+    targets: Vec<OutLayout>,
+    /// The `--out` layout of a record passed through with no fan-out target.
+    pass_through: Option<OutLayout>,
+    /// The `--unassigned` bin.
+    unassigned: Option<BinLayout>,
+    /// The bin of each `--remove` rule, in rule order.
+    removes: Vec<Option<BinLayout>>,
+}
+
+/// Where the bodies of a record bound for `--out` go.
+struct OutLayout {
+    /// Whether the bodies are written as SAM, BAM, or CRAM records.
+    is_alignment: bool,
+    /// The destinations, or why a record cannot be written to `--out`.
+    dests: std::result::Result<OutDests, String>,
+    /// The `@RG` id of a SAM, BAM, or CRAM record.
+    read_group: Option<String>,
+}
+
+/// The `--out` destination of every body, or of each body by `%ordinal`.
+enum OutDests {
+    Single(usize),
+    PerOrdinal(Vec<usize>),
+}
+
+/// The bin destination of every raw segment, or of each by `%source`.
+enum BinLayout {
+    Single(usize),
+    PerSource(Vec<usize>),
+}
+
+/// Destinations gathered by path, each listed once in the order first seen.
+struct DestinationList<'a> {
+    list: Vec<Destination>,
+    index: HashMap<Option<PathBuf>, usize>,
+    input_formats: &'a [SniffedFormat],
+    headers: &'a HashMap<Option<PathBuf>, Header>,
+    default_header: &'a Header,
+}
+
+impl DestinationList<'_> {
+    /// The index of the destination at `path` (stdout when `None`), added if new.
+    fn add(&mut self, path: Option<PathBuf>) -> Result<usize> {
+        if let Some(&at) = self.index.get(&path) {
+            return Ok(at);
+        }
+        let dest = Destination::new(
+            path.clone(),
+            self.input_formats,
+            self.headers,
+            self.default_header,
+        )?;
+        self.list.push(dest);
+        self.index.insert(path, self.list.len() - 1);
+        Ok(self.list.len() - 1)
+    }
+}
+
+/// Resolve every destination a run writes and the layout of each kind of
+/// write, in the order [`labeled_dests`] lists the files. A record with no
+/// sample carries the `read_group` id.
+fn destination_table(
+    plan: &DemuxPlan,
+    routing: &Routing,
+    pool: &str,
+    read_group: &str,
+    body_count: usize,
+    list: &mut DestinationList,
+) -> Result<DestinationTable> {
+    let targets = routing.targets();
+    let pass_through = match targets.is_empty() {
+        true => Some(out_layout(plan, pool, read_group, None, body_count, list)?),
+        false => None,
+    };
+    let targets = targets
+        .iter()
+        .map(|target| out_layout(plan, pool, read_group, Some(target), body_count, list))
+        .collect::<Result<_>>()?;
+    let unassigned = plan
+        .unassigned
+        .as_ref()
+        .map(|pattern| bin_layout(pattern, pool, plan.inputs.len(), list))
+        .transpose()?;
+    let removes = routing
+        .removes()
+        .iter()
+        .map(|remove| {
+            let pattern = remove.pattern.as_ref();
+            pattern
+                .map(|pattern| bin_layout(pattern, pool, plan.inputs.len(), list))
+                .transpose()
+        })
+        .collect::<Result<_>>()?;
+    Ok(DestinationTable {
+        list: std::mem::take(&mut list.list).into(),
+        targets,
+        pass_through,
+        unassigned,
+        removes,
+    })
+}
+
+/// The `--out` layout of the bodies of a record routed to `target` (`None`
+/// for a pass-through record, which carries the `read_group` id), mirroring
+/// [`out_paths`].
+fn out_layout(
+    plan: &DemuxPlan,
+    pool: &str,
+    read_group: &str,
+    target: Option<&Target>,
+    body_count: usize,
+    list: &mut DestinationList,
+) -> Result<OutLayout> {
+    let sample = target.map(|t| t.sample.as_str());
+    let sub_sample = target.and_then(|t| t.sub_sample.as_deref());
+    let path = |ordinal: Option<usize>| {
+        let ctx = PathContext {
+            pool,
+            sample,
+            sub_sample,
+            ordinal,
+            source: None,
+        };
+        plan.out.as_ref().and_then(|p| resolve_pattern(p, &ctx))
+    };
+    let format = output_format(path(Some(1)).as_deref(), list.input_formats)?;
+    let is_alignment = matches!(
+        format,
+        OutputFormat::Sam | OutputFormat::Bam | OutputFormat::Cram
+    );
+    let multi_fastx = plan
+        .out
+        .as_ref()
+        .filter(|_| !is_alignment && body_count > 1);
+    let dests = match multi_fastx {
+        Some(pattern) if !pattern.uses(Placeholder::Ordinal) => Err(format!(
+            "unmux: multi-read FASTX output needs the %ordinal placeholder in --out to \
+             separate the {body_count} template reads"
+        )),
+        Some(_) => Ok(OutDests::PerOrdinal(
+            (1..=body_count)
+                .map(|ordinal| list.add(path(Some(ordinal))))
+                .collect::<Result<_>>()?,
+        )),
+        None => Ok(OutDests::Single(
+            list.add(path((body_count == 1).then_some(1)))?,
+        )),
+    };
+    Ok(OutLayout {
+        is_alignment,
+        dests,
+        read_group: target
+            .map(Target::label)
+            .or_else(|| Some(read_group.to_string())),
+    })
+}
+
+/// The layout of a `--unassigned` or `--remove` bin, mirroring [`bin_paths`].
+fn bin_layout(
+    pattern: &OutputPattern,
+    pool: &str,
+    num_sources: usize,
+    list: &mut DestinationList,
+) -> Result<BinLayout> {
+    let path = |source: usize| {
+        let ctx = PathContext {
+            pool,
+            source: Some(source),
+            ..Default::default()
+        };
+        resolve_pattern(pattern, &ctx)
+    };
+    if num_sources > 1 && pattern.uses(Placeholder::Source) {
+        let dests = (0..num_sources).map(|source| list.add(path(source)));
+        return Ok(BinLayout::PerSource(dests.collect::<Result<_>>()?));
+    }
+    Ok(BinLayout::Single(list.add(path(0))?))
 }
 
 /// Precompute the `@RG`-bearing SAM/BAM header for each distinct `--out`
@@ -1347,64 +1526,15 @@ fn tag_bytes(tag: &str) -> [u8; 2] {
     [bytes[0], bytes[1]]
 }
 
-/// The most BGZF compressor threads the writer pool uses, regardless of
-/// `--threads`. Profiling the 2M dual-index `.fq.gz` demux showed compression
-/// is ~half the CPU (not the minor stage originally assumed), and the warm
-/// match cache leaves matcher threads idle, so the pool is allowed a meaningful
-/// share; the cap bounds it at high `--threads` where compression parallelism
-/// has diminishing returns and BGZF pool overhead grows.
-pub const MAX_WRITER_THREADS: usize = 6;
-
-/// How one `--threads N` is split across the engine's roles. Our input is a
-/// single lockstep cursor, so one read-ahead thread suffices; `decode` threads
-/// inflate BAM or decode CRAM input ahead of it; the main/consumer
-/// thread owns the writer and applies outcomes in input order; `writer` threads
-/// run the BGZF compressor pool (zero when there is no pooled output); every
-/// remaining thread joins the rayon matcher pool. For compressed output the
-/// spare threads (after the reader + consumer) are split evenly between the
-/// BGZF pool and the matchers (compression is ~half the CPU and the warm match
-/// cache idles matchers); with no pooled output every spare thread is a
-/// matcher.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ThreadBudget {
-    /// The read-ahead thread.
-    pub reader: usize,
-    /// The BAM inflate or CRAM decode pool size; zero for FASTX/SAM input.
-    pub decode: usize,
-    /// The orchestrator/consumer thread (owns the writer; applies outcomes in
-    /// order).
-    pub main: usize,
-    /// The BGZF compressor pool size; zero when nothing is pooled.
-    pub writer: usize,
-    /// The rayon matcher pool size (the parallel CPU stage).
-    pub matchers: usize,
-}
-
-/// The BGZF compressor pool size for `threads` total threads, given whether the
-/// run has any poolable (compressed) output. Zero with nothing to compress, and
-/// zero when there are too few threads to staff a pool: a pool needs reader +
-/// main + at least one writer + at least one matcher, i.e. `threads >= 4`;
-/// below that, compression runs inline on the consumer (`SinkWriter::Gzip` /
-/// `Sink::BamInline`). At `threads >= 4` the spare threads (after reader +
-/// main) split evenly between the BGZF pool and the matchers (compression is
-/// ~half the CPU and the warm match cache idles matchers), capped at
-/// [`MAX_WRITER_THREADS`]; the even split keeps `matchers >= writer`.
-fn writer_pool_size(threads: usize, has_poolable: bool) -> usize {
-    if !has_poolable || threads < 4 {
-        return 0;
-    }
-    (threads.saturating_sub(2) / 2).clamp(1, MAX_WRITER_THREADS)
-}
-
 /// The most threads that inflate BAM or decode CRAM input.
 pub const MAX_DECODE_THREADS: usize = 4;
 
 /// The BAM inflate / CRAM decode workers for each input of `formats` at
-/// `threads` total threads. None below 5 threads, where the read-ahead thread
-/// decodes inline. The CRAM inputs share a quarter of the threads first, as
-/// their decode is the heaviest stage; the BAM inputs share an eighth from 16
-/// threads, below which the read-ahead thread keeps up with their inflate, out
-/// of what the CRAM inputs leave of [`MAX_DECODE_THREADS`].
+/// `threads` total threads. None below 5 threads, where the worker reading an
+/// input decodes it inline. The CRAM inputs share a quarter of the threads
+/// first, as their decode is the heaviest stage; the BAM inputs share an eighth
+/// from 16 threads, below which the reading worker keeps up with their inflate,
+/// out of what the CRAM inputs leave of [`MAX_DECODE_THREADS`].
 pub fn decode_workers(threads: usize, formats: &[SniffedFormat]) -> Vec<usize> {
     use SniffedFormat::{Bam, Cram};
     let cram = if threads >= 5 && formats.contains(&Cram) {
@@ -1422,32 +1552,16 @@ pub fn decode_workers(threads: usize, formats: &[SniffedFormat]) -> Vec<usize> {
     cram.iter().zip(bam).map(|(cram, bam)| cram + bam).collect()
 }
 
-/// Partition `--threads N` into the engine's [`ThreadBudget`] after reserving
-/// `writer_threads` for the BGZF pool and `decode_threads` for input decoding.
-/// The `max(1)` keeps at least one matcher.
-pub fn partition_threads(
-    threads: usize,
-    writer_threads: usize,
-    decode_threads: usize,
-) -> ThreadBudget {
-    let reader = 1;
-    let main = 1;
-    let matchers = threads
-        .saturating_sub(reader + decode_threads + main + writer_threads)
-        .max(1);
-    ThreadBudget {
-        reader,
-        decode: decode_threads,
-        main,
-        writer: writer_threads,
-        matchers,
-    }
+/// The worker pool size for `--threads N` once `decode_threads` of them
+/// inflate or decode input; at least one worker.
+pub fn pool_workers(threads: usize, decode_threads: usize) -> usize {
+    threads.saturating_sub(decode_threads).max(1)
 }
 
 /// The static per-run engine context shared across fragments: the parsed plan,
 /// the compiled groups (in dependency order), the canonical `name -> index` map
 /// (for resolving `@grp` anchor names to positional slots), the routing table,
-/// the resolved pool id, and the input formats.
+/// the read group of a record with no sample, and the destinations.
 struct Engine<'a> {
     plan: &'a DemuxPlan,
     groups: &'a [CompiledGroup],
@@ -1458,32 +1572,24 @@ struct Engine<'a> {
     /// quality tag.
     column_tag_qualities: &'a [(&'a str, &'a str)],
     routing: &'a Routing,
-    pool: &'a str,
     /// The read group id of a record with no sample (see [`pool_read_group`]).
     pool_read_group: &'a str,
-    input_formats: &'a [SniffedFormat],
     /// Extract-stream names referenced exactly once across all `--template`s
     /// and `--tag`s. A single-stream template whose stream is movable is the
     /// sole consumer of that extract, so the assembled body can MOVE the
     /// extracted bases/quals rather than copy them (the common case for
     /// whole-record template records, which are large; avoids a per-record copy
-    /// + alloc on the consumer).
+    /// + alloc).
     movable_streams: &'a HashSet<&'a str>,
     /// Extract-stream names drawn on by any `--template`/`--tag`, the
     /// denominator basis for the `frac_bases_unextracted` metric.
     /// Plan-invariant, so it is built once here rather than rebuilt for every
     /// retained record in [`frac_bases`].
     routed_streams: &'a HashSet<&'a str>,
-    /// Per-destination SAM/BAM headers (`@RG` lines), keyed by output path
-    /// (`None` = stdout), shared read-only so a worker can encode SAM/BAM
-    /// records (encode-on-workers) with the exact header the consumer's writer
-    /// was opened with. FASTX ignores it.
-    headers: &'a HashMap<Option<PathBuf>, Header>,
-    /// The fallback header for a destination absent from `headers` (the raw
-    /// `--unassigned`/`--remove` bins, or a non-demux run): the minimal `@HD` +
-    /// `@PG`-provenance header, matching `MultiWriter::open`'s fallback so
-    /// worker-encoded bytes stay byte-identical.
-    default_header: &'a Header,
+    /// Every destination with its format and header, shared read-only so a
+    /// worker encodes SAM/BAM records with the exact header their output was
+    /// opened with, and where each kind of write goes.
+    destinations: &'a DestinationTable,
     /// Whether this is an `@RG`-split run (`--sample-from-group` over an `@RG`
     /// source). When set, an assigned record keeps its original `RG:Z` (its
     /// `@RG` line is carried verbatim by the header, see [`build_constituent_rgs`])
@@ -1612,25 +1718,14 @@ fn run_engine(plan: &DemuxPlan, command_line: Option<&str>) -> Result<()> {
     // (pass-through `--out`, the raw `--unassigned`/`--remove` bins): `@PG`
     // provenance plus a default `@RG` whose ID/SM/LB are the pool id, so every
     // SAM/BAM/CRAM record carries a read group even with no `--sample`. A
-    // worker uses it for encode-on-workers exactly where `MultiWriter::open`
-    // would, so the bytes stay identical.
+    // worker encodes records with the header their output opens with, so the
+    // bytes stay identical.
     let default_header = match &input_header {
         Some(input) => alignment_header(input, None, command_line)?,
         None => default_read_group_header(read_group, &plan.rg_tags, command_line)?,
     };
     // Declared first so it drops after every writer, removing what a failed run wrote.
     let mut staged = StagedOutputs::default();
-    // Declared before `writer` so that, on any unwind, `writer` (and its
-    // PooledWriters) drops before the pool: a PooledWriter dropped after the
-    // pool is stopped would panic. The explicit shutdown below also enforces
-    // this order; the declaration order is the belt-and-suspenders guarantee.
-    let mut writer_pool: Option<Pool> = None;
-    let mut writer = MultiWriter::new(
-        headers.clone(),
-        default_header.clone(),
-        input_formats.clone(),
-        plan.compression,
-    );
     // Every directed output file, created up front so a directed file always
     // exists, even empty.
     let dests = enumerate_dests(
@@ -1647,6 +1742,18 @@ fn run_engine(plan: &DemuxPlan, command_line: Option<&str>) -> Result<()> {
         &input_formats,
         reader.fragment_width(),
     )?;
+    let body_count = match plan.templates.len() {
+        0 => reader.fragment_width(),
+        templates => templates,
+    };
+    let mut list = DestinationList {
+        list: Vec::new(),
+        index: HashMap::new(),
+        input_formats: &input_formats,
+        headers: &headers,
+        default_header: &default_header,
+    };
+    let destinations = destination_table(plan, &routing, &pool, read_group, body_count, &mut list)?;
     log_run_shape(plan, &input_formats, &dests);
     if let Some(reference) = &reference {
         reader.check_reference(&plan.inputs, reference)?;
@@ -1661,73 +1768,21 @@ fn run_engine(plan: &DemuxPlan, command_line: Option<&str>) -> Result<()> {
     .map(|pattern| resolve_metrics_path(pattern, &pool))
     .collect();
     staged.stage(dests.iter().chain(&metrics_paths).cloned());
-    writer.write_files_to(staged.temporaries());
+    let mut sinks = Sinks::new(
+        Arc::clone(&destinations.list),
+        plan.compression,
+        staged.temporaries(),
+    );
+    crate::sink::compressor(plan.compression)?;
 
-    // Route poolable destinations (gzipped FASTX and BAM) through a shared BGZF
-    // compressor pool, so compression runs off the consumer thread (the
-    // single-file BAM `--out` of a combinatorial run is otherwise
-    // serial-compression-bound). The pooled BAM sink emits the BGZF EOF on
-    // close (writer.rs `Sink::BamPooled` finish), so a user-facing BAM `--out`
-    // stays valid (asserted by the BAM round-trip tests + `samtools
-    // quickcheck`). Only CRAM/SAM `--out` stay inline: CRAM has its own
-    // per-block codec (not BGZF) and SAM is uncompressed text, so neither is
-    // poolable (and `OutputFormat::is_pooled` already excludes them; this keeps
-    // them inline regardless).
-    let out_alignment: HashSet<PathBuf> = out_destinations(plan, &routing, &pool, &input_formats)?
-        .into_iter()
-        .filter(|(_, _, format)| !matches!(format, OutputFormat::Bam))
-        .filter_map(|(dest, _, _)| dest)
-        .collect();
-    let poolable: Vec<PathBuf> = dests
-        .iter()
-        .filter(|path| !out_alignment.contains(*path))
-        .filter(|path| {
-            output_format(Some(path), &input_formats)
-                .map(OutputFormat::is_pooled)
-                .unwrap_or(false)
-        })
-        .cloned()
-        .collect();
     // Defensive max(1): clap already guarantees --threads >= 1, but guard for
     // library callers.
     let threads = plan.threads.max(1);
-    let writer_threads =
-        writer_pool_size(threads.saturating_sub(decode_threads), !poolable.is_empty());
-    let budget = partition_threads(threads, writer_threads, decode_threads);
-    match threads {
-        1 => log::info!("threads=1: serial (read + match + write inline, no pools)"),
-        2 => log::info!("threads=2: reader=1, match + write inline (no rayon, no BGZF pool)"),
-        _ => log::info!(
-            "threads={}: reader={}, decode={}, main={}, matchers={}, writer={} (rayon + BGZF pool)",
-            threads,
-            budget.reader,
-            budget.decode,
-            budget.main,
-            budget.matchers,
-            budget.writer,
-        ),
-    }
-
-    let pool_failure = Arc::new(PoolFailure::default());
-    if writer_threads > 0 {
-        let mut builder = PoolBuilder::<PooledFile<BufWriter<File>>, BgzfCompressor>::new()
-            .threads(budget.writer)
-            .compression_level(plan.compression)
-            .map_err(|e| anyhow!("invalid --compression {} for BGZF: {e}", plan.compression))?;
-        let mut exchanged: HashMap<PathBuf, PooledWriter> = HashMap::new();
-        for path in &poolable {
-            let file = crate::writer::create_output_file(staged.path(path))?;
-            let file = PooledFile::new(BufWriter::new(file), path, &pool_failure);
-            exchanged.insert(path.clone(), builder.exchange(file));
-        }
-        writer_pool = Some(
-            builder
-                .build()
-                .map_err(|e| anyhow!("failed to start the BGZF writer pool: {e}"))?,
-        );
-        writer.set_pooled(exchanged);
-        writer.set_pool_failure(Arc::clone(&pool_failure));
-    }
+    let workers = pool_workers(threads, decode_threads);
+    log::info!(
+        "threads={threads}: {workers} worker(s) read, match, and compress; {decode_threads} decode \
+         BAM or CRAM input"
+    );
 
     // Streams referenced exactly once across templates + tags can be MOVED into
     // their (sole) output body instead of copied (see Engine::movable_streams).
@@ -1759,54 +1814,51 @@ fn run_engine(plan: &DemuxPlan, command_line: Option<&str>) -> Result<()> {
         column_streams: &column_streams,
         column_tag_qualities: &column_tag_qualities,
         routing: &routing,
-        pool: &pool,
         pool_read_group: read_group,
-        input_formats: &input_formats,
         movable_streams: &movable_streams,
         routed_streams: &routed_streams,
-        headers: &headers,
-        default_header: &default_header,
+        destinations: &destinations,
         is_read_group_split,
     };
-    let mut metrics = Metrics::new(pool.clone(), routing.targets());
+    let metrics = Metrics::new(pool.clone(), routing.targets());
 
-    // Create the output files and run the parallel engine, capturing the result
-    // WITHOUT `?` so the mandatory shutdown always runs in order even on error:
-    // `finish` closes every PooledWriter (flushing its BGZF EOF), and only then
-    // is the pool stopped (joining the compressor threads). Reversing that
-    // order would hang, and a PooledWriter dropped after `stop_pool` would
-    // panic. `MultiWriter::finish` finalizes every writer even when one errors,
-    // so the pool is always safe to stop once it returns; we stop it
-    // unconditionally (its threads never leak) and surface the most actionable
-    // error first: the run error, then a write error on a file behind the
-    // pool (which can come as late as the pool's last write), then a finalize
-    // error, then a pool-stop error.
-    let run_result = (|| -> Result<()> {
-        writer.create_all(&dests)?;
+    // Create the output files and run every stage on the worker pool. The
+    // outputs are closed whatever the outcome, and the run error comes first.
+    let opened = (|| -> Result<()> {
+        sinks.open_files()?;
         for path in &metrics_paths {
             let temporary = staged.path(path);
             if temporary != path.as_path() {
                 crate::writer::create_output_file(temporary)?;
             }
         }
-        crate::writer::refuse_shared_files(&staged, dests.iter().chain(&metrics_paths))?;
-        match threads {
-            1 => drive_serial(&engine, reader, &mut writer, &mut metrics),
-            2 => drive_pipelined(&engine, reader, &mut writer, &mut metrics),
-            _ => drive_parallel(&engine, budget, reader, &mut writer, &mut metrics),
-        }
+        crate::writer::refuse_shared_files(&staged, dests.iter().chain(&metrics_paths))
     })();
-    let finished = writer.finish();
-    let stopped = match writer_pool {
-        Some(mut writer_pool) => writer_pool
-            .stop_pool()
-            .map_err(|e| anyhow!("failed to stop the BGZF writer pool: {e}")),
-        None => Ok(()),
+    let run = DemuxRun {
+        engine: &engine,
+        source: Source::new(reader),
+        files: sinks.files(),
+        merger: Mutex::new(Merger {
+            sinks,
+            metrics,
+            progress: Progress::new(),
+        }),
+        targets: routing.targets().len(),
+        compression: plan.compression,
     };
+    let run_result = opened.and_then(|()| pool::run(&run, workers));
+    let Merger {
+        sinks,
+        metrics,
+        progress,
+    } = run
+        .merger
+        .into_inner()
+        .unwrap_or_else(PoisonError::into_inner);
+    drop(progress);
+    let closed = sinks.close();
     run_result?;
-    pool_failure.check()?;
-    finished?;
-    stopped?;
+    closed?;
 
     // Provenance lives in the header written up front: `@PG`
     // (program/version/command line) and the per-sample `@RG`. The demux stats
@@ -1837,9 +1889,8 @@ fn run_engine(plan: &DemuxPlan, command_line: Option<&str>) -> Result<()> {
 /// The result of matching every group against one record: either a
 /// find-constraint failure (the record is unassigned) or the per-group hits,
 /// indexed positionally by canonical group index, that drive routing and body
-/// assembly. Owned and `Send` (one `Vec<Option<GroupHit>>`, no per-record heap
-/// maps or `String` clones), so it crosses from a rayon matcher worker to the
-/// serial consumer.
+/// assembly. Owned (one `Vec<Option<GroupHit>>`, no per-record heap maps or
+/// `String` clones).
 enum FragmentMatch {
     /// A group's find constraint (e.g. an unmet `minFindsPerGroup`) was not
     /// met; carries the reason for the optional `--qc-tag` slug, plus the
@@ -1863,8 +1914,8 @@ enum FragmentMatch {
 
 /// One fully-prepared output record: owned bytes ready for the writer, with no
 /// borrows from the engine or the input fragment, so it is `Send` and can be
-/// built on a rayon worker and handed to the serial writer. `tags` is `None`
-/// when the record carries no SAM data (an empty tag set emits no field).
+/// built on a worker and handed to merging. `tags` is `None` when the record
+/// carries no SAM data (an empty tag set emits no field).
 struct PreparedRead {
     name: Vec<u8>,
     bases: Vec<u8>,
@@ -1876,8 +1927,7 @@ struct PreparedRead {
 }
 
 impl PreparedRead {
-    /// Borrow this prepared record as the writer's [`OutputRead`], just before
-    /// the (serial) write.
+    /// Borrow this prepared record as the writer's [`OutputRead`], just before the write.
     fn as_output(&self) -> OutputRead<'_> {
         OutputRead {
             name: &self.name,
@@ -1891,32 +1941,29 @@ impl PreparedRead {
     }
 }
 
-/// What the consumer writes for one [`PreparedWrite`]: bytes already encoded
-/// for the destination's format on the worker (encode-on-workers; appended
-/// verbatim, the common path), or the structured records for a format that
-/// cannot be pre-encoded to an independent per-fragment byte slice (CRAM).
+/// What merging writes for one [`PreparedWrite`]: bytes already encoded for
+/// the destination's format on the worker (appended verbatim, the common path),
+/// or the structured records for a format that cannot be pre-encoded to an
+/// independent per-fragment byte slice (CRAM).
 enum WritePayload {
-    /// Pre-encoded record bytes (from [`encode_fragment`]) for the alignment
-    /// formats (SAM/BAM), whose heavier encode is worth moving off the
-    /// consumer.
+    /// Pre-encoded record bytes (from [`encode_fragment`]) for FASTX, SAM, and
+    /// BAM.
     Encoded(Vec<u8>),
-    /// Structured records, encoded on the consumer: CRAM (not pre-encodable per
-    /// fragment) and the FASTX formats (light text encode that does not pay for
-    /// the worker handoff).
+    /// Structured records, encoded as they merge: CRAM, which is not
+    /// pre-encodable per fragment.
     Records(Vec<PreparedRead>),
 }
 
-/// One write the consumer must issue: a destination (`None` is stdout) and its
-/// payload, in the exact order the inline `write_body` / `write_raw_bin`
-/// emitted them.
+/// One write merging must issue: the index of its destination and its
+/// payload, in the order the record's writes are issued.
 struct PreparedWrite {
-    path: Option<PathBuf>,
+    dest: usize,
     payload: WritePayload,
 }
 
-/// The metrics tally for one fragment, owned (`Target` is `Clone`) so it
-/// crosses the worker boundary. Commutative integer sums, applied on the
-/// consumer in input order (order is irrelevant to the sums).
+/// The metrics tally for one fragment, owned so it crosses the worker
+/// boundary. Commutative integer sums, added in input order (order is
+/// irrelevant to the sums).
 enum Tally {
     Unassigned(Unassigned),
     Removed,
@@ -1925,7 +1972,7 @@ enum Tally {
         unext: u64,
     },
     Assigned {
-        target: Target,
+        target: usize,
         denom: u64,
         unext: u64,
     },
@@ -1935,8 +1982,8 @@ enum Tally {
 /// The fully-prepared outcome of one fragment: the per-record base lengths (for
 /// the record-length metric), the metric tally, and the writes to issue in
 /// order. Owned + `Send`, so the whole route/extract/assemble/encode pipeline
-/// can run on a rayon worker, leaving the consumer to only tally and issue the
-/// (inherently serial, input-ordered) writes.
+/// runs on a worker, leaving merging to only tally and issue the (inherently
+/// serial, input-ordered) writes.
 struct Prepared {
     lengths: SmallVec<[usize; 4]>,
     tally: Tally,
@@ -1954,8 +2001,7 @@ enum BodyOutcome {
 /// Match every group against one record in dependency order: the pure,
 /// parallelizable half of per-record work. No writer, no metrics; it borrows
 /// the record and the shared engine and returns an owned [`FragmentMatch`], so
-/// it runs on a rayon worker with a thread-local [`Scratch`] while the writer
-/// and metrics stay on the serial consumer.
+/// it runs on a worker with a thread-local [`Scratch`].
 fn match_fragment(
     engine: &Engine,
     scratch: &mut Scratch,
@@ -1996,7 +2042,7 @@ fn match_fragment(
             }
             continue;
         }
-        let outcome = match &group.match_streams {
+        let verdict = match &group.match_streams {
             // A `match=` group matches the joined `--extract` streams, not a
             // read window.
             Some(streams) => match_joined(
@@ -2013,7 +2059,7 @@ fn match_fragment(
         // A failed find constraint (e.g. an unmet minFindsPerGroup) leaves the
         // read unassigned; carry the specific failure and the partial hits so
         // far for the optional QC slug.
-        if let Some(failure) = group.find_failure(&outcome) {
+        if let Some(failure) = verdict.failure {
             return Ok(FragmentMatch::Unassigned {
                 reason: Unassigned::FindConstraint {
                     group: idx,
@@ -2022,7 +2068,7 @@ fn match_fragment(
                 hits,
             });
         }
-        if let Some(best) = &outcome.best {
+        if let Some(best) = &verdict.best {
             // A `match=` group matches a synthetic joined text, not a read
             // span, so it anchors nothing (the grammar already forbids `@grp`
             // on a match= group): its slot records the tag but no span, which
@@ -2048,9 +2094,8 @@ fn match_fragment(
 /// The full per-record worker stage: match every group, then
 /// route/extract/assemble/encode the record into an owned, `Send` [`Prepared`].
 /// This is everything except the metric tally and the inherently-serial,
-/// input-ordered writes, so the whole pipeline runs on a rayon worker with a
-/// thread-local [`Scratch`] while only [`apply_prepared`] stays on the
-/// consumer.
+/// input-ordered writes, so the whole pipeline runs on a worker with a
+/// thread-local [`Scratch`].
 fn process_fragment(
     engine: &Engine,
     scratch: &mut Scratch,
@@ -2060,13 +2105,10 @@ fn process_fragment(
     let mut prepared = prepare(engine, fragment, fmatch)?;
     if is_non_primary(fragment) {
         prepared.tally = Tally::NonPrimary;
-        let mut kept = Vec::with_capacity(prepared.writes.len());
-        for write in prepared.writes {
-            if is_alignment_format(output_format(write.path.as_deref(), engine.input_formats)?) {
-                kept.push(write);
-            }
-        }
-        prepared.writes = kept;
+        let destinations = &engine.destinations.list;
+        prepared
+            .writes
+            .retain(|write| is_alignment_format(destinations[write.dest].format));
     }
     encode_writes(engine, &mut prepared.writes)?;
     Ok(prepared)
@@ -2092,32 +2134,26 @@ fn is_alignment_format(format: OutputFormat) -> bool {
 }
 
 /// Encode each write's records into the destination's on-disk bytes here on the
-/// worker (encode-on-workers), so the serial consumer only appends them in
-/// input order rather than running the per-record SAM/BAM/FASTX encode itself.
-/// CRAM stays structured (its records are container/slice-coded, not
-/// independent per-fragment byte slices) and is encoded by the consumer. The
-/// format and header are resolved exactly as the consumer's `MultiWriter::open`
-/// does (per path, falling back to the provenance default), so the appended
-/// bytes match what the consumer would encode, except that a raw BAM record
-/// keeps its input bytes.
+/// worker, so serial merging only appends them in input order rather than
+/// running the per-record SAM/BAM/FASTX encode itself. CRAM stays structured
+/// (its records are container/slice-coded, not independent per-fragment byte
+/// slices) and is encoded as it merges. The format and header are the
+/// destination's, which its output opens with, so the appended bytes match an
+/// encode at merging, except that a raw BAM record keeps its input bytes.
 fn encode_writes(engine: &Engine, writes: &mut [PreparedWrite]) -> Result<()> {
     for write in writes {
-        let format = output_format(write.path.as_deref(), engine.input_formats)?;
+        let destination = &engine.destinations.list[write.dest];
         // CRAM is container/slice-coded, so it cannot be pre-encoded per fragment.
-        if matches!(format, OutputFormat::Cram) {
+        if matches!(destination.format, OutputFormat::Cram) {
             continue;
         }
         let bytes = {
             let WritePayload::Records(reads) = &write.payload else {
                 continue;
             };
-            let header = engine
-                .headers
-                .get(&write.path)
-                .unwrap_or(engine.default_header);
             let outputs: SmallVec<[OutputRead; 2]> =
                 reads.iter().map(PreparedRead::as_output).collect();
-            encode_fragment(format, header, &outputs)?
+            encode_fragment(destination.format, &destination.header, &outputs)?
         };
         write.payload = WritePayload::Encoded(bytes);
     }
@@ -2127,11 +2163,10 @@ fn encode_writes(engine: &Engine, writes: &mut [PreparedWrite]) -> Result<()> {
 /// Prepare one matched record into an owned, `Send` [`Prepared`] (the
 /// per-record lengths, the metric tally, and the writes to issue): route it,
 /// compute `frac_bases`, and assemble its body / bins, but touch neither the
-/// writer nor the metrics. This is the pure half of the old `apply_match`, so
-/// it can run on a rayon worker (alongside matching) while only the tally + the
-/// ordered writes stay serial. The assigned/pass-through decision reflects the
-/// post-assembly outcome (a missing `--template` stream reroutes to
-/// unassigned), exactly as the inline path did.
+/// writer nor the metrics, so it runs on a worker (alongside matching) while
+/// only the tally and the ordered writes stay serial. The assigned/pass-through
+/// decision reflects the post-assembly outcome (a missing `--template` stream
+/// reroutes to unassigned).
 fn prepare(engine: &Engine, fragment: &Fragment, fmatch: FragmentMatch) -> Result<Prepared> {
     let lengths: SmallVec<[usize; 4]> = fragment.records.iter().map(|r| r.bases.len()).collect();
     let hits = match fmatch {
@@ -2174,7 +2209,7 @@ fn prepare(engine: &Engine, fragment: &Fragment, fmatch: FragmentMatch) -> Resul
             match prepare_body(engine, Some(route), &hits, &segments, fragment)? {
                 BodyOutcome::Assembled(writes) => (
                     Tally::Assigned {
-                        target: route.target().clone(),
+                        target: route.target_index(),
                         denom,
                         unext,
                     },
@@ -2204,14 +2239,8 @@ fn unassigned(
     Ok((Tally::Unassigned(reason), writes))
 }
 
-/// Apply one [`Prepared`] on the serial consumer: tally it and issue its writes
-/// in order. The writer and metrics are single-threaded; everything else now
-/// happens on the worker in [`prepare`].
-fn apply_prepared(
-    prepared: Prepared,
-    writer: &mut MultiWriter,
-    metrics: &mut Metrics,
-) -> Result<()> {
+/// Count one [`Prepared`] fragment in `metrics`.
+fn tally(metrics: &mut Metrics, prepared: &Prepared) {
     if !matches!(prepared.tally, Tally::NonPrimary) {
         metrics.record_processed();
         metrics.record_read_lengths(prepared.lengths.iter().copied());
@@ -2224,40 +2253,16 @@ fn apply_prepared(
             target,
             denom,
             unext,
-        } => metrics.record_assigned(target, *denom, *unext),
+        } => metrics.record_assigned(*target, *denom, *unext),
         Tally::NonPrimary => metrics.record_non_primary(),
     }
-    for write in &prepared.writes {
-        match &write.payload {
-            // Encoded on the worker: the consumer only appends the bytes (the
-            // merge-point lever).
-            WritePayload::Encoded(bytes) => writer.write_encoded(write.path.as_deref(), bytes)?,
-            // CRAM fallback: the consumer encodes the structured reads.
-            WritePayload::Records(reads) => {
-                let outputs: SmallVec<[OutputRead; 2]> =
-                    reads.iter().map(PreparedRead::as_output).collect();
-                writer.write(write.path.as_deref(), &outputs)?;
-            }
-        }
-    }
-    Ok(())
 }
 
-/// Fragments per chunk handed from the read-ahead thread to the matcher pool.
-/// Large enough that the per-worker [`Scratch`] (match cache + searcher),
-/// rebuilt per chunk by `map_init`, amortizes its warm-up across many records
-/// (see [`MATCHER_MIN_JOB`]); bounded by [`READ_AHEAD_CHUNKS`] so memory stays
-/// capped.
-const READ_CHUNK: usize = 32768;
-/// Minimum records a single rayon job processes with one `map_init`
-/// [`Scratch`]. Coarsening the split (vs rayon's default fine granularity) lets
-/// the per-job match cache warm up and the searcher be reused across thousands
-/// of records rather than ~one, which is the whole point of the cache.
-const MATCHER_MIN_JOB: usize = 2048;
-/// Bounded read-ahead: at most this many chunks queued ahead of the consumer,
-/// so a slow consumer applies back-pressure to the reader instead of growing
-/// memory.
-const READ_AHEAD_CHUNKS: usize = 2;
+/// The most fragments in one batch, the unit of work a worker prepares at once.
+const READ_CHUNK: usize = 2048;
+
+/// The most bytes of records in one batch, so a batch of long records stays small.
+const BATCH_BYTES: usize = 4 << 20;
 
 /// Records between progress log lines; a final total is logged on completion.
 const PROGRESS_UNIT: u64 = 500_000;
@@ -2275,12 +2280,14 @@ impl Progress {
         Self { seen: 0 }
     }
 
-    /// Count one record, logging the running total at each [`PROGRESS_UNIT`]
-    /// boundary.
-    fn record(&mut self) {
-        self.seen += 1;
-        if self.seen.is_multiple_of(PROGRESS_UNIT) {
-            log::info!("Demultiplexed {} records", self.seen.separate_with_commas());
+    /// Count `records` more, logging the running total at each
+    /// [`PROGRESS_UNIT`] boundary they pass.
+    fn add(&mut self, records: u64) {
+        let passed = self.seen / PROGRESS_UNIT;
+        self.seen += records;
+        for unit in passed + 1..=self.seen / PROGRESS_UNIT {
+            let total = unit * PROGRESS_UNIT;
+            log::info!("Demultiplexed {} records", total.separate_with_commas());
         }
     }
 }
@@ -2295,42 +2302,30 @@ impl Drop for Progress {
     }
 }
 
-/// Pull up to `chunk_size` fragments from the reader into one owned chunk, or
-/// `Ok(None)` at end of input. Shared by the read-ahead thread (`read_chunks`)
-/// and the serial driver (`drive_serial`), which both need the same bounded
-/// pull. A read error propagates.
-fn next_chunk(
-    reader: &mut FragmentReader,
-    chunk_size: usize,
-) -> Result<Option<Vec<PendingFragment>>> {
-    let mut chunk = Vec::with_capacity(chunk_size);
-    for _ in 0..chunk_size {
+/// The next batch of fragments from `reader`, or `None` at the end of the
+/// input. A read error propagates.
+fn next_batch(reader: &mut FragmentReader) -> Result<Option<Vec<PendingFragment>>> {
+    let mut batch = Vec::new();
+    let mut bytes = 0;
+    while batch.len() < READ_CHUNK && bytes < BATCH_BYTES {
         match reader.next_pending_fragment()? {
-            Some(fragment) => chunk.push(fragment),
+            Some(fragment) => {
+                bytes += fragment_bytes(&fragment);
+                batch.push(fragment);
+            }
             None => break,
         }
     }
-    if chunk.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(chunk))
-    }
+    Ok((!batch.is_empty()).then_some(batch))
 }
 
-/// Match every fragment in a chunk serially with one warm `Scratch`, preserving
-/// positional order. The serial counterpart to the rayon `par_iter` in
-/// `drive_parallel`; used by the 1- and 2-thread drivers, where the consumer
-/// does the matching itself.
-fn match_chunk_serial(
-    engine: &Engine,
-    scratch: &mut Scratch,
-    record: &mut RecordBuf,
-    chunk: Vec<PendingFragment>,
-) -> Vec<Result<Prepared>> {
-    chunk
-        .into_iter()
-        .map(|pending| process_pending(engine, scratch, record, pending))
-        .collect()
+/// About how many bytes the records of a fragment hold.
+fn fragment_bytes(fragment: &PendingFragment) -> usize {
+    let size = |record: &PendingRecord| match record {
+        PendingRecord::Ready(record) => record.name.len() + 2 * record.bases.len(),
+        PendingRecord::Bam { raw, .. } => raw.len(),
+    };
+    fragment.records.iter().map(size).sum()
 }
 
 /// Decode a fragment's raw records, reusing `record`, then run [`process_fragment`].
@@ -2344,173 +2339,288 @@ fn process_pending(
     process_fragment(engine, scratch, &fragment)
 }
 
-/// Apply one chunk's prepared outcomes to the writer in input order, tallying
-/// metrics and counting progress, stopping at (and returning) the first error.
-/// Shared by all three drivers; only the serial, inherently-ordered writes
-/// happen here.
-fn apply_chunk(
-    prepared: Vec<Result<Prepared>>,
-    writer: &mut MultiWriter,
-    metrics: &mut Metrics,
-    progress: &mut Progress,
-) -> Result<()> {
-    for outcome in prepared {
-        apply_prepared(outcome?, writer, metrics)?;
-        progress.record();
-    }
-    Ok(())
+/// A batch of fragments prepared on a worker: what merging writes and counts.
+struct Processed {
+    /// The fragments prepared without error.
+    fragments: u64,
+    /// Their metrics.
+    tally: Metrics,
+    /// Their encoded bytes, one buffer per destination.
+    bytes: Vec<(usize, Vec<u8>)>,
+    /// Their records for destinations that encode them as they merge, in order.
+    records: Vec<(usize, Vec<PreparedRead>)>,
+    /// The error that stopped the batch after the fragments above.
+    error: Option<anyhow::Error>,
 }
 
-/// The read-ahead thread: pull fragments into bounded chunks and hand each to
-/// the matcher pool over `tx`. Returns when the input is exhausted or the
-/// consumer hangs up; a read error propagates as `Err`, surfaced when the
-/// consumer joins this thread. Dropping `tx` on return closes the channel,
-/// signalling end-of-input to the consumer.
-fn read_chunks(
-    mut reader: FragmentReader,
-    tx: std::sync::mpsc::SyncSender<Vec<PendingFragment>>,
-    chunk_size: usize,
-) -> Result<()> {
-    while let Some(chunk) = next_chunk(&mut reader, chunk_size)? {
-        if tx.send(chunk).is_err() {
-            return Ok(()); // the consumer hung up (it bailed); stop reading.
+impl Processed {
+    /// Add one prepared fragment, finding the buffer of each destination
+    /// through `slots`, by destination the index of its buffer in `bytes`.
+    fn add(&mut self, prepared: Prepared, slots: &mut [usize]) {
+        tally(&mut self.tally, &prepared);
+        for write in prepared.writes {
+            match write.payload {
+                WritePayload::Encoded(bytes) => {
+                    let slot = &mut slots[write.dest];
+                    if *slot == usize::MAX {
+                        *slot = self.bytes.len();
+                        self.bytes.push((write.dest, Vec::new()));
+                    }
+                    self.bytes[*slot].1.extend_from_slice(&bytes);
+                }
+                WritePayload::Records(reads) => self.records.push((write.dest, reads)),
+            }
         }
-    }
-    Ok(())
-}
-
-/// The read-ahead thread's stack: noodles' CRAM 3.1 rANS Nx16 decoder overflows
-/// the 2 MiB default in optimized builds.
-const READER_STACK_BYTES: usize = 64 << 20;
-
-/// Spawn the read-ahead thread ([`read_chunks`]) with [`READER_STACK_BYTES`].
-fn spawn_reader(
-    reader: FragmentReader,
-    tx: std::sync::mpsc::SyncSender<Vec<PendingFragment>>,
-) -> Result<std::thread::JoinHandle<Result<()>>> {
-    std::thread::Builder::new()
-        .name("unmux-reader".to_string())
-        .stack_size(READER_STACK_BYTES)
-        .spawn(move || read_chunks(reader, tx, READ_CHUNK))
-        .context("failed to spawn the read-ahead thread")
-}
-
-/// Drive the engine on a single thread (`--threads 1`): no read-ahead thread,
-/// no rayon pool, no BGZF pool. Read a chunk, match it serially with one warm
-/// `Scratch`, then apply it, all on this thread; compression, if any, runs
-/// inline on the sink writers. Uses exactly one core, so it never
-/// oversubscribes a single-core runner. Output is input-ordered, like the other
-/// drivers.
-fn drive_serial(
-    engine: &Engine,
-    mut reader: FragmentReader,
-    writer: &mut MultiWriter,
-    metrics: &mut Metrics,
-) -> Result<()> {
-    let mut progress = Progress::new();
-    let mut scratch = Scratch::new();
-    let mut record = RecordBuf::default();
-    while let Some(chunk) = next_chunk(&mut reader, READ_CHUNK)? {
-        let prepared = match_chunk_serial(engine, &mut scratch, &mut record, chunk);
-        apply_chunk(prepared, writer, metrics, &mut progress)?;
-    }
-    Ok(())
-}
-
-/// Drive the engine on two threads (`--threads 2`): a read-ahead thread streams
-/// chunks while this (consumer) thread matches each chunk serially with one
-/// warm `Scratch` and applies it. No rayon matcher pool and no BGZF pool
-/// (compression is inline), so the run uses exactly two cores: one
-/// reading/decompressing, one matching + writing. A consumer error takes
-/// precedence over a read error or a reader panic, matching `drive_parallel`.
-fn drive_pipelined(
-    engine: &Engine,
-    reader: FragmentReader,
-    writer: &mut MultiWriter,
-    metrics: &mut Metrics,
-) -> Result<()> {
-    let mut progress = Progress::new();
-    let mut scratch = Scratch::new();
-    let mut record = RecordBuf::default();
-    let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<PendingFragment>>(READ_AHEAD_CHUNKS);
-    let reader_handle = spawn_reader(reader, tx)?;
-
-    let mut outcome: Result<()> = Ok(());
-    for chunk in &rx {
-        let prepared = match_chunk_serial(engine, &mut scratch, &mut record, chunk);
-        if let Err(error) = apply_chunk(prepared, writer, metrics, &mut progress) {
-            outcome = Err(error);
-            break;
-        }
-    }
-    drop(rx);
-    let reader_result = reader_handle.join();
-    outcome?;
-    match reader_result {
-        Ok(read_outcome) => read_outcome,
-        Err(_) => Err(anyhow!("the read-ahead thread panicked")),
+        self.fragments += 1;
     }
 }
 
-/// Drive the engine in parallel as three overlapped stages: a read-ahead thread
-/// streams bounded chunks of raw fragments; a task on the rayon pool decodes and
-/// fully prepares every record of each chunk ([`process_pending`]); and the
-/// consumer (main) thread applies each prepared chunk to the single writer in
-/// input order while the pool works on the next.
-/// Output stays in input order, so runs are deterministic regardless of
-/// `--threads`.
-fn drive_parallel(
-    engine: &Engine,
-    budget: ThreadBudget,
-    reader: FragmentReader,
-    writer: &mut MultiWriter,
-    metrics: &mut Metrics,
-) -> Result<()> {
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(budget.matchers)
-        .build()
-        .context("failed to build the matcher thread pool")?;
+/// The state of merging: the outputs, the metrics, and the record count.
+struct Merger {
+    sinks: Sinks,
+    metrics: Metrics,
+    progress: Progress,
+}
 
-    let mut progress = Progress::new();
+/// What each worker keeps across the jobs it runs.
+struct DemuxWorker {
+    scratch: Scratch,
+    record: RecordBuf,
+    fastq: noodles::fastq::Record,
+    compressor: Option<::bgzf::Compressor>,
+    slots: Vec<usize>,
+}
 
-    let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<PendingFragment>>(READ_AHEAD_CHUNKS);
-    let reader_handle = spawn_reader(reader, tx)?;
+/// The fragments read while opening FASTQ inputs, and the error that ended
+/// them, if one did.
+type Head = (Vec<PendingFragment>, Option<anyhow::Error>);
 
-    let (prepared_tx, prepared_rx) = std::sync::mpsc::sync_channel::<Vec<Result<Prepared>>>(1);
-    let outcome = pool.in_place_scope(|scope| {
-        scope.spawn(move |_| {
-            for chunk in rx {
-                let prepared: Vec<Result<Prepared>> = chunk
-                    .into_par_iter()
-                    .with_min_len(MATCHER_MIN_JOB)
-                    .map_init(
-                        || (Scratch::new(), RecordBuf::default()),
-                        |(scratch, record), pending| {
-                            process_pending(engine, scratch, record, pending)
-                        },
-                    )
-                    .collect();
-                if prepared_tx.send(prepared).is_err() {
-                    return;
+/// Where the batches of a run come from.
+enum Source {
+    /// Every input read a fragment at a time, by one worker at a time.
+    Fragments {
+        reader: Mutex<(FragmentReader, u64)>,
+        exhausted: AtomicBool,
+    },
+    /// FASTQ inputs read in chunks of records, each input by one worker at a
+    /// time, after the fragments read while opening them, which are batch 0.
+    Fastq {
+        source: FastqSource,
+        head: Mutex<Option<Head>>,
+        interleaved: bool,
+        /// The input paths, when several inputs may not hold both mates of a pair.
+        pairs: Option<Vec<PathBuf>>,
+    },
+}
+
+impl Source {
+    /// Read every input of `reader` in chunks when they are all FASTQ.
+    fn new(reader: FragmentReader) -> Self {
+        match reader.into_fastq() {
+            Ok(inputs) => {
+                let step = if inputs.interleaved { 2 } else { 1 };
+                let source = FastqSource::new(inputs.streams, step, READ_CHUNK * step, BATCH_BYTES);
+                Source::Fastq {
+                    source,
+                    head: Mutex::new(Some(inputs.head)),
+                    interleaved: inputs.interleaved,
+                    pairs: inputs.pairs,
                 }
             }
-        });
-        let mut outcome: Result<()> = Ok(());
-        for prepared in &prepared_rx {
-            if let Err(error) = apply_chunk(prepared, writer, metrics, &mut progress) {
-                outcome = Err(error);
-                break;
+            Err(reader) => Source::Fragments {
+                reader: Mutex::new((*reader, 0)),
+                exhausted: AtomicBool::new(false),
+            },
+        }
+    }
+}
+
+/// A batch of fragments, or the chunks of FASTQ records that hold them.
+enum Batch {
+    Fragments(Vec<PendingFragment>),
+    Chunks(Vec<Chunk>),
+}
+
+/// A demux run on the worker pool: inputs read in batches, workers that
+/// prepare and encode the fragments of each, and outputs merged in input order.
+struct DemuxRun<'a> {
+    engine: &'a Engine<'a>,
+    source: Source,
+    merger: Mutex<Merger>,
+    files: Arc<[OnceLock<BlockFile>]>,
+    targets: usize,
+    compression: u8,
+}
+
+impl DemuxRun<'_> {
+    fn merger(&self) -> std::sync::MutexGuard<'_, Merger> {
+        self.merger.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Prepare `pending` into `processed`, or keep its error there; whether it
+    /// was prepared.
+    fn prepare(
+        &self,
+        worker: &mut DemuxWorker,
+        pending: Result<PendingFragment>,
+        processed: &mut Processed,
+    ) -> bool {
+        let (scratch, record) = (&mut worker.scratch, &mut worker.record);
+        match pending.and_then(|pending| process_pending(self.engine, scratch, record, pending)) {
+            Ok(prepared) => {
+                processed.add(prepared, &mut worker.slots);
+                true
+            }
+            Err(error) => {
+                processed.error = Some(error);
+                false
             }
         }
-        // Closing the channel stops the process task, which closes the reader's.
-        drop(prepared_rx);
-        outcome
-    });
-    let reader_result = reader_handle.join();
-    outcome?;
-    match reader_result {
-        Ok(read_outcome) => read_outcome,
-        Err(_) => Err(anyhow!("the read-ahead thread panicked")),
+    }
+}
+
+impl pool::Stages for DemuxRun<'_> {
+    type Batch = Batch;
+    type Done = Processed;
+    type Block = Block;
+    type Worker = DemuxWorker;
+
+    fn streams(&self) -> usize {
+        match &self.source {
+            Source::Fragments { .. } => 1,
+            Source::Fastq { source, .. } => source.inputs(),
+        }
+    }
+
+    fn worker(&self) -> DemuxWorker {
+        DemuxWorker {
+            scratch: Scratch::new(),
+            record: RecordBuf::default(),
+            fastq: noodles::fastq::Record::default(),
+            compressor: None,
+            slots: vec![usize::MAX; self.files.len()],
+        }
+    }
+
+    fn can_read(&self, stream: usize) -> bool {
+        match &self.source {
+            Source::Fragments { exhausted, .. } => !exhausted.load(Ordering::Acquire),
+            Source::Fastq { source, .. } => source.can_read(stream),
+        }
+    }
+
+    fn read(&self, _: &mut DemuxWorker, stream: usize) -> Readout<Batch> {
+        let mut readout = Readout::nothing();
+        match &self.source {
+            Source::Fragments { reader, exhausted } => {
+                let mut reader = reader.lock().unwrap_or_else(PoisonError::into_inner);
+                let (fragments, next) = &mut *reader;
+                let index = *next;
+                match next_batch(fragments) {
+                    Ok(Some(batch)) => {
+                        *next += 1;
+                        readout.batches.push((index, Batch::Fragments(batch)));
+                    }
+                    Ok(None) => readout.end = Some(End::Exhausted(index)),
+                    Err(error) => readout.end = Some(End::Failed(index, error)),
+                }
+                if readout.end.is_some() {
+                    exhausted.store(true, Ordering::Release);
+                }
+            }
+            Source::Fastq { source, head, .. } => {
+                let head = head.lock().unwrap_or_else(PoisonError::into_inner).take();
+                if let Some((fragments, error)) = head {
+                    readout.batches.push((0, Batch::Fragments(fragments)));
+                    if let Some(error) = error {
+                        source.stop();
+                        readout.end = Some(End::Failed(1, error));
+                        return readout;
+                    }
+                }
+                let framed = source.read(stream);
+                let chunks = framed.chunks.into_iter();
+                let batches = chunks.map(|(index, chunks)| (index + 1, Batch::Chunks(chunks)));
+                readout.batches.extend(batches);
+                readout.end = framed.total.map(|total| End::Exhausted(total + 1));
+            }
+        }
+        readout
+    }
+
+    fn process(&self, worker: &mut DemuxWorker, batch: Batch) -> Processed {
+        let mut processed = Processed {
+            fragments: 0,
+            tally: Metrics::tally(self.targets),
+            bytes: Vec::new(),
+            records: Vec::new(),
+            error: None,
+        };
+        match batch {
+            Batch::Fragments(fragments) => {
+                for pending in fragments {
+                    if !self.prepare(worker, Ok(pending), &mut processed) {
+                        break;
+                    }
+                }
+            }
+            Batch::Chunks(chunks) => {
+                let (interleaved, pairs) = match &self.source {
+                    Source::Fastq {
+                        interleaved, pairs, ..
+                    } => (*interleaved, pairs.as_deref()),
+                    Source::Fragments { .. } => (false, None),
+                };
+                let mut fragments = ChunkFragments::new(chunks, interleaved, pairs);
+                loop {
+                    let pending = match fragments.next(&mut worker.fastq) {
+                        Ok(Some(pending)) => Ok(pending),
+                        Ok(None) => break,
+                        Err(error) => Err(error),
+                    };
+                    if !self.prepare(worker, pending, &mut processed) {
+                        break;
+                    }
+                }
+            }
+        }
+        for &(dest, _) in &processed.bytes {
+            worker.slots[dest] = usize::MAX;
+        }
+        processed
+    }
+
+    fn merge(&self, done: Processed, blocks: &mut Vec<Block>) -> Result<()> {
+        let mut merger = self.merger();
+        let Merger {
+            sinks,
+            metrics,
+            progress,
+        } = &mut *merger;
+        metrics.absorb(&done.tally);
+        for (dest, bytes) in &done.bytes {
+            sinks.write(*dest, bytes, blocks)?;
+        }
+        for (dest, reads) in &done.records {
+            let outputs: SmallVec<[OutputRead; 2]> =
+                reads.iter().map(PreparedRead::as_output).collect();
+            sinks.write_records(*dest, &outputs)?;
+        }
+        progress.add(done.fragments);
+        done.error.map_or(Ok(()), Err)
+    }
+
+    fn finish(&self, blocks: &mut Vec<Block>) -> Result<()> {
+        self.merger().sinks.finish(blocks);
+        Ok(())
+    }
+
+    fn compress(&self, worker: &mut DemuxWorker, block: Block) -> Result<()> {
+        let compressor = match &mut worker.compressor {
+            Some(compressor) => compressor,
+            empty => empty.insert(crate::sink::compressor(self.compression)?),
+        };
+        crate::sink::compress(compressor, &self.files, block)
     }
 }
 
@@ -2599,21 +2709,21 @@ fn match_joined(
     segments: &[Segment],
     hits: &GroupHits,
     group_index: &HashMap<String, usize>,
-) -> Result<GroupOutcome> {
+) -> Result<GroupVerdict> {
     let mut joined = Vec::new();
     for name in streams {
         let Some(spec) = extracts.iter().find(|e| &e.name == name) else {
-            return Ok(GroupOutcome::unmatched());
+            return Ok(GroupVerdict::unmatched(group));
         };
         match extract(&spec.span, segments, hits, group_index)? {
             Some(extracted) => joined.extend_from_slice(&extracted.bases),
-            None => return Ok(GroupOutcome::unmatched()),
+            None => return Ok(GroupVerdict::unmatched(group)),
         }
     }
     if joined.is_empty() {
-        return Ok(GroupOutcome::unmatched());
+        return Ok(GroupVerdict::unmatched(group));
     }
-    Ok(match_group(group, scratch, &[joined.as_slice()]))
+    Ok(match_verdict(group, scratch, &[joined.as_slice()], None))
 }
 
 /// Match one group, honoring its sequential prerequisite: a group with no
@@ -2625,9 +2735,9 @@ fn match_group_for(
     scratch: &mut Scratch,
     segments: &[&[u8]],
     hits: &GroupHits,
-) -> GroupOutcome {
+) -> GroupVerdict {
     let Some(prereq) = &group.prereq else {
-        return match_group(group, scratch, segments);
+        return match_verdict(group, scratch, segments, group.loc.as_ref());
     };
     // Skip the group when any prerequisite upstream did not match (its slot is
     // `None`). Upstreams are earlier in dependency order, so their slots are
@@ -2637,7 +2747,7 @@ fn match_group_for(
         .iter()
         .any(|&upstream| hits[upstream].is_none())
     {
-        return GroupOutcome::unmatched();
+        return GroupVerdict::unmatched(group);
     }
     // A relative `next` link windows the search relative to its upstream's
     // match (present, since the upstream is one of the now-satisfied upstreams;
@@ -2649,14 +2759,10 @@ fn match_group_for(
                 .as_ref()
                 .and_then(|hit| hit.span)
                 .expect("a relative-window upstream is a matched non-match= group with a span");
-            match_group_at(
-                group,
-                scratch,
-                segments,
-                Some(&window_after(&span, window.lo, window.hi)),
-            )
+            let window = window_after(&span, window.lo, window.hi);
+            match_verdict(group, scratch, segments, Some(&window))
         }
-        None => match_group(group, scratch, segments),
+        None => match_verdict(group, scratch, segments, group.loc.as_ref()),
     }
 }
 
@@ -2669,7 +2775,13 @@ fn prepare_removed(
     remove: &RemoveTarget,
     hits: &GroupHits,
 ) -> Result<Vec<PreparedWrite>> {
-    let Some(pattern) = &remove.pattern else {
+    let rule = engine
+        .routing
+        .removes()
+        .iter()
+        .position(|rule| std::ptr::eq(rule, remove));
+    let layout = rule.and_then(|rule| engine.destinations.removes[rule].as_ref());
+    let Some(layout) = layout else {
         return Ok(Vec::new());
     };
     let slug = engine.plan.qc_tag.as_ref().map(|tag| {
@@ -2691,10 +2803,8 @@ fn prepare_removed(
         )
     });
     prepare_raw_bin(
-        pattern,
-        engine.pool,
+        layout,
         engine.pool_read_group,
-        engine.plan.inputs.len(),
         fragment,
         slug.as_ref().map(|(tag, value)| (*tag, value.as_str())),
     )
@@ -2709,8 +2819,8 @@ fn prepare_unassigned(
     reason: &Unassigned,
     hits: &GroupHits,
 ) -> Result<Vec<PreparedWrite>> {
-    match &engine.plan.unassigned {
-        Some(pattern) => {
+    match &engine.destinations.unassigned {
+        Some(layout) => {
             let slug = engine.plan.qc_tag.as_ref().map(|tag| {
                 let base_segments: Vec<&[u8]> = fragment
                     .records
@@ -2723,10 +2833,8 @@ fn prepare_unassigned(
                 )
             });
             prepare_raw_bin(
-                pattern,
-                engine.pool,
+                layout,
                 engine.pool_read_group,
-                engine.plan.inputs.len(),
                 fragment,
                 slug.as_ref().map(|(tag, value)| (*tag, value.as_str())),
             )
@@ -2739,44 +2847,29 @@ fn prepare_unassigned(
 /// With `%source` over multiple `--in` files the segments fan out one file per
 /// input file (record `i` came from file `i`); a single input (whether plain or
 /// auto-detected interleaved) is one `%source` (0), so its mates stay together.
-/// Without `%source`, every segment lands in one file.
+/// Without `%source`, every segment goes to one file.
 fn prepare_raw_bin(
-    pattern: &OutputPattern,
-    pool: &str,
+    layout: &BinLayout,
     read_group: &str,
-    num_sources: usize,
     fragment: &Fragment,
     slug: Option<(&str, &str)>,
 ) -> Result<Vec<PreparedWrite>> {
-    if num_sources > 1 && pattern.uses(Placeholder::Source) {
-        fragment
+    match layout {
+        BinLayout::PerSource(dests) => fragment
             .records
             .iter()
-            .enumerate()
-            .map(|(source, record)| {
-                let ctx = PathContext {
-                    pool,
-                    source: Some(source),
-                    ..Default::default()
-                };
+            .zip(dests)
+            .map(|(record, &dest)| {
                 Ok(PreparedWrite {
-                    path: resolve_pattern(pattern, &ctx),
+                    dest,
                     payload: WritePayload::Records(vec![prepared_raw_read(
                         record, read_group, slug,
                     )?]),
                 })
             })
-            .collect()
-    } else {
-        // A single source: `%source` (if present) is always 0, and every
-        // segment lands together.
-        let ctx = PathContext {
-            pool,
-            source: Some(0),
-            ..Default::default()
-        };
-        Ok(vec![PreparedWrite {
-            path: resolve_pattern(pattern, &ctx),
+            .collect(),
+        &BinLayout::Single(dest) => Ok(vec![PreparedWrite {
+            dest,
             payload: WritePayload::Records(
                 fragment
                     .records
@@ -2784,7 +2877,7 @@ fn prepare_raw_bin(
                     .map(|record| prepared_raw_read(record, read_group, slug))
                     .collect::<Result<_>>()?,
             ),
-        }])
+        }]),
     }
 }
 
@@ -2871,8 +2964,6 @@ fn prepare_body(
     fragment: &Fragment,
 ) -> Result<BodyOutcome> {
     let plan = engine.plan;
-    let pool = engine.pool;
-    let input_formats = engine.input_formats;
     let target = route.map(Route::target);
     let mut streams: HashMap<&str, Extracted> = HashMap::new();
     let mut slot = 0;
@@ -2911,21 +3002,15 @@ fn prepare_body(
 
     let sample = target.map(|t| t.sample.as_str());
     let sub_sample = target.and_then(|t| t.sub_sample.as_deref());
-    // The format is fixed by the path extension (or the stdout mirror),
-    // independent of the ordinal.
-    let probe = PathContext {
-        pool,
-        sample,
-        sub_sample,
-        ordinal: Some(1),
-        source: None,
+    let layout = match route {
+        Some(route) => &engine.destinations.targets[route.target_index()],
+        None => engine
+            .destinations
+            .pass_through
+            .as_ref()
+            .context("internal error: no --out layout for a record without a sample")?,
     };
-    let probe_path = plan.out.as_ref().and_then(|p| resolve_pattern(p, &probe));
-    let format = output_format(probe_path.as_deref(), input_formats)?;
-    let is_alignment = matches!(
-        format,
-        OutputFormat::Sam | OutputFormat::Bam | OutputFormat::Cram
-    );
+    let is_alignment = layout.is_alignment;
 
     let bodies = match assemble_bodies(
         plan,
@@ -2949,12 +3034,9 @@ fn prepare_body(
     // keeps its carried original `RG:Z` instead (already in `read.tags` via
     // `merge_data`); `None` leaves it untouched, since `writer::build_record`
     // only inserts `RG:Z` when a read group is set.
-    let read_group = if engine.is_read_group_split {
-        None
-    } else {
-        target
-            .map(Target::label)
-            .or_else(|| Some(engine.pool_read_group.to_string()))
+    let read_group = match engine.is_read_group_split {
+        true => None,
+        false => layout.read_group.clone(),
     };
 
     let mut datas: Vec<Data> = bodies
@@ -2987,67 +3069,53 @@ fn prepare_body(
     // Multi-read FASTX to a file fans out one file per `%ordinal`; SAM/BAM (a
     // pair in one file), single-read FASTX, and stdout all write every read to
     // one destination.
-    let multi_fastx = (!is_alignment && bodies.len() > 1)
-        .then_some(plan.out.as_ref())
-        .flatten();
-    let writes = if let Some(pattern) = multi_fastx {
-        if !pattern.uses(Placeholder::Ordinal) {
-            bail!(
-                "unmux: multi-read FASTX output needs the %ordinal placeholder in --out to \
-                 separate the {} template reads",
-                bodies.len()
+    let dests = layout
+        .dests
+        .as_ref()
+        .map_err(|message| anyhow!("{message}"))?;
+    let writes = match dests {
+        OutDests::PerOrdinal(dests) => {
+            ensure!(
+                dests.len() == bodies.len(),
+                "internal error: {} bodies for {} --out ordinals",
+                bodies.len(),
+                dests.len()
             );
-        }
-        bodies
-            .into_iter()
-            .zip(datas)
-            .enumerate()
-            .map(|(index, (body, data))| {
-                let ctx = PathContext {
-                    pool,
-                    sample,
-                    sub_sample,
-                    ordinal: Some(index + 1),
-                    source: None,
-                };
-                PreparedWrite {
-                    path: resolve_pattern(pattern, &ctx),
+            bodies
+                .into_iter()
+                .zip(datas)
+                .zip(dests)
+                .map(|((body, data), &dest)| PreparedWrite {
+                    dest,
                     payload: WritePayload::Records(vec![prepared_body_read(body, data, None)]),
-                }
-            })
-            .collect()
-    } else {
-        let ctx = PathContext {
-            pool,
-            sample,
-            sub_sample,
-            ordinal: (bodies.len() == 1).then_some(1),
-            source: None,
-        };
-        let path = plan.out.as_ref().and_then(|p| resolve_pattern(p, &ctx));
-        let reads = bodies
-            .into_iter()
-            .zip(datas)
-            .map(|(mut body, data)| match body.alignment.take() {
-                Some(record) => passed_through_read(
-                    record,
-                    &tag_data,
-                    slug.as_ref().map(|(tag, value)| (*tag, value.as_str())),
-                ),
-                None => {
-                    let read_group = if is_alignment {
-                        read_group.clone()
-                    } else {
-                        None
-                    };
-                    Ok(prepared_body_read(body, data, read_group))
-                }
-            })
-            .collect::<Result<_>>()?;
-        vec![PreparedWrite {
-            path,
-            payload: WritePayload::Records(reads),
-        }]
+                })
+                .collect()
+        }
+        &OutDests::Single(dest) => {
+            let reads = bodies
+                .into_iter()
+                .zip(datas)
+                .map(|(mut body, data)| match body.alignment.take() {
+                    Some(record) => passed_through_read(
+                        record,
+                        &tag_data,
+                        slug.as_ref().map(|(tag, value)| (*tag, value.as_str())),
+                    ),
+                    None => {
+                        let read_group = if is_alignment {
+                            read_group.clone()
+                        } else {
+                            None
+                        };
+                        Ok(prepared_body_read(body, data, read_group))
+                    }
+                })
+                .collect::<Result<_>>()?;
+            vec![PreparedWrite {
+                dest,
+                payload: WritePayload::Records(reads),
+            }]
+        }
     };
     Ok(BodyOutcome::Assembled(writes))
 }
@@ -3395,16 +3463,15 @@ mod tests {
         let mixed = [&[Bam, Cram][..], &[Cram, Bam], &[Bam, Bam, Cram]];
         let single = [&[Bam][..], &[Bam, Bam], &[Cram], &[Fastq, Bam], &[Fastq]];
         for formats in single.into_iter().chain(mixed) {
-            for threads in 3..=40 {
+            for threads in 1..=40 {
                 let decode: usize = decode_workers(threads, formats).iter().sum();
                 assert!(decode <= MAX_DECODE_THREADS);
-                let writer = writer_pool_size(threads - decode, true);
-                let budget = partition_threads(threads, writer, decode);
-                assert!(budget.matchers >= 1);
+                let workers = pool_workers(threads, decode);
+                assert!(workers >= 1);
                 assert_eq!(
-                    budget.reader + budget.decode + budget.main + budget.writer + budget.matchers,
+                    workers + decode,
                     threads,
-                    "{formats:?} at {threads} threads: {budget:?}"
+                    "{formats:?} at {threads} threads"
                 );
             }
         }
@@ -3429,63 +3496,19 @@ mod tests {
     }
 
     #[test]
-    fn test_partition_threads_reserves_roles() {
-        // partition_threads is only consulted for N >= 3 (drive_parallel); 1
-        // and 2 use the serial drivers. No pool: every spare thread is a
-        // matcher.
-        for threads in [3, 4, 5, 6, 7, 8, 16] {
-            let budget = partition_threads(threads, 0, 0);
-            assert_eq!(budget.reader, 1, "one read-ahead thread");
-            assert_eq!(budget.main, 1, "one main/consumer thread");
-            assert_eq!(budget.writer, 0, "no BGZF pool");
-            assert!(budget.matchers >= 1, "at least one matcher");
-            assert_eq!(
-                budget.reader + budget.main + budget.writer + budget.matchers,
-                threads,
-                "the partition accounts for every thread"
-            );
-        }
-        // With a BGZF pool, the writer threads come out of the matcher budget.
-        for (threads, writer) in [(4, 1), (8, 2), (16, 4)] {
-            let budget = partition_threads(threads, writer, 0);
-            assert_eq!(budget.writer, writer);
-            assert!(budget.matchers >= 1, "at least one matcher remains");
-            assert_eq!(
-                budget.reader + budget.main + budget.writer + budget.matchers,
-                threads
-            );
-        }
-    }
-
-    #[test]
-    fn test_writer_pool_size_even_split() {
-        // No compressed output: no BGZF pool, every spare thread is a matcher.
-        assert_eq!(writer_pool_size(8, false), 0);
-        // Compressed output: spare threads split evenly with the matchers. At
-        // --threads 8 this is the measured optimum writer=3/matchers=3
-        // (matchers never below the writer count).
-        assert_eq!(writer_pool_size(8, true), 3);
-        let budget = partition_threads(8, writer_pool_size(8, true), 0);
-        assert_eq!((budget.writer, budget.matchers), (3, 3));
-        // Too few threads to afford a pool (reader + main + >=1 writer + >=1
-        // matcher needs 4): the pool is empty and compression runs inline on
-        // the consumer.
-        assert_eq!(writer_pool_size(2, true), 0);
-        assert_eq!(writer_pool_size(3, true), 0);
-        // Small thread counts still reserve a matcher; high counts are capped
-        // at MAX_WRITER_THREADS.
-        assert_eq!(writer_pool_size(4, true), 1);
-        assert_eq!(writer_pool_size(16, true), MAX_WRITER_THREADS);
-        assert!(writer_pool_size(64, true) <= MAX_WRITER_THREADS);
+    fn test_pool_workers_keep_one_worker() {
+        assert_eq!(pool_workers(1, 0), 1);
+        assert_eq!(pool_workers(8, 0), 8);
+        assert_eq!(pool_workers(8, 2), 6);
+        assert_eq!(pool_workers(2, 4), 1);
     }
 
     #[test]
     fn test_low_thread_output_matches_high_thread() {
-        // --threads 1 (serial) and 2 (pipelined) must produce the same
+        // --threads 1 and 2 must produce the same
         // demultiplexed records as a high-thread run. Plain FASTQ is
-        // byte-identical across every thread count. Compressed output (inline
-        // BAM at 1/2/3 vs pooled BGZF at 16) can frame BGZF blocks differently,
-        // so those compare decoded records via read_back rather than raw bytes.
+        // byte-identical across every thread count. Compressed output is
+        // compared as decoded records via read_back rather than raw bytes.
         let dir = tempfile::tempdir().unwrap();
         let n = READ_CHUNK + 137; // spans a chunk boundary plus a partial tail
         let mut fq = Vec::new();
@@ -3524,8 +3547,7 @@ mod tests {
             );
         }
 
-        // Compressed BAM: compare decoded records (inline vs pooled BGZF
-        // framing may differ).
+        // Compressed BAM: compare decoded records.
         let ref_bam = dir.path().join("ref.bam");
         run(16, &ref_bam);
         let ref_records = read_back(&ref_bam);
@@ -4598,8 +4620,9 @@ mod tests {
         let resolved = HashMap::new();
         let (tag_sets, _) = load_tag_sets(&plan, &resolved).unwrap();
         let (compiled, _index) = compile_groups(&plan, &tag_sets, &resolved).unwrap();
-        let outcome = |read: &[u8]| match_group(&compiled[0], &mut Scratch::new(), &[read]);
-        let matched_tags = |result: &GroupOutcome| -> BTreeSet<usize> {
+        let outcome =
+            |read: &[u8]| crate::matcher::match_group(&compiled[0], &mut Scratch::new(), &[read]);
+        let matched_tags = |result: &crate::matcher::GroupOutcome| -> BTreeSet<usize> {
             result.accepted.iter().map(|hit| hit.tag_idx).collect()
         };
 
@@ -4950,9 +4973,8 @@ mod tests {
     }
 
     #[test]
-    fn test_pooled_fastx_gz_is_bgzf_and_round_trips() {
-        // A gzipped-FASTX fan-out goes through the BGZF compressor pool: each
-        // .fq.gz is BGZF-framed (valid gzip), round-trips its reads, and a
+    fn test_fastx_gz_is_bgzf_and_round_trips() {
+        // Each .fq.gz of a gzipped-FASTX fan-out is BGZF-framed (valid gzip), round-trips its reads, and a
         // zero-read sample is an empty but valid BGZF file (the EOF block
         // only).
         let dir = tempfile::tempdir().unwrap();
@@ -5052,11 +5074,8 @@ mod tests {
     }
 
     #[test]
-    fn test_pooled_bam_unassigned_bin_round_trips() {
-        // A BAM `--unassigned` bin is pooled (file-backed BAM), so it exercises
-        // the pooled BAM writer's bytes directly: it must be a valid BAM that
-        // reads back, proving the pooled bam writer carries no double-BGZF and
-        // the EOF is sound.
+    fn test_bam_unassigned_bin_round_trips() {
+        // A BAM `--unassigned` bin must read back, with one BGZF layer and a sound EOF.
         let dir = tempfile::tempdir().unwrap();
         let input = write_file(dir.path(), "in.fq", b"@a\nGGGG\n+\nIIII\n"); // matches no sample
         let mut args = base_args();
@@ -5086,13 +5105,11 @@ mod tests {
     }
 
     #[test]
-    fn test_pooled_error_path_returns_clean_error_not_panic() {
-        // A consumer write error while a BGZF pool is live must surface a clean
-        // Err, not panic via the pool/PooledWriter drop order (the pool is
-        // stopped only after every writer is finalized). The run errors because
-        // a 3-input pass-through emits 3 reads per record, which alignment
-        // output cannot hold; a poolable `.fq.gz` unassigned bin forces the
-        // pool to be built.
+    fn test_bgzf_error_path_returns_clean_error_not_panic() {
+        // A write error while BGZF outputs are open must surface a clean Err,
+        // not a panic. The run errors because a 3-input pass-through emits 3
+        // reads per record, which alignment output cannot hold, beside a
+        // `.fq.gz` unassigned bin.
         let dir = tempfile::tempdir().unwrap();
         let in0 = write_file(dir.path(), "0.fq", b"@r\nAAAA\n+\nIIII\n");
         let in1 = write_file(dir.path(), "1.fq", b"@r\nCCCC\n+\nIIII\n");
@@ -5115,10 +5132,10 @@ mod tests {
     }
 
     #[test]
-    fn test_pooled_fastx_gz_deterministic_across_threads() {
-        // BGZF output is byte-identical regardless of --threads: the consumer
-        // feeds the pool in input order and BGZF block compression is
-        // deterministic at a fixed level.
+    fn test_fastx_gz_deterministic_across_threads() {
+        // BGZF output is byte-identical regardless of --threads: merging cuts
+        // blocks in input order and BGZF block compression is deterministic at
+        // a fixed level.
         let dir = tempfile::tempdir().unwrap();
         let mut fq = Vec::new();
         for i in 0..500 {
@@ -5179,9 +5196,8 @@ mod tests {
 
     #[test]
     fn test_parallel_output_is_deterministic_across_thread_counts() {
-        // Matching fans across the rayon pool, but the consumer applies results
-        // in input order, so a single-file --out is byte-identical regardless
-        // of --threads. The input spans several READ_CHUNK chunks so
+        // Records are written in input order, so a single-file --out is
+        // byte-identical regardless of --threads. The input spans several READ_CHUNK chunks so
         // cross-chunk ordering is exercised too.
         let dir = tempfile::tempdir().unwrap();
         let n = READ_CHUNK * 2 + 137; // > 2 chunks plus a partial tail
@@ -5221,8 +5237,7 @@ mod tests {
 
     #[test]
     fn test_parallel_bam_output_deterministic_across_thread_counts() {
-        // The encode-on-workers SAM/BAM path: records are encoded on the rayon
-        // matcher workers and appended by the consumer in input order, so a
+        // Records are encoded on the workers and written in input order, so a
         // single-file BAM `--out` is byte-identical regardless of --threads.
         // The input spans several READ_CHUNK chunks so cross-chunk ordering and
         // multi-job parallel encode (with_min_len coarsens each chunk into
@@ -5253,10 +5268,7 @@ mod tests {
             run_demux(args).unwrap();
         };
 
-        // 4 is the pooled-BGZF floor: read-ahead + main + >=1 writer + >=1
-        // matcher. With fewer worker threads than that, compression runs inline
-        // instead of through the pool; here both runs clear the floor, so both
-        // use the pool and the bytes are identical.
+        // Both thread counts must give identical bytes.
         let out_min = dir.path().join("min.bam");
         let out_many = dir.path().join("many.bam");
         run(4, &out_min);

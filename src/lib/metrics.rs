@@ -8,7 +8,7 @@
 //! sum(denominator)` over the target's records (0 for a pure pass-through run,
 //! where the whole record is the output).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::BufWriter;
 use std::path::Path;
@@ -56,7 +56,7 @@ struct TargetTally {
 pub struct Metrics {
     pool: String,
     targets: Vec<Target>,
-    per_target: HashMap<Target, TargetTally>,
+    per_target: Vec<TargetTally>,
     total: u64,
     pass_through: u64,
     unassigned: u64,
@@ -75,15 +75,10 @@ impl Metrics {
     /// A fresh accumulator for `pool` with one tally slot per fan-out `target`
     /// (in first-seen order).
     pub fn new(pool: impl Into<String>, targets: &[Target]) -> Self {
-        let per_target = targets
-            .iter()
-            .cloned()
-            .map(|target| (target, TargetTally::default()))
-            .collect();
         Self {
             pool: pool.into(),
             targets: targets.to_vec(),
-            per_target,
+            per_target: vec![TargetTally::default(); targets.len()],
             total: 0,
             pass_through: 0,
             unassigned: 0,
@@ -94,6 +89,44 @@ impl Metrics {
             retained_unextracted_bases: 0,
             input_len_sums: Vec::new(),
             input_len_counts: Vec::new(),
+        }
+    }
+
+    /// An empty tally over `targets` fan-out targets, for one batch of records
+    /// to add to the metrics of the run with [`Metrics::absorb`].
+    pub fn tally(targets: usize) -> Self {
+        let mut tally = Self::new(String::new(), &[]);
+        tally.per_target = vec![TargetTally::default(); targets];
+        tally
+    }
+
+    /// Add the counts of `batch`, a [`Metrics::tally`] over the same targets.
+    pub fn absorb(&mut self, batch: &Self) {
+        for (tally, more) in self.per_target.iter_mut().zip(&batch.per_target) {
+            tally.reads += more.reads;
+            tally.denominator_bases += more.denominator_bases;
+            tally.unextracted_bases += more.unextracted_bases;
+        }
+        self.total += batch.total;
+        self.pass_through += batch.pass_through;
+        self.unassigned += batch.unassigned;
+        for (reason, reads) in &batch.unassigned_by_reason {
+            *self.unassigned_by_reason.entry(reason.clone()).or_default() += reads;
+        }
+        self.removed += batch.removed;
+        self.non_primary += batch.non_primary;
+        self.retain_bases(
+            batch.retained_denominator_bases,
+            batch.retained_unextracted_bases,
+        );
+        let inputs = batch.input_len_sums.len();
+        if self.input_len_sums.len() < inputs {
+            self.input_len_sums.resize(inputs, 0);
+            self.input_len_counts.resize(inputs, 0);
+        }
+        for input in 0..inputs {
+            self.input_len_sums[input] += batch.input_len_sums[input];
+            self.input_len_counts[input] += batch.input_len_counts[input];
         }
     }
 
@@ -131,10 +164,10 @@ impl Metrics {
             .join(",")
     }
 
-    /// Count a record routed to `target`, with its `frac_bases_unextracted`
-    /// contribution.
-    pub fn record_assigned(&mut self, target: &Target, denominator: u64, unextracted: u64) {
-        let tally = self.per_target.entry(target.clone()).or_default();
+    /// Count a record routed to the `target`th fan-out target, with its
+    /// `frac_bases_unextracted` contribution.
+    pub fn record_assigned(&mut self, target: usize, denominator: u64, unextracted: u64) {
+        let tally = &mut self.per_target[target];
         tally.reads += 1;
         tally.denominator_bases += denominator;
         tally.unextracted_bases += unextracted;
@@ -180,10 +213,7 @@ impl Metrics {
 
     /// Total records routed to a fan-out target.
     fn assigned(&self) -> u64 {
-        self.targets
-            .iter()
-            .map(|target| self.tally(target).reads)
-            .sum()
+        self.per_target.iter().map(|tally| tally.reads).sum()
     }
 
     /// The fraction of processed records that matched no sample (the `log`
@@ -192,16 +222,11 @@ impl Metrics {
         frac(self.unassigned, self.total)
     }
 
-    fn tally(&self, target: &Target) -> TargetTally {
-        self.per_target.get(target).cloned().unwrap_or_default()
-    }
-
     /// Write the per-sample TSV: leading `pool`/`sample`/`sub_sample`, then the
     /// wide metric columns, one row per fan-out target.
     pub fn write_per_sample_tsv(&self, path: &Path) -> Result<()> {
         let mut writer = tsv_writer(path)?;
-        for target in &self.targets {
-            let tally = self.tally(target);
+        for (target, tally) in self.targets.iter().zip(&self.per_target) {
             writer
                 .serialize(PerSampleRow {
                     pool: &self.pool,
@@ -295,8 +320,7 @@ impl Metrics {
                 self.non_primary.separate_with_commas(),
             );
         }
-        for target in &self.targets {
-            let tally = self.tally(target);
+        for (target, tally) in self.targets.iter().zip(&self.per_target) {
             log::info!(
                 "metrics pool={} sample={} sub_sample={}: reads={} frac_of_pool={:.4} frac_bases_unextracted={:.4}",
                 self.pool,
@@ -444,10 +468,10 @@ mod tests {
         // dna01: 6 reads, 9/100 bases unextracted each. dna02: 2 reads, fully
         // extracted.
         for _ in 0..6 {
-            metrics.record_assigned(&targets[0], 100, 9);
+            metrics.record_assigned(0, 100, 9);
         }
         for _ in 0..2 {
-            metrics.record_assigned(&targets[1], 50, 0);
+            metrics.record_assigned(1, 50, 0);
         }
         metrics.record_unassigned(&Unassigned::NoSample);
         metrics.record_unassigned(&Unassigned::NoSample);
@@ -477,8 +501,8 @@ mod tests {
             metrics.record_processed();
             metrics.record_read_lengths(lens.into_iter());
         }
-        metrics.record_assigned(&targets[0], 100, 10);
-        metrics.record_assigned(&targets[0], 100, 10);
+        metrics.record_assigned(0, 100, 10);
+        metrics.record_assigned(0, 100, 10);
         metrics.record_unassigned(&Unassigned::NoSample);
         metrics.record_removed();
         metrics.record_removed();
