@@ -342,8 +342,8 @@ struct DemuxCmd {
     /// reverse-strand match, observed bases are in the tag's orientation, as
     /// the corrected ones are; the `obs` of `--qc-tag` stays in the read's.
     ///
-    /// A record keeps the input tags of the read its first stream is cut
-    /// from. Per-base tags such as `MM`/`ML` and `OQ` stay only on a record
+    /// A record keeps the input tags of the read its first bases come from.
+    /// Per-base tags such as `MM`/`ML` and `OQ` stay only on a record
     /// that copies that whole read in order, with no `~` or corrected
     /// barcode; otherwise they are left out, with a warning.
     ///

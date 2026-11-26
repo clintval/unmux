@@ -152,6 +152,21 @@ Feature: Input tags on --template records
       | --extract a=0:0:0 --extract b=1:0:end | GGGGTTTT	JJJJJJJJ | ZA:Z:two	OQ:Z:HGFEDCBA |
       | --extract a=0:0:end --extract b=1:0:0 | AAAACCCC	IIIIIIII | ZA:Z:one	OQ:Z:ABCDEFGH |
 
+  Scenario: a template record with no bases takes the tags of the read its stream is cut from
+    Given a file "in.sam" containing:
+      """
+      @HD	VN:1.6
+      q1	77	*	0	0	*	*	0	0	AAAACCCC	IIIIIIII	ZA:Z:one
+      q1	141	*	0	0	*	*	0	0	*	*	ZA:Z:two
+      """
+    When I run `unmux in.sam --pool p --extract a=0:0:end --extract b=1:0:end --template a b --out out.sam`
+    Then the exit code is 0
+    And the records of "out.sam" are:
+      """
+      q1	77	*	0	255	*	*	0	0	AAAACCCC	IIIIIIII	ZA:Z:one	RG:Z:p
+      q1	141	*	0	255	*	*	0	0	*	*	ZA:Z:two	RG:Z:p
+      """
+
   Scenario: FASTQ comment tags stay on a trimmed record
     Given a file "in.fq" containing:
       """

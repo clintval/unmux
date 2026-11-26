@@ -3567,11 +3567,11 @@ fn without_per_base_tags(data: &Data) -> (Data, PerBaseTags) {
     (kept, dropped)
 }
 
-/// Where a template body's bases come from, by the source of each stream it joins.
+/// Where a template body's bases come from, by the source of each non-empty stream it joins.
 struct BodyOrigin {
-    /// The input file of the first stream cut from a read.
+    /// The input file of the first non-empty stream, else of the first stream cut from a read.
     file: Option<usize>,
-    /// Whether a later stream is cut from another file.
+    /// Whether a later non-empty stream is cut from another file.
     joined: bool,
     /// How far the streams copy that read from its start, forward and in order, if they all do.
     copied: Option<usize>,
@@ -3584,11 +3584,17 @@ impl BodyOrigin {
             joined: false,
             copied: Some(0),
         };
+        let mut empty_file = None;
         for stream in &template.streams {
             let Some(extracted) = streams.get(stream.name.as_str()) else {
                 continue;
             };
+            if extracted.tag_bases(template.raw).is_empty() {
+                empty_file = empty_file.or(extracted.source.map(|source| source.file));
+                continue;
+            }
             let Some(source) = extracted.source else {
+                origin.copied = None;
                 continue;
             };
             match origin.file {
@@ -3603,6 +3609,7 @@ impl BodyOrigin {
                 .filter(|&at| forward && observed && source.start == at)
                 .map(|_| source.end);
         }
+        origin.file = origin.file.or(empty_file);
         origin
     }
 
