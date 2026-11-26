@@ -148,3 +148,9 @@ Feature: Lifting SAM tags from FASTX read-name comments
       | xf:f:nan         | xf:f |
       | xf:f:1e40        | xf:f |
       | RX:Z:GGGG        | RX   |
+
+  Scenario: the help says that comment tags are lifted and a malformed one stops the run
+    When I run `unmux --help`
+    Then the exit code is 0
+    And stdout contains "SAM tags in a FASTX record-name comment are lifted onto the record,"
+    And stdout contains "and a malformed one stops the run."
