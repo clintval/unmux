@@ -344,8 +344,8 @@ struct DemuxCmd {
     ///
     /// A record keeps the input tags of the read its first stream is cut
     /// from. Per-base tags such as `MM`/`ML` and `OQ` stay only on a record
-    /// that is that read unchanged; otherwise they are left out, with a
-    /// warning.
+    /// that copies that whole read in order, with no `~` or corrected
+    /// barcode; otherwise they are left out, with a warning.
     ///
     ///   --template cdna               one record = the whole cdna stream
     ///   --template cb+umi             concatenate two streams into one

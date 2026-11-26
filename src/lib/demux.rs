@@ -3567,14 +3567,60 @@ fn without_per_base_tags(data: &Data) -> (Data, PerBaseTags) {
     (kept, dropped)
 }
 
+/// Where a template body's bases come from, by the source of each stream it joins.
+struct BodyOrigin {
+    /// The input file of the first stream cut from a read.
+    file: Option<usize>,
+    /// Whether a later stream is cut from another file.
+    joined: bool,
+    /// How far the streams copy that read from its start, forward and in order, if they all do.
+    copied: Option<usize>,
+}
+
+impl BodyOrigin {
+    fn of(template: &Template, streams: &HashMap<&str, Extracted>) -> Self {
+        let mut origin = Self {
+            file: None,
+            joined: false,
+            copied: Some(0),
+        };
+        for stream in &template.streams {
+            let Some(extracted) = streams.get(stream.name.as_str()) else {
+                continue;
+            };
+            let Some(source) = extracted.source else {
+                continue;
+            };
+            match origin.file {
+                None => origin.file = Some(source.file),
+                Some(file) if file != source.file => origin.joined = true,
+                Some(_) => {}
+            }
+            let forward = !stream.revcomp && !source.reversed;
+            let observed = template.raw || extracted.corrected.is_none();
+            origin.copied = origin
+                .copied
+                .filter(|&at| forward && observed && source.start == at)
+                .map(|_| source.end);
+        }
+        origin
+    }
+
+    /// Whether the body copies all of `read`, forward and in order, and nothing else.
+    fn copies(&self, read: &InputRecord) -> bool {
+        !self.joined && self.copied == Some(read.bases.len())
+    }
+}
+
 /// Assemble a record's output bodies: the raw input segments (each carrying its
 /// tags, and its source alignment when `keep_alignment` is set) when there is no
 /// `--template`, else one body per `--template`. A template body carries the
 /// tags of the read that supplies its first segment, without the per-base ones
-/// unless the body is that read unchanged; the per-base tags left out are
-/// returned with the bodies. Returns `Err(missing_stream_name)` when a template
-/// references a stream that was not extracted (its anchoring group did not
-/// match), naming the absent stream for the `--qc-tag` slug.
+/// unless the body copies all of that read, forward and in order; the per-base
+/// tags left out are returned with the bodies. Returns
+/// `Err(missing_stream_name)` when a template references a stream that was not
+/// extracted (its anchoring group did not match), naming the absent stream for
+/// the `--qc-tag` slug.
 fn assemble_bodies(
     plan: &DemuxPlan,
     fragment: &Fragment,
@@ -3618,12 +3664,7 @@ fn assemble_bodies(
     let mut bodies = Vec::with_capacity(plan.templates.len());
     let mut dropped = PerBaseTags::default();
     for template in &plan.templates {
-        let mut sources = template
-            .streams
-            .iter()
-            .filter_map(|stream| streams.get(stream.name.as_str())?.source);
-        let first = sources.next();
-        let joined = sources.any(|source| Some(source) != first);
+        let origin = BodyOrigin::of(template, streams);
         // A single-stream template whose stream is referenced nowhere else is
         // that extract's sole consumer, so move its (possibly large)
         // bases/quals into the body instead of copying. The moved stream is in
@@ -3651,16 +3692,13 @@ fn assemble_bodies(
             }
             _ => assemble_template(template, streams)?,
         };
-        let source = match first {
+        let source = match origin.file {
             Some(file) => fragment.records.get(file),
             None => fragment.records.first(),
         };
         let carried = source.and_then(|record| {
             let tags = record.tags.as_ref()?;
-            let unchanged = !joined
-                && template.streams.iter().all(|stream| !stream.revcomp)
-                && bases == record.bases
-                && quals == record.quals;
+            let unchanged = origin.copies(record) && bases == record.bases && quals == record.quals;
             if unchanged {
                 return Some(tags.clone());
             }

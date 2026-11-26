@@ -98,10 +98,23 @@ pub struct Corrected {
     pub quals: Option<Vec<u8>>,
 }
 
+/// Where an extracted stream is cut from: bases `[start, end)` of input file `file`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamSource {
+    /// The 0-based input file.
+    pub file: usize,
+    /// The 0-based start offset in the file's read.
+    pub start: usize,
+    /// The 0-based exclusive end offset in the file's read.
+    pub end: usize,
+    /// Whether the stream's bases were reverse-complemented from the read's orientation.
+    pub reversed: bool,
+}
+
 /// An extracted stream: the observed bases and (optional) qualities, both
 /// already trimmed and, for a span measured from a reverse-strand match,
 /// reverse-complemented into the matched tag's orientation, plus an optional
-/// error-corrected form and the input file it is cut from. `bases`/`quals`
+/// error-corrected form and where in the input it is cut from. `bases`/`quals`
 /// always hold the observed, uncorrected values; `corrected` is populated only
 /// for a matched keeplist `@grp` self-span, and a `--tag`/`--template` consults
 /// it unless `raw=true` selects the observed bytes.
@@ -116,8 +129,8 @@ pub struct Extracted {
     /// The error-corrected form, populated only for a matched keeplist `@grp`
     /// self-span; `None` otherwise.
     pub corrected: Option<Corrected>,
-    /// The input file the stream is cut from; `None` for text or a stream with no region.
-    pub source: Option<usize>,
+    /// Where the stream is cut from; `None` for text or a stream with no region.
+    pub source: Option<StreamSource>,
 }
 
 impl Extracted {
@@ -349,7 +362,12 @@ fn slice(segment: Segment, file: usize, start: usize, end: usize, reverse: bool)
         bases,
         quals,
         corrected: None,
-        source: Some(file),
+        source: Some(StreamSource {
+            file,
+            start,
+            end,
+            reversed: false,
+        }),
     }
 }
 
@@ -817,9 +835,15 @@ mod tests {
                 .collect();
             let (flipped_hits, flipped_index) = stranded(&mirrored);
             let span = sp(value);
+            let unsourced = |extracted: Option<Extracted>| {
+                extracted.map(|extracted| Extracted {
+                    source: None,
+                    ..extracted
+                })
+            };
             assert_eq!(
-                extract(&span, &read, &hits, &index).unwrap(),
-                extract(&span, &flipped, &flipped_hits, &flipped_index).unwrap(),
+                unsourced(extract(&span, &read, &hits, &index).unwrap()),
+                unsourced(extract(&span, &flipped, &flipped_hits, &flipped_index).unwrap()),
                 "{value} {pairs:?}"
             );
         };
