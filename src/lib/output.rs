@@ -1008,6 +1008,47 @@ mod tests {
     }
 
     #[test]
+    fn test_build_tag_data_cy_holds_the_cr_qualities_where_cr_writes_them() {
+        let cb = binding("CB", &["u"], QualTag::Default, None);
+        let mut cr = binding("CR", &["v"], QualTag::Default, None);
+        cr.fallbacks = vec![vec![StreamRef {
+            name: "n".to_string(),
+            revcomp: false,
+        }]];
+        let tags = |bindings: &[TagBinding], present: &[&str]| {
+            let streams: HashMap<&str, Extracted> = [
+                ("u", extracted(b"AAAA", Some(&[40; 4]))),
+                ("v", extracted(b"CCCC", Some(&[20; 4]))),
+                ("n", extracted(b"cell", None)),
+            ]
+            .into_iter()
+            .filter(|(name, _)| present.contains(name))
+            .collect();
+            build_tag_data(bindings, &streams)
+                .iter()
+                .map(|(tag, value)| {
+                    let tag = String::from_utf8(<[u8; 2]>::from(tag).to_vec()).unwrap();
+                    match value {
+                        Value::String(text) => format!("{tag}:{text}"),
+                        _ => tag,
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let cb_first = [cb.clone(), cr.clone()];
+        let cr_first = [cr, cb];
+        assert_eq!(tags(&cb_first, &["u", "v"]), "CB:AAAA CY:5555 CR:CCCC");
+        assert_eq!(tags(&cr_first, &["u", "v"]), "CR:CCCC CY:5555 CB:AAAA");
+        assert_eq!(tags(&cb_first, &["u"]), "CB:AAAA CY:IIII");
+        assert_eq!(tags(&cr_first, &["u"]), "CB:AAAA CY:IIII");
+        assert_eq!(tags(&cb_first, &["u", "n"]), "CB:AAAA CY:IIII CR:cell");
+        assert_eq!(tags(&cr_first, &["u", "n"]), "CR:cell CB:AAAA CY:IIII");
+        assert_eq!(tags(&cb_first, &["v"]), "CR:CCCC CY:5555");
+        assert_eq!(tags(&cr_first, &["v"]), "CR:CCCC CY:5555");
+    }
+
+    #[test]
     fn test_read_group_header_lists_targets() {
         let targets = [
             Target {

@@ -4356,6 +4356,10 @@ mod tests {
             ),
             (
                 &["CB=u", "CR=v", "CY=cell"],
+                refusal("CY", default_of("CB=u"), by("CY=cell"), "CB"),
+            ),
+            (
+                &["CR=v", "CB=u", "CY=cell"],
                 refusal("CY", default_of("CR=v"), by("CY=cell"), "CR"),
             ),
             (
@@ -4388,7 +4392,7 @@ mod tests {
     }
 
     #[test]
-    fn test_cb_beside_cr_on_default_quality_tags_leaves_cy_to_cr() {
+    fn test_cb_and_cr_may_both_default_to_cy() {
         let qualities = |tags: &[&str]| -> Vec<String> {
             let plan = parse_demux(&tag_args(tags, None)).unwrap();
             plan.tags
@@ -4399,12 +4403,13 @@ mod tests {
                 })
                 .collect()
         };
-        assert_eq!(qualities(&["CB=u", "CR=v"]), ["CB>-", "CR>CY"]);
-        assert_eq!(qualities(&["CR=v", "CB=u"]), ["CR>CY", "CB>-"]);
+        assert_eq!(qualities(&["CB=u", "CR=v"]), ["CB>CY", "CR>CY"]);
+        assert_eq!(qualities(&["CR=v", "CB=u"]), ["CR>CY", "CB>CY"]);
         assert_eq!(
             qualities(&["CB=u+v", "CR=u+v", "CR::raw=true"]),
-            ["CB>-", "CR>CY"]
+            ["CB>CY", "CR>CY"]
         );
+        assert_eq!(qualities(&["CB=u", "CR=cell|v"]), ["CB>CY", "CR>CY"]);
         assert_eq!(qualities(&["CB=u"]), ["CB>CY"]);
         assert_eq!(qualities(&["CR=v"]), ["CR>CY"]);
         assert_eq!(
