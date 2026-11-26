@@ -391,6 +391,31 @@ fn anchor5p_window_overrun_warning(group: &CompiledGroup) -> Option<String> {
     ))
 }
 
+/// The widest window a group searches for its tags, over every record length,
+/// or `None` when nothing bounds it: an `anchor=5p` tag runs past its window
+/// end, and a `match=` group has no window.
+fn widest_window(group: &crate::grammar::Group, groups: &[crate::grammar::Group]) -> Option<usize> {
+    if group.attrs.anchor == Some(Anchor::FivePrime) || group.attrs.match_streams.is_some() {
+        return None;
+    }
+    let relative = groups.iter().find_map(|upstream| {
+        let next = upstream.attrs.next.as_ref()?;
+        (next.group == group.name).then_some(next.window).flatten()
+    });
+    if let Some((lo, hi)) = relative {
+        return Some(hi.saturating_sub(lo));
+    }
+    let loc = group.attrs.loc.as_ref()?;
+    match (loc.start, loc.end.unwrap_or(Endpoint::ReadEnd)) {
+        (Endpoint::FromStart(start), Endpoint::FromStart(end)) => Some(end.saturating_sub(start)),
+        (Endpoint::FromEnd(start), Endpoint::FromEnd(end)) => Some(start.saturating_sub(end)),
+        (Endpoint::FromEnd(start), Endpoint::FromStart(end)) => Some(start.min(end)),
+        (Endpoint::FromEnd(start), Endpoint::ReadEnd) => Some(start),
+        (Endpoint::ReadEnd, _) => Some(0),
+        (Endpoint::FromStart(_), _) => None,
+    }
+}
+
 /// Compile each `--group` into a matcher [`CompiledGroup`] over its loaded tag
 /// set, return them in dependency order (each group after the upstream group
 /// its `next`/`prev` link depends on), and the `name -> canonical index` map
@@ -408,18 +433,22 @@ fn compile_groups(
         let attrs = &group.attrs;
         let dist = attrs.dist.unwrap_or_default();
         let mode = attrs.mode.unwrap_or(MatchMode::All);
-        // Guard the IUPAC tag set up front: reject a combinatorial explosion or
-        // an indistinguishable tag pair, and warn on a within-`dist` overlap
-        // that `mode=nearest` would only disambiguate. An `@RG` group's "tags"
-        // are synthetic routing tokens (not DNA), so this sequence machinery
-        // does not apply to it.
+        // Guard the IUPAC tag set up front: reject a combinatorial explosion,
+        // and refuse two tags that one read can match (only warn under
+        // `mode=nearest`, which leaves such a read unassigned). An `@RG`
+        // group's "tags" are synthetic routing tokens (not DNA), so this
+        // sequence machinery does not apply to it.
         if !is_read_group {
-            for warning in crate::iupac::validate_group(
-                &group.name,
-                &tag_sets[&group.name].seqs(),
-                &dist,
+            let search = crate::iupac::Search {
+                dist,
                 mode,
-            )? {
+                anchor: attrs.anchor,
+                both_strands: attrs.revcomp.unwrap_or(false),
+                window: widest_window(group, &plan.groups),
+            };
+            for warning in
+                crate::iupac::validate_group(&group.name, &tag_sets[&group.name].seqs(), &search)?
+            {
                 log::warn!("{warning}");
             }
         }
@@ -4606,6 +4635,40 @@ mod tests {
         );
         assert_eq!(rg.dist, crate::grammar::Dist::default());
         assert!(rg.loc.is_none());
+    }
+
+    #[test]
+    fn test_widest_window_is_the_largest_over_every_record_length() {
+        for (attrs, widest) in [
+            ("g::loc=0:2:10", Some(8)),
+            ("g::loc=0:10:2", Some(0)),
+            ("g::loc=0:-10", Some(10)),
+            ("g::loc=0:-10:-4", Some(6)),
+            ("g::loc=0:-10:6", Some(6)),
+            ("g::loc=0:2", None),
+            ("g::loc=0:2:-3", None),
+            ("g::loc=0:2:10,anchor=5p", None),
+            ("g::loc=0:2:10,anchor=3p", Some(8)),
+            ("g::dist=1", None),
+        ] {
+            let mut args = base_args();
+            args.inputs = vec!["0=/dev/null".to_string()];
+            args.groups = vec!["g={a=ACGT}".to_string(), attrs.to_string()];
+            let plan = crate::grammar::parse_demux(&args).unwrap();
+            assert_eq!(
+                widest_window(&plan.groups[0], &plan.groups),
+                widest,
+                "{attrs}"
+            );
+        }
+        let mut args = base_args();
+        args.inputs = vec!["0=/dev/null".to_string()];
+        args.groups = ["u={a=AAAA}", "u::loc=0:0:4,next=g:2-9", "g={a=ACGT}"]
+            .map(str::to_string)
+            .to_vec();
+        let plan = crate::grammar::parse_demux(&args).unwrap();
+        let target = plan.groups.iter().find(|group| group.name == "g").unwrap();
+        assert_eq!(widest_window(target, &plan.groups), Some(7));
     }
 
     #[test]

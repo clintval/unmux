@@ -533,9 +533,10 @@ const CELLS: &str = "--group b1={in}/bc.tsv --group b1::loc=0:0:13 --group b1::d
     --sample-from-group bc --out %sample.bam --unassigned un.bam --qc-tag {METRICS}"
 )]
 #[case::anywhere_on_both_strands_with_indels(
-    "8ffee180c8c1edd157527c206fb50d5d",
+    "3290bf76cfbc0afe3ef371b7e3ab5ccc",
     "{in}/any.fq \
     --group bc={in}/bc.tsv --group bc::dist=1:1:1 --group bc::bothStrands=true \
+    --group bc::mode=nearest \
     --group bc::maxFindsPerTag=1 --extract s=@bc --extract r=0:0:end --template r --tag CB=s \
     --sample-from-group bc --out %sample.bam --unassigned un.bam --qc-tag {METRICS}"
 )]

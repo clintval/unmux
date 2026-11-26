@@ -1,17 +1,16 @@
 //! IUPAC degeneracy validation for tag groups: a combinatorial-explosion guard
-//! (warn plus a hard cap) and a mode-aware collision check for two tags whose
-//! degenerate sets overlap within `dist`. Matching itself uses sassy's native
-//! `Iupac` profile with no expansion; this module conceptually expands the
-//! degenerate codes only to validate the tag set up front, so a barcode that
-//! explodes combinatorially or two barcodes that cannot be told apart are
-//! caught before a run rather than silently mis-assigning records. It also
-//! provides the base-level IUPAC primitives ([`complement`],
-//! [`reverse_complement`]) shared by extraction, input parsing, and tag
-//! correction.
+//! (warn plus a hard cap) and a mode-aware check for two tags that one read can
+//! match together. Matching itself uses sassy's native `Iupac` profile with no
+//! expansion; this module reads the degenerate codes as base sets only to
+//! validate the tag set up front, so a barcode that explodes combinatorially or
+//! two barcodes that one read can match are caught before a run rather than
+//! silently mis-assigning records. It also provides the base-level IUPAC
+//! primitives ([`complement`], [`reverse_complement`]) shared by extraction,
+//! input parsing, and tag correction.
 
 use anyhow::{bail, Result};
 
-use crate::grammar::{Dist, MatchMode};
+use crate::grammar::{Anchor, Dist, MatchMode};
 
 /// Warn when one tag expands to at least this many concrete sequences; a
 /// barcode this degenerate (six fully-degenerate positions is already 4096) is
@@ -56,25 +55,38 @@ pub fn degeneracy(seq: &[u8]) -> u64 {
     })
 }
 
+/// How a group searches records for its tags, which decides whether one read
+/// can match two of them.
+#[derive(Debug, Clone, Copy)]
+pub struct Search {
+    /// The error budget each tag is matched within.
+    pub dist: Dist,
+    /// How matches within the budget are accepted.
+    pub mode: MatchMode,
+    /// The window edge each tag is pinned to, or `None` to let tags slide.
+    pub anchor: Option<Anchor>,
+    /// Whether tags also match the reverse-complement strand.
+    pub both_strands: bool,
+    /// The widest the search window can be, or `None` when nothing bounds it.
+    pub window: Option<usize>,
+}
+
 /// Validate one group's tags. Returns soft warnings (the caller logs them); an
 /// explosion past the hard cap or a disqualifying collision is a fail-fast
 /// error.
 ///
-/// Collision is mode-aware. Two equal-length tags whose IUPAC sets intersect at
-/// every position are indistinguishable (a record matches both with zero
-/// errors) and always fail. Otherwise, with `D` the number of positions where
-/// the sets are disjoint, a record can stay within `k = dist.mismatch` of both
-/// iff `D <= 2*k` (at a disjoint position a record base satisfies at most one
-/// of the two, costing the other a mismatch): under `mode=all` that is a silent
-/// mis-assignment and fails; under `mode=nearest` the tie is resolved or
-/// dropped by `delta`, so it only warns. Cross-length (indel-mediated) overlaps
-/// are not checked.
-pub fn validate_group(
-    name: &str,
-    seqs: &[Vec<u8>],
-    dist: &Dist,
-    mode: MatchMode,
-) -> Result<Vec<String>> {
+/// Two tags collide when one read can match both at one place: some bases, no
+/// longer than the first tag or the search window, that the first tag matches
+/// end to end within `dist` and the second matches within (at their start
+/// under `anchor=5p`, at their end under `anchor=3p`), either tag taken first,
+/// and the second also reverse-complemented when `bothStrands` is set. Each tag
+/// keeps its own substitution, indel, and total caps, and the message gives
+/// bases checked to match both. A collision with zero errors always fails; any
+/// other fails under `mode=all`, which would silently mis-assign such reads,
+/// and warns under `mode=nearest`, which leaves them unassigned unless `delta`
+/// separates the two. Truncated matches (`partial5`/`partial3`) are not
+/// considered.
+pub fn validate_group(name: &str, seqs: &[Vec<u8>], search: &Search) -> Result<Vec<String>> {
     let mut warnings = Vec::new();
 
     let mut group_total: u64 = 0;
@@ -112,36 +124,650 @@ pub fn validate_group(
         ));
     }
 
-    let k = dist.mismatch;
-    for (i, a) in seqs.iter().enumerate() {
-        for b in &seqs[i + 1..] {
-            if a.len() != b.len() {
+    let shape = Shape::of(search.anchor);
+    let tags: Vec<Tag> = seqs.iter().map(|seq| Tag::new(seq)).collect();
+    let flipped: Vec<Tag> = match search.both_strands {
+        true => seqs
+            .iter()
+            .map(|seq| {
+                let mut seq = seq.clone();
+                reverse_complement(&mut seq);
+                Tag::new(&seq)
+            })
+            .collect(),
+        false => Vec::new(),
+    };
+    for (i, a) in tags.iter().enumerate() {
+        for (j, b) in tags.iter().enumerate().skip(i + 1) {
+            let strands = search.both_strands.then(|| (&flipped[i], &flipped[j]));
+            let Some(found) = collision(a, b, strands, search, shape) else {
                 continue;
+            };
+            let (a_s, b_s) = (
+                String::from_utf8_lossy(&seqs[i]),
+                String::from_utf8_lossy(&seqs[j]),
+            );
+            let bases = String::from_utf8_lossy(&found.bases);
+            let strand = if found.flipped {
+                ", one on each strand"
+            } else {
+                ""
+            };
+            if found.exact {
+                bail!("group `{name}`: tags `{a_s}` and `{b_s}` are indistinguishable (the bases `{bases}` match both with zero errors{strand}); remove one or make them distinct");
             }
-            let disjoint = a
-                .iter()
-                .zip(b)
-                .filter(|(&x, &y)| mask(x) & mask(y) == 0)
-                .count();
-            let (a_s, b_s) = (String::from_utf8_lossy(a), String::from_utf8_lossy(b));
-            if disjoint == 0 {
-                bail!("group `{name}`: tags `{a_s}` and `{b_s}` are indistinguishable (a read matches both with zero errors); remove the duplicate or make them distinct");
-            }
-            if disjoint <= 2 * k {
-                let overlap = format!(
-                    "group `{name}`: tags `{a_s}` and `{b_s}` can both match one read within dist={k} (they differ at only {disjoint} position(s))"
-                );
-                match mode {
-                    MatchMode::All => bail!("{overlap}; with mode=all this silently mis-assigns - separate the tags, lower dist, or use mode=nearest"),
-                    MatchMode::Nearest => warnings.push(format!(
-                        "{overlap}; mode=nearest leaves ambiguous reads unassigned unless delta separates them"
-                    )),
-                }
+            let overlap = format!(
+                "group `{name}`: tags `{a_s}` and `{b_s}` can both match one read within dist={} (the bases `{bases}` match both{strand})",
+                dist_spec(&search.dist)
+            );
+            match search.mode {
+                MatchMode::All => bail!("{overlap}; with mode=all this silently mis-assigns reads: separate the tags, lower dist, or use mode=nearest"),
+                MatchMode::Nearest => warnings.push(format!(
+                    "{overlap}; mode=nearest leaves ambiguous reads unassigned unless delta separates them"
+                )),
             }
         }
     }
 
     Ok(warnings)
+}
+
+/// The `dist` attribute as written, leaving out the fields at their defaults.
+fn dist_spec(dist: &Dist) -> String {
+    let Dist {
+        mismatch,
+        indel,
+        total,
+    } = *dist;
+    match (indel, total) {
+        (0, total) if total == mismatch => mismatch.to_string(),
+        (indel, total) if total == mismatch + indel => format!("{mismatch}:{indel}"),
+        _ => format!("{mismatch}:{indel}:{total}"),
+    }
+}
+
+/// A tag's IUPAC base sets, with the positions meeting each set as bits when it
+/// is at most 64 bases long, and its 3-grams: the concrete ones as bits, the
+/// windows that may match more than those, and the 3-grams it can hold.
+struct Tag {
+    masks: Vec<u8>,
+    sites: Option<[u64; 16]>,
+    concrete: [u32; 4],
+    admitting: [u32; 4],
+    empty: u32,
+    windows: usize,
+    grams: u64,
+    loose: usize,
+    holds: u64,
+}
+
+impl Tag {
+    fn new(seq: &[u8]) -> Self {
+        let masks: Vec<u8> = seq.iter().map(|&base| mask(base)).collect();
+        let mut sites = [0u64; 16];
+        let (mut concrete, mut admitting) = ([0; 4], [0; 4]);
+        for (at, &set) in masks.iter().enumerate() {
+            for (meets, bits) in sites.iter_mut().enumerate() {
+                if at < 64 && usize::from(set) & meets != 0 {
+                    *bits |= 1 << at;
+                }
+            }
+            for (base, count) in admitting.iter_mut().enumerate() {
+                *count += u32::from(set >> base & 1);
+            }
+            if set.count_ones() == 1 {
+                concrete[set.trailing_zeros() as usize] += 1;
+            }
+        }
+        let (mut grams, mut kept, mut wild) = (0u64, 0, 0);
+        for window in masks.windows(3).filter(|window| !window.contains(&0)) {
+            if window.iter().any(|set| set.count_ones() > 1) {
+                wild += 1;
+            } else {
+                let code = window
+                    .iter()
+                    .fold(0, |code, set| code << 2 | set.trailing_zeros());
+                grams |= 1 << code;
+                kept += 1;
+            }
+        }
+        let degenerate = masks.iter().any(|set| set.count_ones() > 1);
+        Self {
+            empty: masks.iter().map(|&set| u32::from(set == 0)).sum(),
+            sites: (masks.len() <= 64).then_some(sites),
+            windows: masks.len().saturating_sub(2),
+            loose: wild + kept - grams.count_ones() as usize,
+            holds: if degenerate { u64::MAX } else { grams },
+            grams,
+            masks,
+            concrete,
+            admitting,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.masks.len()
+    }
+}
+
+/// Where one tag may sit within the bases another tag spans: anywhere, or
+/// pinned at their start or their end.
+#[derive(Clone, Copy)]
+struct Shape {
+    free_start: bool,
+    free_end: bool,
+}
+
+impl Shape {
+    const PINNED: Shape = Shape {
+        free_start: false,
+        free_end: false,
+    };
+
+    fn of(anchor: Option<Anchor>) -> Self {
+        Shape {
+            free_start: anchor != Some(Anchor::FivePrime),
+            free_end: anchor != Some(Anchor::ThreePrime),
+        }
+    }
+}
+
+/// Bases one read can carry that two tags both match.
+struct Overlap {
+    bases: Vec<u8>,
+    exact: bool,
+    flipped: bool,
+    spread: (usize, usize),
+}
+
+/// The overlap of two tags over the orders and strands the search allows,
+/// preferring one with zero errors, then the most even one.
+fn collision(
+    a: &Tag,
+    b: &Tag,
+    flipped: Option<(&Tag, &Tag)>,
+    search: &Search,
+    shape: Shape,
+) -> Option<Overlap> {
+    let symmetric = search.dist.indel == 0 && a.len() == b.len();
+    let (flipped_a, flipped_b) = flipped.unzip();
+    let orders = [
+        Some((a, b, false)),
+        (!symmetric).then_some((b, a, false)),
+        flipped_b.map(|flipped_b| (a, flipped_b, true)),
+        flipped_a
+            .filter(|_| !symmetric)
+            .map(|flipped_a| (b, flipped_a, true)),
+    ];
+    orders
+        .into_iter()
+        .flatten()
+        .filter_map(|(outer, inner, flipped)| {
+            overlap(outer, inner, search, shape).map(|found| Overlap { flipped, ..found })
+        })
+        .min_by_key(|found| (!found.exact, found.spread))
+}
+
+/// Bases that `outer` matches end to end and `inner` matches within, checked
+/// against the budget.
+fn overlap(outer: &Tag, inner: &Tag, search: &Search, shape: Shape) -> Option<Overlap> {
+    let dist = &search.dist;
+    let longest = search
+        .window
+        .map_or(outer.len(), |width| width.min(outer.len()));
+    if inner.len() == 0 || inner.len() > longest + dist.indel {
+        return None;
+    }
+    let found = match dist.indel {
+        0 => ungapped(outer, inner, dist, shape, longest)?,
+        _ => gapped(outer, inner, dist, shape, longest)?,
+    };
+    let bases = found.bases(outer, inner);
+    let fits = aligns(&outer.masks, &bases, dist, Shape::PINNED)
+        && aligns(&inner.masks, &bases, dist, shape);
+    fits.then_some(Overlap {
+        bases,
+        exact: found.exact,
+        flipped: false,
+        spread: found.spread,
+    })
+}
+
+/// One column of an alignment of an inner tag within an outer one, by outer
+/// and inner position: an outer base outside the inner tag, a pair, an outer
+/// base the inner tag lacks, and an inner base the outer tag lacks.
+#[derive(Clone, Copy)]
+enum Step {
+    Flank(usize),
+    Pair(usize, usize),
+    Skip(usize),
+    Extra(usize),
+}
+
+/// The disjoint pairs, skipped outer bases, and extra inner bases charged to
+/// the outer tag; the rest are charged to the inner one.
+#[derive(Clone, Copy)]
+struct Split {
+    subs: usize,
+    skipped: usize,
+    extra: usize,
+}
+
+/// An alignment of an inner tag within an outer one and how its edits split.
+struct Candidate {
+    steps: Vec<Step>,
+    split: Split,
+    spread: (usize, usize),
+    exact: bool,
+}
+
+impl Candidate {
+    /// The bases where each edit counts against only the tag it is charged to.
+    fn bases(&self, outer: &Tag, inner: &Tag) -> Vec<u8> {
+        let Split {
+            mut subs,
+            mut skipped,
+            mut extra,
+        } = self.split;
+        let mut bases = Vec::with_capacity(outer.len() + extra);
+        for &step in &self.steps {
+            match step {
+                Step::Flank(p) => bases.push(base(outer.masks[p])),
+                Step::Pair(p, j) => {
+                    let (x, y) = (outer.masks[p], inner.masks[j]);
+                    let set = if x & y != 0 {
+                        x & y
+                    } else if subs > 0 {
+                        subs -= 1;
+                        y
+                    } else {
+                        x
+                    };
+                    bases.push(base(set));
+                }
+                Step::Skip(_) if skipped > 0 => skipped -= 1,
+                Step::Skip(p) => bases.push(base(outer.masks[p])),
+                Step::Extra(j) if extra > 0 => {
+                    extra -= 1;
+                    bases.push(base(inner.masks[j]));
+                }
+                Step::Extra(_) => {}
+            }
+        }
+        bases
+    }
+}
+
+/// A concrete base in the IUPAC set `set`, or `A` for the empty set.
+fn base(set: u8) -> u8 {
+    match set.trailing_zeros() {
+        1 => b'C',
+        2 => b'G',
+        3 => b'T',
+        _ => b'A',
+    }
+}
+
+/// The placement of `inner` within `outer` with the fewest disjoint pairs and
+/// no indels.
+fn ungapped(
+    outer: &Tag,
+    inner: &Tag,
+    dist: &Dist,
+    shape: Shape,
+    longest: usize,
+) -> Option<Candidate> {
+    let (n, k) = (outer.len(), inner.len());
+    if n > longest || k > n {
+        return None;
+    }
+    let last = n - k;
+    let offsets = match (shape.free_start, shape.free_end) {
+        (false, _) => 0..=0,
+        (true, false) => last..=last,
+        (true, true) => 0..=last,
+    };
+    let (offset, subs) = offsets
+        .map(|offset| (offset, disjoint(outer, inner, offset)))
+        .min_by_key(|&(_, subs)| subs)?;
+    if subs > 2 * dist.mismatch {
+        return None;
+    }
+    let (spread, split) = split_edits(subs, 0, 0, dist, n, longest)?;
+    let steps = (0..offset)
+        .map(Step::Flank)
+        .chain((0..k).map(|j| Step::Pair(offset + j, j)))
+        .chain((offset + k..n).map(Step::Flank))
+        .collect();
+    Some(Candidate {
+        steps,
+        split,
+        spread,
+        exact: subs == 0,
+    })
+}
+
+/// How many bases of `inner` share no base with those of `outer` from `offset`.
+fn disjoint(outer: &Tag, inner: &Tag, offset: usize) -> usize {
+    match (&outer.sites, &inner.sites) {
+        (Some(x), Some(y)) => {
+            let met = [1, 2, 4, 8]
+                .into_iter()
+                .fold(0, |met, set| met | (x[set] >> offset) & y[set]);
+            inner.len() - met.count_ones() as usize
+        }
+        _ => inner
+            .masks
+            .iter()
+            .zip(&outer.masks[offset..])
+            .filter(|&(y, x)| x & y == 0)
+            .count(),
+    }
+}
+
+/// The alignment of `inner` within `outer`, indels allowed, whose edits split
+/// most evenly within `dist`.
+fn gapped(
+    outer: &Tag,
+    inner: &Tag,
+    dist: &Dist,
+    shape: Shape,
+    longest: usize,
+) -> Option<Candidate> {
+    let budget = 2 * dist.total;
+    if unmatched(outer, inner) > budget
+        || !shares_grams(outer, inner, budget)
+        || !covered(outer, inner, shape, 2 * dist.indel, budget)
+        || !edits_within(outer, inner, shape, budget)
+    {
+        return None;
+    }
+    let grid = Grid::fill(outer, inner, dist, shape);
+    let gaps = grid.gaps;
+    let ends = match shape.free_end {
+        true => 0..=outer.len(),
+        false => outer.len()..=outer.len(),
+    };
+    let (spread, split, end, exact) = ends
+        .flat_map(|end| {
+            (0..=gaps).flat_map(move |skipped| {
+                (0..=gaps - skipped).map(move |extra| (end, skipped, extra))
+            })
+        })
+        .filter_map(|(end, skipped, extra)| {
+            let subs = grid.get(inner.len(), end, skipped, extra)?;
+            let (spread, split) = split_edits(subs, skipped, extra, dist, outer.len(), longest)?;
+            Some((
+                spread,
+                split,
+                (end, skipped, extra),
+                subs + skipped + extra == 0,
+            ))
+        })
+        .min_by_key(|&(spread, ..)| spread)?;
+    Some(Candidate {
+        steps: grid.trace(outer, inner, shape, end),
+        split,
+        spread,
+        exact,
+    })
+}
+
+/// How many bases of `inner` no base of `outer` can pair with, a lower bound on
+/// the edits of any alignment of the two.
+fn unmatched(outer: &Tag, inner: &Tag) -> usize {
+    let short = (0..4).map(|base| inner.concrete[base].saturating_sub(outer.admitting[base]));
+    (inner.empty + short.sum::<u32>()) as usize
+}
+
+/// Whether `inner` can have enough 3-grams that `outer` holds for an alignment
+/// with at most `budget` edits, as each edit breaks at most three of them.
+fn shares_grams(outer: &Tag, inner: &Tag, budget: usize) -> bool {
+    let held = (inner.grams & outer.holds).count_ones() as usize + inner.loose;
+    held + 3 * budget >= inner.windows
+}
+
+/// Whether `gaps + 1` neighboring diagonals, where an alignment with at most
+/// `gaps` unpaired bases stays, pair all but at most `budget` bases of `inner`
+/// with outer bases they meet; assumed when the diagonals may sit far apart or
+/// a tag is longer than 64 bases.
+fn covered(outer: &Tag, inner: &Tag, shape: Shape, gaps: usize, budget: usize) -> bool {
+    let (Some(x), Some(y)) = (&outer.sites, &inner.sites) else {
+        return true;
+    };
+    let (gaps, spare) = (gaps as isize, outer.len() as isize - inner.len() as isize);
+    let last = match shape.free_start {
+        true => spare,
+        false => 0,
+    };
+    if last > 0 || gaps > 8 {
+        return true;
+    }
+    let met = |diagonal: isize| {
+        let shift = |bits: u64| match diagonal >= 0 {
+            true => bits.checked_shr(diagonal as u32).unwrap_or(0),
+            false => bits
+                .checked_shl(diagonal.unsigned_abs() as u32)
+                .unwrap_or(0),
+        };
+        [1, 2, 4, 8]
+            .into_iter()
+            .fold(0, |met, set| met | shift(x[set]) & y[set])
+    };
+    (-gaps..=last).any(|first| {
+        let paired = (first..=first + gaps).fold(0, |paired, diagonal| paired | met(diagonal));
+        inner.len() - paired.count_ones() as usize <= budget
+    })
+}
+
+/// Whether an alignment of `inner` within `outer` has at most `budget`
+/// disjoint pairs and unpaired bases, by Myers' bit-vector algorithm; assumed
+/// when `inner` is longer than 64 bases.
+fn edits_within(outer: &Tag, inner: &Tag, shape: Shape, budget: usize) -> bool {
+    let Some(sites) = &inner.sites else {
+        return true;
+    };
+    let last = 1u64 << (inner.len() - 1);
+    let (mut pv, mut mv, mut score) = (u64::MAX, 0u64, inner.len());
+    let mut fewest = score;
+    for &set in &outer.masks {
+        let eq = sites[usize::from(set & 15)];
+        let xv = eq | mv;
+        let xh = ((eq & pv).wrapping_add(pv) ^ pv) | eq;
+        let ph = mv | !(xh | pv);
+        let mh = pv & xh;
+        score = score + usize::from(ph & last != 0) - usize::from(mh & last != 0);
+        let ph = ph << 1 | u64::from(!shape.free_start);
+        pv = mh << 1 | !(xv | ph);
+        mv = ph & xv;
+        fewest = fewest.min(score);
+    }
+    match shape.free_end {
+        true => fewest <= budget,
+        false => score <= budget,
+    }
+}
+
+/// The fewest disjoint pairs over the alignments of an inner tag within an
+/// outer one, by inner bases placed, outer bases passed, and the outer and
+/// inner bases left unpaired.
+struct Grid {
+    span: usize,
+    gaps: usize,
+    cells: Vec<usize>,
+}
+
+impl Grid {
+    fn index(&self, j: usize, p: usize, skipped: usize, extra: usize) -> usize {
+        ((j * (self.span + 1) + p) * (self.gaps + 1) + skipped) * (self.gaps + 1) + extra
+    }
+
+    fn get(&self, j: usize, p: usize, skipped: usize, extra: usize) -> Option<usize> {
+        let subs = self.cells[self.index(j, p, skipped, extra)];
+        (subs != usize::MAX).then_some(subs)
+    }
+
+    fn paired(
+        &self,
+        outer: &Tag,
+        inner: &Tag,
+        j: usize,
+        p: usize,
+        skipped: usize,
+        extra: usize,
+    ) -> Option<usize> {
+        let subs = self.get(j - 1, p - 1, skipped, extra)?;
+        Some(subs + usize::from(outer.masks[p - 1] & inner.masks[j - 1] == 0))
+    }
+
+    fn fill(outer: &Tag, inner: &Tag, dist: &Dist, shape: Shape) -> Self {
+        let gaps = 2 * dist.indel;
+        let size = (inner.len() + 1) * (outer.len() + 1) * (gaps + 1) * (gaps + 1);
+        let mut grid = Grid {
+            span: outer.len(),
+            gaps,
+            cells: vec![usize::MAX; size],
+        };
+        for j in 0..=inner.len() {
+            for p in 0..=outer.len() {
+                for skipped in 0..=gaps {
+                    for extra in 0..=gaps - skipped {
+                        let start = j == 0 && skipped + extra == 0 && (p == 0 || shape.free_start);
+                        let mut subs = if start { 0 } else { usize::MAX };
+                        if j > 0 && p > 0 {
+                            let paired = grid.paired(outer, inner, j, p, skipped, extra);
+                            subs = subs.min(paired.unwrap_or(usize::MAX));
+                        }
+                        if p > 0 && skipped > 0 {
+                            let from = grid.get(j, p - 1, skipped - 1, extra);
+                            subs = subs.min(from.unwrap_or(usize::MAX));
+                        }
+                        if j > 0 && extra > 0 {
+                            let from = grid.get(j - 1, p, skipped, extra - 1);
+                            subs = subs.min(from.unwrap_or(usize::MAX));
+                        }
+                        if subs > 2 * dist.mismatch || subs + skipped + extra > 2 * dist.total {
+                            subs = usize::MAX;
+                        }
+                        let at = grid.index(j, p, skipped, extra);
+                        grid.cells[at] = subs;
+                    }
+                }
+            }
+        }
+        grid
+    }
+
+    /// The steps of an alignment that ends at `end`, an outer position and its
+    /// skipped and extra bases, with the fewest disjoint pairs.
+    fn trace(
+        &self,
+        outer: &Tag,
+        inner: &Tag,
+        shape: Shape,
+        end: (usize, usize, usize),
+    ) -> Vec<Step> {
+        let (mut p, mut skipped, mut extra) = end;
+        let mut j = inner.len();
+        let mut steps: Vec<Step> = (p..outer.len()).rev().map(Step::Flank).collect();
+        while j > 0 || skipped + extra > 0 || !(p == 0 || shape.free_start) {
+            let subs = self.get(j, p, skipped, extra);
+            if j > 0 && p > 0 && self.paired(outer, inner, j, p, skipped, extra) == subs {
+                steps.push(Step::Pair(p - 1, j - 1));
+                (j, p) = (j - 1, p - 1);
+            } else if p > 0 && skipped > 0 && self.get(j, p - 1, skipped - 1, extra) == subs {
+                steps.push(Step::Skip(p - 1));
+                (p, skipped) = (p - 1, skipped - 1);
+            } else {
+                steps.push(Step::Extra(j - 1));
+                (j, extra) = (j - 1, extra - 1);
+            }
+        }
+        steps.extend((0..p).rev().map(Step::Flank));
+        steps.reverse();
+        steps
+    }
+}
+
+/// The most even way to charge an alignment's disjoint pairs, skipped outer
+/// bases, and extra inner bases to the two tags within `dist`, with the bases
+/// it leaves between one and `longest` long.
+fn split_edits(
+    subs: usize,
+    skipped: usize,
+    extra: usize,
+    dist: &Dist,
+    outer_len: usize,
+    longest: usize,
+) -> Option<((usize, usize), Split)> {
+    let mut best: Option<((usize, usize), Split)> = None;
+    for outer_skipped in 0..=skipped {
+        for outer_extra in 0..=extra {
+            let len = (outer_len + outer_extra).saturating_sub(outer_skipped);
+            if len == 0 || len > longest {
+                continue;
+            }
+            let outer_gaps = outer_skipped + outer_extra;
+            let inner_gaps = skipped + extra - outer_gaps;
+            if outer_gaps.max(inner_gaps) > dist.indel.min(dist.total) {
+                continue;
+            }
+            let fewest = subs
+                .saturating_sub(dist.mismatch)
+                .max(subs.saturating_sub(dist.total - inner_gaps));
+            let most = subs.min(dist.mismatch).min(dist.total - outer_gaps);
+            for outer_subs in fewest..=most {
+                let charged = outer_subs + outer_gaps;
+                let rest = subs - outer_subs + inner_gaps;
+                let spread = (charged.abs_diff(rest), charged.max(rest));
+                if best.is_none_or(|(seen, _)| spread < seen) {
+                    let split = Split {
+                        subs: outer_subs,
+                        skipped: outer_skipped,
+                        extra: outer_extra,
+                    };
+                    best = Some((spread, split));
+                }
+            }
+        }
+    }
+    best
+}
+
+/// Whether `tag`, as IUPAC sets, aligns to `bases` within `dist`, with the
+/// bases before and after it free as `shape` allows.
+fn aligns(tag: &[u8], bases: &[u8], dist: &Dist, shape: Shape) -> bool {
+    let (rows, cols, gaps) = (tag.len() + 1, bases.len() + 1, dist.indel + 1);
+    let index = |j: usize, i: usize, q: usize| (j * cols + i) * gaps + q;
+    let mut fewest = vec![usize::MAX; rows * cols * gaps];
+    for j in 0..rows {
+        for i in 0..cols {
+            for q in 0..gaps {
+                let start = j == 0 && q == 0 && (i == 0 || shape.free_start);
+                let mut subs = if start { 0 } else { usize::MAX };
+                if j > 0 && i > 0 {
+                    let missed = usize::from(tag[j - 1] & mask(bases[i - 1]) == 0);
+                    subs = subs.min(fewest[index(j - 1, i - 1, q)].saturating_add(missed));
+                }
+                if q > 0 && j > 0 {
+                    subs = subs.min(fewest[index(j - 1, i, q - 1)]);
+                }
+                if q > 0 && i > 0 {
+                    subs = subs.min(fewest[index(j, i - 1, q - 1)]);
+                }
+                fewest[index(j, i, q)] = subs;
+            }
+        }
+    }
+    let ends = match shape.free_end {
+        true => 0..cols,
+        false => cols - 1..cols,
+    };
+    ends.flat_map(|i| (0..gaps).map(move |q| (i, q)))
+        .any(|(i, q)| {
+            let subs = fewest[index(rows - 1, i, q)];
+            subs <= dist.mismatch && subs + q <= dist.total
+        })
 }
 
 /// IUPAC-aware complement of a single base (case-preserving). Unrecognized
@@ -209,8 +835,18 @@ mod tests {
         items.iter().map(|s| s.as_bytes().to_vec()).collect()
     }
 
+    fn search(dist: Dist, mode: MatchMode) -> Search {
+        Search {
+            dist,
+            mode,
+            anchor: None,
+            both_strands: false,
+            window: None,
+        }
+    }
+
     fn check(tags: &[&str], dist: Dist, mode: MatchMode) -> Result<Vec<String>> {
-        validate_group("g", &seqs(tags), &dist, mode)
+        validate_group("g", &seqs(tags), &search(dist, mode))
     }
 
     fn budget(mismatch: usize, indel: usize) -> Dist {
@@ -315,8 +951,282 @@ mod tests {
     fn test_well_separated_barcodes_pass() {
         // No read is within one substitution of two barcodes three substitutions apart.
         let tags = spread_barcodes(96, 8, 3);
-        let w = validate_group("g", &tags, &dist(1), MatchMode::All).unwrap();
+        let w = validate_group("g", &tags, &search(dist(1), MatchMode::All)).unwrap();
         assert!(w.is_empty(), "well-separated barcodes are clean: {w:?}");
+    }
+
+    fn shaped(anchor: Option<Anchor>, both_strands: bool, window: Option<usize>) -> Search {
+        Search {
+            anchor,
+            both_strands,
+            window,
+            ..search(dist(0), MatchMode::All)
+        }
+    }
+
+    #[test]
+    fn test_anchored_tags_are_compared_at_the_pinned_edge_only() {
+        // CGTA sits one base into ACGTAC, ACGT starts it, and GTAC ends it.
+        let (five, three) = (Some(Anchor::FivePrime), Some(Anchor::ThreePrime));
+        for (tags, at_five, at_three) in [
+            (["CGTA", "ACGTAC"], false, false),
+            (["ACGT", "ACGTAC"], true, false),
+            (["GTAC", "ACGTAC"], false, true),
+        ] {
+            let tags = seqs(&tags);
+            let refused = |search: Search| validate_group("g", &tags, &search).is_err();
+            assert!(refused(shaped(None, false, None)), "{tags:?} slide");
+            assert_eq!(refused(shaped(five, false, None)), at_five, "{tags:?} 5p");
+            assert_eq!(
+                refused(shaped(three, false, Some(8))),
+                at_three,
+                "{tags:?} 3p"
+            );
+        }
+    }
+
+    #[test]
+    fn test_both_strands_compares_each_tag_with_the_other_reverse_complemented() {
+        let tags = seqs(&["ACGTACGG", "CCGTACGT"]);
+        assert!(validate_group("g", &tags, &shaped(None, false, None))
+            .unwrap()
+            .is_empty());
+        let err = validate_group("g", &tags, &shaped(None, true, None))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("one on each strand"), "{err}");
+    }
+
+    #[test]
+    fn test_window_narrower_than_a_tag_holds_no_read_matching_it() {
+        // Without indels an 8 bp tag never fits a 6 bp window.
+        let tags = seqs(&["ACGTACGT", "ACGTACGA"]);
+        let narrow = Search {
+            dist: dist(1),
+            ..shaped(None, false, Some(6))
+        };
+        assert!(validate_group("g", &tags, &narrow).unwrap().is_empty());
+        let wide = Search {
+            window: Some(8),
+            ..narrow
+        };
+        assert!(validate_group("g", &tags, &wide).is_err());
+    }
+
+    #[test]
+    fn test_base_matching_nothing_is_charged_to_its_own_tag() {
+        // X matches no read base, so both tags pay for it and no read is within one of both.
+        let tags = seqs(&["AXA", "CXA"]);
+        let w = validate_group("g", &tags, &search(dist(1), MatchMode::All)).unwrap();
+        assert!(w.is_empty(), "{w:?}");
+        assert!(validate_group("g", &tags, &search(dist(2), MatchMode::All)).is_err());
+    }
+
+    #[test]
+    fn test_dist_spec_leaves_out_default_fields() {
+        assert_eq!(dist_spec(&dist(2)), "2");
+        assert_eq!(dist_spec(&budget(1, 1)), "1:1");
+        let capped = Dist {
+            total: 1,
+            ..budget(1, 1)
+        };
+        assert_eq!(dist_spec(&capped), "1:1:1");
+    }
+
+    /// A random search over short tags, within what the grammar accepts.
+    fn random_search(rng: &mut Rng) -> Search {
+        let (mismatch, indel, total) = [
+            (0, 0, 0),
+            (1, 0, 1),
+            (2, 0, 2),
+            (0, 1, 1),
+            (1, 1, 1),
+            (1, 1, 2),
+            (0, 2, 2),
+            (2, 1, 3),
+            (1, 2, 3),
+        ][rng.below(9)];
+        let anchor = [None, Some(Anchor::FivePrime), Some(Anchor::ThreePrime)][rng.below(3)]
+            .filter(|&anchor| anchor != Anchor::ThreePrime || indel == 0);
+        let bounded = anchor != Some(Anchor::FivePrime) && rng.below(3) == 0;
+        Search {
+            dist: Dist {
+                mismatch,
+                indel,
+                total,
+            },
+            mode: MatchMode::All,
+            anchor,
+            both_strands: anchor.is_none() && rng.below(2) == 0,
+            window: bounded.then(|| 1 + rng.below(8)),
+        }
+    }
+
+    fn flip(seq: &[u8]) -> Vec<u8> {
+        let mut seq = seq.to_vec();
+        reverse_complement(&mut seq);
+        seq
+    }
+
+    fn found(a: &[u8], b: &[u8], search: &Search) -> Option<Overlap> {
+        let flipped = (Tag::new(&flip(a)), Tag::new(&flip(b)));
+        let strands = search.both_strands.then_some((&flipped.0, &flipped.1));
+        let shape = Shape::of(search.anchor);
+        collision(&Tag::new(a), &Tag::new(b), strands, search, shape)
+    }
+
+    #[test]
+    fn test_reported_bases_match_both_tags_in_the_matcher() {
+        let mut rng = Rng(0x5eed);
+        let mut reported = 0;
+        for _ in 0..4000 {
+            let search = random_search(&mut rng);
+            let letters: &[u8] = [&b"ACGT"[..], b"AC", b"ACGTNRY"][rng.below(3)];
+            let (len_a, len_b) = (1 + rng.below(8), 1 + rng.below(8));
+            let (a, b) = (rng.sample(len_a, letters), rng.sample(len_b, letters));
+            let Some(overlap) = found(&a, &b, &search) else {
+                continue;
+            };
+            reported += 1;
+            let mut group = crate::matcher::CompiledGroup::new("g", vec![a.clone(), b.clone()]);
+            group.dist = search.dist;
+            group.revcomp = search.both_strands;
+            group.anchor = search.anchor;
+            let read = [overlap.bases.as_slice()];
+            let mut scratch = crate::matcher::Scratch::new();
+            let outcome = crate::matcher::match_group(&group, &mut scratch, &read);
+            for tag_idx in 0..2 {
+                assert!(
+                    outcome.accepted.iter().any(|m| m.tag_idx == tag_idx),
+                    "tag {tag_idx} of {:?} misses {:?} under {search:?}: {outcome:?}",
+                    seqs_shown(&[&a, &b]),
+                    String::from_utf8_lossy(&overlap.bases),
+                );
+            }
+        }
+        assert!(reported > 500, "the trials exercise the check: {reported}");
+    }
+
+    fn seqs_shown(tags: &[&[u8]]) -> Vec<String> {
+        tags.iter()
+            .map(|tag| String::from_utf8_lossy(tag).into_owned())
+            .collect()
+    }
+
+    /// The fewest disjoint pairs plus unpaired bases over the alignments of
+    /// `inner` within `outer` with at most `gaps` unpaired bases, by a plain table.
+    fn plain_fewest(outer: &[u8], inner: &[u8], shape: Shape, gaps: usize) -> usize {
+        let mut fewest: Vec<Vec<usize>> = (0..=outer.len())
+            .map(|i| {
+                let mut cell = vec![usize::MAX; gaps + 1];
+                match shape.free_start {
+                    true => cell[0] = 0,
+                    false if i <= gaps => cell[i] = i,
+                    false => {}
+                }
+                cell
+            })
+            .collect();
+        for &base in inner {
+            let mut next = vec![vec![usize::MAX; gaps + 1]; outer.len() + 1];
+            for i in 0..=outer.len() {
+                for g in 0..=gaps {
+                    let mut best = usize::MAX;
+                    if g > 0 {
+                        best = best.min(fewest[i][g - 1].saturating_add(1));
+                    }
+                    if i > 0 {
+                        let missed = usize::from(mask(base) & mask(outer[i - 1]) == 0);
+                        best = best.min(fewest[i - 1][g].saturating_add(missed));
+                        if g > 0 {
+                            best = best.min(next[i - 1][g - 1].saturating_add(1));
+                        }
+                    }
+                    next[i][g] = best;
+                }
+            }
+            fewest = next;
+        }
+        let ends = match shape.free_end {
+            true => 0..=outer.len(),
+            false => outer.len()..=outer.len(),
+        };
+        ends.flat_map(|i| fewest[i].clone()).min().unwrap()
+    }
+
+    #[test]
+    fn test_edit_bounds_agree_with_a_plain_table() {
+        let mut rng = Rng(0xed17);
+        for _ in 0..1500 {
+            let letters: &[u8] = [&b"ACGT"[..], b"AC", b"ACGTNRX"][rng.below(3)];
+            let len_x = 1 + rng.below(20);
+            let len_y = [len_x, 1 + rng.below(20)][rng.below(2)];
+            let (x, y) = (rng.sample(len_x, letters), rng.sample(len_y, letters));
+            let shape = Shape {
+                free_start: rng.below(2) == 0,
+                free_end: rng.below(2) == 0,
+            };
+            let (outer, inner) = (Tag::new(&x), Tag::new(&y));
+            let fewest = plain_fewest(&x, &y, shape, x.len() + y.len());
+            let by_gaps: Vec<usize> = (0..5).map(|g| plain_fewest(&x, &y, shape, g)).collect();
+            for budget in 0..8 {
+                let shown = seqs_shown(&[&y, &x]);
+                let within = edits_within(&outer, &inner, shape, budget);
+                assert_eq!(within, fewest <= budget, "{shown:?} within {budget}");
+                if within {
+                    assert!(unmatched(&outer, &inner) <= budget, "{shown:?} counts");
+                    assert!(shares_grams(&outer, &inner, budget), "{shown:?} 3-grams");
+                }
+                for (gaps, &capped) in by_gaps.iter().enumerate() {
+                    if capped <= budget {
+                        let banded = covered(&outer, &inner, shape, gaps, budget);
+                        assert!(banded, "{shown:?} with {gaps} gaps within {budget}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Whether bases exist, at most `longest` long, that `outer` matches end to
+    /// end and `inner` matches within as the search places it.
+    fn bases_exist(outer: &[u8], inner: &[u8], search: &Search) -> bool {
+        let (outer, inner) = (Tag::new(outer), Tag::new(inner));
+        let longest = search.window.map_or(outer.len(), |w| w.min(outer.len()));
+        let shape = Shape::of(search.anchor);
+        (1..=longest).any(|len| {
+            (0..1usize << (2 * len)).any(|code| {
+                let bases: Vec<u8> = (0..len).map(|at| b"ACGT"[code >> (2 * at) & 3]).collect();
+                aligns(&outer.masks, &bases, &search.dist, Shape::PINNED)
+                    && aligns(&inner.masks, &bases, &search.dist, shape)
+            })
+        })
+    }
+
+    #[test]
+    fn test_bases_matching_both_tags_are_found_whenever_they_exist() {
+        let mut rng = Rng(0xb0a7);
+        let mut collided = 0;
+        for _ in 0..600 {
+            let search = random_search(&mut rng);
+            let letters: &[u8] = [&b"ACGT"[..], b"AC", b"ACGTNR"][rng.below(3)];
+            let (len_a, len_b) = (1 + rng.below(4), 1 + rng.below(4));
+            let (a, b) = (rng.sample(len_a, letters), rng.sample(len_b, letters));
+            let mut orders = vec![(a.clone(), b.clone()), (b.clone(), a.clone())];
+            if search.both_strands {
+                orders.extend([(a.clone(), flip(&b)), (b.clone(), flip(&a))]);
+            }
+            let exists = orders
+                .iter()
+                .any(|(outer, inner)| bases_exist(outer, inner, &search));
+            collided += usize::from(exists);
+            assert_eq!(
+                found(&a, &b, &search).is_some(),
+                exists,
+                "{:?} under {search:?}",
+                seqs_shown(&[&a, &b])
+            );
+        }
+        assert!(collided > 100, "the trials exercise collisions: {collided}");
     }
 
     #[test]
@@ -332,8 +1242,7 @@ mod tests {
         let w = validate_group(
             "g",
             &seqs(&["AAAA", "CCCC", "GGGG"]),
-            &dist(1),
-            MatchMode::All,
+            &search(dist(1), MatchMode::All),
         )
         .unwrap();
         assert!(w.is_empty(), "well-separated barcodes are clean: {w:?}");
@@ -344,7 +1253,7 @@ mod tests {
         // AAAW (W = A|T) covers AAAA at every position -> a read AAAA matches
         // both at dist 0.
         for mode in [MatchMode::All, MatchMode::Nearest] {
-            let err = validate_group("g", &seqs(&["AAAA", "AAAW"]), &dist(0), mode)
+            let err = validate_group("g", &seqs(&["AAAA", "AAAW"]), &search(dist(0), mode))
                 .unwrap_err()
                 .to_string();
             assert!(err.contains("indistinguishable"), "{err}");
@@ -357,12 +1266,12 @@ mod tests {
         // overlap.
         let tags = seqs(&["AAAA", "AATT"]);
         // mode=all: hard error.
-        let err = validate_group("g", &tags, &dist(1), MatchMode::All)
+        let err = validate_group("g", &tags, &search(dist(1), MatchMode::All))
             .unwrap_err()
             .to_string();
         assert!(err.contains("mode=all"), "{err}");
         // mode=nearest: warning, not error.
-        let w = validate_group("g", &tags, &dist(1), MatchMode::Nearest).unwrap();
+        let w = validate_group("g", &tags, &search(dist(1), MatchMode::Nearest)).unwrap();
         assert_eq!(w.len(), 1, "one collision warning: {w:?}");
         assert!(w[0].contains("within dist=1"));
     }
@@ -371,11 +1280,13 @@ mod tests {
     fn test_well_separated_pair_ok_at_dist() {
         // AAAA vs TTTT differ at all 4 positions; at dist=1, D=4 > 2 -> no
         // collision.
-        assert!(
-            validate_group("g", &seqs(&["AAAA", "TTTT"]), &dist(1), MatchMode::All)
-                .unwrap()
-                .is_empty()
-        );
+        assert!(validate_group(
+            "g",
+            &seqs(&["AAAA", "TTTT"]),
+            &search(dist(1), MatchMode::All)
+        )
+        .unwrap()
+        .is_empty());
     }
 
     #[test]
@@ -383,9 +1294,13 @@ mod tests {
         // 10 fully-degenerate positions plus a 3-way `B` = 4^10 * 3 ~= 3.1M,
         // over the 1<<20 cap. The `B` keeps it from being all-N (which has its
         // own, earlier error), so this exercises the cap.
-        let err = validate_group("g", &seqs(&["NNNNNNNNNNB"]), &dist(0), MatchMode::All)
-            .unwrap_err()
-            .to_string();
+        let err = validate_group(
+            "g",
+            &seqs(&["NNNNNNNNNNB"]),
+            &search(dist(0), MatchMode::All),
+        )
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("cap"), "{err}");
     }
 
@@ -394,7 +1309,7 @@ mod tests {
         // A short all-N tag (NNNN = 256, under the degeneracy cap) is still
         // rejected: it matches any 4 bases, so it is a positional span, not a
         // barcode. This is the gap the cap alone misses.
-        let err = validate_group("bc", &seqs(&["NNNN"]), &dist(0), MatchMode::All)
+        let err = validate_group("bc", &seqs(&["NNNN"]), &search(dist(0), MatchMode::All))
             .unwrap_err()
             .to_string();
         assert!(err.contains("all-N"), "{err}");
@@ -407,7 +1322,7 @@ mod tests {
     #[test]
     fn test_lowercase_all_n_tag_is_rejected() {
         // The mask is case-insensitive, so lowercase nnnn is caught too.
-        assert!(validate_group("bc", &seqs(&["nnnn"]), &dist(0), MatchMode::All).is_err());
+        assert!(validate_group("bc", &seqs(&["nnnn"]), &search(dist(0), MatchMode::All)).is_err());
     }
 
     #[test]
@@ -415,7 +1330,9 @@ mod tests {
         // A tag with any non-N base is not all-N; NNNANNN (4^6 = 4096, at the
         // warn threshold, not over it) is accepted, so the all-N guard does not
         // fire on it.
-        assert!(validate_group("bc", &seqs(&["NNNANNN"]), &dist(0), MatchMode::All).is_ok());
+        assert!(
+            validate_group("bc", &seqs(&["NNNANNN"]), &search(dist(0), MatchMode::All)).is_ok()
+        );
     }
 
     #[test]
@@ -521,7 +1438,8 @@ mod tests {
         // 4^7 = 16384 expansions: past the per-tag warn threshold (4096) but well
         // under the hard cap, and not all-N (the trailing A), so it is accepted
         // with a soft warning rather than rejected.
-        let w = validate_group("g", &seqs(&["NNNNNNNA"]), &dist(0), MatchMode::All).unwrap();
+        let w =
+            validate_group("g", &seqs(&["NNNNNNNA"]), &search(dist(0), MatchMode::All)).unwrap();
         assert_eq!(w.len(), 1, "one per-tag degeneracy warning: {w:?}");
         assert!(w[0].contains("highly degenerate"), "{}", w[0]);
     }
@@ -535,8 +1453,7 @@ mod tests {
         let w = validate_group(
             "g",
             &seqs(&["NNNNNNNNA", "NNNNNNNNC"]),
-            &dist(0),
-            MatchMode::All,
+            &search(dist(0), MatchMode::All),
         )
         .unwrap();
         assert!(
@@ -550,7 +1467,7 @@ mod tests {
         // Ten tags of 4^10 = 1_048_576 each (exactly the per-tag cap, so none trips
         // it individually) sum to 10_485_760, over the 10_000_000 group cap.
         let big = vec![b"NNNNNNNNNNA".to_vec(); 10];
-        let err = validate_group("g", &big, &dist(0), MatchMode::All)
+        let err = validate_group("g", &big, &search(dist(0), MatchMode::All))
             .unwrap_err()
             .to_string();
         assert!(err.contains("sequences total"), "{err}");
