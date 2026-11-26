@@ -1004,8 +1004,7 @@ fn labeled_dests(
             }
         }
     }
-    // The `--unassigned` and `--remove` bins (raw segments; `%source` fans out
-    // over the input files), sharing the `--out` writer when given its pattern.
+    // The `--unassigned` and `--remove` bins, which share the `--out` writer when given its pattern.
     let bin = |pattern: &OutputPattern, option: String| {
         if plan.out.as_ref() == Some(pattern) {
             OutputOrigin::Records(option)
