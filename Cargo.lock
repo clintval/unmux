@@ -2312,6 +2312,7 @@ dependencies = [
  "ahash",
  "anyhow",
  "assert_cmd",
+ "bgzf",
  "bolero",
  "clap",
  "crossbeam-channel",
