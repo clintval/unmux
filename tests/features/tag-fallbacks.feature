@@ -52,6 +52,25 @@ Feature: Tag stream fallbacks
       | bam | 1       |
       | bam | 8       |
 
+  Scenario: a stream with several fallbacks uses the first present one
+    Given a file "sheet.tsv" containing:
+      """
+      sample	a	b	nucleus	other
+      s1	a1	b1	N1	O1
+      s2	a1	b2		O2
+      s3	a2	b1		
+      s4	a2	b2	N4	
+      """
+    When I run `unmux reads.fq --group a={a1=AAAA,a2=CCCC} --group a::loc=0:0:4 --group b={b1=GGGG,b2=TTTT} --group b::loc=0:4:8 --extract nuc=%sample::nucleus --extract alt=%sample::other --extract ba=@a --extract bb=@b --extract r=0:8:end --tag CB=nuc|alt|ba+bb --template r --sample-sheet sheet.tsv --out out.sam`
+    Then the exit code is 0
+    And the records of "out.sam" are:
+      """
+      r1	4	*	0	255	*	*	0	0	ACGTACGT	IJKLMNOP	CB:Z:N1-GGGG	RG:Z:s1
+      r2	4	*	0	255	*	*	0	0	ACGTACGT	IJKLMNOP	CB:Z:O2-TTTT	RG:Z:s2
+      r3	4	*	0	255	*	*	0	0	ACGTACGT	IJKLMNOP	CB:Z:CCCC-GGGG	CY:Z:ABCD EFGH	RG:Z:s3
+      r4	4	*	0	255	*	*	0	0	ACGTACGT	IJKLMNOP	CB:Z:N4-TTTT	RG:Z:s4
+      """
+
   Scenario: a tag is left out when every choice for one of its streams is absent
     Given a file "sheet.tsv" containing:
       """
