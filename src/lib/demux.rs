@@ -2164,15 +2164,7 @@ fn match_fragment(
         let verdict = match &group.match_streams {
             // A `match=` group matches the joined `--extract` streams, not a
             // read window.
-            Some(streams) => match_joined(
-                group,
-                scratch,
-                streams,
-                &engine.plan.extracts,
-                &segments,
-                &hits,
-                engine.group_index,
-            )?,
+            Some(streams) => match_joined(engine, group, scratch, streams, &segments, &hits)?,
             None => match_group_for(group, scratch, &base_segments, &hits),
         };
         // A failed find constraint (e.g. an unmet minFindsPerGroup) leaves the
@@ -2816,26 +2808,26 @@ fn match_read_group(rg_to_idx: &HashMap<Vec<u8>, usize>, fragment: &Fragment) ->
 }
 
 /// Match a `match=` group against the concatenation of its named `--extract`
-/// streams (no delimiter). A referenced stream that is absent (its anchoring
-/// group did not match, or it resolved to nothing) makes the group a non-match.
-/// The tags are searched within the joined text as a single synthetic segment,
-/// so `dist`/`mode`/`delta`/`bothStrands` apply over the concatenation.
+/// streams (no delimiter), each as a `--tag` without `raw=true` writes it. A
+/// referenced stream that is absent (its anchoring group did not match, or it
+/// resolved to nothing) makes the group a non-match. The tags are searched
+/// within the joined text as a single synthetic segment, so
+/// `dist`/`mode`/`delta`/`bothStrands` apply over the concatenation.
 fn match_joined(
+    engine: &Engine,
     group: &CompiledGroup,
     scratch: &mut Scratch,
     streams: &[String],
-    extracts: &[crate::grammar::Extract],
     segments: &[Segment],
     hits: &GroupHits,
-    group_index: &HashMap<String, usize>,
 ) -> Result<GroupVerdict> {
     let mut joined = Vec::new();
     for name in streams {
-        let Some(spec) = extracts.iter().find(|e| &e.name == name) else {
+        let Some(spec) = engine.plan.extracts.iter().find(|e| &e.name == name) else {
             return Ok(GroupVerdict::unmatched(group));
         };
-        match extract(&spec.span, segments, hits, group_index)? {
-            Some(extracted) => joined.extend_from_slice(&extracted.bases),
+        match extract_stream(engine, spec, segments, hits)? {
+            Some(extracted) => joined.extend_from_slice(extracted.tag_bases(false)),
             None => return Ok(GroupVerdict::unmatched(group)),
         }
     }
@@ -3048,6 +3040,24 @@ fn canonical_correction<'a>(engine: &'a Engine, hits: &GroupHits, group: &str) -
     compiled.tags.get(hit.tag_idx).map(Vec::as_slice)
 }
 
+/// Resolve a stream, carrying the matched tag as the corrected form of an `@grp` self-span.
+fn extract_stream(
+    engine: &Engine,
+    spec: &crate::grammar::Extract,
+    segments: &[Segment],
+    hits: &GroupHits,
+) -> Result<Option<Extracted>> {
+    let Some(mut extracted) = extract(&spec.span, segments, hits, engine.group_index)? else {
+        return Ok(None);
+    };
+    if let SpanBody::AnchorMatch { group } = &spec.span.body {
+        if let Some(canonical) = canonical_correction(engine, hits, group) {
+            extracted.corrected = Some(corrected_form(&extracted, canonical));
+        }
+    }
+    Ok(Some(extracted))
+}
+
 /// The matched tag's value for a column stream, or `None` when its group did not
 /// match.
 fn column_value<'a>(engine: &'a Engine, hits: &GroupHits, stream: &str) -> Option<&'a str> {
@@ -3091,20 +3101,7 @@ fn prepare_body(
             }
             continue;
         }
-        if let Some(mut extracted) = extract(&spec.span, segments, hits, engine.group_index)? {
-            // Attach the matched tag's canonical sequence as the stream's
-            // corrected form, so a `raw=false` `--tag`/`--template` emits the
-            // corrected barcode while a `raw=true` one (or any stream with no
-            // corrected form) emits the observed bases. Only the `@grp`
-            // self-span is corrected (anchored-offset and between-anchor spans
-            // are unaffected). The observed span is already in the tag's
-            // orientation, so both forms share it; the read strand is a
-            // use-site choice (`--tag T=~stream` / `--template ~stream`).
-            if let SpanBody::AnchorMatch { group } = &spec.span.body {
-                if let Some(canonical) = canonical_correction(engine, hits, group) {
-                    extracted.corrected = Some(corrected_form(&extracted, canonical));
-                }
-            }
+        if let Some(extracted) = extract_stream(engine, spec, segments, hits)? {
             streams.insert(spec.name.as_str(), extracted);
         }
     }
