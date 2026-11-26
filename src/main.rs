@@ -94,7 +94,8 @@ pub(crate) const CARGO_STYLING: Styles = Styles::styled()
 ///                    negative counts from the record END. The FIRST number
 ///                    is the input file index. 1:5:9 = file 1 & bases [5,9).
 ///   @grp             a group's matched span. `@grp+off:len` & `@grp-off:len`
-///                    step past & before it (trailing number is a LENGTH!).
+///                    step past & before it (trailing number is a LENGTH!),
+///                    in the matched tag's orientation (see `bothStrands`).
 ///   @grpA..@grpB     the region between two matched spans.
 ///   @grp::COLUMN     the matched tag's value in a tag-file column, or its `id`.
 ///   @RG[::F[::F]]    an input read-group `--group` source (SAM/BAM/CRAM only);
@@ -235,6 +236,14 @@ struct DemuxCmd {
     ///   bc::anchor=3p            anchor tags' 3-prime base at `loc.end`
     ///   bc::match=i7+i5          match tags on joined `--extract` streams
     ///
+    /// A reverse-strand match (`bothStrands=true`) is read in its tag's own
+    /// orientation, as if the record were reverse-complemented: `@grp`
+    /// streams from it are reverse-complemented with their qualities
+    /// reversed, offsets and `next=` windows step from it in that orientation
+    /// (`+` toward the record start), and a `next=` target matches on its
+    /// strand (or either strand, with `bothStrands=true` of its own). So a
+    /// record and its reverse complement give the same streams.
+    ///
     /// An `@RG` source reads the input header's read groups instead of
     /// matching sequences (SAM/BAM/CRAM only; no barcode attributes, no
     /// `@`-span). Pair with `--sample-from-group` to write one file per
@@ -261,8 +270,14 @@ struct DemuxCmd {
     /// anchored `@grp` forms take a `LENGTH` as the trailing number instead.
     ///
     /// The `@grpA..@grpB` form is the bases from the end of `grpA`'s match to
-    /// the start of `grpB`'s. It is empty, but still present, where a group
-    /// is unmatched or `grpB` does not follow `grpA` in the same input file.
+    /// the start of `grpB`'s, in `grpA`'s orientation. It is empty, but still
+    /// present, where a group is unmatched or `grpB` does not follow `grpA` in
+    /// the same input file.
+    ///
+    /// A `@grp` form anchored on a reverse-strand match (`bothStrands=true`)
+    /// is taken in the tag's orientation: `@grp+off:len` steps toward the
+    /// record start, and the bases are reverse-complemented and the qualities
+    /// reversed, so the stream reads as the tag does.
     ///
     /// The `@grp::COLUMN` form is the matched tag's text in a column of the
     /// group's tag file, where a blank means the tag's `seq`. Header case is
