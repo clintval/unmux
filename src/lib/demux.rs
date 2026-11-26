@@ -2148,6 +2148,7 @@ fn run_engine(plan: &DemuxPlan, command_line: Option<&str>) -> Result<()> {
             sinks,
             metrics,
             progress: Progress::new(),
+            dropped: PerBaseTags::default(),
         }),
         targets: routing.targets().len(),
         compression: plan.compression,
@@ -2157,6 +2158,7 @@ fn run_engine(plan: &DemuxPlan, command_line: Option<&str>) -> Result<()> {
         sinks,
         metrics,
         progress,
+        dropped,
     } = run
         .merger
         .into_inner()
@@ -2177,6 +2179,12 @@ fn run_engine(plan: &DemuxPlan, command_line: Option<&str>) -> Result<()> {
             "{} records carried no RG:Z, or one the header does not declare, and were dropped; \
              keep them with --unassigned",
             metrics.unassigned().separate_with_commas()
+        );
+    }
+    if !dropped.is_empty() {
+        log::warn!(
+            "--template changed the bases of some records, so their per-base tags were left out: {}",
+            dropped.names()
         );
     }
     if let Some(pattern) = &plan.metrics_per_sample {
@@ -2294,13 +2302,16 @@ struct Prepared {
     lengths: SmallVec<[usize; 4]>,
     tally: Tally,
     writes: Vec<PreparedWrite>,
+    /// The per-base tags its `--template` bodies left out.
+    dropped: PerBaseTags,
 }
 
-/// The result of assembling a routed record's body: the writes to issue, or the
-/// name of a `--template` stream whose anchoring group did not match (so the
-/// record is rerouted to the `--unassigned` bin).
+/// The result of assembling a routed record's body: the writes to issue with the
+/// per-base tags its `--template` bodies left out, or the name of a `--template`
+/// stream whose anchoring group did not match (so the record is rerouted to the
+/// `--unassigned` bin).
 enum BodyOutcome {
-    Assembled(Vec<PreparedWrite>),
+    Assembled(Vec<PreparedWrite>, PerBaseTags),
     MissingStream(String),
 }
 
@@ -2474,6 +2485,7 @@ fn prepare(engine: &Engine, fragment: &Fragment, fmatch: FragmentMatch) -> Resul
                 lengths,
                 tally: Tally::Unassigned(reason),
                 writes,
+                dropped: PerBaseTags::default(),
             });
         }
         FragmentMatch::Routed { hits } => hits,
@@ -2487,6 +2499,7 @@ fn prepare(engine: &Engine, fragment: &Fragment, fmatch: FragmentMatch) -> Resul
         })
         .collect();
 
+    let mut dropped = PerBaseTags::default();
     let (tally, writes) = match engine.routing.route(&hits) {
         Disposition::Removed(remove) => (
             Tally::Removed,
@@ -2496,7 +2509,10 @@ fn prepare(engine: &Engine, fragment: &Fragment, fmatch: FragmentMatch) -> Resul
         Disposition::PassThrough => {
             let (denom, unext) = frac_bases(engine, &segments, &hits)?;
             match prepare_body(engine, None, &hits, &segments, fragment)? {
-                BodyOutcome::Assembled(writes) => (Tally::PassThrough { denom, unext }, writes),
+                BodyOutcome::Assembled(writes, left_out) => {
+                    dropped = left_out;
+                    (Tally::PassThrough { denom, unext }, writes)
+                }
                 BodyOutcome::MissingStream(missing) => {
                     unassigned(engine, fragment, Unassigned::MissingStream(missing), &hits)?
                 }
@@ -2505,14 +2521,17 @@ fn prepare(engine: &Engine, fragment: &Fragment, fmatch: FragmentMatch) -> Resul
         Disposition::Assigned(route) => {
             let (denom, unext) = frac_bases(engine, &segments, &hits)?;
             match prepare_body(engine, Some(route), &hits, &segments, fragment)? {
-                BodyOutcome::Assembled(writes) => (
-                    Tally::Assigned {
-                        target: route.target_index(),
-                        denom,
-                        unext,
-                    },
-                    writes,
-                ),
+                BodyOutcome::Assembled(writes, left_out) => {
+                    dropped = left_out;
+                    (
+                        Tally::Assigned {
+                            target: route.target_index(),
+                            denom,
+                            unext,
+                        },
+                        writes,
+                    )
+                }
                 BodyOutcome::MissingStream(missing) => {
                     unassigned(engine, fragment, Unassigned::MissingStream(missing), &hits)?
                 }
@@ -2523,6 +2542,7 @@ fn prepare(engine: &Engine, fragment: &Fragment, fmatch: FragmentMatch) -> Resul
         lengths,
         tally,
         writes,
+        dropped,
     })
 }
 
@@ -2647,6 +2667,8 @@ struct Processed {
     bytes: Vec<(usize, Vec<u8>)>,
     /// Their records for destinations that encode them as they merge, in order.
     records: Vec<(usize, Vec<PreparedRead>)>,
+    /// The per-base tags their `--template` bodies left out.
+    dropped: PerBaseTags,
     /// The error that stopped the batch after the fragments above.
     error: Option<anyhow::Error>,
 }
@@ -2656,6 +2678,7 @@ impl Processed {
     /// through `slots`, by destination the index of its buffer in `bytes`.
     fn add(&mut self, prepared: Prepared, slots: &mut [usize]) {
         tally(&mut self.tally, &prepared);
+        self.dropped |= prepared.dropped;
         for write in prepared.writes {
             match write.payload {
                 WritePayload::Encoded(bytes) => {
@@ -2673,11 +2696,13 @@ impl Processed {
     }
 }
 
-/// The state of merging: the outputs, the metrics, and the record count.
+/// The state of merging: the outputs, the metrics, the record count, and the
+/// per-base tags left out of `--template` bodies.
 struct Merger {
     sinks: Sinks,
     metrics: Metrics,
     progress: Progress,
+    dropped: PerBaseTags,
 }
 
 /// What each worker keeps across the jobs it runs.
@@ -2852,6 +2877,7 @@ impl pool::Stages for DemuxRun<'_> {
             tally: Metrics::tally(self.targets),
             bytes: Vec::new(),
             records: Vec::new(),
+            dropped: PerBaseTags::default(),
             error: None,
         };
         match batch {
@@ -2894,8 +2920,10 @@ impl pool::Stages for DemuxRun<'_> {
             sinks,
             metrics,
             progress,
+            dropped,
         } = &mut *merger;
         metrics.absorb(&done.tally);
+        *dropped |= done.dropped;
         for (dest, bytes) in &done.bytes {
             sinks.write(*dest, bytes, blocks)?;
         }
@@ -3313,14 +3341,14 @@ fn prepare_body(
     };
     let is_alignment = layout.is_alignment;
 
-    let bodies = match assemble_bodies(
+    let (bodies, dropped) = match assemble_bodies(
         plan,
         fragment,
         &mut streams,
         engine.movable_streams,
         is_alignment,
     ) {
-        Ok(bodies) => bodies,
+        Ok(assembled) => assembled,
         // A templated stream is absent (its anchoring group did not match): the
         // caller reroutes to unassigned, naming the missing stream in the QC
         // slug.
@@ -3422,7 +3450,7 @@ fn prepare_body(
             }]
         }
     };
-    Ok(BodyOutcome::Assembled(writes))
+    Ok(BodyOutcome::Assembled(writes, dropped))
 }
 
 /// One assembled body as an owned prepared record: the body's bytes are moved
@@ -3477,8 +3505,8 @@ fn passed_through_read(
     })
 }
 
-/// One assembled output record: its name, bases, qualities, and (for a raw
-/// pass-through body) the carried input tags it should keep.
+/// One assembled output record: its name, bases, qualities, and the carried
+/// input tags it should keep.
 struct Body {
     name: Vec<u8>,
     bases: Vec<u8>,
@@ -3488,21 +3516,74 @@ struct Body {
     alignment: Option<Alignment>,
 }
 
+/// SAM tags tied to a read's exact bases: modifications, per-base qualities, kinetics, moves.
+const PER_BASE_TAGS: [[u8; 2]; 25] = [
+    *b"MM", *b"ML", *b"MN", *b"OQ", *b"BQ", *b"E2", *b"U2", *b"CQ", *b"CS", *b"FZ", *b"PT", *b"BI",
+    *b"BD", *b"ip", *b"pw", *b"fi", *b"fp", *b"ri", *b"rp", *b"dq", *b"dt", *b"iq", *b"mq", *b"sq",
+    *b"mv",
+];
+
+/// A set of [`PER_BASE_TAGS`], one bit per tag.
+#[derive(Clone, Copy, Default)]
+struct PerBaseTags(u32);
+
+impl PerBaseTags {
+    fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    /// The tags of the set, comma-separated in [`PER_BASE_TAGS`] order.
+    fn names(self) -> String {
+        PER_BASE_TAGS
+            .iter()
+            .enumerate()
+            .filter(|&(index, _)| self.0 & 1 << index != 0)
+            .map(|(_, tag)| String::from_utf8_lossy(tag))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+impl std::ops::BitOrAssign for PerBaseTags {
+    fn bitor_assign(&mut self, other: Self) {
+        self.0 |= other.0;
+    }
+}
+
+/// The tags of `data` without its per-base ones, and which per-base tags it held.
+fn without_per_base_tags(data: &Data) -> (Data, PerBaseTags) {
+    let mut dropped = PerBaseTags::default();
+    let kept = data
+        .iter()
+        .filter(|(tag, _)| {
+            let per_base = PER_BASE_TAGS.iter().position(|bytes| tag.as_ref() == bytes);
+            if let Some(index) = per_base {
+                dropped.0 |= 1 << index;
+            }
+            per_base.is_none()
+        })
+        .map(|(tag, value)| (tag, value.clone()))
+        .collect();
+    (kept, dropped)
+}
+
 /// Assemble a record's output bodies: the raw input segments (each carrying its
 /// tags, and its source alignment when `keep_alignment` is set) when there is no
-/// `--template`, else one body per `--template`. Returns
-/// `Err(missing_stream_name)` when a template references a stream that was not
-/// extracted (its anchoring group did not match), naming the absent stream for
-/// the `--qc-tag` slug.
+/// `--template`, else one body per `--template`. A template body carries the
+/// tags of the read that supplies its first segment, without the per-base ones
+/// unless the body is that read unchanged; the per-base tags left out are
+/// returned with the bodies. Returns `Err(missing_stream_name)` when a template
+/// references a stream that was not extracted (its anchoring group did not
+/// match), naming the absent stream for the `--qc-tag` slug.
 fn assemble_bodies(
     plan: &DemuxPlan,
     fragment: &Fragment,
     streams: &mut HashMap<&str, Extracted>,
     movable: &HashSet<&str>,
     keep_alignment: bool,
-) -> std::result::Result<Vec<Body>, String> {
+) -> std::result::Result<(Vec<Body>, PerBaseTags), String> {
     if plan.templates.is_empty() {
-        return Ok(fragment
+        let bodies = fragment
             .records
             .iter()
             .map(
@@ -3525,7 +3606,8 @@ fn assemble_bodies(
                     },
                 },
             )
-            .collect());
+            .collect();
+        return Ok((bodies, PerBaseTags::default()));
     }
     let name = fragment
         .records
@@ -3534,7 +3616,14 @@ fn assemble_bodies(
         .unwrap_or_default();
     let qc_fail = fragment.records.iter().any(|record| record.qc_fail);
     let mut bodies = Vec::with_capacity(plan.templates.len());
+    let mut dropped = PerBaseTags::default();
     for template in &plan.templates {
+        let mut sources = template
+            .streams
+            .iter()
+            .filter_map(|stream| streams.get(stream.name.as_str())?.source);
+        let first = sources.next();
+        let joined = sources.any(|source| Some(source) != first);
         // A single-stream template whose stream is referenced nowhere else is
         // that extract's sole consumer, so move its (possibly large)
         // bases/quals into the body instead of copying. The moved stream is in
@@ -3562,16 +3651,33 @@ fn assemble_bodies(
             }
             _ => assemble_template(template, streams)?,
         };
+        let source = match first {
+            Some(file) => fragment.records.get(file),
+            None => fragment.records.first(),
+        };
+        let carried = source.and_then(|record| {
+            let tags = record.tags.as_ref()?;
+            let unchanged = !joined
+                && template.streams.iter().all(|stream| !stream.revcomp)
+                && bases == record.bases
+                && quals == record.quals;
+            if unchanged {
+                return Some(tags.clone());
+            }
+            let (kept, left_out) = without_per_base_tags(tags);
+            dropped |= left_out;
+            Some(kept)
+        });
         bodies.push(Body {
             name: name.clone(),
             bases,
             quals,
-            carried: None,
+            carried,
             qc_fail,
             alignment: None,
         });
     }
-    Ok(bodies)
+    Ok((bodies, dropped))
 }
 
 /// The `--tag` bindings that `tag_data` leaves out because a stream is absent,

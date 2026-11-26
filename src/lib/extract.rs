@@ -101,10 +101,10 @@ pub struct Corrected {
 /// An extracted stream: the observed bases and (optional) qualities, both
 /// already trimmed and, for a span measured from a reverse-strand match,
 /// reverse-complemented into the matched tag's orientation, plus an optional
-/// error-corrected form. `bases`/`quals` always hold the observed, uncorrected
-/// values; `corrected` is populated only for a matched keeplist `@grp`
-/// self-span, and a `--tag`/`--template` consults it unless `raw=true` selects
-/// the observed bytes.
+/// error-corrected form and the input file it is cut from. `bases`/`quals`
+/// always hold the observed, uncorrected values; `corrected` is populated only
+/// for a matched keeplist `@grp` self-span, and a `--tag`/`--template` consults
+/// it unless `raw=true` selects the observed bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Extracted {
     /// The observed (uncorrected) bases, in the matched tag's orientation for a
@@ -116,6 +116,8 @@ pub struct Extracted {
     /// The error-corrected form, populated only for a matched keeplist `@grp`
     /// self-span; `None` otherwise.
     pub corrected: Option<Corrected>,
+    /// The input file the stream is cut from; `None` for text or a stream with no region.
+    pub source: Option<usize>,
 }
 
 impl Extracted {
@@ -125,6 +127,7 @@ impl Extracted {
             bases: text.as_bytes().to_vec(),
             quals: None,
             corrected: None,
+            source: None,
         }
     }
 
@@ -166,12 +169,19 @@ pub fn extract(
             start,
             end,
             reverse,
-        } => Some(slice(segment_at(segments, file)?, start, end, reverse)),
+        } => Some(slice(
+            segment_at(segments, file)?,
+            file,
+            start,
+            end,
+            reverse,
+        )),
         // No region between the anchors: the stream is empty but present.
         SpanRange::EmptyPresent => Some(Extracted {
             bases: Vec::new(),
             quals: segments.first().and_then(|s| s.quals.map(|_| Vec::new())),
             corrected: None,
+            source: None,
         }),
         // An `@grp` whose group did not match: the stream is absent.
         SpanRange::Absent => None,
@@ -324,9 +334,9 @@ fn segment_at<'a>(segments: &'a [Segment<'a>], file: usize) -> Result<Segment<'a
     })
 }
 
-/// Slice `[start, end)` of a segment, carrying qualities when present, and
+/// Slice `[start, end)` of input file `file`'s segment, carrying qualities when present, and
 /// reverse-complement it (reversing the qualities) when `reverse` is set.
-fn slice(segment: Segment, start: usize, end: usize, reverse: bool) -> Extracted {
+fn slice(segment: Segment, file: usize, start: usize, end: usize, reverse: bool) -> Extracted {
     let mut bases = segment.bases[start..end].to_vec();
     let mut quals = segment.quals.map(|q| q[start..end].to_vec());
     if reverse {
@@ -339,6 +349,7 @@ fn slice(segment: Segment, start: usize, end: usize, reverse: bool) -> Extracted
         bases,
         quals,
         corrected: None,
+        source: Some(file),
     }
 }
 
