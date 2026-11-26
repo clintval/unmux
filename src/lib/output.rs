@@ -573,20 +573,51 @@ pub fn check_output_collisions(outputs: &[(PathBuf, OutputOrigin)]) -> Result<()
     Ok(())
 }
 
-/// Refuse an output that is one of the input files under any name, which would replace that input.
+/// A file the run reads, reported when an output would replace it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InputOrigin {
+    /// A record input, by its 0-based index.
+    Reads(usize),
+    /// The tag file of a `--group`.
+    TagFile(String),
+    /// The `--sample-sheet`.
+    SampleSheet,
+    /// The `--reference` FASTA.
+    Reference,
+    /// An index of the `--reference` FASTA.
+    ReferenceIndex,
+}
+
+impl std::fmt::Display for InputOrigin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Reads(index) => write!(f, "input {index}"),
+            Self::TagFile(group) => write!(f, "the tag file of group {group}"),
+            Self::SampleSheet => f.write_str("the sample sheet"),
+            Self::Reference => f.write_str("the reference"),
+            Self::ReferenceIndex => f.write_str("the reference index"),
+        }
+    }
+}
+
+/// Refuse an output that is a file the run reads under any name, which would replace that file.
 pub fn check_outputs_over_inputs(
     outputs: &[(PathBuf, OutputOrigin)],
-    inputs: &[PathBuf],
+    inputs: &[(PathBuf, InputOrigin)],
 ) -> Result<()> {
     let files: Vec<_> = inputs
         .iter()
-        .enumerate()
-        .filter(|(_, path)| !matches!(path.to_str(), Some("-" | "/dev/stdin")))
-        .filter_map(|(index, path)| {
+        .filter(|(path, origin)| {
+            !matches!(
+                (origin, path.to_str()),
+                (InputOrigin::Reads(_), Some("-" | "/dev/stdin"))
+            )
+        })
+        .filter_map(|(path, origin)| {
             let metadata = std::fs::metadata(path)
                 .ok()
                 .filter(std::fs::Metadata::is_file)?;
-            Some((index, (resolve(path, &mut 0), file_id(&metadata))))
+            Some((path, origin, resolve(path, &mut 0), file_id(&metadata)))
         })
         .collect();
     if files.is_empty() {
@@ -599,14 +630,16 @@ pub fn check_outputs_over_inputs(
             Ok(metadata) => file_id(&metadata),
             Err(_) => None,
         };
-        let Some((index, _)) = files
+        let Some((input, input_origin, ..)) = files
             .iter()
-            .find(|(_, (input, id))| *input == real || id.is_some_and(|id| file == Some(id)))
+            .find(|(_, _, input, id)| *input == real || id.is_some_and(|id| file == Some(id)))
         else {
             continue;
         };
-        let (output, input) = (path.display(), inputs[*index].display());
-        bail!("output \"{output}\" ({origin}) is input {index} ({input}); give it a distinct path");
+        let (output, input) = (path.display(), input.display());
+        bail!(
+            "output \"{output}\" ({origin}) is {input_origin} ({input}); give it a distinct path"
+        );
     }
     Ok(())
 }
@@ -1362,9 +1395,46 @@ mod tests {
             .iter()
             .map(|path| (path.clone(), OutputOrigin::Records("--unassigned".into())))
             .collect();
-        check_outputs_over_inputs(&outputs, inputs)
+        let inputs: Vec<(PathBuf, InputOrigin)> = inputs
+            .iter()
+            .enumerate()
+            .map(|(index, path)| (path.clone(), InputOrigin::Reads(index)))
+            .collect();
+        check_outputs_over_inputs(&outputs, &inputs)
             .err()
             .map(|e| e.to_string())
+    }
+
+    #[test]
+    fn test_over_inputs_reports_which_file_the_run_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, origin, shown) in [
+            (
+                "bc.tsv",
+                InputOrigin::TagFile("bc".into()),
+                "the tag file of group bc",
+            ),
+            ("sheet.tsv", InputOrigin::SampleSheet, "the sample sheet"),
+            ("ref.fa", InputOrigin::Reference, "the reference"),
+            (
+                "ref.fa.fai",
+                InputOrigin::ReferenceIndex,
+                "the reference index",
+            ),
+        ] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, "").unwrap();
+            let outputs = [(path.clone(), OutputOrigin::Metrics("--metrics-summary"))];
+            let error = check_outputs_over_inputs(&outputs, &[(path.clone(), origin)]).unwrap_err();
+            let path = path.display();
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "output \"{path}\" (--metrics-summary) is {shown} ({path}); give it a \
+                     distinct path"
+                )
+            );
+        }
     }
 
     #[test]
