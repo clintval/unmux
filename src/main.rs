@@ -239,10 +239,12 @@ struct DemuxCmd {
     /// A reverse-strand match (`bothStrands=true`) is read in its tag's own
     /// orientation, as if the record were reverse-complemented: `@grp`
     /// streams from it are reverse-complemented with their qualities
-    /// reversed, offsets and `next=` windows step from it in that orientation
-    /// (`+` toward the record start), and a `next=` target matches on its
-    /// strand (or either strand, with `bothStrands=true` of its own). So a
-    /// record and its reverse complement give the same streams.
+    /// reversed, and offsets and `next=G:lo-hi` windows step from it in that
+    /// orientation (`+` toward the record start). A windowed `next=` target
+    /// matches on that match's strand (or either strand, with its own
+    /// `bothStrands=true`); a bare `next=G` target keeps its own `loc` and
+    /// strands. Spans and windowed targets thus agree between a record
+    /// and its reverse complement.
     ///
     /// An `@RG` source reads the input header's read groups instead of
     /// matching sequences (SAM/BAM/CRAM only; no barcode attributes, no
