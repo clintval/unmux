@@ -73,6 +73,30 @@ Feature: Split an aligned input by read group, keeping alignments
       """
     And the BAM header of "out/rg1.bam" contains "SN:chr1"
 
+  Scenario: a BAM split stores U and u bases as T, while a SAM split keeps them
+    Given a file "rna.sam" containing:
+      """
+      @HD	VN:1.6	SO:coordinate
+      @SQ	SN:chr1	LN:100
+      @RG	ID:rg1	SM:sampleA
+      q1	0	chr1	10	60	8M	*	0	0	ACGUacgu	ABCDEFGH	RG:Z:rg1
+      q2	16	chr1	20	60	8M	*	0	0	UUGGCCAA	ABCDEFGH	RG:Z:rg1
+      """
+    When I run `unmux rna.sam --group rg=@RG --sample-from-group rg --out out/%sample.bam`
+    Then the exit code is 0
+    And the records of "out/rg1.bam" are:
+      """
+      q1	0	chr1	10	60	8M	*	0	0	ACGTACGT	ABCDEFGH	RG:Z:rg1
+      q2	16	chr1	20	60	8M	*	0	0	TTGGCCAA	ABCDEFGH	RG:Z:rg1
+      """
+    When I run `unmux rna.sam --group rg=@RG --sample-from-group rg --out out/%sample.sam`
+    Then the exit code is 0
+    And the records of "out/rg1.sam" are:
+      """
+      q1	0	chr1	10	60	8M	*	0	0	ACGUacgu	ABCDEFGH	RG:Z:rg1
+      q2	16	chr1	20	60	8M	*	0	0	UUGGCCAA	ABCDEFGH	RG:Z:rg1
+      """
+
   Scenario: a record with no known read group passes through to the unassigned bin
     Given a file "orphan.sam" containing:
       """

@@ -550,3 +550,69 @@ Feature: Tag matching with distance tolerance and error handling
     When I run `unmux reads.fq --group bc={s1=ACGTA} --group bc::loc=0:0:10,anchor=3p,dist=0 --extract bc=@bc --extract body=0:0:end --tag BC=bc --tag BC::raw=true --sample dna01=bc::s1 --out %sample.fq --unassigned un.fq`
     Then the exit code is 0
     And the file "dna01.fq" contains "BC:Z:ACGTA"
+
+  Scenario Outline: A U or u read base matches a T tag base as T does, with <search>
+    Given a file "reads.fq" containing:
+      """
+      @dna
+      CCAATTCCC
+      +
+      IIIIIIIII
+      @rna
+      CCAAUUCCC
+      +
+      IIIIIIIII
+      @lower
+      ccaauuccc
+      +
+      IIIIIIIII
+      """
+    # CB holds the corrected form, which is the tag, and BC the raw form, which is the read's bases.
+    When I run `unmux reads.fq --group bc=<tags> --group bc::<attrs> --extract bc=@bc --tag CB=bc --tag BC=bc --tag BC::raw=true --sample-from-group bc --out %sample.fq --unassigned un.fq`
+    Then the exit code is 0
+    And the file "x.fq" contains "@dna CB:Z:<tag>"
+    And the file "x.fq" contains "@rna CB:Z:<tag>"
+    And the file "x.fq" contains "@lower CB:Z:<tag>"
+    And the file "x.fq" contains "BC:Z:AAUUC"
+    And the file "x.fq" contains "BC:Z:aauuc"
+    And the file "un.fq" does not contain "@rna"
+    And the file "un.fq" does not contain "@lower"
+
+    Examples:
+      | search                  | tags                                                                      | attrs                        | tag   |
+      | a sliding search        | {x=AATTC}                                                                 | dist=0                       | AATTC |
+      | a loc window            | {x=AATTC}                                                                 | loc=0:1:8                    | AATTC |
+      | an indel budget         | {x=AATTC}                                                                 | dist=1:1                     | AATTC |
+      | anchor=5p               | {x=AATTC}                                                                 | loc=0:2:9,anchor=5p          | AATTC |
+      | anchor=5p and indels    | {x=AATTC}                                                                 | loc=0:2:9,anchor=5p,dist=0:1 | AATTC |
+      | anchor=3p               | {x=AATTC}                                                                 | loc=0:0:7,anchor=3p          | AATTC |
+      | an IUPAC tag            | {x=AAKKC}                                                                 | dist=0                       | AAKKC |
+      | bothStrands             | {x=GAATT}                                                                 | bothStrands=true             | GAATT |
+      | nine tags of one length | {x=AATTC,a=CCCCC,b=GGGGG,c=ACACA,d=CACAC,e=GAGAG,f=AGAGA,g=CGCGC,h=GCGCG} | dist=0                       | AATTC |
+
+  Scenario Outline: A U or u read base matches a T tag base as T does in <link>
+    Given a file "reads.fq" containing:
+      """
+      @dna
+      CCAATTCCC
+      +
+      IIIIIIIII
+      @rna
+      CCAAUUCCC
+      +
+      IIIIIIIII
+      @lower
+      ccaauuccc
+      +
+      IIIIIIIII
+      """
+    When I run `unmux reads.fq <groups> --sample-from-group bc --out %sample.fq --unassigned un.fq`
+    Then the exit code is 0
+    And the file "x.fq" contains "@dna"
+    And the file "x.fq" contains "@rna"
+    And the file "x.fq" contains "@lower"
+
+    Examples:
+      | link           | groups                                                                          |
+      | a match= join  | --extract i=0:2:4 --extract j=0:4:7 --group bc={x=AATTC} --group bc::match=i+j |
+      | a next= window | --group ad={a=CC} --group ad::loc=0:0:2,next=bc:0-6 --group bc={x=AATTC}        |
