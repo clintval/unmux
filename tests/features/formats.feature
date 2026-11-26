@@ -989,6 +989,40 @@ Feature: Input and output format handling
       IIII
       """
 
+  Scenario: A record without a name in an htslib CRAM reads back without one
+    Given the test file "nameless.htslib-3.1.cram"
+    # samtools 1.25 wrote this CRAM 3.1 from nameless.sam, storing the missing name as * and a NUL.
+    When I run `unmux nameless.htslib-3.1.cram --pool p --out back.sam`
+    Then the exit code is 0
+    And the records of "back.sam" are:
+      """
+      n1	4	*	0	255	*	*	0	0	AAAA	IIII	RG:Z:p
+      *	4	*	0	255	*	*	0	0	CCCC	IIII	RG:Z:p
+      n3	4	*	0	255	*	*	0	0	GGGG	IIII	RG:Z:p
+      n4	4	*	0	255	*	*	0	0	TTTT	IIII	RG:Z:p
+      """
+    When I run `unmux nameless.htslib-3.1.cram --out back.fq`
+    Then the exit code is 0
+    And the file "back.fq" is:
+      """
+      @n1
+      AAAA
+      +
+      IIII
+      @
+      CCCC
+      +
+      IIII
+      @n3
+      GGGG
+      +
+      IIII
+      @n4
+      TTTT
+      +
+      IIII
+      """
+
   Scenario Outline: A read name too long for BAM fails <format> output with the same error
     Given a file "in.fq" containing:
       """
