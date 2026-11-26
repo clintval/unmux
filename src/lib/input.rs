@@ -1004,13 +1004,18 @@ fn first_token(name: &[u8]) -> Vec<u8> {
 /// Lift the SAM tags of a FASTX read-name comment, the inverse of the writer's
 /// `render_tags`. A tab-separated field not shaped like a tag (a bare UMI, an
 /// Illumina CASAVA string, free text) is skipped, and a tag whose value its type
-/// does not allow or a BAM record cannot hold is an error. Returns `None` when
-/// no tag is lifted.
+/// does not allow or a BAM record cannot hold, or a tag given twice, is an
+/// error. Returns `None` when no tag is lifted.
 fn parse_comment_tags(comment: &[u8]) -> Result<Option<Data>> {
     let mut data = Data::default();
     for field in comment.split(|&b| b == b'\t') {
         if let Some((tag, value)) = parse_aux_field(field)? {
-            data.insert(tag, value);
+            if data.insert(tag, value).is_some() {
+                bail!(
+                    "the comment tag `{}` appears more than once",
+                    String::from_utf8_lossy(&field[..2])
+                );
+            }
         }
     }
     Ok((!data.is_empty()).then_some(data))
