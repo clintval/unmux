@@ -50,6 +50,36 @@ Feature: Lifting SAM tags from FASTX read-name comments
     And the file "out.sam" contains "AAAACCCC"
     And the file "out.sam" does not contain "GATTACAUMI"
 
+  Scenario: a numeric or array value followed by a space is not a tag, so its field is skipped
+    Given a file "in.fq" containing:
+      """
+      @r1 ns:i:5 BC:Z:ACGT
+      AAAACCCC
+      +
+      IIIIIIII
+      @r2 ch:i:12 extra
+      AAAACCCC
+      +
+      IIIIIIII
+      @r3 ML:B:C,1,2 MM:Z:C+m,0;
+      AAAACCCC
+      +
+      IIIIIIII
+      @r4	ns:i:5 	BC:Z:ACGT
+      AAAACCCC
+      +
+      IIIIIIII
+      """
+    When I run `unmux in.fq --out out.sam`
+    Then the exit code is 0
+    And the records of "out.sam" are:
+      """
+      r1	4	*	0	255	*	*	0	0	AAAACCCC	IIIIIIII	RG:Z:in
+      r2	4	*	0	255	*	*	0	0	AAAACCCC	IIIIIIII	RG:Z:in
+      r3	4	*	0	255	*	*	0	0	AAAACCCC	IIIIIIII	RG:Z:in
+      r4	4	*	0	255	*	*	0	0	AAAACCCC	IIIIIIII	BC:Z:ACGT	RG:Z:in
+      """
+
   Scenario: a base-modification FASTQ keeps its MM, ML, and ns tags
     Given a file "mod.fq" containing:
       """

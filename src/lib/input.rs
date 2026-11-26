@@ -2526,7 +2526,6 @@ mod tests {
             "ML:B:I,4294967296",
             "ML:B:C,1,x",
             "ML:B:C,",
-            "ML:B:C 1",
             "ML:B:Q,1",
             "ML:B:",
             "xh:H:CAF",
@@ -2543,6 +2542,40 @@ mod tests {
                 let error = read_error(&text);
                 let expected = format!("malformed {kind} record `r1`: the comment tag `{tag}`");
                 assert!(error.contains(&expected), "{field}: {error}");
+            }
+        }
+    }
+
+    /// The tags lifted from the first record of the FASTX `text`.
+    fn first_record_tags(text: &str) -> Option<Data> {
+        read_all(&temp_with(text.as_bytes()))
+            .remove(0)
+            .records
+            .remove(0)
+            .tags
+    }
+
+    #[test]
+    fn test_read_fastx_skips_a_comment_field_whose_value_holds_a_space() {
+        let mut only_rx = Data::default();
+        only_rx.insert(Tag::new(b'R', b'X'), Value::from("ACGT"));
+        for field in [
+            "ns:i:5 BC:Z:ACGT",
+            "ch:i:12 extra",
+            "ns:i:5 ",
+            "ns:i: 5",
+            "xf:f:1.5 x",
+            "xh:H:CAFE x",
+            "ML:B:C,1,2 MM:Z:C+m,0;",
+            "ML:B:C 1",
+            "xa:A:Q extra",
+            "xa:A: ",
+        ] {
+            for text in [
+                format!("@r1\tRX:Z:ACGT\t{field}\nACGT\n+\nIIII\n"),
+                format!(">r1 RX:Z:ACGT\t{field}\nACGT\n"),
+            ] {
+                assert_eq!(first_record_tags(&text), Some(only_rx.clone()), "{text:?}");
             }
         }
     }
