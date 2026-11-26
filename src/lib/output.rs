@@ -25,7 +25,7 @@ use noodles::sam::header::record::value::Map;
 use crate::extract::Extracted;
 use crate::fanout::Target;
 use crate::grammar::{
-    default_qual_tag, OutputPattern, PatternSegment, Placeholder, QualTag, TagBinding,
+    default_qual_tag, OutputPattern, PatternSegment, Placeholder, QualTag, StreamRef, TagBinding,
 };
 use crate::input::{SniffedFormat, PHRED_OFFSET};
 use crate::writer::{file_id, output_format, FileId, OutputFormat};
@@ -122,19 +122,9 @@ pub fn build_tag_data(bindings: &[TagBinding], streams: &HashMap<&str, Extracted
         // Each present stream is paired with its `StreamRef` so a `~`
         // (reverse-complement at this use site) can flip that stream's bases
         // and qualities.
-        let present: Vec<_> = binding
-            .streams
-            .iter()
-            .zip(&binding.fallbacks)
-            .filter_map(|(first, fallbacks)| {
-                std::iter::once(first)
-                    .chain(fallbacks)
-                    .find_map(|s| streams.get(s.name.as_str()).map(|e| (s, e)))
-            })
-            .collect();
-        if present.len() != binding.streams.len() {
+        let Some(present) = chosen_streams(binding, streams) else {
             continue;
-        }
+        };
         let sep = binding.sep.as_deref().unwrap_or_default().as_bytes();
         // A tag emits the corrected form by default and the observed bases
         // under `raw=true`; a stream with no corrected form (not an
@@ -186,6 +176,34 @@ pub fn build_tag_data(bindings: &[TagBinding], streams: &HashMap<&str, Extracted
         }
     }
     data
+}
+
+/// The stream chosen for each part of a tag, the first present of its choices,
+/// or `None` when some part has none present.
+fn chosen_streams<'a>(
+    binding: &'a TagBinding,
+    streams: &'a HashMap<&str, Extracted>,
+) -> Option<Vec<(&'a StreamRef, &'a Extracted)>> {
+    binding
+        .streams
+        .iter()
+        .zip(&binding.fallbacks)
+        .map(|(first, fallbacks)| {
+            std::iter::once(first)
+                .chain(fallbacks)
+                .find_map(|s| streams.get(s.name.as_str()).map(|e| (s, e)))
+        })
+        .collect()
+}
+
+/// Whether a record writes the tag `binding` from a stream without base
+/// qualities, such as column text, so no quality tag can describe it.
+pub fn lacks_qualities(binding: &TagBinding, streams: &HashMap<&str, Extracted>) -> bool {
+    chosen_streams(binding, streams).is_some_and(|chosen| {
+        chosen
+            .iter()
+            .any(|(_, stream)| stream.tag_quals(binding.raw).is_none())
+    })
 }
 
 /// The quality tag name a binding emits: the explicit `qual=QTAG`, the
@@ -636,7 +654,7 @@ fn fold(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::grammar::{OutputPattern, StreamRef};
+    use crate::grammar::OutputPattern;
 
     /// Parse a pattern through the grammar so tests use real `OutputPattern`
     /// values.

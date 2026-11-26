@@ -401,14 +401,30 @@ impl TagBinding {
     /// Whether some part of this tag can only be filled by the column streams
     /// `columns`, so the tag never has base qualities.
     fn has_column(&self, columns: &HashSet<&str>) -> bool {
+        self.text_only_stream(columns).is_some()
+    }
+
+    /// The first stream of a part of this tag that only the column streams
+    /// `columns` can fill.
+    fn text_only_stream(&self, columns: &HashSet<&str>) -> Option<&StreamRef> {
         self.streams
             .iter()
             .zip(&self.fallbacks)
-            .any(|(stream, fallbacks)| {
-                std::iter::once(stream)
-                    .chain(fallbacks)
+            .find(|(stream, fallbacks)| {
+                std::iter::once(*stream)
+                    .chain(fallbacks.iter())
                     .all(|s| columns.contains(s.name.as_str()))
             })
+            .map(|(stream, _)| stream)
+    }
+
+    /// Whether the stream `name` is the last choice of some part of this tag, so
+    /// the tag is left out when it is absent.
+    pub fn is_last_choice(&self, name: &str) -> bool {
+        self.streams
+            .iter()
+            .zip(&self.fallbacks)
+            .any(|(stream, fallbacks)| fallbacks.last().unwrap_or(stream).name == name)
     }
 
     /// Every stream this tag may read, its fallbacks included.
@@ -1385,12 +1401,13 @@ fn parse_tags(specs: &[String]) -> Result<Vec<TagBinding>> {
                     .map(str::trim)
                     .filter(|s| !s.is_empty())
                     .map(|part| {
-                        part.split('|')
-                            .map(str::trim)
-                            .map(parse_stream_ref)
-                            .collect()
+                        let choices: Vec<&str> = part.split('|').map(str::trim).collect();
+                        if choices.len() > 1 && choices.iter().any(|choice| choice.is_empty()) {
+                            bail!("tag `{tag}` has an empty choice around `|` in {part:?}");
+                        }
+                        Ok(choices.into_iter().map(parse_stream_ref).collect())
                     })
-                    .collect();
+                    .collect::<Result<_>>()?;
                 if streams.is_empty() {
                     bail!("tag `{tag}` has no streams: {value:?}");
                 }
@@ -1499,14 +1516,20 @@ pub(crate) fn default_qual_tag(tag: &str) -> Option<&'static str> {
     }
 }
 
-/// The tags with a column stream that have a default quality tag, each with that
-/// quality tag.
-pub(crate) fn column_tag_qualities(plan: &DemuxPlan) -> Vec<(&str, &'static str)> {
+/// The tags that may read a column stream and have a quality tag, each with
+/// that quality tag: the one set by `qual=`, or else the default.
+pub(crate) fn column_tag_qualities(plan: &DemuxPlan) -> Vec<(&str, &str)> {
     let columns = column_streams(&plan.extracts);
     plan.tags
         .iter()
-        .filter(|tag| tag.has_column(&columns))
-        .filter_map(|tag| Some((tag.tag.as_str(), default_qual_tag(&tag.tag)?)))
+        .filter(|tag| tag.all_streams().any(|s| columns.contains(s.name.as_str())))
+        .filter_map(|tag| {
+            let quality = match &tag.qual {
+                QualTag::Named(name) => Some(name.as_str()),
+                _ => default_qual_tag(&tag.tag),
+            };
+            Some((tag.tag.as_str(), quality?))
+        })
         .collect()
 }
 
@@ -2184,14 +2207,14 @@ fn validate_plan(plan: &DemuxPlan) -> Result<()> {
                     stream.name
                 );
             }
-            if let QualTag::Named(qual) = &tag.qual {
-                bail!(
-                    "tag `{}` sets `qual={qual}`, but its column stream `{}` has no base qualities; \
-                     remove `qual` or set `qual=none`",
-                    tag.tag,
-                    stream.name
-                );
-            }
+        }
+        if let (QualTag::Named(qual), Some(stream)) = (&tag.qual, tag.text_only_stream(&columns)) {
+            bail!(
+                "tag `{}` sets `qual={qual}`, but its column stream `{}` has no base qualities; \
+                 remove `qual` or set `qual=none`",
+                tag.tag,
+                stream.name
+            );
         }
     }
 
