@@ -115,7 +115,8 @@ fn placeholder_value(placeholder: Placeholder, ctx: &PathContext) -> String {
 /// paired quality tag (from the default seq->qual map, an explicit `qual=`, or
 /// off for `qual=none`) is the streams' qualities re-encoded to ASCII Phred+33
 /// and joined by `qual-sep`; it is emitted only when every stream carries
-/// qualities.
+/// qualities. `CB` and `CR` may both default to `CY`, which a record takes from
+/// `CR` where it writes one, as the SAM spec pairs them, and from `CB` elsewhere.
 pub fn build_tag_data(bindings: &[TagBinding], streams: &HashMap<&str, Extracted>) -> Data {
     let mut data = Data::default();
     for binding in bindings {
@@ -146,9 +147,13 @@ pub fn build_tag_data(bindings: &[TagBinding], streams: &HashMap<&str, Extracted
         );
 
         if let Some(qual_tag) = qual_tag_name(binding) {
-            if present
-                .iter()
-                .all(|(_, stream)| stream.tag_quals(binding.raw).is_some())
+            let left_to_cr = binding.tag == "CB"
+                && binding.qual == QualTag::Default
+                && data.get(&two_byte_tag(qual_tag)).is_some();
+            if !left_to_cr
+                && present
+                    .iter()
+                    .all(|(_, stream)| stream.tag_quals(binding.raw).is_some())
             {
                 let qual_sep = binding.qual_sep.as_deref().unwrap_or_default().as_bytes();
                 let quals: Vec<Vec<u8>> = present

@@ -365,7 +365,7 @@ pub enum QualTag {
     Omitted,
     /// `qual=QTAG`: an explicit quality tag.
     Named(String),
-    /// No quality tag: `qual=none`, or a `CB` that leaves `CY` to `CR`.
+    /// `qual=none`: drop the quality tag.
     None,
 }
 
@@ -691,7 +691,6 @@ pub fn parse_demux(args: &DemuxArgs) -> Result<DemuxPlan> {
             tag.qual = QualTag::Omitted;
         }
     }
-    leave_cy_to_cr(&mut plan.tags);
     validate_tag_writers(&plan)?;
     for warning in plan_warnings(&plan) {
         log::warn!("{warning}");
@@ -2276,19 +2275,6 @@ fn validate_plan(plan: &DemuxPlan) -> Result<()> {
     Ok(())
 }
 
-/// Leave a default `CY` that `CB` and `CR` would both write to `CR`, its pair in the SAM spec.
-fn leave_cy_to_cr(tags: &mut [TagBinding]) {
-    let defaults = |name: &str| {
-        tags.iter()
-            .any(|tag| tag.tag == name && tag.qual == QualTag::Default)
-    };
-    if defaults("CB") && defaults("CR") {
-        if let Some(cb) = tags.iter_mut().find(|tag| tag.tag == "CB") {
-            cb.qual = QualTag::None;
-        }
-    }
-}
-
 /// A source of one SAM tag on an output record.
 #[derive(Clone, Copy)]
 enum TagWriter<'a> {
@@ -2348,6 +2334,10 @@ fn validate_tag_writers(plan: &DemuxPlan) -> Result<()> {
         let Some(&(_, first)) = writers[..index].iter().find(|(seen, _)| *seen == tag) else {
             continue;
         };
+        // Only CB and CR default to one tag, CY, which a record takes from CR where it writes one.
+        if let (TagWriter::DefaultQuality(_), TagWriter::DefaultQuality(_)) = (first, second) {
+            continue;
+        }
         let hint = match (first, second) {
             (TagWriter::DefaultQuality(binding), _) | (_, TagWriter::DefaultQuality(binding)) => {
                 format!("set `{0}::qual=none` or `{0}::qual=<TAG>`", binding.tag)
