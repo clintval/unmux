@@ -791,11 +791,15 @@ const MISSING_QUALITY: u8 = 0xFF;
 
 trait AlignmentSink: AlignmentWrite {
     const NEEDS_MISSING_QUALITIES_FILLED: bool = false;
+    const NEEDS_U_STORED_AS_T: bool = false;
 }
 
 impl<W: Write> AlignmentSink for sam::io::Writer<W> {}
 
-impl<W: Write> AlignmentSink for bam::io::Writer<W> {}
+/// BAM codes each base in 4 bits, with no code for U.
+impl<W: Write> AlignmentSink for bam::io::Writer<W> {
+    const NEEDS_U_STORED_AS_T: bool = true;
+}
 
 /// The noodles CRAM writer flags every record as storing a quality per base, even one with none.
 impl<W: Write> AlignmentSink for cram::io::Writer<W> {
@@ -826,6 +830,9 @@ fn write_alignments<W: AlignmentSink>(
         if W::NEEDS_MISSING_QUALITIES_FILLED {
             fill_missing_qualities(&mut record);
         }
+        if W::NEEDS_U_STORED_AS_T {
+            store_u_as_t(&mut record);
+        }
         writer
             .write_alignment_record(header, record.as_ref())
             .context("failed to write SAM/BAM/CRAM record")?;
@@ -837,6 +844,16 @@ fn fill_missing_qualities(record: &mut std::borrow::Cow<'_, RecordBuf>) {
     let bases = record.sequence().len();
     if bases > 0 && record.quality_scores().is_empty() {
         *record.to_mut().quality_scores_mut() = QualityScores::from(vec![MISSING_QUALITY; bases]);
+    }
+}
+
+fn store_u_as_t(record: &mut std::borrow::Cow<'_, RecordBuf>) {
+    if memchr::memchr2(b'U', b'u', record.sequence().as_ref()).is_some() {
+        for base in record.to_mut().sequence_mut().as_mut() {
+            if matches!(*base, b'U' | b'u') {
+                *base = b'T';
+            }
+        }
     }
 }
 
