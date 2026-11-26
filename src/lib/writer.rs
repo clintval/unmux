@@ -789,10 +789,15 @@ fn render_array(array: &Array) -> String {
 /// The quality that BAM and CRAM store per base for a record without qualities.
 const MISSING_QUALITY: u8 = 0xFF;
 
+/// The longest read name SAM and BAM allow.
+const MAX_NAME_LENGTH: usize = 254;
+
 trait AlignmentSink: AlignmentWrite {
     const NEEDS_U_STORED_AS_T: bool = false;
-    /// Adjust `record` so this writer stores it as BAM output does.
-    fn prepare(_record: &mut std::borrow::Cow<'_, RecordBuf>) {}
+    /// Adjust `record` so this writer stores it as BAM output does, or refuse what BAM refuses.
+    fn prepare(_record: &mut std::borrow::Cow<'_, RecordBuf>) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 impl<W: Write> AlignmentSink for sam::io::Writer<W> {}
@@ -804,13 +809,38 @@ impl<W: Write> AlignmentSink for bam::io::Writer<W> {
 
 /// The noodles CRAM writer flags every record as storing a quality per base, even one with none.
 impl<W: Write> AlignmentSink for cram::io::Writer<W> {
-    fn prepare(record: &mut std::borrow::Cow<'_, RecordBuf>) {
+    fn prepare(record: &mut std::borrow::Cow<'_, RecordBuf>) -> io::Result<()> {
+        check_name(record)?;
         // noodles ends a missing name with a second stop byte, which readers take as another name.
         if record.name().is_none() {
             *record.to_mut().name_mut() = Some("*".into());
         }
         fill_missing_qualities(record);
+        Ok(())
     }
+}
+
+/// Refuse a read name that BAM output refuses, with its error; noodles checks none for CRAM.
+fn check_name(record: &RecordBuf) -> io::Result<()> {
+    let Some(name) = record.name() else {
+        return Ok(());
+    };
+    let reason = if name.len() > MAX_NAME_LENGTH {
+        // The length noodles reports counts the NUL that ends a name in BAM.
+        let length = name.len() + 1;
+        format!("invalid length: expected 1 <= n <= {MAX_NAME_LENGTH}, got {length}")
+    } else if name.is_empty()
+        || name == "*"
+        || name.iter().any(|&b| !b.is_ascii_graphic() || b == b'@')
+    {
+        format!("invalid name: {name}")
+    } else {
+        return Ok(());
+    };
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!("invalid name: {reason}"),
+    ))
 }
 
 /// Write a fragment's records as SAM/BAM alignment records, setting
@@ -834,12 +864,11 @@ fn write_alignments<W: AlignmentSink>(
                 std::borrow::Cow::Owned(build_record(read, record_flags(read, index, reads.len())))
             }
         };
-        W::prepare(&mut record);
         if W::NEEDS_U_STORED_AS_T {
             store_u_as_t(&mut record);
         }
-        writer
-            .write_alignment_record(header, record.as_ref())
+        W::prepare(&mut record)
+            .and_then(|()| writer.write_alignment_record(header, record.as_ref()))
             .context("failed to write SAM/BAM/CRAM record")?;
     }
     Ok(())
