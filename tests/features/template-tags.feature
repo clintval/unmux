@@ -34,7 +34,7 @@ Feature: Input tags on --template records
     Given a file "in.sam" containing:
       """
       @HD	VN:1.6
-      r1	4	*	0	0	*	*	0	0	ACGTACGTCG	IIIIIIIIII	qs:f:20	ch:i:7	st:Z:2023-06-22T07:17:48.308+00:00	MN:i:10	MM:Z:C+m?,0,0;	ML:B:C,200,10	mv:B:c,5,1,0,1,1,0,1,1,0,1,1,0,1,1
+      r1	4	*	0	0	*	*	0	0	ACGTACGTCG	IIIIIIIIII	qs:f:20	ch:i:7	st:Z:2023-06-22T07:17:48.308+00:00	sm:f:96.5	pt:i:23	MN:i:10	MM:Z:C+m?,0,0;	ML:B:C,200,10	mv:B:c,5,1,0,1,1,0,1,1,0,1,1,0,1,1
       r2	4	*	0	0	*	*	0	0	TTGCATGCAA	IIIIIIIIII	np:i:12	rq:f:0.999	zm:i:42	fi:B:C,1,2,3,4,5,6,7,8,9,10	ip:B:C,1,2,3,4,5,6,7,8,9,10
       r3	4	*	0	0	*	*	0	0	GGATCCATGG	IIIIIIIIII	OQ:Z:ABCDEFGHIJ	RX:Z:GGGG	QX:Z:FFFF
       """
@@ -42,12 +42,26 @@ Feature: Input tags on --template records
     Then the exit code is 0
     And the records of "out.sam" are:
       """
-      r1	4	*	0	255	*	*	0	0	GTACGTCG	IIIIIIII	qs:f:20	ch:i:7	st:Z:2023-06-22T07:17:48.308+00:00	RG:Z:p
+      r1	4	*	0	255	*	*	0	0	GTACGTCG	IIIIIIII	qs:f:20	ch:i:7	st:Z:2023-06-22T07:17:48.308+00:00	sm:f:96.5	pt:i:23	RG:Z:p
       r2	4	*	0	255	*	*	0	0	GCATGCAA	IIIIIIII	np:i:12	rq:f:0.999	zm:i:42	RG:Z:p
       r3	4	*	0	255	*	*	0	0	ATCCATGG	IIIIIIII	RX:Z:GGGG	QX:Z:FFFF	RG:Z:p
       """
     And stderr contains "--template changed the bases of some records, so their per-base tags were left out: MM, ML, MN, OQ, ip, fi, mv"
     And stderr contains "per-base tags were left out" exactly once
+
+  Scenario: a trimming template leaves out PacBio pulse and pileup tags
+    Given a file "in.sam" containing:
+      """
+      @HD	VN:1.6
+      r1	4	*	0	0	*	*	0	0	ACGTACGTCG	IIIIIIIIII	zm:i:42	sa:B:I,10,3	sx:B:C,0,0,0,1,0,0,0,0,0,0	pc:Z:ACgGTACGTCG	pq:Z:IIIIIIIIIII	pg:Z:IIIIIIIIIII	pm:B:S,3,3,4,3,3,3,4,3,3,3,4	pd:B:S,8,5,5,8,8,5,5,8,8,5,5	px:B:S,2,2,4,5,2,2,4,5,2,2,4	pe:B:C,0,0,2,0,0,0,0,0,0,0,0	sf:B:I,10,15,23,28,30,35,40,45,50,55,60	bs:B:f,1.5,2.5,3.5,4.5	pb:B:I,11
+      """
+    When I run `unmux in.sam --pool p --extract body=0:2:end --template body --out out.sam`
+    Then the exit code is 0
+    And the records of "out.sam" are:
+      """
+      r1	4	*	0	255	*	*	0	0	GTACGTCG	IIIIIIII	zm:i:42	RG:Z:p
+      """
+    And stderr contains "per-base tags were left out: sa, sx, pc, pq, pg, pm, pd, px, pe, sf, bs, pb"
 
   Scenario Outline: a record keeps per-base tags only when it is its read unchanged
     Given a file "in.sam" containing:
