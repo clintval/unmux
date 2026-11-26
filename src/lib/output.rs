@@ -578,26 +578,26 @@ pub fn check_outputs_over_inputs(
     outputs: &[(PathBuf, OutputOrigin)],
     inputs: &[PathBuf],
 ) -> Result<()> {
-    let real_file = |path: &Path| {
-        let file = match std::fs::metadata(path) {
-            Ok(metadata) if !metadata.is_file() => return None,
-            Ok(metadata) => file_id(&metadata),
-            Err(_) => None,
-        };
-        Some((resolve(path, &mut 0), file))
-    };
     let files: Vec<_> = inputs
         .iter()
         .enumerate()
         .filter(|(_, path)| !matches!(path.to_str(), Some("-" | "/dev/stdin")))
-        .filter_map(|(index, path)| Some((index, real_file(path)?)))
+        .filter_map(|(index, path)| {
+            let metadata = std::fs::metadata(path)
+                .ok()
+                .filter(std::fs::Metadata::is_file)?;
+            Some((index, (resolve(path, &mut 0), file_id(&metadata))))
+        })
         .collect();
     if files.is_empty() {
         return Ok(());
     }
     for (path, origin) in outputs {
-        let Some((real, file)) = real_file(path) else {
-            continue;
+        let real = resolve(path, &mut 0);
+        let file = match std::fs::metadata(&real) {
+            Ok(metadata) if !metadata.is_file() => continue,
+            Ok(metadata) => file_id(&metadata),
+            Err(_) => None,
         };
         let Some((index, _)) = files
             .iter()
