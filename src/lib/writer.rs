@@ -807,7 +807,7 @@ impl<W: Write> AlignmentSink for bam::io::Writer<W> {
     const NEEDS_U_STORED_AS_T: bool = true;
 }
 
-/// The noodles CRAM writer flags every record as storing a quality per base, even one with none.
+/// Give noodles' CRAM writer only names BAM allows, `*` for a missing one, and a quality per base.
 impl<W: Write> AlignmentSink for cram::io::Writer<W> {
     fn prepare(record: &mut std::borrow::Cow<'_, RecordBuf>) -> io::Result<()> {
         check_name(record)?;
