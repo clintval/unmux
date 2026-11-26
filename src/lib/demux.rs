@@ -6116,7 +6116,10 @@ mod tests {
             let err = passes_alignments_through(&plan, true, &[OutputFormat::Bam])
                 .unwrap_err()
                 .to_string();
-            assert!(err.contains(&format!("`{tag}` would overwrite")), "{err}");
+            assert!(
+                err.contains(&format!("`{tag}` would overwrite an alignment tag")),
+                "{err}"
+            );
         }
     }
 

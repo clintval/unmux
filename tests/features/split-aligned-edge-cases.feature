@@ -234,7 +234,7 @@ Feature: Edge cases of an aligned read-group split
       """
     When I run `unmux in.sam --group rg=@RG --sample-from-group rg --extract head=0:0:4 --tag NM=head --out out/%sample.sam`
     Then the exit code is 1
-    And stderr contains "`NM` would overwrite"
+    And stderr contains "`NM` would overwrite an alignment tag of records kept whole"
 
   Scenario: a sequence-matching group is refused, so a secondary cannot be routed apart from its primary
     Given a file "in.sam" containing:
