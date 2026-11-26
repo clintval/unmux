@@ -5,9 +5,9 @@
 //! stdin via `--in 0=-` and the `.bam` extension selects BAM output; a bare
 //! `> r1.bam` redirect would not, since stdout mirrors the input format).
 //!
-//! Lifting is lenient and per-field: a field that is not a well-formed SAM tag
-//! (a bare UMI, a CASAVA string, free text) is skipped, while the valid tags in
-//! the same comment still lift.
+//! Lifting is per-field: a field that is not shaped like a SAM tag (a bare UMI,
+//! a CASAVA string, free text) is skipped, while the tags in the same comment
+//! still lift, each with the BAM type a SAM reader gives it.
 
 use assert_cmd::Command;
 use noodles::sam::alignment::record::data::field::Tag;

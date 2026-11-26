@@ -3,9 +3,13 @@ Feature: Lifting SAM tags from FASTX read-name comments
   convention that unmux itself writes on FASTX output). On input those tags are
   lifted back into real SAM tags, the inverse of that output, so a tag-bearing
   FASTQ converts to a uBAM/SAM with real tags and no extraction configured.
-  Lifting is lenient and per-field, matching `samtools import -T`: a field that
-  is not a well-formed `XX:T:VALUE` tag (a bare UMI, an Illumina CASAVA string,
-  free text) is skipped while the valid tags in the same comment still lift.
+  Every type unmux writes reads back: `A`, `f`, `Z`, `H`, `B` arrays of every
+  subtype, and `i` from -2147483648 to 4294967295 in the narrowest BAM type that
+  holds it. Lifting is per-field: a field that is not shaped like an
+  `XX:T:VALUE` tag (a bare UMI, an Illumina CASAVA string, free text) is skipped
+  while the tags in the same comment still lift, but a tag whose value its type
+  does not allow, or a BAM record cannot hold, stops the run with an error that
+  identifies the record and the tag.
 
   Scenario: a single SAM tag in a FASTQ comment becomes a real SAM tag
     Given a file "in.fq" containing:

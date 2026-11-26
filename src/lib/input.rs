@@ -38,6 +38,7 @@ use std::collections::HashMap;
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use noodles::sam::alignment::record::data::field::Tag;
 use noodles::sam::alignment::record::Flags;
+use noodles::sam::alignment::record_buf::data::field::value::Array;
 use noodles::sam::alignment::record_buf::data::field::Value;
 use noodles::sam::alignment::record_buf::Data;
 use noodles::sam::alignment::RecordBuf;
@@ -274,8 +275,8 @@ pub struct InputRecord {
     pub bases: Vec<u8>,
     /// The per-base qualities, when the format carries them.
     pub quals: Option<Vec<u8>>,
-    /// Carried SAM tags from an alignment input (`None` for FASTX), re-emitted
-    /// to the output record.
+    /// Carried SAM tags, from an alignment input or a FASTX read-name comment,
+    /// re-emitted to the output record.
     pub tags: Option<Data>,
     /// Whether the record failed quality control (flag `0x200`).
     pub qc_fail: bool,
@@ -828,11 +829,17 @@ impl FormatReader {
                     .trim_start()
                     .split_once([' ', '\t'])
                     .map_or("", |(_, rest)| rest);
+                let tags = parse_comment_tags(comment.as_bytes()).with_context(|| {
+                    format!(
+                        "malformed FASTA record `{}`",
+                        String::from_utf8_lossy(&name)
+                    )
+                })?;
                 let input = InputRecord {
                     name,
                     bases,
                     quals: None,
-                    tags: parse_comment_tags(comment.as_bytes()),
+                    tags,
                     qc_fail: false,
                     alignment: None,
                 };
@@ -949,8 +956,15 @@ fn read_fastq<R: BufRead>(
             String::from_utf8_lossy(&first_token(record.name()))
         );
     }
+    let name = first_token(record.name());
+    let tags = parse_comment_tags(record.description()).with_context(|| {
+        format!(
+            "malformed FASTQ record `{}`",
+            String::from_utf8_lossy(&name)
+        )
+    })?;
     Ok(Some(InputRecord {
-        name: first_token(record.name()),
+        name,
         bases: record.sequence().to_vec(),
         quals: Some(
             record
@@ -959,7 +973,7 @@ fn read_fastq<R: BufRead>(
                 .map(|&q| q.saturating_sub(PHRED_OFFSET))
                 .collect(),
         ),
-        tags: parse_comment_tags(record.description()),
+        tags,
         qc_fail: false,
         alignment: None,
     }))
@@ -987,46 +1001,88 @@ fn first_token(name: &[u8]) -> Vec<u8> {
         .to_vec()
 }
 
-/// Lift well-formed SAM auxiliary tags out of a FASTX read-name comment, the
-/// inverse of the writer's `render_tags`. Mirrors `samtools import -T`: the
-/// comment is split on tabs and each field that parses as a SAM aux field
-/// (`XX:T:VALUE`) is lifted, while a field that is not a well-formed tag (a bare
-/// UMI, an Illumina CASAVA string, free text) is skipped and the scan
-/// continues. Returns `None` when no tag is lifted, leaving the record tag-free.
-fn parse_comment_tags(comment: &[u8]) -> Option<Data> {
+/// Lift the SAM tags of a FASTX read-name comment, the inverse of the writer's
+/// `render_tags`. A tab-separated field not shaped like a tag (a bare UMI, an
+/// Illumina CASAVA string, free text) is skipped, and a tag whose value its type
+/// does not allow or a BAM record cannot hold is an error. Returns `None` when
+/// no tag is lifted.
+fn parse_comment_tags(comment: &[u8]) -> Result<Option<Data>> {
     let mut data = Data::default();
     for field in comment.split(|&b| b == b'\t') {
-        if let Some((tag, value)) = parse_aux_field(field) {
+        if let Some((tag, value)) = parse_aux_field(field)? {
             data.insert(tag, value);
         }
     }
-    (!data.is_empty()).then_some(data)
+    Ok((!data.is_empty()).then_some(data))
 }
 
-/// Parse one `XX:T:VALUE` SAM aux field, supporting the `A`, `i`, `f`, and `Z`
-/// types the writer emits. Returns `None` for any field that does not match the
-/// `<alpha><alphanum>:<type>:<value>` shape or whose value is invalid for its
-/// type, so a non-tag comment field is skipped rather than mangled. A `Z` value
-/// may contain spaces (only tabs separate fields, and the comment is already
-/// split on tabs).
-fn parse_aux_field(field: &[u8]) -> Option<(Tag, Value)> {
-    if field.len() < 5 || field[2] != b':' || field[4] != b':' {
-        return None;
-    }
-    let (b0, b1, ty) = (field[0], field[1], field[3]);
-    // SAM tag names are `[A-Za-z][A-Za-z0-9]`.
-    if !b0.is_ascii_alphabetic() || !b1.is_ascii_alphanumeric() {
-        return None;
-    }
-    let raw = &field[5..];
-    let value = match ty {
-        b'A' if raw.len() == 1 => Value::Character(raw[0]),
-        b'i' => Value::Int32(std::str::from_utf8(raw).ok()?.parse().ok()?),
-        b'f' => Value::Float(std::str::from_utf8(raw).ok()?.parse().ok()?),
-        b'Z' => Value::String(raw.to_vec().into()),
-        _ => return None,
+/// One comment field as a SAM tag of a type the writer emits, or `None` when it
+/// is not shaped `XX:T:VALUE`; an integer takes the narrowest BAM type that
+/// holds it and an array keeps its subtype.
+fn parse_aux_field(field: &[u8]) -> Result<Option<(Tag, Value)>> {
+    let &[name0, name1, b':', ty, b':', ref raw @ ..] = field else {
+        return Ok(None);
     };
-    Some((Tag::new(b0, b1), value))
+    if !name0.is_ascii_alphabetic() || !name1.is_ascii_alphanumeric() {
+        return Ok(None);
+    }
+    let value = match ty {
+        b'A' => match *raw {
+            [c] => Ok(Value::Character(c)),
+            _ => Err("one character"),
+        },
+        b'i' => parse_number(raw)
+            .and_then(|n: i64| Value::try_from(n).ok())
+            .ok_or("an integer from -2147483648 to 4294967295"),
+        b'f' => parse_number(raw).map(Value::Float).ok_or("a number"),
+        b'Z' => Ok(Value::String(raw.into())),
+        b'H' => is_hex(raw)
+            .then(|| Value::Hex(raw.into()))
+            .ok_or("an even number of uppercase hex digits"),
+        b'B' => parse_array(raw)
+            .map(Value::Array)
+            .ok_or("a c, C, s, S, i, I, or f array whose values fit that subtype"),
+        _ => return Ok(None),
+    };
+    match value {
+        Ok(value) => Ok(Some((Tag::new(name0, name1), value))),
+        Err(expected) => bail!(
+            "the comment tag `{}` must be {expected}",
+            String::from_utf8_lossy(&field[..4])
+        ),
+    }
+}
+
+/// The number that `raw` spells in full, or `None` if it is not a `T`.
+fn parse_number<T: std::str::FromStr>(raw: &[u8]) -> Option<T> {
+    std::str::from_utf8(raw).ok()?.parse().ok()
+}
+
+/// Whether `raw` is a SAM `H` value: pairs of uppercase hex digits.
+fn is_hex(raw: &[u8]) -> bool {
+    raw.len().is_multiple_of(2) && raw.iter().all(|b| matches!(b, b'0'..=b'9' | b'A'..=b'F'))
+}
+
+/// A SAM `B` value's array, or `None` unless every value fits its subtype.
+fn parse_array(raw: &[u8]) -> Option<Array> {
+    fn values<T: std::str::FromStr>(raw: &[u8]) -> Option<Vec<T>> {
+        match raw {
+            [] => Some(Vec::new()),
+            [b',', values @ ..] => values.split(|&b| b == b',').map(parse_number).collect(),
+            _ => None,
+        }
+    }
+    let (subtype, raw) = raw.split_first()?;
+    match subtype {
+        b'c' => values(raw).map(Array::Int8),
+        b'C' => values(raw).map(Array::UInt8),
+        b's' => values(raw).map(Array::Int16),
+        b'S' => values(raw).map(Array::UInt16),
+        b'i' => values(raw).map(Array::Int32),
+        b'I' => values(raw).map(Array::UInt32),
+        b'f' => values(raw).map(Array::Float),
+        _ => None,
+    }
 }
 
 /// SAM aux tags that describe an alignment to a reference (scores, edit
@@ -2303,7 +2359,9 @@ mod tests {
 
     #[test]
     fn parse_comment_tags_lifts_valid_sam_tags() {
-        let data = parse_comment_tags(b"RX:Z:ACGT\tBC:Z:GGGG").expect("valid tags lift");
+        let data = parse_comment_tags(b"RX:Z:ACGT\tBC:Z:GGGG")
+            .unwrap()
+            .expect("valid tags lift");
         assert_eq!(z_tag(&data, b"RX").as_deref(), Some(&b"ACGT"[..]));
         assert_eq!(z_tag(&data, b"BC").as_deref(), Some(&b"GGGG"[..]));
     }
@@ -2311,7 +2369,9 @@ mod tests {
     #[test]
     fn parse_comment_tags_lifts_integer_tag() {
         use noodles::sam::alignment::record_buf::data::field::Value;
-        let data = parse_comment_tags(b"xi:i:42").expect("integer tag lifts");
+        let data = parse_comment_tags(b"xi:i:42")
+            .unwrap()
+            .expect("integer tag lifts");
         assert!(matches!(data.get(b"xi"), Some(Value::UInt8(42))));
     }
 
@@ -2319,8 +2379,9 @@ mod tests {
     fn parse_comment_tags_skips_non_tag_fields_lenient() {
         // A bare-UMI / free-text field is silently skipped; the valid tag in the
         // same comment still lifts (the samtools-import lenient behavior).
-        let data =
-            parse_comment_tags(b"GATTACA\tRX:Z:ACGT").expect("the valid tag lifts past the junk");
+        let data = parse_comment_tags(b"GATTACA\tRX:Z:ACGT")
+            .unwrap()
+            .expect("the valid tag lifts past the junk");
         assert_eq!(z_tag(&data, b"RX").as_deref(), Some(&b"ACGT"[..]));
         assert!(data.get(b"GA").is_none(), "the junk field is not lifted");
     }
@@ -2329,16 +2390,19 @@ mod tests {
     fn parse_comment_tags_returns_none_for_non_tag_comments() {
         // A bare UMI, an Illumina CASAVA string, a malformed type code, and an
         // empty comment all yield no tags.
-        assert!(parse_comment_tags(b"ACGTACGT").is_none(), "bare UMI");
-        assert!(parse_comment_tags(b"1:N:0:ACGT").is_none(), "CASAVA");
-        assert!(parse_comment_tags(b"RX:?:ACGT").is_none(), "bad type code");
-        assert!(parse_comment_tags(b"").is_none(), "empty comment");
+        let lifted = |comment: &[u8]| parse_comment_tags(comment).unwrap();
+        assert!(lifted(b"ACGTACGT").is_none(), "bare UMI");
+        assert!(lifted(b"1:N:0:ACGT").is_none(), "CASAVA");
+        assert!(lifted(b"RX:?:ACGT").is_none(), "bad type code");
+        assert!(lifted(b"").is_none(), "empty comment");
     }
 
     #[test]
     fn parse_comment_tags_preserves_spaces_in_z_value() {
         // Only tabs separate fields, so a space inside a Z value is kept verbatim.
-        let data = parse_comment_tags(b"CO:Z:hello world").expect("Z tag lifts");
+        let data = parse_comment_tags(b"CO:Z:hello world")
+            .unwrap()
+            .expect("Z tag lifts");
         assert_eq!(z_tag(&data, b"CO").as_deref(), Some(&b"hello world"[..]));
     }
 
