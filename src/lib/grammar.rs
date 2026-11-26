@@ -378,6 +378,9 @@ pub struct TagBinding {
     /// The streams concatenated into the tag value, in order (each may carry a
     /// `~` reverse-complement).
     pub streams: Vec<StreamRef>,
+    /// For each of `streams`, the streams to use in its place, in order, when it
+    /// is absent (`a|b`); empty for a stream without a fallback.
+    pub fallbacks: Vec<Vec<StreamRef>>,
     /// The paired quality tag policy.
     pub qual: QualTag,
     /// `sep=`: the sequence separator joining two or more streams (defaults to
@@ -395,11 +398,22 @@ pub struct TagBinding {
 }
 
 impl TagBinding {
-    /// Whether any stream of this tag is one of the column streams `columns`.
+    /// Whether some part of this tag can only be filled by the column streams
+    /// `columns`, so the tag never has base qualities.
     fn has_column(&self, columns: &HashSet<&str>) -> bool {
         self.streams
             .iter()
-            .any(|stream| columns.contains(stream.name.as_str()))
+            .zip(&self.fallbacks)
+            .any(|(stream, fallbacks)| {
+                std::iter::once(stream)
+                    .chain(fallbacks)
+                    .all(|s| columns.contains(s.name.as_str()))
+            })
+    }
+
+    /// Every stream this tag may read, its fallbacks included.
+    pub fn all_streams(&self) -> impl Iterator<Item = &StreamRef> {
+        self.streams.iter().chain(self.fallbacks.iter().flatten())
     }
 }
 
@@ -1329,7 +1343,7 @@ fn parse_template(spec: &str) -> Result<Template> {
 /// Builder accumulating a tag's streams and attributes across repeated flags.
 struct TagBuilder {
     tag: String,
-    streams: Option<Vec<StreamRef>>,
+    streams: Option<Vec<Vec<StreamRef>>>,
     qual: Option<QualTag>,
     sep: Option<String>,
     qual_sep: Option<String>,
@@ -1366,16 +1380,21 @@ fn parse_tags(specs: &[String]) -> Result<Vec<TagBinding>> {
                         "tag `{tag}` joins streams with `+` (e.g. `{tag}=a+b+c`), not `,`. Got: {value:?}"
                     );
                 }
-                let streams: Vec<StreamRef> = value
+                let streams: Vec<Vec<StreamRef>> = value
                     .split('+')
                     .map(str::trim)
                     .filter(|s| !s.is_empty())
-                    .map(parse_stream_ref)
+                    .map(|part| {
+                        part.split('|')
+                            .map(str::trim)
+                            .map(parse_stream_ref)
+                            .collect()
+                    })
                     .collect();
                 if streams.is_empty() {
                     bail!("tag `{tag}` has no streams: {value:?}");
                 }
-                for stream in &streams {
+                for stream in streams.iter().flatten() {
                     validate_stream_name(&stream.name)?;
                 }
                 builder.streams = Some(streams);
@@ -1493,12 +1512,19 @@ pub(crate) fn column_tag_qualities(plan: &DemuxPlan) -> Vec<(&str, &'static str)
 
 /// Finalize a tag builder: require streams and enforce the separator rules.
 fn finish_tag(builder: TagBuilder) -> Result<TagBinding> {
-    let streams = builder.streams.with_context(|| {
+    let parts = builder.streams.with_context(|| {
         format!(
             "tag `{}` has attributes but no streams (a `{}=STREAMS` is required)",
             builder.tag, builder.tag
         )
     })?;
+    let (streams, fallbacks): (Vec<StreamRef>, Vec<Vec<StreamRef>>) = parts
+        .into_iter()
+        .map(|mut part| {
+            let first = part.remove(0);
+            (first, part)
+        })
+        .unzip();
     let qual = builder.qual.unwrap_or(QualTag::Default);
     let emits_qual = match &qual {
         QualTag::None | QualTag::Omitted => false,
@@ -1522,6 +1548,7 @@ fn finish_tag(builder: TagBuilder) -> Result<TagBinding> {
     Ok(TagBinding {
         tag: builder.tag,
         streams,
+        fallbacks,
         qual,
         sep,
         qual_sep,
@@ -2145,7 +2172,7 @@ fn validate_plan(plan: &DemuxPlan) -> Result<()> {
         }
     }
     for tag in &plan.tags {
-        for stream in &tag.streams {
+        for stream in tag.all_streams() {
             require_extract(&extract_names, &stream.name, &format!("tag `{}`", tag.tag))?;
             if !columns.contains(stream.name.as_str()) {
                 continue;
@@ -2366,7 +2393,7 @@ fn plan_warnings(plan: &DemuxPlan) -> Vec<String> {
         .templates
         .iter()
         .flat_map(|t| t.streams.iter())
-        .chain(plan.tags.iter().flat_map(|t| t.streams.iter()))
+        .chain(plan.tags.iter().flat_map(|t| t.all_streams()))
         .map(|s| s.name.as_str())
         .chain(
             plan.groups
@@ -2487,7 +2514,7 @@ impl<'a> Consumers<'a> {
             .templates
             .iter()
             .flat_map(|t| t.streams.iter())
-            .chain(plan.tags.iter().flat_map(|t| t.streams.iter()))
+            .chain(plan.tags.iter().flat_map(|t| t.all_streams()))
             .map(|s| s.name.as_str())
             .collect();
         let match_refs = plan
