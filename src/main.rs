@@ -306,7 +306,13 @@ struct DemuxCmd {
     /// (default: '`-`') and qualities with `qual-sep` (default: a space).
     /// Default `qual` tags pre-exist for: `CB`/`CY` `CR`/`CY` `RX`/`QX` `BC`/`QT` `OX`/`BZ`.
     ///
-    /// A stream may name others after '`|`' to use, in order, when it is
+    /// A tag that two writers would set is an error. The writers are each
+    /// binding, its `qual` tag (named or default), `--qc-tag`, and the `RG` read
+    /// group unmux writes; where a default `qual` tag clashes, set `qual=none`
+    /// or `qual=TAG`. When `CB` and `CR` both default to `CY`, `CY` holds the `CR`
+    /// qualities (the SAM spec pairs them) and `CB` writes none.
+    ///
+    /// A stream may list others after '`|`' to use, in order, when it is
     /// absent, and '`|`' binds tighter than '`+`'. A tag is written only when
     /// every stream in it, or one of its fallbacks, is present; otherwise the
     /// tag, its quality tag, and any input copies of them are left out.
