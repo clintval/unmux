@@ -8,10 +8,13 @@
 //! position; negatives count from the record end; `end` is the record length),
 //! the matched span of a group (`@grp`), a fixed length `offset` past a group's
 //! matched end (`@grp+offset:len`), or the region between two matched anchors
-//! (`@grpA..@grpB`). Extraction is orientation-neutral: reverse-complement is
-//! applied at the point of use (`--tag T=~stream` / `--template ~stream`), not
-//! here. Anchored spans that reference a group which did not match resolve to
-//! no stream (`None`), so the caller can route the record.
+//! (`@grpA..@grpB`). A span anchored on a reverse-strand match is measured in
+//! the matched tag's own orientation and reverse-complemented into it, with its
+//! qualities reversed, so a read and its reverse complement give the same
+//! stream; a `~` at the point of use (`--tag T=~stream` / `--template ~stream`)
+//! reverse-complements a stream again. Anchored spans that reference a group
+//! which did not match resolve to no stream (`None`), so the caller can route
+//! the record.
 
 use std::collections::HashMap;
 
@@ -19,13 +22,18 @@ use anyhow::Result;
 
 use crate::grammar::{AnchorLen, Span, SpanBody};
 
-/// Resolve an anchor group name to its match span, looking the group up by name
-/// in the canonical `name -> index` map and reading that slot of the positional
-/// hits. Returns `None` when the group is unknown, did not match, or is a
-/// `match=` group (which records a tag but anchors no span).
-fn anchor_span(group: &str, hits: &GroupHits, index: &HashMap<String, usize>) -> Option<MatchSpan> {
-    let idx = *index.get(group)?;
-    hits.get(idx)?.as_ref()?.span
+/// Resolve an anchor group name to its match span and whether that match is on
+/// the reverse strand, looking the group up by name in the canonical `name ->
+/// index` map and reading that slot of the positional hits. Returns `None` when
+/// the group is unknown, did not match, or is a `match=` group (which records a
+/// tag but anchors no span).
+fn anchor_span(
+    group: &str,
+    hits: &GroupHits,
+    index: &HashMap<String, usize>,
+) -> Option<(MatchSpan, bool)> {
+    let hit = hits.get(*index.get(group)?)?.as_ref()?;
+    Some((hit.span?, hit.revcomp))
 }
 
 /// A record's bases and (optional) per-base qualities for one input file. FASTA
@@ -78,10 +86,9 @@ pub struct GroupHit {
 pub type GroupHits = [Option<GroupHit>];
 
 /// The error-corrected form of a matched `@grp` stream: the canonical tag bases
-/// (reverse-complemented to match the span) with the observed qualities
-/// length-fitted. Carried alongside the observed bases so a SAM tag can emit
-/// the corrected sequence (the default) while the record body keeps what was
-/// sequenced.
+/// with the observed qualities length-fitted. Carried alongside the observed
+/// bases so a SAM tag can emit the corrected sequence (the default) while the
+/// record body keeps what was sequenced.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Corrected {
     /// The canonical (corrected) bases.
@@ -91,11 +98,12 @@ pub struct Corrected {
 }
 
 /// An extracted stream: the observed bases and (optional) qualities, both
-/// already trimmed (reverse-complement is applied at the point of use, not
-/// here), plus an optional error-corrected form. `bases`/`quals` are always the
-/// bytes as sequenced; `corrected` is populated only for a matched keeplist
-/// `@grp` self-span, and a `--tag`/`--template` consults it unless `raw=true`
-/// selects the observed bytes.
+/// already trimmed and, for a span measured from a reverse-strand match,
+/// reverse-complemented into the matched tag's orientation, plus an optional
+/// error-corrected form. `bases`/`quals` are always the bases as sequenced;
+/// `corrected` is populated only for a matched keeplist `@grp` self-span, and a
+/// `--tag`/`--template` consults it unless `raw=true` selects the observed
+/// bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Extracted {
     /// The observed (as-sequenced) bases.
@@ -150,9 +158,12 @@ pub fn extract(
     index: &HashMap<String, usize>,
 ) -> Result<Option<Extracted>> {
     let resolved = match resolve_range(&span.body, segments, hits, index)? {
-        SpanRange::Bounded { file, start, end } => {
-            Some(slice(segment_at(segments, file)?, start, end))
-        }
+        SpanRange::Bounded {
+            file,
+            start,
+            end,
+            reverse,
+        } => Some(slice(segment_at(segments, file)?, start, end, reverse)),
         // No region between the anchors: the stream is empty but present.
         SpanRange::EmptyPresent => Some(Extracted {
             bases: Vec::new(),
@@ -177,7 +188,9 @@ pub fn span_range(
     index: &HashMap<String, usize>,
 ) -> Result<Option<(usize, usize, usize)>> {
     Ok(match resolve_range(&span.body, segments, hits, index)? {
-        SpanRange::Bounded { file, start, end } => Some((file, start, end)),
+        SpanRange::Bounded {
+            file, start, end, ..
+        } => Some((file, start, end)),
         SpanRange::EmptyPresent | SpanRange::Absent => None,
     })
 }
@@ -194,6 +207,9 @@ enum SpanRange {
         start: usize,
         /// 0-based exclusive end offset.
         end: usize,
+        /// Whether the range is read reverse-complemented, in the orientation
+        /// of the reverse-strand match it is measured from.
+        reverse: bool,
     },
     /// The stream exists but is empty: a between-anchors span with an unmatched
     /// anchor, or whose anchors overlap, are out of order, or lie in different
@@ -222,13 +238,15 @@ fn resolve_range(
                 file: *file,
                 start,
                 end,
+                reverse: false,
             }
         }
         SpanBody::AnchorMatch { group } => match anchor_span(group, hits, index) {
-            Some(anchor) => SpanRange::Bounded {
+            Some((anchor, reverse)) => SpanRange::Bounded {
                 file: anchor.file,
                 start: anchor.start,
                 end: anchor.end,
+                reverse,
             },
             None => SpanRange::Absent,
         },
@@ -239,9 +257,10 @@ fn resolve_range(
             offset,
             len,
         } => match anchor_span(group, hits, index) {
-            Some(anchor) => {
+            Some((anchor, reverse)) => {
                 let total = segment_at(segments, anchor.file)?.bases.len();
-                let (start, end) = if *before {
+                // In a reverse-strand match's orientation, past it is toward the read start.
+                let (start, end) = if *before != reverse {
                     // Leftward: the span ends `offset` bases before the matched
                     // start and extends `len` bases back, saturating at the
                     // read start (0); `:end` reaches the start.
@@ -265,17 +284,30 @@ fn resolve_range(
                     file: anchor.file,
                     start,
                     end,
+                    reverse,
                 }
             }
             None => SpanRange::Absent,
         },
         SpanBody::Between { from, to } => {
             match (anchor_span(from, hits, index), anchor_span(to, hits, index)) {
-                (Some(a), Some(b)) if a.file == b.file && a.end <= b.start => SpanRange::Bounded {
-                    file: a.file,
-                    start: a.end,
-                    end: b.start,
-                },
+                (Some((a, false)), Some((b, _))) if a.file == b.file && a.end <= b.start => {
+                    SpanRange::Bounded {
+                        file: a.file,
+                        start: a.end,
+                        end: b.start,
+                        reverse: false,
+                    }
+                }
+                // In a reverse-strand `from`'s orientation, `to` follows toward the read start.
+                (Some((a, true)), Some((b, _))) if a.file == b.file && b.end <= a.start => {
+                    SpanRange::Bounded {
+                        file: a.file,
+                        start: b.end,
+                        end: a.start,
+                        reverse: true,
+                    }
+                }
                 _ => SpanRange::EmptyPresent,
             }
         }
@@ -289,10 +321,17 @@ fn segment_at<'a>(segments: &'a [Segment<'a>], file: usize) -> Result<Segment<'a
     })
 }
 
-/// Slice `[start, end)` of a segment, carrying qualities when present.
-fn slice(segment: Segment, start: usize, end: usize) -> Extracted {
-    let bases = segment.bases[start..end].to_vec();
-    let quals = segment.quals.map(|q| q[start..end].to_vec());
+/// Slice `[start, end)` of a segment, carrying qualities when present, and
+/// reverse-complement it (reversing the qualities) when `reverse` is set.
+fn slice(segment: Segment, start: usize, end: usize, reverse: bool) -> Extracted {
+    let mut bases = segment.bases[start..end].to_vec();
+    let mut quals = segment.quals.map(|q| q[start..end].to_vec());
+    if reverse {
+        crate::iupac::reverse_complement(&mut bases);
+        if let Some(quals) = quals.as_mut() {
+            quals.reverse();
+        }
+    }
     Extracted {
         bases,
         quals,

@@ -48,8 +48,8 @@ use crate::input::{
     PendingRecord, SniffedFormat,
 };
 use crate::matcher::{
-    match_verdict, window_after, CompiledGroup, GroupVerdict, MatchStrand, Prereq, RelativeWindow,
-    Scratch,
+    match_verdict, match_verdict_after, CompiledGroup, GroupVerdict, MatchStrand, Prereq,
+    RelativeWindow, Scratch,
 };
 use crate::metrics::Metrics;
 use crate::output::{
@@ -2797,7 +2797,7 @@ fn match_joined(
 /// Match one group, honoring its sequential prerequisite: a group with no
 /// prerequisite searches at its own `loc`; a downstream group whose upstream
 /// did not match is skipped (unmatched); a relative `next=GROUP:lo-hi` link
-/// windows the search relative to the upstream match end.
+/// windows the search past the upstream match, in that match's orientation.
 fn match_group_for(
     group: &CompiledGroup,
     scratch: &mut Scratch,
@@ -2823,12 +2823,11 @@ fn match_group_for(
     // otherwise the group searches at its own `loc`.
     match &prereq.window {
         Some(window) => {
-            let span = hits[window.upstream]
+            let (span, reverse) = hits[window.upstream]
                 .as_ref()
-                .and_then(|hit| hit.span)
+                .and_then(|hit| Some((hit.span?, hit.revcomp)))
                 .expect("a relative-window upstream is a matched non-match= group with a span");
-            let window = window_after(&span, window.lo, window.hi);
-            match_verdict(group, scratch, segments, Some(&window))
+            match_verdict_after(group, scratch, segments, &span, reverse, window)
         }
         None => match_verdict(group, scratch, segments, group.loc.as_ref()),
     }
@@ -2986,25 +2985,16 @@ fn prepared_raw_read(
     })
 }
 
-/// The canonical (corrected) tag sequence for a matched `@grp` self-span, plus
-/// whether this match landed on the reverse-complement strand, or `None` when
-/// the group did not match. Resolved lazily from the group's positional hit
-/// (its matched tag index and strand) against the engine's group slice (the
+/// The canonical (corrected) tag sequence for a matched `@grp` self-span, or
+/// `None` when the group did not match. Resolved lazily from the group's
+/// positional hit (its matched tag index) against the engine's group slice (the
 /// tag's canonical bases), so no per-record correction buffer is carried across
-/// the matcher boundary. The strand is the per-match outcome, not the group's
-/// `bothStrands` attribute: a `bothStrands=true` group also searches the
-/// forward strand, and a forward match must not have its observed quals
-/// reversed.
-fn canonical_correction<'a>(
-    engine: &'a Engine,
-    hits: &GroupHits,
-    group: &str,
-) -> Option<(&'a [u8], bool)> {
+/// the matcher boundary.
+fn canonical_correction<'a>(engine: &'a Engine, hits: &GroupHits, group: &str) -> Option<&'a [u8]> {
     let idx = *engine.group_index.get(group)?;
     let compiled = &engine.groups[idx];
     let hit = hits.get(idx)?.as_ref()?;
-    let canonical = compiled.tags.get(hit.tag_idx).map(Vec::as_slice)?;
-    Some((canonical, hit.revcomp))
+    compiled.tags.get(hit.tag_idx).map(Vec::as_slice)
 }
 
 /// The matched tag's value for a column stream, or `None` when its group did not
@@ -3056,12 +3046,12 @@ fn prepare_body(
             // corrected barcode while a `raw=true` one (or any stream with no
             // corrected form) emits the observed bases. Only the `@grp`
             // self-span is corrected (anchored-offset and between-anchor spans
-            // are unaffected). The corrected form is always the declared
-            // canonical (matching=only `bothStrands=true`); orientation is a
+            // are unaffected). The observed span is already in the tag's
+            // orientation, so both forms share it; the read strand is a
             // use-site choice (`--tag T=~stream` / `--template ~stream`).
             if let SpanBody::AnchorMatch { group } = &spec.span.body {
-                if let Some((canonical, antisense)) = canonical_correction(engine, hits, group) {
-                    extracted.corrected = Some(corrected_form(&extracted, canonical, antisense));
+                if let Some(canonical) = canonical_correction(engine, hits, group) {
+                    extracted.corrected = Some(corrected_form(&extracted, canonical));
                 }
             }
             streams.insert(spec.name.as_str(), extracted);
@@ -3424,23 +3414,18 @@ fn is_stale_quality(carried: &Data, tag_data: &Data, tag: &str, quality: &str) -
 }
 
 /// Build the corrected form of a matched `@grp` stream: always the declared
-/// canonical sequence, in the orientation the user supplied it (orientation is
-/// a use-site choice via `~`, not baked in here). Degenerate / IUPAC positions
-/// are emitted verbatim. The observed qualities are copied and resized to the
-/// corrected length; for an antisense match the observed quals are in
-/// read-strand order (the reverse complement of the declared orientation), so
-/// they are reversed to co-orient with the declared bases. Non-destructive: the
-/// observed bases/quals on `extracted` are left intact for the record body and
-/// for a `raw=true` tag/template.
-fn corrected_form(extracted: &Extracted, canonical: &[u8], antisense: bool) -> Corrected {
+/// canonical sequence, in the orientation the user supplied it (the read strand
+/// is a use-site choice via `~`, not baked in here). Degenerate / IUPAC
+/// positions are emitted verbatim. The observed qualities, already in the
+/// tag's orientation, are copied and resized to the corrected length.
+/// Non-destructive: the observed bases/quals on `extracted` are left intact for
+/// the record body and for a `raw=true` tag/template.
+fn corrected_form(extracted: &Extracted, canonical: &[u8]) -> Corrected {
     let bases = canonical.to_vec();
-    let quals = extracted.quals.as_ref().map(|quals| {
-        let mut quals = quals.clone();
-        if antisense {
-            quals.reverse();
-        }
-        fit_quals(quals, bases.len())
-    });
+    let quals = extracted
+        .quals
+        .as_ref()
+        .map(|quals| fit_quals(quals.clone(), bases.len()));
     Corrected { bases, quals }
 }
 

@@ -21,8 +21,8 @@
 //! The sequential orchestration (`next`/`prev`), `match=` over joined streams,
 //! `partial5`/`partial3` overhang, and the canonicalization (corrected-form)
 //! layer on top of this primitive: the engine runs groups in dependency order
-//! ([`CompiledGroup::prereq`]) and calls [`match_group_at`] with a per-record
-//! window when a relative `next` link locates a downstream group.
+//! ([`CompiledGroup::prereq`]) and calls [`match_verdict_after`] when a
+//! relative `next` link locates a downstream group past an upstream match.
 
 use std::borrow::Cow;
 use std::cell::LazyCell;
@@ -78,15 +78,16 @@ pub struct Prereq {
 }
 
 /// The relative search window a `next=GROUP:lo-hi` link gives its downstream
-/// group, anchored to the upstream group's match end.
+/// group, measured past the upstream group's match in that match's
+/// orientation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RelativeWindow {
-    /// The upstream group whose match end the window is measured from, by
+    /// The upstream group whose match the window is measured from, by
     /// canonical index.
     pub upstream: usize,
-    /// Bases past the upstream match end where the window starts.
+    /// Bases past the upstream match where the window starts.
     pub lo: usize,
-    /// Bases past the upstream match end where the window ends.
+    /// Bases past the upstream match where the window ends.
     pub hi: usize,
 }
 
@@ -120,6 +121,22 @@ pub struct TagMatch {
     pub indels: usize,
     /// The strand the tag matched on.
     pub strand: MatchStrand,
+}
+
+impl TagMatch {
+    /// This match as seen on the reverse complement of a text `len` bases long.
+    fn mirrored(self, len: usize) -> Self {
+        let strand = match self.strand {
+            MatchStrand::Forward => MatchStrand::ReverseComplement,
+            MatchStrand::ReverseComplement => MatchStrand::Forward,
+        };
+        Self {
+            start: len - self.end,
+            end: len - self.start,
+            strand,
+            ..self
+        }
+    }
 }
 
 /// A group compiled for matching: the tag sequences plus the attributes
@@ -381,9 +398,10 @@ impl CompiledGroup {
 }
 
 /// The downstream search window implied by a `next=GROUP:lo-hi` link, given the
-/// chosen upstream match span: `[matchEnd+lo, matchEnd+hi]` in the upstream
-/// match's file. Returns `None` when the link has no relative window (a bare
-/// `next=` leaves the downstream group searching at its own `loc`).
+/// chosen upstream match span on the forward strand: `[matchEnd+lo,
+/// matchEnd+hi]` in the upstream match's file. Returns `None` when the link has
+/// no relative window (a bare `next=` leaves the downstream group searching at
+/// its own `loc`). [`match_verdict_after`] also handles a reverse-strand match.
 pub fn next_window(upstream: &MatchSpan, link: &NextLink) -> Option<Location> {
     let (lo, hi) = link.window?;
     Some(window_after(upstream, lo, hi))
@@ -391,9 +409,9 @@ pub fn next_window(upstream: &MatchSpan, link: &NextLink) -> Option<Location> {
 
 /// The window `[upstream.end + lo, upstream.end + hi]` in the upstream match's
 /// file, the search slice a relative `next=GROUP:lo-hi` link gives its
-/// downstream group. Only the upstream's `file` and `end` are needed, so it
-/// takes a [`MatchSpan`] (the positional anchor) rather than a full
-/// [`TagMatch`].
+/// downstream group past a forward-strand match. Only the upstream's `file` and
+/// `end` are needed, so it takes a [`MatchSpan`] (the positional anchor) rather
+/// than a full [`TagMatch`].
 pub fn window_after(upstream: &MatchSpan, lo: usize, hi: usize) -> Location {
     Location {
         file: upstream.file,
@@ -629,6 +647,43 @@ pub fn match_verdict(
         cached.verdicts.insert(key, relative);
     }
     verdict
+}
+
+/// The verdict of a relative `next=GROUP:lo-hi` target: `group` searched
+/// `lo..hi` bases past `upstream` in the orientation of that match. Past a
+/// reverse-strand match the window lies before it in the read, and `group` is
+/// searched on the reverse complement there, so its strands are taken relative
+/// to the upstream tag and a read and its reverse complement give the same
+/// verdict.
+pub fn match_verdict_after(
+    group: &CompiledGroup,
+    scratch: &mut Scratch,
+    segments: &[&[u8]],
+    upstream: &MatchSpan,
+    reverse: bool,
+    window: &RelativeWindow,
+) -> GroupVerdict {
+    if !reverse {
+        let loc = window_after(upstream, window.lo, window.hi);
+        return match_verdict(group, scratch, segments, Some(&loc));
+    }
+    let before = &segments[upstream.file][..upstream.start];
+    // The search reads no further than `hi + key_reach` bases past the match.
+    let needed = window.hi.saturating_add(key_reach(group)).min(before.len());
+    let mut flipped = before[before.len() - needed..].to_vec();
+    crate::iupac::reverse_complement(&mut flipped);
+    let mut oriented: SmallVec<[&[u8]; 4]> = segments.iter().copied().collect();
+    oriented[upstream.file] = &flipped;
+    let loc = Location {
+        file: upstream.file,
+        start: Endpoint::FromStart(window.lo),
+        end: Some(Endpoint::FromStart(window.hi)),
+    };
+    let verdict = match_verdict(group, scratch, &oriented, Some(&loc));
+    GroupVerdict {
+        best: verdict.best.map(|best| best.mirrored(upstream.start)),
+        failure: verdict.failure,
+    }
 }
 
 /// The bases from a window start that the kernel reads whatever the window end.
@@ -2735,6 +2790,87 @@ mod tests {
             window: None,
         };
         assert!(next_window(&upstream, &link).is_none());
+    }
+
+    #[test]
+    fn test_a_window_past_a_reverse_strand_match_mirrors_the_reverse_complement() {
+        let mut rng = Rng(0xa11e);
+        let mut found = 0;
+        for trial in 0..2000 {
+            let len = 3 + rng.below(5);
+            let tags = (0..1 + rng.below(3)).map(|_| rng.bases(len)).collect();
+            let mut g = CompiledGroup::new("g", tags);
+            g.dist = [
+                substitutions(0),
+                substitutions(1),
+                Dist {
+                    mismatch: 0,
+                    indel: 1,
+                    total: 1,
+                },
+                Dist {
+                    mismatch: 1,
+                    indel: 1,
+                    total: 2,
+                },
+            ][trial % 4];
+            match rng.below(4) {
+                0 => g.anchor = Some(Anchor::FivePrime),
+                1 if g.dist.indel == 0 => g.anchor = Some(Anchor::ThreePrime),
+                2 => g.revcomp = true,
+                _ => {}
+            }
+            let mut planted = g.tags[rng.below(g.tags.len())].clone();
+            if rng.below(2) == 0 {
+                crate::iupac::reverse_complement(&mut planted);
+            }
+            let (left, right) = (rng.below(25), rng.below(25));
+            let read = [
+                rng.sample(left, b"ACGTN"),
+                planted,
+                rng.sample(right, b"ACGTN"),
+            ]
+            .concat();
+            let mut flipped = read.clone();
+            crate::iupac::reverse_complement(&mut flipped);
+            let start = rng.below(read.len() + 1);
+            let end = (start + rng.below(6)).min(read.len());
+            let lo = rng.below(12);
+            let window = RelativeWindow {
+                upstream: 0,
+                lo,
+                hi: lo + rng.below(16),
+            };
+            let upstream = MatchSpan {
+                file: 0,
+                start,
+                end,
+            };
+            let mirrored = MatchSpan {
+                file: 0,
+                start: read.len() - end,
+                end: read.len() - start,
+            };
+            let past_reverse =
+                match_verdict_after(&g, &mut Scratch::new(), &[&read], &upstream, true, &window);
+            let past_forward = match_verdict_after(
+                &g,
+                &mut Scratch::new(),
+                &[&flipped],
+                &mirrored,
+                false,
+                &window,
+            );
+            assert_eq!(past_reverse.failure, past_forward.failure, "{g:?}");
+            assert_eq!(
+                past_reverse.best,
+                past_forward.best.map(|best| best.mirrored(read.len())),
+                "{g:?} {} {upstream:?} {window:?}",
+                String::from_utf8_lossy(&read)
+            );
+            found += usize::from(past_reverse.best.is_some());
+        }
+        assert!(found > 200, "{found} trials matched");
     }
 
     #[test]
