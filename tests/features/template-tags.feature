@@ -69,6 +69,38 @@ Feature: Input tags on --template records
       | --extract r=0:0:end --template ~r                    | ACGT  | ch:i:7                           |
       | --extract a=0:0:2 --extract b=0:2:end --template b+a | GTAC  | ch:i:7                           |
 
+  Scenario: a template that rearranges a read into the same bases still leaves out its per-base tags
+    Given a file "in.sam" containing:
+      """
+      @HD	VN:1.6
+      r1	4	*	0	0	*	*	0	0	ACGACGACGACG	IIIIIIIIIIII	ch:i:7	OQ:Z:ABCDEFGHIJKL	MM:Z:C+m?,0;	ML:B:C,200
+      """
+    When I run `unmux in.sam --pool p --extract a=0:0:3 --extract b=0:3:end --template b+a --out out.sam`
+    Then the exit code is 0
+    And the records of "out.sam" are:
+      """
+      r1	4	*	0	255	*	*	0	0	ACGACGACGACG	IIIIIIIIIIII	ch:i:7	RG:Z:p
+      """
+    And stderr contains "per-base tags were left out: MM, ML, OQ"
+
+  Scenario Outline: per-base tags stay with the observed bases of a whole-read barcode, not its corrected form
+    Given a file "in.sam" containing:
+      """
+      @HD	VN:1.6
+      r1	4	*	0	0	*	*	0	0	ACGTACGT	IIIIIIII	ch:i:7	OQ:Z:ABCDEFGH
+      """
+    When I run `unmux in.sam --pool p --group bc={x=ACGTACGT} --extract bc=@bc --template <template> --out out.sam`
+    Then the exit code is 0
+    And the records of "out.sam" are:
+      """
+      r1	4	*	0	255	*	*	0	0	ACGTACGT	IIIIIIII	<tags>	RG:Z:p
+      """
+
+    Examples:
+      | template     | tags                  |
+      | bc           | ch:i:7                |
+      | bc::raw=true | ch:i:7	OQ:Z:ABCDEFGH |
+
   Scenario: each template record of a pair keeps the tags of its own read
     Given a file "in.sam" containing:
       """
@@ -125,8 +157,7 @@ Feature: Input tags on --template records
       r1	4	*	0	0	*	*	0	0	AAAACCCCGGGG	IIIIIIIIIIII	CB:Z:OLD	CY:Z:FFF	ch:i:7
       r2	4	*	0	0	*	*	0	0	TTTTCCCCGGGG	IIIIIIIIIIII	CB:Z:OLD	CY:Z:FFF	ch:i:8
       """
-    # @r1 gets CB from the tag ID and loses the carried CY, which described the old CB; @r2 misses
-    # bc, so its CB binding is left out along with the carried CB and CY.
+    # @r1 takes CB from the tag ID and drops its stale CY; @r2 misses bc, so its CB and CY go.
     When I run `unmux in.sam --pool p --group bc={x=AAAA} --group bc::loc=0:0:4 --extract cell=@bc::id --extract body=0:4:end --tag CB=cell --template body --out out.sam`
     Then the exit code is 0
     And the records of "out.sam" are:
