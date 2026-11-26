@@ -319,25 +319,45 @@ mod tests {
     }
 
     /// Build the positional hits plus the `name -> index` map for a set of
-    /// `(group, span)` anchors, assigning each named group a canonical index in
-    /// first-seen order.
+    /// forward-strand `(group, span)` anchors, assigning each named group a
+    /// canonical index in first-seen order.
     fn anchors(pairs: &[(&str, MatchSpan)]) -> (Vec<Option<GroupHit>>, HashMap<String, usize>) {
+        let pairs: Vec<_> = pairs
+            .iter()
+            .map(|&(name, span)| (name, span, false))
+            .collect();
+        stranded(&pairs)
+    }
+
+    /// The same as [`anchors`] for `(group, span, revcomp)` anchors on either strand.
+    fn stranded(
+        pairs: &[(&str, MatchSpan, bool)],
+    ) -> (Vec<Option<GroupHit>>, HashMap<String, usize>) {
         let mut index = HashMap::new();
         let mut hits: Vec<Option<GroupHit>> = Vec::new();
-        for (name, span) in pairs {
+        for &(name, span, revcomp) in pairs {
             let idx = *index.entry(name.to_string()).or_insert_with(|| {
                 hits.push(None);
                 hits.len() - 1
             });
             hits[idx] = Some(GroupHit {
                 tag_idx: 0,
-                span: Some(*span),
+                span: Some(span),
                 subs: 0,
                 indels: 0,
-                revcomp: false,
+                revcomp,
             });
         }
         (hits, index)
+    }
+
+    /// A span in input file 0.
+    fn at(start: usize, end: usize) -> MatchSpan {
+        MatchSpan {
+            file: 0,
+            start,
+            end,
+        }
     }
 
     #[test]
@@ -657,5 +677,116 @@ mod tests {
         let span = sp("@grp::cell");
         assert_eq!(extract(&span, &segments, &hits, &index).unwrap(), None);
         assert_eq!(span_range(&span, &segments, &hits, &index).unwrap(), None);
+    }
+
+    #[test]
+    fn test_extract_reverse_strand_match_is_in_the_tag_orientation() {
+        // The reverse-strand match over ACCG is CGGT in the tag's orientation.
+        let segments = segs(b"AACCGGTTAC", b"0123456789");
+        let (hits, index) = stranded(&[("grp", at(1, 5), true)]);
+        let got = extract(&sp("@grp"), &segments, &hits, &index)
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.bases, b"CGGT");
+        assert_eq!(got.quals.unwrap(), b"4321");
+    }
+
+    #[test]
+    fn test_extract_reverse_strand_offsets_step_in_the_tag_orientation() {
+        // Past the reverse-strand match [4,8) is toward the read start, and before
+        // it is toward the read end; both clamp at the read edge.
+        let segments = segs(b"AACCGGTTAC", b"0123456789");
+        let (hits, index) = stranded(&[("grp", at(4, 8), true)]);
+        for (value, bases, quals, range) in [
+            ("@grp+0:3", "GGT", "321", (1, 4)),
+            ("@grp+1:2", "GT", "21", (1, 3)),
+            ("@grp+2:9", "TT", "10", (0, 2)),
+            ("@grp+0:end", "GGTT", "3210", (0, 4)),
+            ("@grp-0:2", "GT", "98", (8, 10)),
+            ("@grp-1:5", "G", "9", (9, 10)),
+            ("@grp-0:end", "GT", "98", (8, 10)),
+            ("@grp-3:1", "", "", (10, 10)),
+        ] {
+            let span = sp(value);
+            let got = extract(&span, &segments, &hits, &index).unwrap().unwrap();
+            assert_eq!(got.bases, bases.as_bytes(), "{value}");
+            assert_eq!(got.quals.unwrap(), quals.as_bytes(), "{value}");
+            assert_eq!(
+                span_range(&span, &segments, &hits, &index).unwrap(),
+                Some((0, range.0, range.1)),
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_extract_between_is_in_the_orientation_of_the_first_anchor() {
+        // [2,7) is CCGGT forward and ACCGG in the orientation of a reverse-strand `a`.
+        let segments = segs(b"AACCGGTTAC", b"0123456789");
+        let span = sp("@a..@b");
+        for (a, a_reverse, b, b_reverse, bases, quals) in [
+            (at(0, 2), false, at(7, 9), false, "CCGGT", "23456"),
+            (at(0, 2), false, at(7, 9), true, "CCGGT", "23456"),
+            (at(7, 9), true, at(0, 2), true, "ACCGG", "65432"),
+            (at(7, 9), true, at(0, 2), false, "ACCGG", "65432"),
+            (at(0, 2), true, at(7, 9), true, "", ""),
+            (at(7, 9), false, at(0, 2), false, "", ""),
+        ] {
+            let (hits, index) = stranded(&[("a", a, a_reverse), ("b", b, b_reverse)]);
+            let got = extract(&span, &segments, &hits, &index).unwrap().unwrap();
+            let case = format!("a={a:?} {a_reverse} b={b:?} {b_reverse}");
+            assert_eq!(got.bases, bases.as_bytes(), "{case}");
+            assert_eq!(got.quals.unwrap(), quals.as_bytes(), "{case}");
+        }
+        let (hits, index) = stranded(&[("a", at(7, 9), true), ("b", at(0, 2), true)]);
+        assert_eq!(
+            span_range(&span, &segments, &hits, &index).unwrap(),
+            Some((0, 2, 7))
+        );
+    }
+
+    #[test]
+    fn test_reverse_strand_extracts_equal_forward_extracts_of_the_reverse_complement() {
+        let bases = b"AACGTTGCANCG";
+        let quals = b"0123456789:;";
+        let mut flipped_bases = bases.to_vec();
+        crate::iupac::reverse_complement(&mut flipped_bases);
+        let flipped_quals: Vec<u8> = quals.iter().rev().copied().collect();
+        let read = segs(bases, quals);
+        let flipped = segs(&flipped_bases, &flipped_quals);
+        let len = bases.len();
+        let check = |value: &str, pairs: &[(&str, MatchSpan, bool)]| {
+            let (hits, index) = stranded(pairs);
+            let mirrored: Vec<_> = pairs
+                .iter()
+                .map(|&(name, span, reverse)| {
+                    (name, at(len - span.end, len - span.start), !reverse)
+                })
+                .collect();
+            let (flipped_hits, flipped_index) = stranded(&mirrored);
+            let span = sp(value);
+            assert_eq!(
+                extract(&span, &read, &hits, &index).unwrap(),
+                extract(&span, &flipped, &flipped_hits, &flipped_index).unwrap(),
+                "{value} {pairs:?}"
+            );
+        };
+        let spans: Vec<MatchSpan> = (0..len)
+            .flat_map(|start| (start + 1..=len).map(move |end| at(start, end)))
+            .collect();
+        for &a in &spans {
+            for a_reverse in [false, true] {
+                for value in [
+                    "@a", "@a+0:3", "@a+2:4", "@a+1:end", "@a-0:3", "@a-2:4", "@a-1:end",
+                ] {
+                    check(value, &[("a", a, a_reverse)]);
+                }
+                for &b in &spans {
+                    for b_reverse in [false, true] {
+                        check("@a..@b", &[("a", a, a_reverse), ("b", b, b_reverse)]);
+                    }
+                }
+            }
+        }
     }
 }

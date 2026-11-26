@@ -4371,7 +4371,7 @@ mod tests {
         // `~` at the point of use reverse-complements that stream's
         // contribution there: `--tag CB=~bc` flips the corrected canonical, and
         // `--template ~bc::raw=true` flips the observed bases. The extract
-        // itself stays orientation-neutral.
+        // itself keeps the orientation of the match.
         let dir = tempfile::tempdir().unwrap();
         let input = write_file(dir.path(), "in.fq", b"@r\nAGCCTTTT\n+\nIIIIIIII\n");
         let out = dir.path().join("out.bam");
@@ -4399,8 +4399,8 @@ mod tests {
     #[test]
     fn test_both_strands_group_emits_declared_canonical() {
         // A `bothStrands=true` group matches antisense, but the corrected tag
-        // is always the declared canonical (bothStrands is matching-only); the
-        // raw CR still shows the observed read-strand bases.
+        // is always the declared canonical, and the raw CR is the observed
+        // bases in the same (the tag's) orientation.
         let dir = tempfile::tempdir().unwrap();
         // [10:16] = CACGAT; tag AACGTG matches its rc (CACGTT) at dist=1.
         let input = write_file(
@@ -4430,16 +4430,16 @@ mod tests {
         // CB: the declared canonical AACGTG, regardless of the antisense match
         // (use `~` for read strand).
         assert_eq!(string_tag(&record, *b"CB").as_deref(), Some("AACGTG"));
-        // CR (raw): the observed read bases CACGAT (a 1-mismatch instance of
-        // the rc, read strand).
-        assert_eq!(string_tag(&record, *b"CR").as_deref(), Some("CACGAT"));
+        // CR (raw): the observed read bases CACGAT reverse-complemented into
+        // the tag's orientation, one substitution from AACGTG.
+        assert_eq!(string_tag(&record, *b"CR").as_deref(), Some("ATCGTG"));
     }
 
     #[test]
     fn test_both_strands_corrected_quals_co_orient_with_declared() {
         // The corrected qualities must co-orient with the DECLARED canonical
-        // bases. For an antisense match the observed quals are in read-strand
-        // order (the rc of the declared orientation), so they are reversed.
+        // bases. For an antisense match the read's quals run opposite to the
+        // declared orientation, so they are reversed into it.
         // Distinct per-base quals make the orientation observable.
         let dir = tempfile::tempdir().unwrap();
         // [10:16] = CACGAT with quals raw 20..=25 (Phred+33 = "56789:"); tag
@@ -4502,6 +4502,116 @@ mod tests {
         // bug of using the group's `bothStrands` config instead of the match
         // strand.
         assert_eq!(string_tag(&record, *b"CY").as_deref(), Some("56789:"));
+    }
+
+    #[test]
+    fn test_a_read_and_its_reverse_complement_carry_identical_streams() {
+        struct Lcg(u64);
+        impl Lcg {
+            fn below(&mut self, n: usize) -> usize {
+                self.0 = self
+                    .0
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                (self.0 >> 33) as usize % n
+            }
+            fn bases(&mut self, n: usize) -> Vec<u8> {
+                (0..n).map(|_| b"ACGT"[self.below(4)]).collect()
+            }
+        }
+        let barcodes: [&[u8]; 4] = [b"ACGTTGCA", b"TTGCAACG", b"GATCCTAG", b"CCATGGTA"];
+        let mut rng = Lcg(0x5eed);
+        let mut fastq = Vec::new();
+        for i in 0..300 {
+            let mut barcode = barcodes[rng.below(4)].to_vec();
+            if rng.below(3) == 0 {
+                let at = rng.below(barcode.len());
+                barcode[at] = b"ACGT"[rng.below(4)];
+            }
+            let lengths = [rng.below(12), rng.below(4), rng.below(16), rng.below(12)];
+            let read = [
+                rng.bases(lengths[0]),
+                b"CTACACGACGCTCTTCCGATCT".to_vec(),
+                rng.bases(lengths[1]),
+                barcode,
+                rng.bases(10 + lengths[2]),
+                b"GGTACCTTAGCA".to_vec(),
+                rng.bases(lengths[3]),
+            ]
+            .concat();
+            let quals: Vec<u8> = (0..read.len())
+                .map(|_| b'#' + rng.below(40) as u8)
+                .collect();
+            let mut flipped = read.clone();
+            crate::iupac::reverse_complement(&mut flipped);
+            let flipped_quals: Vec<u8> = quals.iter().rev().copied().collect();
+            for (name, bases, quals) in [("f", &read, &quals), ("r", &flipped, &flipped_quals)] {
+                fastq.extend(format!("@{name}{i}\n").bytes());
+                fastq.extend(
+                    bases
+                        .iter()
+                        .chain(b"\n+\n")
+                        .chain(quals.iter())
+                        .chain(b"\n"),
+                );
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let input = write_file(dir.path(), "in.fq", &fastq);
+        let out = dir.path().join("out.sam");
+        let mut args = base_args();
+        args.inputs = vec![format!("0={}", input.display())];
+        args.groups = vec![
+            "ad={CTACACGACGCTCTTCCGATCT}".to_string(),
+            "ad::bothStrands=true,next=bc:0-12".to_string(),
+            "bc={a=ACGTTGCA,b=TTGCAACG,c=GATCCTAG,d=CCATGGTA}".to_string(),
+            "bc::dist=1".to_string(),
+            "tr={GGTACCTTAGCA}".to_string(),
+            "tr::bothStrands=true".to_string(),
+        ];
+        args.extracts = vec![
+            "cb=@bc".to_string(),
+            "umi=@bc+0:10".to_string(),
+            "up=@ad-0:6".to_string(),
+            "gap=@ad..@bc".to_string(),
+            "ins=@bc..@tr".to_string(),
+            "tail=@tr+0:end".to_string(),
+        ];
+        args.tags = [
+            "CB=cb",
+            "CR=cb",
+            "CR::raw=true",
+            "CR::qual=XC",
+            "RX=umi",
+            "XU=up",
+            "XU::qual=XV",
+            "XG=gap",
+            "XG::qual=XH",
+            "XI=ins",
+            "XI::qual=XJ",
+            "XT=tail",
+            "XT::qual=XW",
+        ]
+        .map(String::from)
+        .to_vec();
+        args.out = Some(out.display().to_string());
+        run_demux(args).unwrap();
+
+        let text = std::fs::read_to_string(&out).unwrap();
+        let records: Vec<Vec<&str>> = text
+            .lines()
+            .filter(|line| !line.starts_with('@'))
+            .map(|line| line.split('\t').skip(11).collect())
+            .collect();
+        assert_eq!(records.len(), 600);
+        for pair in records.chunks(2) {
+            assert_eq!(pair[0], pair[1]);
+        }
+        let barcoded = records
+            .iter()
+            .filter(|tags| tags.iter().any(|tag| tag.starts_with("CB:Z:")))
+            .count();
+        assert!(barcoded > 500, "{barcoded} of 600 records carry a CB");
     }
 
     #[test]

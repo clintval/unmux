@@ -522,7 +522,7 @@ const CELLS: &str = "--group b1={in}/bc.tsv --group b1::loc=0:0:13 --group b1::d
     --sample-from-group b1 --out %sample.fq.gz --unassigned un.%source.fq --qc-tag {METRICS}"
 )]
 #[case::anywhere_on_both_strands(
-    "68e6105173cce5f702ded6266dafd2bb",
+    "38e250fe91c23bacfa95b118126a3be7",
     "{in}/any.fq \
     --group bc={in}/bc.tsv --group bc::dist=1 --group bc::bothStrands=true \
     --group bc::mode=nearest --extract s=@bc --extract r=0:0:end --extract l=@bc-0:9 --template r \
