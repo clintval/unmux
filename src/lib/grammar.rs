@@ -4271,10 +4271,10 @@ mod tests {
                  another tag for one of them"
             )
         };
-        let read_group = |first: &str| {
+        let read_group = |flag: &str| {
             format!(
-                "tag `RG` would be written twice, by `{first}` and by unmux as the read group of \
-                 each SAM/BAM/CRAM record; choose another tag"
+                "tag `RG` is reserved for the read group, which unmux sets itself on SAM/BAM/CRAM \
+                 output; choose another tag for `{flag}`"
             )
         };
         for (tags, qc_tag, message) in [
@@ -4303,7 +4303,18 @@ mod tests {
                 Some("ZS"),
                 refusal("ZS", "--tag RX::qual=ZS", "--qc-tag=ZS"),
             ),
+            (
+                &["XA=v|u", "XA::qual=XA"],
+                None,
+                refusal("XA", "--tag XA=v|u", "--tag XA::qual=XA"),
+            ),
+            (
+                &["XA=~v|u+u", "XB=v", "XB::qual=XA"],
+                None,
+                refusal("XA", "--tag XA=~v|u+u", "--tag XB::qual=XA"),
+            ),
             (&["RG=u"], None, read_group("--tag RG=u")),
+            (&["RG=cell|u"], None, read_group("--tag RG=cell|u")),
             (
                 &["XA=~u", "XA::qual=RG"],
                 None,
@@ -4331,6 +4342,10 @@ mod tests {
             (
                 &["CY=u", "CB=v"][..],
                 refusal("CY", by("CY=u"), default_of("CB=v"), "CB"),
+            ),
+            (
+                &["CY=u", "CB=cell|v"],
+                refusal("CY", by("CY=u"), default_of("CB=cell|v"), "CB"),
             ),
             (
                 &["CB=v", "CY=u"],

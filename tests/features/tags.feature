@@ -196,11 +196,37 @@ Feature: SAM tag emission with quality tag pairing and separators
       | --tag XA=u --tag XA::qual=XA            | tag `XA` would be written twice, by `--tag XA=u` and by `--tag XA::qual=XA`; choose another tag for one of them        |
       | --tag XA=u --tag XB=v --tag XB::qual=XA | tag `XA` would be written twice, by `--tag XA=u` and by `--tag XB::qual=XA`; choose another tag for one of them        |
       | --tag RX=u --tag RX::qual=ZS --qc-tag   | tag `ZS` would be written twice, by `--tag RX::qual=ZS` and by `--qc-tag=ZS`; choose another tag for one of them       |
-      | --tag RG=u                              | tag `RG` would be written twice, by `--tag RG=u` and by unmux as the read group of each SAM/BAM/CRAM record             |
-      | --tag XA=u --tag XA::qual=RG            | tag `RG` would be written twice, by `--tag XA::qual=RG` and by unmux as the read group of each SAM/BAM/CRAM record     |
+      | --tag RG=u                              | tag `RG` is reserved for the read group, which unmux sets itself on SAM/BAM/CRAM output; choose another tag for `--tag RG=u` |
+      | --tag XA=u --tag XA::qual=RG            | tag `RG` is reserved for the read group, which unmux sets itself on SAM/BAM/CRAM output; choose another tag for `--tag XA::qual=RG` |
       | --tag CY=u --tag CB=v                   | tag `CY` would be written twice, by `--tag CY=u` and as the default quality tag of `--tag CB=v`; set `CB::qual=none`   |
       | --tag CB=u --tag CB::qual=CY --tag CR=v | tag `CY` would be written twice, by `--tag CB::qual=CY` and as the default quality tag of `--tag CR=v`; set `CR::qual=none` |
       | --tag CB=u --tag CR=v --tag CY=u        | tag `CY` would be written twice, as the default quality tag of `--tag CB=u` and by `--tag CY=u`; set `CB::qual=none`   |
+
+  Scenario: a clash error gives a tag's streams with their fallbacks
+    Given a file "test.fq" containing:
+      """
+      @r1
+      AAAACCCCGGGG
+      +
+      IIII5555????
+      """
+    When I run `unmux test.fq --extract u=0:0:4 --extract v=0:4:8 --tag XA=v|u --tag XB=u --tag XB::qual=XA --out out.sam`
+    Then the exit code is 1
+    And stderr contains "tag `XA` would be written twice, by `--tag XA=v|u` and by `--tag XB::qual=XA`; choose another tag for one of them"
+    And a file "out.sam" does not exist
+
+  Scenario: RG is reserved even when every output is FASTX
+    Given a file "test.fq" containing:
+      """
+      @r1
+      AAAACCCCGGGG
+      +
+      IIII5555????
+      """
+    When I run `unmux test.fq --extract u=0:0:4 --tag RG=u --out out.fq`
+    Then the exit code is 1
+    And stderr contains "tag `RG` is reserved for the read group, which unmux sets itself on SAM/BAM/CRAM output; choose another tag for `--tag RG=u`"
+    And a file "out.fq" does not exist
 
   Scenario Outline: CY holds the CR qualities when CB and CR both default to it, in either order
     Given a file "test.fq" containing:
