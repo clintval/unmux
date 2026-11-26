@@ -365,7 +365,7 @@ pub enum QualTag {
     Omitted,
     /// `qual=QTAG`: an explicit quality tag.
     Named(String),
-    /// `qual=none`: drop the quality tag.
+    /// No quality tag: `qual=none`, or a `CB` that leaves `CY` to `CR`.
     None,
 }
 
@@ -691,6 +691,8 @@ pub fn parse_demux(args: &DemuxArgs) -> Result<DemuxPlan> {
             tag.qual = QualTag::Omitted;
         }
     }
+    leave_cy_to_cr(&mut plan.tags);
+    validate_tag_writers(&plan)?;
     for warning in plan_warnings(&plan) {
         log::warn!("{warning}");
     }
@@ -1504,10 +1506,8 @@ fn parse_separator(value: &str, tag: &str, attr: &str) -> Result<String> {
 /// default.
 pub(crate) fn default_qual_tag(tag: &str) -> Option<&'static str> {
     match tag {
+        // The SAM spec pairs CY with CR; CB borrows it by convention.
         "CB" => Some("CY"),
-        // CR is the raw cellular barcode; its quality has no dedicated SAM tag,
-        // so it shares CY (the cell-barcode quality) by convention, letting
-        // `--tag CR=bc::raw=true` pair a quality with no explicit `qual=`.
         "CR" => Some("CY"),
         "RX" => Some("QX"),
         "BC" => Some("QT"),
@@ -2273,6 +2273,96 @@ fn validate_plan(plan: &DemuxPlan) -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+/// Leave a default `CY` that `CB` and `CR` would both write to `CR`, its pair in the SAM spec.
+fn leave_cy_to_cr(tags: &mut [TagBinding]) {
+    let defaults = |name: &str| {
+        tags.iter()
+            .any(|tag| tag.tag == name && tag.qual == QualTag::Default)
+    };
+    if defaults("CB") && defaults("CR") {
+        if let Some(cb) = tags.iter_mut().find(|tag| tag.tag == "CB") {
+            cb.qual = QualTag::None;
+        }
+    }
+}
+
+/// A source of one SAM tag on an output record.
+#[derive(Clone, Copy)]
+enum TagWriter<'a> {
+    /// The sequence of a `--tag` binding.
+    Sequence(&'a TagBinding),
+    /// The `qual=` tag of a `--tag` binding.
+    Quality(&'a TagBinding),
+    /// The default quality tag of a `--tag` binding.
+    DefaultQuality(&'a TagBinding),
+    /// The `--qc-tag` slug.
+    Qc,
+    /// The read group unmux writes on SAM/BAM/CRAM records.
+    ReadGroup,
+}
+
+impl TagWriter<'_> {
+    /// How an error refers to this writer of `tag`.
+    fn describe(self, tag: &str) -> String {
+        let spec = |binding: &TagBinding| {
+            format!(
+                "`--tag {}={}`",
+                binding.tag,
+                join_streams(&binding.streams, "+")
+            )
+        };
+        match self {
+            TagWriter::Sequence(binding) => format!("by {}", spec(binding)),
+            TagWriter::Quality(binding) => format!("by `--tag {}::qual={tag}`", binding.tag),
+            TagWriter::DefaultQuality(binding) => {
+                format!("as the default quality tag of {}", spec(binding))
+            }
+            TagWriter::Qc => format!("by `--qc-tag={tag}`"),
+            TagWriter::ReadGroup => {
+                "by unmux as the read group of each SAM/BAM/CRAM record".to_string()
+            }
+        }
+    }
+}
+
+/// Refuse a SAM tag that two writers would set, since one would replace the other.
+fn validate_tag_writers(plan: &DemuxPlan) -> Result<()> {
+    let mut writers: Vec<(&str, TagWriter)> = Vec::new();
+    for binding in &plan.tags {
+        writers.push((&binding.tag, TagWriter::Sequence(binding)));
+        match &binding.qual {
+            QualTag::Named(qual) => writers.push((qual, TagWriter::Quality(binding))),
+            QualTag::Default => writers.extend(
+                default_qual_tag(&binding.tag)
+                    .map(|qual| (qual, TagWriter::DefaultQuality(binding))),
+            ),
+            QualTag::None | QualTag::Omitted => {}
+        }
+    }
+    writers.extend(plan.qc_tag.as_deref().map(|tag| (tag, TagWriter::Qc)));
+    writers.push(("RG", TagWriter::ReadGroup));
+    for (index, &(tag, second)) in writers.iter().enumerate() {
+        let Some(&(_, first)) = writers[..index].iter().find(|(seen, _)| *seen == tag) else {
+            continue;
+        };
+        let hint = match (first, second) {
+            (TagWriter::DefaultQuality(binding), _) | (_, TagWriter::DefaultQuality(binding)) => {
+                format!("set `{0}::qual=none` or `{0}::qual=<TAG>`", binding.tag)
+            }
+            (TagWriter::ReadGroup, _) | (_, TagWriter::ReadGroup) => {
+                "choose another tag".to_string()
+            }
+            _ => "choose another tag for one of them".to_string(),
+        };
+        bail!(
+            "tag `{tag}` would be written twice, {} and {}; {hint}",
+            first.describe(tag),
+            second.describe(tag)
+        );
+    }
     Ok(())
 }
 
