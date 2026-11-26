@@ -807,24 +807,39 @@ fn log_blank_sample_column(
     values: &[Option<String>],
 ) {
     let blank = values.iter().filter(|value| value.is_none()).count();
-    let tags: Vec<&str> = plan
+    let (fallen_back, left_out): (Vec<&TagBinding>, Vec<&TagBinding>) = plan
         .tags
         .iter()
         .filter(|tag| tag.all_streams().any(|s| s.name == stream))
-        .map(|tag| tag.tag.as_str())
-        .collect();
-    if blank == 0 || tags.is_empty() {
+        .partition(|tag| tag.falls_back_from(stream));
+    if blank == 0 || (fallen_back.is_empty() && left_out.is_empty()) {
         return;
     }
+    let names = |tags: &[&TagBinding]| {
+        tags.iter()
+            .map(|tag| tag.tag.as_str())
+            .collect::<Vec<_>>()
+            .join(" or ")
+    };
     let rows = match &plan.samples {
         SampleSpec::Sheet(..) => "sheet rows".to_string(),
         SampleSpec::FromGroup(group) => format!("tags of group `{group}`"),
         _ => "samples".to_string(),
     };
+    let mut outcomes = Vec::new();
+    if !left_out.is_empty() {
+        outcomes.push(format!("get no {} tag", names(&left_out)));
+    }
+    if !fallen_back.is_empty() {
+        outcomes.push(format!(
+            "fall back to the next stream for {}",
+            names(&fallen_back)
+        ));
+    }
     log::info!(
-        "column {column:?} is blank in {blank} of {} {rows}; records they route get no {} tag",
+        "column {column:?} is blank in {blank} of {} {rows}; records they route {}",
         values.len(),
-        tags.join(" or ")
+        outcomes.join(" and ")
     );
 }
 
