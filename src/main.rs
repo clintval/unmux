@@ -174,9 +174,12 @@ struct DemuxCmd {
     /// `%sample`, `%sub_sample`, and `%ordinal`. Outputs that would be one
     /// file are refused: paths differing only in case (one file on a
     /// case-insensitive file system), two spellings of one file, a metrics
-    /// file on another output's path, or an output that is a file the run
-    /// reads under any name (an input, a tag file, the sample sheet, or the
-    /// reference and its indexes).
+    /// file on another output's path, an `--unassigned` or `--remove` path
+    /// equal to an `--out` path only once placeholders expand, or an output
+    /// that is a file the run reads under any name (an input, a tag file,
+    /// the sample sheet, or the reference and its indexes). Pass the `--out`
+    /// pattern itself to `--unassigned` or `--remove` to keep those records
+    /// in the `--out` file.
     ///
     ///   --out out.bam                   one file with all assigned records
     ///   --out %sample.bam               one file per sample
