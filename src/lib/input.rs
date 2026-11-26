@@ -1032,14 +1032,20 @@ fn parse_aux_field(field: &[u8]) -> Result<Option<(Tag, Value)>> {
     }
     let value = match ty {
         b'A' => match *raw {
-            [c] => Ok(Value::Character(c)),
-            _ => Err("one character"),
+            [c] if c.is_ascii_graphic() => Ok(Value::Character(c)),
+            _ => Err("one character from ! to ~"),
         },
         b'i' => parse_number(raw)
             .and_then(|n: i64| Value::try_from(n).ok())
             .ok_or("an integer from -2147483648 to 4294967295"),
-        b'f' => parse_number(raw).map(Value::Float).ok_or("a number"),
-        b'Z' => Ok(Value::String(raw.into())),
+        b'f' => parse_float(raw)
+            .map(Value::Float)
+            .ok_or("a finite number such as 1.5 or 2e-3"),
+        b'Z' => raw
+            .iter()
+            .all(|b| matches!(b, b' '..=b'~'))
+            .then(|| Value::String(raw.into()))
+            .ok_or("printable ASCII"),
         b'H' => is_hex(raw)
             .then(|| Value::Hex(raw.into()))
             .ok_or("an even number of uppercase hex digits"),
@@ -1062,6 +1068,30 @@ fn parse_number<T: std::str::FromStr>(raw: &[u8]) -> Option<T> {
     std::str::from_utf8(raw).ok()?.parse().ok()
 }
 
+/// A finite float in the SAM grammar `[-+]?[0-9]*\.?[0-9]+([eE][-+]?[0-9]+)?`.
+fn parse_float(raw: &[u8]) -> Option<f32> {
+    fn unsigned(raw: &[u8]) -> &[u8] {
+        raw.strip_prefix(b"-")
+            .or(raw.strip_prefix(b"+"))
+            .unwrap_or(raw)
+    }
+    fn digits(raw: &[u8]) -> bool {
+        !raw.is_empty() && raw.iter().all(u8::is_ascii_digit)
+    }
+    let (mantissa, exponent) = match raw.iter().position(|b| matches!(b, b'e' | b'E')) {
+        Some(at) => (unsigned(&raw[..at]), Some(unsigned(&raw[at + 1..]))),
+        None => (unsigned(raw), None),
+    };
+    let (whole, fraction) = match mantissa.iter().position(|&b| b == b'.') {
+        Some(dot) => (&mantissa[..dot], &mantissa[dot + 1..]),
+        None => (&[][..], mantissa),
+    };
+    if !whole.iter().all(u8::is_ascii_digit) || !digits(fraction) || !exponent.is_none_or(digits) {
+        return None;
+    }
+    parse_number::<f32>(raw).filter(|float| float.is_finite())
+}
+
 /// Whether `raw` is a SAM `H` value: pairs of uppercase hex digits.
 fn is_hex(raw: &[u8]) -> bool {
     raw.len().is_multiple_of(2) && raw.iter().all(|b| matches!(b, b'0'..=b'9' | b'A'..=b'F'))
@@ -1069,22 +1099,22 @@ fn is_hex(raw: &[u8]) -> bool {
 
 /// A SAM `B` value's array, or `None` unless every value fits its subtype.
 fn parse_array(raw: &[u8]) -> Option<Array> {
-    fn values<T: std::str::FromStr>(raw: &[u8]) -> Option<Vec<T>> {
+    fn values<T>(raw: &[u8], parse: fn(&[u8]) -> Option<T>) -> Option<Vec<T>> {
         match raw {
             [] => Some(Vec::new()),
-            [b',', values @ ..] => values.split(|&b| b == b',').map(parse_number).collect(),
+            [b',', values @ ..] => values.split(|&b| b == b',').map(parse).collect(),
             _ => None,
         }
     }
     let (subtype, raw) = raw.split_first()?;
     match subtype {
-        b'c' => values(raw).map(Array::Int8),
-        b'C' => values(raw).map(Array::UInt8),
-        b's' => values(raw).map(Array::Int16),
-        b'S' => values(raw).map(Array::UInt16),
-        b'i' => values(raw).map(Array::Int32),
-        b'I' => values(raw).map(Array::UInt32),
-        b'f' => values(raw).map(Array::Float),
+        b'c' => values(raw, parse_number).map(Array::Int8),
+        b'C' => values(raw, parse_number).map(Array::UInt8),
+        b's' => values(raw, parse_number).map(Array::Int16),
+        b'S' => values(raw, parse_number).map(Array::UInt16),
+        b'i' => values(raw, parse_number).map(Array::Int32),
+        b'I' => values(raw, parse_number).map(Array::UInt32),
+        b'f' => values(raw, parse_float).map(Array::Float),
         _ => None,
     }
 }
