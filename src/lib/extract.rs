@@ -734,8 +734,7 @@ mod tests {
 
     #[test]
     fn test_extract_reverse_strand_offsets_step_in_the_tag_orientation() {
-        // Past the reverse-strand match [4,8) is toward the read start, and before
-        // it is toward the read end; both clamp at the read edge.
+        // From a reverse-strand match, `+` steps toward the read start and `-` toward its end.
         let segments = segs(b"AACCGGTTAC", b"0123456789");
         let (hits, index) = stranded(&[("grp", at(4, 8), true)]);
         for (value, bases, quals, range) in [
