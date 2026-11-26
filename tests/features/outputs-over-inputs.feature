@@ -2,8 +2,10 @@ Feature: An output on an input's path is refused
   Every output is written beside its destination and moved into place when the run ends, so an
   output that is one of the input files would replace that input, and the reads it held would be
   lost with a zero exit. unmux refuses such runs before any output is created, whatever the output
-  option and however its path is spelled. Standard input, standard output and /dev/null are not
-  files on a path, so they are exempt, while a metrics path is always a file, even one spelled -.
+  option and however its path is spelled. The same holds for every other file the run reads: the
+  tag files, the sample sheet, and the reference with its index. Standard input from a pipe,
+  standard output and /dev/null are not files on a path, so they are exempt, while a metrics path
+  is always a file, even one spelled -.
 
   Background:
     Given a file "in.fq" containing:
@@ -193,6 +195,59 @@ Feature: An output on an input's path is refused
       @HD	VN:1.6
       a	4	*	0	0	*	*	0	0	ACGTACGT	IIIIIIII
       """
+
+  Scenario Outline: an output from <option> on a tag file is refused
+    Given a file "bc.tsv" containing:
+      """
+      id	seq
+      a	AAAAAAAA
+      """
+    When I run `unmux in.fq --group bc=bc.tsv --sample-from-group bc --out x.fq <option> bc.tsv`
+    Then the exit code is 1
+    And stderr contains "output "bc.tsv" (<option>) is the tag file of group bc (bc.tsv); give it a distinct path"
+    And the file "bc.tsv" is:
+      """
+      id	seq
+      a	AAAAAAAA
+      """
+    And a file "x.fq" does not exist
+
+    Examples:
+      | option            |
+      | --metrics-summary |
+      | --unassigned      |
+
+  Scenario: a metrics file on the sample sheet is refused
+    Given a file "sheet.tsv" containing:
+      """
+      sample	bc
+      s1	a
+      """
+    When I run `unmux in.fq --group bc={a=AAAAAAAA} --sample-sheet sheet.tsv --out x.fq --metrics-per-sample sheet.tsv`
+    Then the exit code is 1
+    And stderr contains "output "sheet.tsv" (--metrics-per-sample) is the sample sheet (sheet.tsv); give it a distinct path"
+    And the file "sheet.tsv" is:
+      """
+      sample	bc
+      s1	a
+      """
+
+  Scenario Outline: a metrics file on the <what> is refused
+    Given the test file "contigs.fa"
+    And the test file "contigs.fa.fai"
+    When I run `unmux in.fq --reference contigs.fa --out x.fq --metrics-summary <file>`
+    Then the exit code is 1
+    And stderr contains "output "<file>" (--metrics-summary) is the <what> (<file>); give it a distinct path"
+    And the file "<file>" does not contain "reads_assigned"
+
+    Examples:
+      | file           | what            |
+      | contigs.fa     | reference       |
+      | contigs.fa.fai | reference index |
+
+  Scenario: standard input from a pipe is exempt, whatever file fed the pipe
+    When I run `unmux - --extract a=0:0:4 --template a --out in.fq` with "in.fq" on stdin
+    Then the exit code is 0
 
   Scenario: an output beside its input is written as before
     When I run `unmux in.fq --extract a=0:0:4 --template a --out out.fq --metrics-summary in.tsv`

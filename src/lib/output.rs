@@ -1394,7 +1394,7 @@ mod tests {
         std::os::unix::fs::symlink("in.fq", dir.path().join("link.fq")).unwrap();
         std::os::unix::fs::symlink(".", dir.path().join("here")).unwrap();
         std::fs::hard_link(&input, dir.path().join("hard.fq")).unwrap();
-        for output in ["link.fq", "here/in.fq", "hard.fq"] {
+        for output in ["link.fq", "here/in.fq", "hard.fq", "missing/../hard.fq"] {
             let error = over_inputs(&[dir.path().join(output)], std::slice::from_ref(&input));
             assert!(
                 error.is_some_and(|e| e.contains(" is input 0 (")),
@@ -1410,8 +1410,10 @@ mod tests {
         let input = dir.path().join("in.fq");
         std::fs::write(&input, "").unwrap();
         let folds_case = dir.path().join("IN.FQ").exists();
-        let error = over_inputs(&[dir.path().join("IN.FQ")], &[input]);
-        assert_eq!(error.is_some(), folds_case, "{error:?}");
+        for output in ["IN.FQ", "missing/../IN.FQ"] {
+            let error = over_inputs(&[dir.path().join(output)], std::slice::from_ref(&input));
+            assert_eq!(error.is_some(), folds_case, "{output}: {error:?}");
+        }
     }
 
     #[test]
