@@ -1233,6 +1233,36 @@ impl DestinationList<'_> {
         self.index.insert(path, self.list.len() - 1);
         Ok(self.list.len() - 1)
     }
+
+    /// Add `option`'s bin destination like [`Self::add`], declaring its records' read groups.
+    fn add_bin(&mut self, path: Option<PathBuf>, option: &str) -> Result<usize> {
+        let at = self.add(path)?;
+        let dest = &mut self.list[at];
+        if !is_alignment_format(dest.format) {
+            return Ok(at);
+        }
+        for (id, read_group) in self.default_header.read_groups() {
+            match dest.header.read_groups().get(id) {
+                None => {
+                    dest.header
+                        .read_groups_mut()
+                        .insert(id.clone(), read_group.clone());
+                }
+                Some(declared) if declared != read_group => {
+                    let place = match &dest.path {
+                        Some(path) => format!("in \"{}\"", path.display()),
+                        None => "on stdout".to_string(),
+                    };
+                    bail!(
+                        "{option} records would share read group \"{id}\" with a sample {place}; \
+                         set --pool to another name"
+                    );
+                }
+                Some(_) => {}
+            }
+        }
+        Ok(at)
+    }
 }
 
 /// Resolve every destination a run writes and the layout of each kind of
@@ -1258,15 +1288,16 @@ fn destination_table(
     let unassigned = plan
         .unassigned
         .as_ref()
-        .map(|pattern| bin_layout(pattern, pool, plan.inputs.len(), list))
+        .map(|pattern| bin_layout(pattern, "--unassigned", pool, plan.inputs.len(), list))
         .transpose()?;
     let removes = routing
         .removes()
         .iter()
         .map(|remove| {
+            let option = format!("--remove {}", remove.selector);
             let pattern = remove.pattern.as_ref();
             pattern
-                .map(|pattern| bin_layout(pattern, pool, plan.inputs.len(), list))
+                .map(|pattern| bin_layout(pattern, &option, pool, plan.inputs.len(), list))
                 .transpose()
         })
         .collect::<Result<_>>()?;
@@ -1337,6 +1368,7 @@ fn out_layout(
 /// The layout of a `--unassigned` or `--remove` bin, mirroring [`bin_paths`].
 fn bin_layout(
     pattern: &OutputPattern,
+    option: &str,
     pool: &str,
     num_sources: usize,
     list: &mut DestinationList,
@@ -1350,10 +1382,10 @@ fn bin_layout(
         resolve_pattern(pattern, &ctx)
     };
     if num_sources > 1 && pattern.uses(Placeholder::Source) {
-        let dests = (0..num_sources).map(|source| list.add(path(source)));
+        let dests = (0..num_sources).map(|source| list.add_bin(path(source), option));
         return Ok(BinLayout::PerSource(dests.collect::<Result<_>>()?));
     }
-    Ok(BinLayout::Single(list.add(path(0))?))
+    Ok(BinLayout::Single(list.add_bin(path(0), option)?))
 }
 
 /// Precompute the `@RG`-bearing SAM/BAM header for each distinct `--out`
