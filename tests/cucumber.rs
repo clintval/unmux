@@ -260,6 +260,16 @@ async fn stderr_contains_times(world: &mut SassWorld, needle: String, expected: 
     );
 }
 
+#[then(regex = r#"^stderr contains "(.*)" exactly once$"#)]
+async fn stderr_contains_once(world: &mut SassWorld, needle: String) {
+    let count = world.stderr.matches(&needle).count();
+    assert_eq!(
+        count, 1,
+        "stderr contained {needle:?} {count} times\nstderr:\n{}",
+        world.stderr
+    );
+}
+
 #[then(regex = r#"^a file "([^"]+)" exists$"#)]
 async fn file_exists(world: &mut SassWorld, name: String) {
     let path = world.work_dir().join(&name);

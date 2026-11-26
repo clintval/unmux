@@ -448,49 +448,49 @@ const CELLS: &str = "--group b1={in}/bc.tsv --group b1::loc=0:0:13 --group b1::d
 
 #[rstest]
 #[case::paired_fastq(
-    "b9371e4487934a7b1851afb16d6e2fe4",
+    "df99966fe2690677ee396af0c6a5ef19",
     "{in}/r1.fq {in}/r2.fq {BC} {CUT} \
     --template a b --tag RX=umi --tag BC=s --sample-from-group bc --out %sample.R%ordinal.fq.gz \
     {BINS} {METRICS}"
 )]
 #[case::gzip_to_fastq(
-    "8f4c37d4cb488f899edc92a6cc2a0d48",
+    "a1a15615c7cbf3e12d6a4d9629e56dd4",
     "{in}/r1.fq.gz {in}/r2.bgzf.fq.gz {BC} \
     {CUT} --template a b --tag RX=umi --sample-from-group bc --out %sample.R%ordinal.fq \
     --unassigned un.fq {METRICS}"
 )]
 #[case::gzip_members_to_bam(
-    "e240dfddc8793d4f43e070c756c6c3e4",
+    "780e7c43337676fbb2d2ad75407ba5ed",
     "{in}/r1.members.fq.gz {in}/r2.fq \
     {BC} {CUT} --template a b --tag BC=s --tag RX=umi --sample-from-group bc --out %sample.bam \
     {BINS} {METRICS}"
 )]
 #[case::mixed_gzip_to_one_bam(
-    "486652a48e387baac611dd02e3297c19",
+    "b80e2d0ce792212a4ffd039ffab3a874",
     "{in}/r1.mixed.fq.gz \
     {in}/r2.bgzf.fq.gz {BC} {CUT} --template ~b a+s --tag BC=~s --tag OX=umi+s \
     --sample-from-group bc --out all.bam --unassigned un.bam"
 )]
 #[case::crlf_and_no_final_newline(
-    "29b77280253dec8691bbd0d01895ec91",
+    "69cf814d25114e40e42b5782003d099a",
     "{in}/crlf.r1.fq \
     {in}/noeol.r2.fq {BC} {CUT} --template a b --tag BC=s --tag BC::raw=true \
     --sample-from-group bc --out %sample.R%ordinal.fa.gz --unassigned un.R%source.fa {METRICS}"
 )]
 #[case::interleaved_to_sam(
-    "8a878113cc0691a6a69dbc80da0d81a1",
+    "f0433e2dbea8bda1f3a96cfcde1385ad",
     "{in}/inter.fq {BC} \
     --extract a=0:8:end --extract b=1:0:end --template a b --sample-from-group bc \
     --out %sample.sam --unassigned un.sam --qc-tag"
 )]
 #[case::interleaved_per_record(
-    "34056b2908e49a835eb28f8b86778ec9",
+    "b2a138c4d8451639aa25729422397915",
     "{in}/inter.fq --per-record \
     {BC} --extract a=0:8:end --template a --sample-from-group bc --out %sample.fq.gz {BINS} \
     {METRICS}"
 )]
 #[case::index_reads_matched_joined(
-    "c03ca974d585dbada38ca16ddddf4e5e",
+    "5e892318871b1e27e868df43d8225f60",
     "{in}/r1.fq {in}/r2.fq \
     {in}/i1.fq {in}/i2.fq --group bc={in}/bc.tsv --group bc::match=x+y --group bc::dist=1 \
     --group bc::mode=nearest --extract x=2:0:4 --extract y=2:4:8 --extract a=0:0:end \
@@ -498,7 +498,7 @@ const CELLS: &str = "--group b1={in}/bc.tsv --group b1::loc=0:0:13 --group b1::d
     --sample-sheet-ignore note --out %sample.%sub_sample.R%ordinal.fq.gz {BINS} {METRICS}"
 )]
 #[case::dual_index_sheet_to_cram(
-    "a5b265b0b07e476d736be8a31bb7d8d7",
+    "bb571f2849b91e70dd2ddbc8b67e7c43",
     "{in}/r1.fq {in}/r2.fq \
     {in}/i1.fq {in}/i2.fq --group bc={in}/bc.tsv --group bc::loc=2:0:8 --group bc::dist=1 \
     --group i5={in}/bc.tsv --group i5::loc=3:0:9 --group i5::dist=1:1:1 \
@@ -574,7 +574,7 @@ const CELLS: &str = "--group b1={in}/bc.tsv --group b1::loc=0:0:13 --group b1::d
     {METRICS}"
 )]
 #[case::anchored(
-    "5a796422c41d7c191de54084c517a4e8",
+    "f6cd9e6b9100a2e8d64cb4c29a034d1b",
     "{in}/r1.fq --group bc={in}/bc.tsv \
     --group bc::loc=0:0:9 --group bc::dist=1:1:1 --group bc::anchor=5p --group bc::mode=nearest \
     --group e={x=A,c=C,g=G} --group e::loc=0:5:-1 --group e::anchor=3p --extract s=@bc \
@@ -582,14 +582,14 @@ const CELLS: &str = "--group b1={in}/bc.tsv --group b1::loc=0:0:13 --group b1::d
     --out %sample.fq.gz --unassigned un.fq.gz --qc-tag {METRICS}"
 )]
 #[case::missing_template_stream(
-    "cacc2c6c480761ea6ada6afadeae7bda",
+    "3bb9b4368b1e4aa7a7037fb8d0db2321",
     "{in}/r1.fq {in}/r2.fq \
     --group bc={in}/bc.tsv --group bc::loc=0:0:8 --extract s=@bc --extract b=1:0:end \
     --template s b --tag RX=s --out out.R%ordinal.fq.gz --unassigned un.%source.fq.gz --qc-tag \
     {METRICS}"
 )]
 #[case::fasta(
-    "6f7ce040379de8ff4737cec8a1e24d35",
+    "40eb3b93d4ad90b6495d922147d03584",
     "{in}/reads.fa {BC} --extract a=0:8:end \
     --extract s=@bc --template a --tag BC=s --sample-from-group bc --out %sample.fa.gz \
     --unassigned un.fa {METRICS}"
@@ -607,7 +607,7 @@ const CELLS: &str = "--group b1={in}/bc.tsv --group b1::loc=0:0:13 --group b1::d
     {METRICS}"
 )]
 #[case::paired_bam_to_bam(
-    "fa52bd51031207e9d65c96ceb0edfb6f",
+    "6b73a2c3e3da3c0b52edee8291ce13cd",
     "{in}/pairs.bam {BC} \
     --extract a=0:8:end --extract b=1:0:end --extract s=@bc --template a b --tag BC=s \
     --sample-from-group bc --out %sample.bam --unassigned un.bam {METRICS}"

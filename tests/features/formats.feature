@@ -484,7 +484,7 @@ Feature: Input and output format handling
     Then the exit code is 0
     And the records of "out.sam" are:
       """
-      a	4	*	0	255	*	*	0	0	ACGTACGT	ABCDEFGH	RX:Z:	QX:Z:	RG:Z:p
+      a	4	*	0	255	*	*	0	0	ACGTACGT	ABCDEFGH	RG:Z:p	RX:Z:	QX:Z:
       """
 
     Examples:
