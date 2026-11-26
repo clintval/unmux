@@ -188,6 +188,12 @@ struct DemuxCmd {
     /// error-corrected by default. Each tag in a set needs its own ID; pool
     /// several tags into one sample with `--sample NAME=GROUP::ID1,ID2`.
     ///
+    /// A set is refused when one read can match two of its tags at one place
+    /// within `dist`, counting indels, a shorter tag inside a longer one, and
+    /// with `bothStrands=true` the reverse strand. With `mode=nearest`, which
+    /// leaves such reads unassigned, this is only a warning, unless the read
+    /// matches both tags exactly.
+    ///
     /// Sources (`NAME::SOURCE`):
     ///
     ///   bc=tags.tsv        from a TSV file with `id` and `seq` columns; any
