@@ -161,7 +161,7 @@ Options:
           @SQ, @PG, and @CO lines, only its own @RG lines, and an unmux
           @PG; records keep input order. --rg-tag has no effect there, and
           --template, --tag, sequence-matching groups, aligned CRAM output,
-          and several inputs are errors.
+          FASTX outputs beside SAM/BAM ones, and several inputs are errors.
           For unmapped records, run samtools reset on the outputs.
 
       --extract <SPEC>
