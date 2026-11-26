@@ -74,7 +74,7 @@ pub(crate) enum End {
 }
 
 /// The most batches read but not yet merged, per worker.
-const BATCHES_PER_WORKER: usize = 3;
+const BATCHES_PER_WORKER: usize = 2;
 
 /// The most blocks waiting to be compressed, per worker, before merging waits.
 const BLOCKS_PER_WORKER: usize = 8;

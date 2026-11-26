@@ -7,6 +7,7 @@
 //! point, re-exported here for the binary to dispatch.
 #![warn(missing_docs)]
 
+mod chunks;
 mod cram_raw;
 pub mod demux;
 pub mod extract;

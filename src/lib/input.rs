@@ -24,7 +24,8 @@
 //! reader raw ([`PendingRecord::Bam`]) so their decode runs on the matcher
 //! workers, and an aligned BAM record passed through to BAM output is written
 //! back from those raw bytes without a decode and re-encode, so it keeps the
-//! input's tag order and bin.
+//! input's tag order and bin. FASTQ inputs can instead be read in chunks of
+//! whole records that any worker parses.
 
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read};
@@ -45,6 +46,7 @@ use noodles::sam::header::record::value::Map;
 use noodles::{bam, bgzf, cram, fasta, fastq, sam};
 use smallvec::SmallVec;
 
+use crate::chunks::{Chunk, ChunkReader};
 use crate::cram_raw::Recorder;
 use crate::reference::{quietly, read_container, CramDecoder, Reference};
 
@@ -795,40 +797,8 @@ impl FormatReader {
     fn read_next(&mut self, keep: bool) -> Result<Option<(InputRecord, Flags)>> {
         match self {
             FormatReader::Fastq { reader, record } => {
-                if reader
-                    .read_record(record)
-                    .context("failed to read FASTQ record")?
-                    == 0
-                {
-                    return Ok(None);
-                }
-                // A FASTQ record's sequence and quality strings must be the
-                // same length. noodles does not enforce this, so a malformed
-                // record would otherwise carry the mismatch downstream and
-                // panic on an out-of-bounds quality slice during extraction;
-                // reject it here instead.
-                let (n_bases, n_quals) = (record.sequence().len(), record.quality_scores().len());
-                if n_bases != n_quals {
-                    bail!(
-                        "malformed FASTQ record `{}`: the sequence has {n_bases} base(s) but the quality string has {n_quals} character(s)",
-                        String::from_utf8_lossy(&first_token(record.name()))
-                    );
-                }
-                let input = InputRecord {
-                    name: first_token(record.name()),
-                    bases: record.sequence().to_vec(),
-                    quals: Some(
-                        record
-                            .quality_scores()
-                            .iter()
-                            .map(|&q| q.saturating_sub(PHRED_OFFSET))
-                            .collect(),
-                    ),
-                    tags: parse_comment_tags(record.description()),
-                    qc_fail: false,
-                    alignment: None,
-                };
-                Ok(Some((input, Flags::empty())))
+                let read = read_fastq(reader, record)?;
+                Ok(read.map(|input| (input, Flags::empty())))
             }
             FormatReader::Fasta { reader, definition } => {
                 // noodles `read_definition` appends to the buffer, so clear the
@@ -953,6 +923,46 @@ impl FormatReader {
             _ => None,
         }
     }
+}
+
+/// Read the next FASTQ record from `reader` into `record`, or `None` at the end
+/// of the input.
+fn read_fastq<R: BufRead>(
+    reader: &mut fastq::io::Reader<R>,
+    record: &mut fastq::Record,
+) -> Result<Option<InputRecord>> {
+    if reader
+        .read_record(record)
+        .context("failed to read FASTQ record")?
+        == 0
+    {
+        return Ok(None);
+    }
+    // A FASTQ record's sequence and quality strings must be the same length.
+    // noodles does not enforce this, so a malformed record would otherwise
+    // carry the mismatch downstream and panic on an out-of-bounds quality
+    // slice during extraction; reject it here instead.
+    let (n_bases, n_quals) = (record.sequence().len(), record.quality_scores().len());
+    if n_bases != n_quals {
+        bail!(
+            "malformed FASTQ record `{}`: the sequence has {n_bases} base(s) but the quality string has {n_quals} character(s)",
+            String::from_utf8_lossy(&first_token(record.name()))
+        );
+    }
+    Ok(Some(InputRecord {
+        name: first_token(record.name()),
+        bases: record.sequence().to_vec(),
+        quals: Some(
+            record
+                .quality_scores()
+                .iter()
+                .map(|&q| q.saturating_sub(PHRED_OFFSET))
+                .collect(),
+        ),
+        tags: parse_comment_tags(record.description()),
+        qc_fail: false,
+        alignment: None,
+    }))
 }
 
 /// The first record of an alignment input, kept whole and read on the CRAM decode stack.
@@ -1317,6 +1327,119 @@ pub struct FragmentReader {
 const REGROUP_HINT: &str = "sort the input by read name (e.g. `samtools sort -n`), or pass \
                             --per-record to read each record on its own";
 
+/// The error for an interleaved input with an odd number of records.
+const UNPAIRED_LAST_MATE: &str =
+    "interleaved input ended on an unpaired mate (odd number of records)";
+
+/// The error for inputs that end at different records.
+const UNEQUAL_RECORD_COUNTS: &str =
+    "input files have unequal record counts (one input ended before the others)";
+
+/// Every input of a run that reads FASTQ alone, ready to be read in chunks.
+pub(crate) struct FastqInputs {
+    /// The fragments of the records read while opening the inputs, and the
+    /// error that ended them, if one did.
+    pub head: (Vec<PendingFragment>, Option<anyhow::Error>),
+    /// The decoded stream of each input, positioned after the records in `head`.
+    pub streams: Vec<Box<dyn BufRead + Send>>,
+    /// Whether the one input is interleaved, two records to a fragment.
+    pub interleaved: bool,
+    /// The input paths, when there are several and no input may hold both
+    /// mates of a pair.
+    pub pairs: Option<Vec<PathBuf>>,
+}
+
+/// The fragments in chunks of FASTQ records, one chunk per input with the
+/// same fragments in each, read as [`FragmentReader`] reads the inputs whole.
+pub(crate) struct ChunkFragments<'a> {
+    readers: SmallVec<[fastq::io::Reader<ChunkReader>; 2]>,
+    interleaved: bool,
+    /// Set when several inputs are refused a record that follows its mate.
+    pairs: Option<Pairs<'a>>,
+}
+
+/// The inputs of several whose records may not follow their mates.
+struct Pairs<'a> {
+    paths: &'a [PathBuf],
+    /// Each input's last record name.
+    lasts: SmallVec<[Vec<u8>; 2]>,
+}
+
+impl<'a> ChunkFragments<'a> {
+    /// The fragments of `chunks`, one per input in `--in` order, refusing a
+    /// record that follows its mate when the input `pairs` paths are given.
+    pub(crate) fn new(chunks: Vec<Chunk>, interleaved: bool, pairs: Option<&'a [PathBuf]>) -> Self {
+        let pairs = pairs.map(|paths| {
+            let mut record = fastq::Record::default();
+            let mut prior_name = |chunk: &Chunk| {
+                let mut reader = fastq::io::Reader::new(chunk.prior());
+                match read_fastq(&mut reader, &mut record) {
+                    Ok(Some(prior)) => prior.name,
+                    Ok(None) | Err(_) => Vec::new(),
+                }
+            };
+            let lasts = chunks.iter().map(&mut prior_name).collect();
+            Pairs { paths, lasts }
+        });
+        let readers = chunks
+            .into_iter()
+            .map(|chunk| fastq::io::Reader::new(chunk.into_reader()))
+            .collect();
+        Self {
+            readers,
+            interleaved,
+            pairs,
+        }
+    }
+
+    /// The next fragment, parsed with `record`, or `None` after the last.
+    pub(crate) fn next(&mut self, record: &mut fastq::Record) -> Result<Option<PendingFragment>> {
+        if let [reader] = self.readers.as_mut_slice() {
+            let Some(first) = read_fastq(reader, record)? else {
+                return Ok(None);
+            };
+            if !self.interleaved {
+                return Ok(Some(PendingFragment {
+                    records: smallvec::smallvec![PendingRecord::Ready(first)],
+                }));
+            }
+            let second = read_fastq(reader, record)?.ok_or_else(|| anyhow!(UNPAIRED_LAST_MATE))?;
+            check_names_concord(&[&first.name, &second.name])?;
+            return Ok(Some(PendingFragment {
+                records: smallvec::smallvec![
+                    PendingRecord::Ready(first),
+                    PendingRecord::Ready(second)
+                ],
+            }));
+        }
+        let mut maybe: SmallVec<[Option<InputRecord>; 4]> = SmallVec::new();
+        for (i, reader) in self.readers.iter_mut().enumerate() {
+            let read = read_fastq(reader, record)?;
+            if let (Some(read), Some(pairs)) = (&read, &mut self.pairs) {
+                check_fastx_unpaired(i, &pairs.paths[i], &mut pairs.lasts[i], &read.name)?;
+            }
+            maybe.push(read);
+        }
+        let present = maybe.iter().filter(|record| record.is_some()).count();
+        if present == 0 {
+            return Ok(None);
+        }
+        if present != maybe.len() {
+            bail!(UNEQUAL_RECORD_COUNTS);
+        }
+        let records: SmallVec<[InputRecord; 2]> = maybe.into_iter().map(Option::unwrap).collect();
+        check_names_concord(
+            &records
+                .iter()
+                .map(|record| record.name.as_slice())
+                .collect::<SmallVec<[&[u8]; 4]>>(),
+        )?;
+        Ok(Some(PendingFragment {
+            records: records.into_iter().map(PendingRecord::Ready).collect(),
+        }))
+    }
+}
+
 impl FragmentReader {
     /// Open every input by sniffing and dispatching, preserving 0-based `--in`
     /// order. With a single FASTX input and `per_record` false, the stream is
@@ -1452,6 +1575,40 @@ impl FragmentReader {
         self.decode_threads
     }
 
+    /// Every input's decoded stream when every input is FASTQ, after the
+    /// fragments of the records read while opening them; else `self`.
+    pub(crate) fn into_fastq(mut self) -> std::result::Result<FastqInputs, Box<Self>> {
+        let fastq = |reader: &FormatReader| matches!(reader, FormatReader::Fastq { .. });
+        if self.readers.is_empty() || !self.readers.iter().all(fastq) {
+            return Err(Box::new(self));
+        }
+        let mut fragments = Vec::new();
+        let mut error = None;
+        while !self.buffered.is_empty() && error.is_none() {
+            match self.next_pending_fragment() {
+                Ok(Some(fragment)) => fragments.push(fragment),
+                Ok(None) => break,
+                Err(failed) => error = Some(failed),
+            }
+        }
+        let several = self.readers.len() > 1;
+        let pairs = (several && self.seen.is_some()).then(|| self.paths.clone());
+        let streams = self
+            .readers
+            .drain(..)
+            .filter_map(|reader| match reader {
+                FormatReader::Fastq { reader, .. } => Some(reader.into_inner()),
+                _ => None,
+            })
+            .collect();
+        Ok(FastqInputs {
+            head: (fragments, error),
+            streams,
+            interleaved: self.interleaved,
+            pairs,
+        })
+    }
+
     /// The read groups declared by the input headers, in first-seen order, plus
     /// whether any input is aligned (`@SQ` present). FASTX inputs contribute
     /// nothing. A repeated RG id whose `SM`/`LB` disagree across inputs errors.
@@ -1556,9 +1713,9 @@ impl FragmentReader {
                     records: smallvec::smallvec![first],
                 }));
             }
-            let (second, _) = self.next_from_first()?.ok_or_else(|| {
-                anyhow!("interleaved input ended on an unpaired mate (odd number of records)")
-            })?;
+            let (second, _) = self
+                .next_from_first()?
+                .ok_or_else(|| anyhow!(UNPAIRED_LAST_MATE))?;
             check_names_concord(&[first.name(), second.name()])?;
             return Ok(Some(PendingFragment {
                 records: smallvec::smallvec![first, second],
@@ -1579,7 +1736,7 @@ impl FragmentReader {
             return Ok(None);
         }
         if present != maybe.len() {
-            bail!("input files have unequal record counts (one input ended before the others)");
+            bail!(UNEQUAL_RECORD_COUNTS);
         }
         let records: SmallVec<[PendingRecord; 2]> = maybe.into_iter().map(Option::unwrap).collect();
         check_names_concord(
@@ -1597,40 +1754,25 @@ impl FragmentReader {
             return Ok(());
         };
         let (last, mates) = &mut seen[i];
-        let shown = |name: &[u8]| String::from_utf8_lossy(name).into_owned();
-        let (found, split) = if self.readers[i].header().is_some() {
-            if flags.is_segmented() {
-                *mates |= flags & (Flags::FIRST_SEGMENT | Flags::LAST_SEGMENT);
-            }
-            if !mates.contains(Flags::FIRST_SEGMENT | Flags::LAST_SEGMENT) {
-                return Ok(());
-            }
-            let found = format!(
-                "holds both first (0x40) and last (0x80) mates of paired records, as of `{}`",
-                shown(name)
-            );
-            (found, "samtools fastq -1/-2")
-        } else {
-            let key = mate_key(name);
-            if key.is_empty() || key != mate_key(last) {
-                last.clear();
-                last.extend_from_slice(name);
-                return Ok(());
-            }
-            let found = format!(
-                "is interleaved (`{}` is followed by its mate `{}`)",
-                shown(last),
-                shown(name)
-            );
-            (found, "seqtk seq -1/-2")
-        };
-        bail!(
-            "input file {i} ({}) {found}, but with several inputs a read takes one record from \
-             each, which would split its mates across reads; give each mate as its own input \
-             (e.g. from `{split}`) or this input alone, or pass --per-record to treat each \
-             record as single-end",
-            self.paths[i].display()
-        )
+        if self.readers[i].header().is_none() {
+            return check_fastx_unpaired(i, &self.paths[i], last, name);
+        }
+        if flags.is_segmented() {
+            *mates |= flags & (Flags::FIRST_SEGMENT | Flags::LAST_SEGMENT);
+        }
+        if !mates.contains(Flags::FIRST_SEGMENT | Flags::LAST_SEGMENT) {
+            return Ok(());
+        }
+        let found = format!(
+            "holds both first (0x40) and last (0x80) mates of paired records, as of `{}`",
+            String::from_utf8_lossy(name)
+        );
+        Err(paired_among_several(
+            i,
+            &self.paths[i],
+            &found,
+            "samtools fastq -1/-2",
+        ))
     }
 
     /// The fragment that `first` starts in a single alignment input that is `paired` or not.
@@ -1703,6 +1845,37 @@ impl FragmentReader {
         }
         self.readers[0].read_pending(self.keep_alignments)
     }
+}
+
+/// Refuse FASTX record `name` of input `i` of several, read from `path`, when it
+/// follows `last`, the input's previous record name, as its mate; else make
+/// it the last.
+fn check_fastx_unpaired(i: usize, path: &Path, last: &mut Vec<u8>, name: &[u8]) -> Result<()> {
+    let key = mate_key(name);
+    if key.is_empty() || key != mate_key(last) {
+        last.clear();
+        last.extend_from_slice(name);
+        return Ok(());
+    }
+    let shown = |name: &[u8]| String::from_utf8_lossy(name).into_owned();
+    let found = format!(
+        "is interleaved (`{}` is followed by its mate `{}`)",
+        shown(last),
+        shown(name)
+    );
+    Err(paired_among_several(i, path, &found, "seqtk seq -1/-2"))
+}
+
+/// The error for input `i` of several, read from `path`, that holds both mates
+/// of a pair as `found` says; `split` is a tool that gives each mate its own file.
+fn paired_among_several(i: usize, path: &Path, found: &str, split: &str) -> anyhow::Error {
+    anyhow!(
+        "input file {i} ({}) {found}, but with several inputs a read takes one record from \
+         each, which would split its mates across reads; give each mate as its own input \
+         (e.g. from `{split}`) or this input alone, or pass --per-record to treat each \
+         record as single-end",
+        path.display()
+    )
 }
 
 /// A name's mate-pairing key: the name with a trailing `/1` or `/2` mate suffix
@@ -3020,6 +3193,94 @@ mod tests {
                     zipped_bases(&[r1, single_end], false, threads).unwrap(),
                     expected
                 );
+            }
+        }
+    }
+
+    /// The bases of each fragment of the inputs at `paths` and the error that
+    /// ended them, read whole or, with `chunk` records at a time, in chunks
+    /// parsed apart.
+    fn fastq_fragments(
+        paths: &[PathBuf],
+        per_record: bool,
+        chunk: Option<usize>,
+    ) -> (Vec<Vec<String>>, Option<String>) {
+        let mut reader = FragmentReader::open(paths, per_record).unwrap();
+        let bases = |fragment: PendingFragment| {
+            let fragment = fragment.decode(&mut RecordBuf::default()).unwrap();
+            let bases = fragment
+                .records
+                .iter()
+                .map(|r| String::from_utf8_lossy(&r.bases));
+            bases.map(|bases| bases.into_owned()).collect::<Vec<_>>()
+        };
+        let mut fragments = Vec::new();
+        let Some(records) = chunk else {
+            loop {
+                match reader.next_pending_fragment() {
+                    Ok(Some(fragment)) => fragments.push(bases(fragment)),
+                    Ok(None) => return (fragments, None),
+                    Err(error) => return (fragments, Some(format!("{error:#}"))),
+                }
+            }
+        };
+        let Ok(inputs) = reader.into_fastq() else {
+            panic!("every input is FASTQ");
+        };
+        let (head, error) = inputs.head;
+        fragments.extend(head.into_iter().map(bases));
+        if let Some(error) = error {
+            return (fragments, Some(format!("{error:#}")));
+        }
+        let step = if inputs.interleaved { 2 } else { 1 };
+        let source = crate::chunks::FastqSource::new(inputs.streams, step, records * step, 1 << 20);
+        let mut batches = std::collections::BTreeMap::new();
+        while let Some(input) = (0..source.inputs()).find(|&input| source.can_read(input)) {
+            batches.extend(source.read(input).chunks);
+        }
+        let mut record = fastq::Record::default();
+        for chunks in batches.into_values() {
+            let mut chunked =
+                ChunkFragments::new(chunks, inputs.interleaved, inputs.pairs.as_deref());
+            loop {
+                match chunked.next(&mut record) {
+                    Ok(Some(fragment)) => fragments.push(bases(fragment)),
+                    Ok(None) => break,
+                    Err(error) => return (fragments, Some(format!("{error:#}"))),
+                }
+            }
+        }
+        (fragments, None)
+    }
+
+    #[test]
+    fn test_chunked_fastq_refuses_a_record_after_its_mate_as_reading_whole_does() {
+        let record = |name: &str| format!("@{name}\nACGT\n+\nIIII\n");
+        let file = |names: &[&str]| names.iter().map(|name| record(name)).collect::<String>();
+        let single = file(&["a", "b", "c", "d", "e", "f"]);
+        let suffixed = file(&["a", "b", "c/1", "c/2", "e", "f"]);
+        let casava = file(&["a", "b 1:N:0:A", "b 2:N:0:A", "d", "e", "f"]);
+        let nameless = file(&["", "", "", "", "", ""]);
+        for (inputs, refused) in [
+            ([&single, &suffixed], true),
+            ([&suffixed, &single], true),
+            ([&single, &casava], true),
+            ([&nameless, &nameless], false),
+            ([&single, &single], false),
+        ] {
+            let files = inputs.map(|text| temp_with(text.as_bytes()));
+            let paths: Vec<PathBuf> = files.iter().map(|file| file.path().to_path_buf()).collect();
+            for per_record in [false, true] {
+                let whole = fastq_fragments(&paths, per_record, None);
+                let interleaved = whole
+                    .1
+                    .as_ref()
+                    .is_some_and(|e| e.contains("is interleaved"));
+                assert_eq!(interleaved, refused && !per_record, "{whole:?}");
+                for chunk in [1, 2, 3, 4, 100] {
+                    let chunked = fastq_fragments(&paths, per_record, Some(chunk));
+                    assert_eq!(chunked, whole, "{chunk} records to a chunk");
+                }
             }
         }
     }

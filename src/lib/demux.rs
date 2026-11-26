@@ -31,6 +31,7 @@ use noodles::sam::Header;
 use smallvec::SmallVec;
 use thousands::Separable;
 
+use crate::chunks::{Chunk, FastqSource};
 use crate::extract::{
     extract, span_range, Corrected, Extracted, GroupHit, GroupHits, MatchSpan, Segment,
 };
@@ -43,7 +44,8 @@ use crate::grammar::{
     OutputPattern, Placeholder, QualTag, SampleSpec, SpanBody, TagBinding, Template,
 };
 use crate::input::{
-    Alignment, Fragment, FragmentReader, InputRecord, PendingFragment, PendingRecord, SniffedFormat,
+    Alignment, ChunkFragments, Fragment, FragmentReader, InputRecord, PendingFragment,
+    PendingRecord, SniffedFormat,
 };
 use crate::matcher::{
     match_verdict, window_after, CompiledGroup, GroupVerdict, MatchStrand, Prereq, RelativeWindow,
@@ -1836,8 +1838,7 @@ fn run_engine(plan: &DemuxPlan, command_line: Option<&str>) -> Result<()> {
     })();
     let run = DemuxRun {
         engine: &engine,
-        reader: Mutex::new((reader, 0)),
-        exhausted: AtomicBool::new(false),
+        source: Source::new(reader),
         files: sinks.files(),
         merger: Mutex::new(Merger {
             sinks,
@@ -2261,7 +2262,7 @@ fn tally(metrics: &mut Metrics, prepared: &Prepared) {
 }
 
 /// The most fragments in one batch, the unit of work a worker prepares at once.
-const READ_CHUNK: usize = 4096;
+const READ_CHUNK: usize = 2048;
 
 /// The most bytes of records in one batch, so a batch of long records stays small.
 const BATCH_BYTES: usize = 4 << 20;
@@ -2388,16 +2389,66 @@ struct Merger {
 struct DemuxWorker {
     scratch: Scratch,
     record: RecordBuf,
+    fastq: noodles::fastq::Record,
     compressor: Option<::bgzf::Compressor>,
     slots: Vec<usize>,
 }
 
-/// A demux run on the worker pool: one reader over every input, workers that
-/// prepare and encode batches of fragments, and outputs merged in input order.
+/// The fragments read while opening FASTQ inputs, and the error that ended
+/// them, if one did.
+type Head = (Vec<PendingFragment>, Option<anyhow::Error>);
+
+/// Where the batches of a run come from.
+enum Source {
+    /// Every input read a fragment at a time, by one worker at a time.
+    Fragments {
+        reader: Mutex<(FragmentReader, u64)>,
+        exhausted: AtomicBool,
+    },
+    /// FASTQ inputs read in chunks of records, each input by one worker at a
+    /// time, after the fragments read while opening them, which are batch 0.
+    Fastq {
+        source: FastqSource,
+        head: Mutex<Option<Head>>,
+        interleaved: bool,
+        /// The input paths, when several inputs may not hold both mates of a pair.
+        pairs: Option<Vec<PathBuf>>,
+    },
+}
+
+impl Source {
+    /// Read every input of `reader` in chunks when they are all FASTQ.
+    fn new(reader: FragmentReader) -> Self {
+        match reader.into_fastq() {
+            Ok(inputs) => {
+                let step = if inputs.interleaved { 2 } else { 1 };
+                let source = FastqSource::new(inputs.streams, step, READ_CHUNK * step, BATCH_BYTES);
+                Source::Fastq {
+                    source,
+                    head: Mutex::new(Some(inputs.head)),
+                    interleaved: inputs.interleaved,
+                    pairs: inputs.pairs,
+                }
+            }
+            Err(reader) => Source::Fragments {
+                reader: Mutex::new((*reader, 0)),
+                exhausted: AtomicBool::new(false),
+            },
+        }
+    }
+}
+
+/// A batch of fragments, or the chunks of FASTQ records that hold them.
+enum Batch {
+    Fragments(Vec<PendingFragment>),
+    Chunks(Vec<Chunk>),
+}
+
+/// A demux run on the worker pool: inputs read in batches, workers that
+/// prepare and encode the fragments of each, and outputs merged in input order.
 struct DemuxRun<'a> {
     engine: &'a Engine<'a>,
-    reader: Mutex<(FragmentReader, u64)>,
-    exhausted: AtomicBool,
+    source: Source,
     merger: Mutex<Merger>,
     files: Arc<[OnceLock<BlockFile>]>,
     targets: usize,
@@ -2408,51 +2459,99 @@ impl DemuxRun<'_> {
     fn merger(&self) -> std::sync::MutexGuard<'_, Merger> {
         self.merger.lock().unwrap_or_else(PoisonError::into_inner)
     }
+
+    /// Prepare `pending` into `processed`, or keep its error there; whether it
+    /// was prepared.
+    fn prepare(
+        &self,
+        worker: &mut DemuxWorker,
+        pending: Result<PendingFragment>,
+        processed: &mut Processed,
+    ) -> bool {
+        let (scratch, record) = (&mut worker.scratch, &mut worker.record);
+        match pending.and_then(|pending| process_pending(self.engine, scratch, record, pending)) {
+            Ok(prepared) => {
+                processed.add(prepared, &mut worker.slots);
+                true
+            }
+            Err(error) => {
+                processed.error = Some(error);
+                false
+            }
+        }
+    }
 }
 
 impl pool::Stages for DemuxRun<'_> {
-    type Batch = Vec<PendingFragment>;
+    type Batch = Batch;
     type Done = Processed;
     type Block = Block;
     type Worker = DemuxWorker;
 
     fn streams(&self) -> usize {
-        1
+        match &self.source {
+            Source::Fragments { .. } => 1,
+            Source::Fastq { source, .. } => source.inputs(),
+        }
     }
 
     fn worker(&self) -> DemuxWorker {
         DemuxWorker {
             scratch: Scratch::new(),
             record: RecordBuf::default(),
+            fastq: noodles::fastq::Record::default(),
             compressor: None,
             slots: vec![usize::MAX; self.files.len()],
         }
     }
 
-    fn can_read(&self, _: usize) -> bool {
-        !self.exhausted.load(Ordering::Acquire)
+    fn can_read(&self, stream: usize) -> bool {
+        match &self.source {
+            Source::Fragments { exhausted, .. } => !exhausted.load(Ordering::Acquire),
+            Source::Fastq { source, .. } => source.can_read(stream),
+        }
     }
 
-    fn read(&self, _: &mut DemuxWorker, _: usize) -> Readout<Vec<PendingFragment>> {
-        let mut reader = self.reader.lock().unwrap_or_else(PoisonError::into_inner);
-        let (fragments, next) = &mut *reader;
-        let index = *next;
+    fn read(&self, _: &mut DemuxWorker, stream: usize) -> Readout<Batch> {
         let mut readout = Readout::nothing();
-        match next_batch(fragments) {
-            Ok(Some(batch)) => {
-                *next += 1;
-                readout.batches.push((index, batch));
+        match &self.source {
+            Source::Fragments { reader, exhausted } => {
+                let mut reader = reader.lock().unwrap_or_else(PoisonError::into_inner);
+                let (fragments, next) = &mut *reader;
+                let index = *next;
+                match next_batch(fragments) {
+                    Ok(Some(batch)) => {
+                        *next += 1;
+                        readout.batches.push((index, Batch::Fragments(batch)));
+                    }
+                    Ok(None) => readout.end = Some(End::Exhausted(index)),
+                    Err(error) => readout.end = Some(End::Failed(index, error)),
+                }
+                if readout.end.is_some() {
+                    exhausted.store(true, Ordering::Release);
+                }
             }
-            Ok(None) => readout.end = Some(End::Exhausted(index)),
-            Err(error) => readout.end = Some(End::Failed(index, error)),
-        }
-        if readout.end.is_some() {
-            self.exhausted.store(true, Ordering::Release);
+            Source::Fastq { source, head, .. } => {
+                let head = head.lock().unwrap_or_else(PoisonError::into_inner).take();
+                if let Some((fragments, error)) = head {
+                    readout.batches.push((0, Batch::Fragments(fragments)));
+                    if let Some(error) = error {
+                        source.stop();
+                        readout.end = Some(End::Failed(1, error));
+                        return readout;
+                    }
+                }
+                let framed = source.read(stream);
+                let chunks = framed.chunks.into_iter();
+                let batches = chunks.map(|(index, chunks)| (index + 1, Batch::Chunks(chunks)));
+                readout.batches.extend(batches);
+                readout.end = framed.total.map(|total| End::Exhausted(total + 1));
+            }
         }
         readout
     }
 
-    fn process(&self, worker: &mut DemuxWorker, batch: Vec<PendingFragment>) -> Processed {
+    fn process(&self, worker: &mut DemuxWorker, batch: Batch) -> Processed {
         let mut processed = Processed {
             fragments: 0,
             tally: Metrics::tally(self.targets),
@@ -2460,13 +2559,31 @@ impl pool::Stages for DemuxRun<'_> {
             records: Vec::new(),
             error: None,
         };
-        for pending in batch {
-            let (scratch, record) = (&mut worker.scratch, &mut worker.record);
-            match process_pending(self.engine, scratch, record, pending) {
-                Ok(prepared) => processed.add(prepared, &mut worker.slots),
-                Err(error) => {
-                    processed.error = Some(error);
-                    break;
+        match batch {
+            Batch::Fragments(fragments) => {
+                for pending in fragments {
+                    if !self.prepare(worker, Ok(pending), &mut processed) {
+                        break;
+                    }
+                }
+            }
+            Batch::Chunks(chunks) => {
+                let (interleaved, pairs) = match &self.source {
+                    Source::Fastq {
+                        interleaved, pairs, ..
+                    } => (*interleaved, pairs.as_deref()),
+                    Source::Fragments { .. } => (false, None),
+                };
+                let mut fragments = ChunkFragments::new(chunks, interleaved, pairs);
+                loop {
+                    let pending = match fragments.next(&mut worker.fastq) {
+                        Ok(Some(pending)) => Ok(pending),
+                        Ok(None) => break,
+                        Err(error) => Err(error),
+                    };
+                    if !self.prepare(worker, pending, &mut processed) {
+                        break;
+                    }
                 }
             }
         }

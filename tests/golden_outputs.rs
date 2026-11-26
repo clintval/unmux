@@ -273,6 +273,10 @@ fn write_inputs(dir: &Path) {
     put("sc2.fq", sc2.as_bytes());
     put("any.fq", any.as_bytes());
     put("inter.fq", inter.as_bytes());
+    put(
+        "inter.odd.fq",
+        (inter.clone() + &fastq("z/1", "", "ACGT", "IIII")).as_bytes(),
+    );
     put("reads.fa", fasta.as_bytes());
     put("flat.sam", flat.as_bytes());
     put("crlf.r1.fq", r1.replace('\n', "\r\n").as_bytes());
@@ -685,6 +689,9 @@ fn outputs_are_pinned_at_every_thread_count(#[case] expected: &str, #[case] args
 )]
 #[case::truncated_text("FASTQ record", "{in}/no-quals.fq")]
 #[case::record_counts("unequal record counts", "{in}/big.fq {in}/half.fq")]
+#[case::record_counts_first_shorter("unequal record counts", "{in}/half.fq {in}/big.fq")]
+#[case::truncated_second_input("FASTQ record", "{in}/big.fq {in}/no-quals.fq")]
+#[case::interleaved_odd("an unpaired mate (odd number of records)", "{in}/inter.odd.fq")]
 #[case::record_names(
     "mismatched read names (`b40000` vs `c40000`)",
     "{in}/big.fq {in}/renamed.fq"
