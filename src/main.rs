@@ -342,6 +342,11 @@ struct DemuxCmd {
     /// reverse-strand match, observed bases are in the tag's orientation, as
     /// the corrected ones are; the `obs` of `--qc-tag` stays in the read's.
     ///
+    /// A record keeps the input tags of the read its first stream is cut
+    /// from. Per-base tags such as `MM`/`ML` and `OQ` stay only on a record
+    /// that is that read unchanged; otherwise they are left out, with a
+    /// warning.
+    ///
     ///   --template cdna               one record = the whole cdna stream
     ///   --template cb+umi             concatenate two streams into one
     ///   --template r1 r2              two output records (a pair)
