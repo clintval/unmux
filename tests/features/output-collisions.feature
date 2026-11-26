@@ -3,7 +3,10 @@ Feature: Outputs that would be one file are refused
   (the macOS and Windows defaults), so their writers would overwrite each other and records would be
   lost with a zero exit. unmux refuses such runs on every operating system, before any output is
   created, so a run that works on Linux cannot lose records on a laptop. The same holds for two
-  spellings of one path, and for a metrics file sharing a path with another output.
+  spellings of one path, for a metrics file sharing a path with another output, and for an
+  `--unassigned` or `--remove` bin whose path equals an `--out` path only once placeholders expand.
+  Outputs written alike still share one file: samples on one `--out` pattern, bins with each other,
+  and a bin given the `--out` pattern itself.
 
   Background:
     Given a file "reads.fq" containing:
@@ -54,6 +57,38 @@ Feature: Outputs that would be one file are refused
     When I run `unmux reads.fq --group bc={A=AAAAAAAA} --sample a=bc::A --out o/%sample.fq --unassigned ./o/a.fq`
     Then the exit code is 1
     And stderr contains "outputs "o/a.fq" (sample a) and "./o/a.fq" (--unassigned) are the same file; give them distinct paths"
+
+  Scenario Outline: a bin that shares an --out file only once placeholders expand is refused
+    When I run `unmux reads.fq --pool lib --group bc={A=AAAAAAAA,T=TTTTTTTT} <outputs>`
+    Then the exit code is 1
+    And stderr contains "outputs "<path>" (<out>) and "<path>" (<bin>) are the same file; give them distinct paths"
+    And a file "o" does not exist
+
+    Examples:
+      | outputs                                                   | path     | out      | bin            |
+      | --sample a=bc::A --out o/%sample.fq --unassigned o/a.fq   | o/a.fq   | sample a | --unassigned   |
+      | --sample a=bc::A --out o/%sample.fq --remove bc::T=o/a.fq | o/a.fq   | sample a | --remove bc::T |
+      | --sample a=bc::A --out o/%pool.fq --unassigned o/lib.fq   | o/lib.fq | sample a | --unassigned   |
+      | --sample a=bc::A --out o/lib.fq --unassigned o/%pool.fq   | o/lib.fq | sample a | --unassigned   |
+      | --out o/%pool.fq --remove bc::T=o/lib.fq                  | o/lib.fq | --out    | --remove bc::T |
+
+  Scenario Outline: a bin given the --out pattern itself shares the --out file
+    When I run `unmux reads.fq --pool lib --group bc={A=AAAAAAAA,T=TTTTTTTT} --sample a=bc::A <outputs>`
+    Then the exit code is 0
+    And the file "<path>" contains "@r1"
+    And the file "<path>" contains "@r2"
+
+    Examples:
+      | outputs                                   | path     |
+      | --out o/all.fq --unassigned o/all.fq      | o/all.fq |
+      | --out o/%pool.fq --unassigned o/%pool.fq  | o/lib.fq |
+      | --out o/all.fq --remove bc::T=o/all.fq    | o/all.fq |
+
+  Scenario: bins share a file with each other, also once placeholders expand
+    When I run `unmux reads.fq --pool lib --group bc={A=AAAAAAAA,T=TTTTTTTT,G=GGGGGGGG} --sample g=bc::G --out o/%sample.fq --unassigned o/lib.fq --remove bc::T=o/%pool.fq`
+    Then the exit code is 0
+    And the file "o/lib.fq" contains "@r1"
+    And the file "o/lib.fq" contains "@r2"
 
   Scenario: a metrics file sharing a path with a sample output is refused
     When I run `unmux reads.fq --group bc={A=AAAAAAAA} --sample a=bc::A --out o/%sample.fq --metrics-summary o/a.fq`
