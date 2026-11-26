@@ -12,10 +12,12 @@
 //! and extraction consume. SAM/BAM/CRAM inputs carry their record tags through
 //! for the writer to re-emit. A single FASTX input is auto-detected as
 //! interleaved, and a single SAM/BAM/CRAM input as paired when its first record
-//! has flag `0x1` (two mates per fragment). An input path of `-` reads stdin (at
-//! most one). CRAM input decodes against a `--reference` FASTA when given,
-//! which must match the CRAM's `@SQ` lines; a CRAM that needs one and has none
-//! fails at its first reference-compressed slice.
+//! has flag `0x1` (two mates per fragment). With several inputs, a mate in any
+//! input is refused instead, as one record per input would split its mates
+//! across fragments. An input path of `-` reads stdin (at most one). CRAM input
+//! decodes against a `--reference` FASTA when given, which must match the
+//! CRAM's `@SQ` lines; a CRAM that needs one and has none fails at its first
+//! reference-compressed slice.
 //!
 //! With decode threads to spare, BAM input inflates its BGZF blocks on a worker
 //! pool and CRAM input decodes its containers on one. BAM records leave the
@@ -1281,11 +1283,16 @@ pub struct ReadGroupInfo {
 }
 
 /// Reads logical records across all inputs. With several `--in` files, one
-/// record is pulled from each in lockstep; a single FASTX input is
-/// auto-detected as interleaved and a single SAM/BAM/CRAM input as paired (two
-/// mates per fragment) unless `--per-record` opts out.
+/// record is pulled from each in lockstep, and an interleaved or paired input
+/// is refused; a single FASTX input is auto-detected as interleaved and a
+/// single SAM/BAM/CRAM input as paired (two mates per fragment). `--per-record`
+/// opts out of both.
 pub struct FragmentReader {
     readers: Vec<FormatReader>,
+    /// The input paths, in `--in` order.
+    paths: Vec<PathBuf>,
+    /// Per input of several, the last FASTX name and the mate flags seen, or `None` under `--per-record`.
+    seen: Option<Vec<(Vec<u8>, Flags)>>,
     /// The sniffed format of each input, in `--in` order (blend-compatible by
     /// construction).
     formats: Vec<SniffedFormat>,
@@ -1409,6 +1416,8 @@ impl FragmentReader {
 
         Ok(Self {
             readers,
+            paths: paths.to_vec(),
+            seen: (!per_record).then(|| vec![(Vec::new(), Flags::empty()); paths.len()]),
             formats,
             interleaved,
             paired,
@@ -1518,8 +1527,9 @@ impl FragmentReader {
     /// fragment; multiple inputs are zipped one record each. Returns `None`
     /// once every input is exhausted together. A file that ends before the
     /// others, input segments whose read names disagree, a paired record not
-    /// followed by its mate, or a mix of paired and unpaired records is a
-    /// fail-fast error (each would silently mispair records).
+    /// followed by its mate, a mix of paired and unpaired records, or a mate
+    /// in one of several inputs is a fail-fast error (each would silently
+    /// mispair records).
     pub fn next_fragment(&mut self) -> Result<Option<Fragment>> {
         match self.next_pending_fragment()? {
             Some(pending) => pending.decode(&mut RecordBuf::default()).map(Some),
@@ -1557,8 +1567,11 @@ impl FragmentReader {
 
         let mut maybe: SmallVec<[Option<PendingRecord>; 4]> =
             SmallVec::with_capacity(self.readers.len());
-        for reader in &mut self.readers {
-            let read = reader.read_pending(self.keep_alignments)?;
+        for i in 0..self.readers.len() {
+            let read = self.readers[i].read_pending(self.keep_alignments)?;
+            if let Some((record, flags)) = &read {
+                self.check_unpaired(i, record.name(), *flags)?;
+            }
             maybe.push(read.map(|(record, _)| record));
         }
         let present = maybe.iter().filter(|record| record.is_some()).count();
@@ -1576,6 +1589,48 @@ impl FragmentReader {
                 .collect::<SmallVec<[&[u8]; 4]>>(),
         )?;
         Ok(Some(PendingFragment { records }))
+    }
+
+    /// Refuse record `name` of input `i` of several once that input has held both mates of a pair.
+    fn check_unpaired(&mut self, i: usize, name: &[u8], flags: Flags) -> Result<()> {
+        let Some(seen) = self.seen.as_mut() else {
+            return Ok(());
+        };
+        let (last, mates) = &mut seen[i];
+        let shown = |name: &[u8]| String::from_utf8_lossy(name).into_owned();
+        let (found, split) = if self.readers[i].header().is_some() {
+            if flags.is_segmented() {
+                *mates |= flags & (Flags::FIRST_SEGMENT | Flags::LAST_SEGMENT);
+            }
+            if !mates.contains(Flags::FIRST_SEGMENT | Flags::LAST_SEGMENT) {
+                return Ok(());
+            }
+            let found = format!(
+                "holds both first (0x40) and last (0x80) mates of paired records, as of `{}`",
+                shown(name)
+            );
+            (found, "samtools fastq -1/-2")
+        } else {
+            let key = mate_key(name);
+            if key.is_empty() || key != mate_key(last) {
+                last.clear();
+                last.extend_from_slice(name);
+                return Ok(());
+            }
+            let found = format!(
+                "is interleaved (`{}` is followed by its mate `{}`)",
+                shown(last),
+                shown(name)
+            );
+            (found, "seqtk seq -1/-2")
+        };
+        bail!(
+            "input file {i} ({}) {found}, but with several inputs a read takes one record from \
+             each, which would split its mates across reads; give each mate as its own input \
+             (e.g. from `{split}`) or this input alone, or pass --per-record to treat each \
+             record as single-end",
+            self.paths[i].display()
+        )
     }
 
     /// The fragment that `first` starts in a single alignment input that is `paired` or not.
@@ -2598,10 +2653,20 @@ mod tests {
 
     /// The bases of each fragment's records, for one input read on `threads` decode workers.
     fn fragment_bases(bytes: &[u8], per_record: bool, threads: usize) -> Result<Vec<Vec<String>>> {
-        let file = temp_with(bytes);
-        let path = file.path().to_path_buf();
-        let mut reader =
-            FragmentReader::open_with_threads(&[path], per_record, None, |_| vec![threads])?;
+        zipped_bases(&[bytes], per_record, threads)
+    }
+
+    /// The bases of each fragment's records, for inputs read together on `threads` decode workers each.
+    fn zipped_bases(
+        inputs: &[&[u8]],
+        per_record: bool,
+        threads: usize,
+    ) -> Result<Vec<Vec<String>>> {
+        let files: Vec<_> = inputs.iter().map(|bytes| temp_with(bytes)).collect();
+        let paths: Vec<PathBuf> = files.iter().map(|file| file.path().to_path_buf()).collect();
+        let mut reader = FragmentReader::open_with_threads(&paths, per_record, None, |formats| {
+            vec![threads; formats.len()]
+        })?;
         let bases = |record: &InputRecord| String::from_utf8_lossy(&record.bases).into_owned();
         let mut fragments = Vec::new();
         while let Some(fragment) = reader.next_fragment()? {
@@ -2780,6 +2845,183 @@ mod tests {
             format!("{error:#}").contains("failed to read SAM record"),
             "{error:#}"
         );
+    }
+
+    const SINGLE_END_FASTQ: &[u8] = b"@a\nGGGG\n+\nIIII\n@b\nTTTT\n+\nIIII\n";
+
+    const BOTH_MATES_OF_A: &str =
+        "holds both first (0x40) and last (0x80) mates of paired records, as of `a`";
+
+    /// The count of fragments read from `inputs` together on `threads` decode
+    /// workers each before the error they must fail with, and that error.
+    fn zipped_error(inputs: &[&[u8]], threads: usize) -> (usize, String) {
+        let files: Vec<_> = inputs.iter().map(|bytes| temp_with(bytes)).collect();
+        let paths: Vec<PathBuf> = files.iter().map(|file| file.path().to_path_buf()).collect();
+        let mut reader = FragmentReader::open_with_threads(&paths, false, None, |formats| {
+            vec![threads; formats.len()]
+        })
+        .unwrap();
+        let mut read = 0;
+        loop {
+            match reader.next_fragment() {
+                Ok(Some(_)) => read += 1,
+                Ok(None) => panic!(
+                    "expected the inputs to be refused, read {:?}",
+                    zipped_bases(inputs, false, threads)
+                ),
+                Err(error) => return (read, format!("{error:#}")),
+            }
+        }
+    }
+
+    #[test]
+    fn test_several_inputs_refuse_a_paired_alignment_input_at_its_second_mate() {
+        for sam in [PAIRED_SAM, PAIRED_AMONG_OTHERS_SAM] {
+            let (bam, cram) = bam_and_cram(sam);
+            for paired in [sam.to_vec(), bam, cram] {
+                for threads in [0, 3] {
+                    for (inputs, i) in [
+                        ([&paired[..], &paired[..]], 0),
+                        ([&paired[..], SINGLE_END_FASTQ], 0),
+                        ([SINGLE_END_FASTQ, &paired[..]], 1),
+                    ] {
+                        let (read, error) = zipped_error(&inputs, threads);
+                        assert_eq!(read, 1, "{error}");
+                        assert!(error.starts_with(&format!("input file {i} (")), "{error}");
+                        assert!(error.contains(BOTH_MATES_OF_A), "{error}");
+                        assert!(error.contains("samtools fastq -1/-2"), "{error}");
+                        assert!(error.contains("--per-record"), "{error}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_several_inputs_refuse_an_interleaved_fastx_input_at_its_second_record() {
+        let fastq: &[u8] = b"@a/1\nAAAA\n+\nIIII\n@a/2\nCCCC\n+\nIIII\n";
+        let casava: &[u8] = b"@a 1:N:0:AC\nAAAA\n+\nIIII\n@a 2:N:0:AC\nCCCC\n+\nIIII\n";
+        let fasta: &[u8] = b">a/1\nAAAA\n>a/2\nCCCC\n";
+        let single_end_fasta: &[u8] = b">a\nGGGG\n>b\nTTTT\n";
+        let suffixed = "`a/1` is followed by its mate `a/2`";
+        for (interleaved, single_end, mates) in [
+            (fastq, SINGLE_END_FASTQ, suffixed),
+            (casava, SINGLE_END_FASTQ, "`a` is followed by its mate `a`"),
+            (fasta, single_end_fasta, suffixed),
+        ] {
+            for (inputs, i) in [
+                ([interleaved, interleaved], 0),
+                ([interleaved, single_end], 0),
+                ([single_end, interleaved], 1),
+            ] {
+                let (read, error) = zipped_error(&inputs, 0);
+                assert_eq!(read, 1, "{error}");
+                assert!(error.starts_with(&format!("input file {i} (")), "{error}");
+                assert!(
+                    error.contains(&format!("is interleaved ({mates})")),
+                    "{error}"
+                );
+                assert!(error.contains("--per-record"), "{error}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_several_inputs_refuse_mates_that_follow_unpaired_records() {
+        let sam: &[u8] = b"@HD\tVN:1.6\n\
+            z\t4\t*\t0\t0\t*\t*\t0\t0\tAAAA\tIIII\n\
+            y\t4\t*\t0\t0\t*\t*\t0\t0\tCCCC\tIIII\n\
+            a\t77\t*\t0\t0\t*\t*\t0\t0\tGGGG\tIIII\n\
+            a\t141\t*\t0\t0\t*\t*\t0\t0\tTTTT\tIIII\n";
+        let fastq: &[u8] = b"@z\nAAAA\n+\nIIII\n@y\nCCCC\n+\nIIII\n\
+            @a/1\nGGGG\n+\nIIII\n@a/2\nTTTT\n+\nIIII\n";
+        let companion: &[u8] = b"@z\nA\n+\nI\n@y\nC\n+\nI\n@a\nG\n+\nI\n@b\nT\n+\nI\n";
+        let (bam, cram) = bam_and_cram(sam);
+        let paired = BOTH_MATES_OF_A;
+        let interleaved = "is interleaved (`a/1` is followed by its mate `a/2`)";
+        for (mixed, fragments, mates) in [
+            (sam.to_vec(), 3, paired),
+            (bam, 3, paired),
+            (cram, 3, paired),
+            (fastq.to_vec(), 3, interleaved),
+        ] {
+            for threads in [0, 3] {
+                let (read, error) = zipped_error(&[companion, &mixed], threads);
+                assert_eq!(read, fragments, "{error}");
+                assert!(error.starts_with("input file 1 ("), "{error}");
+                assert!(error.contains(mates), "{error}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_several_inputs_read_one_mate_each_as_pairs() {
+        let first: &[u8] = b"@HD\tVN:1.6\n\
+            a\t77\t*\t0\t0\t*\t*\t0\t0\tAAAA\tIIII\n\
+            b\t77\t*\t0\t0\t*\t*\t0\t0\tGGGG\tIIII\n";
+        let last: &[u8] = b"@HD\tVN:1.6\n\
+            a\t141\t*\t0\t0\t*\t*\t0\t0\tCCCC\tIIII\n\
+            b\t141\t*\t0\t0\t*\t*\t0\t0\tTTTT\tIIII\n";
+        let (first_bam, first_cram) = bam_and_cram(first);
+        let (last_bam, last_cram) = bam_and_cram(last);
+        for (r1, r2) in [
+            (first.to_vec(), last.to_vec()),
+            (first_bam, last_bam),
+            (first_cram, last_cram),
+        ] {
+            for threads in [0, 3] {
+                assert_eq!(
+                    zipped_bases(&[&r1, &r2], false, threads).unwrap(),
+                    vec![vec!["AAAA", "CCCC"], vec!["GGGG", "TTTT"]]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_per_record_reads_several_paired_inputs_one_record_from_each() {
+        let (bam, cram) = bam_and_cram(PAIRED_SAM);
+        let interleaved = b"@a/1\nAAAA\n+\nIIII\n@a/2\nCCCC\n+\nIIII\n\
+            @b/1\nGGGG\n+\nIIII\n@b/2\nTTTT\n+\nIIII\n";
+        for paired in [PAIRED_SAM.to_vec(), bam, cram, interleaved.to_vec()] {
+            for threads in [0, 3] {
+                assert_eq!(
+                    zipped_bases(&[&paired, &paired], true, threads).unwrap(),
+                    vec![
+                        vec!["AAAA", "AAAA"],
+                        vec!["CCCC", "CCCC"],
+                        vec!["GGGG", "GGGG"],
+                        vec!["TTTT", "TTTT"]
+                    ]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_several_single_end_inputs_are_read_one_record_from_each() {
+        let r1: &[u8] = b"@a/1\nAAAA\n+\nIIII\n@b/1\nCCCC\n+\nIIII\n";
+        let r2: &[u8] = b"@a/2\nGGGG\n+\nIIII\n@b/2\nTTTT\n+\nIIII\n";
+        let nameless_r1: &[u8] = b"@\nAAAA\n+\nIIII\n@\nCCCC\n+\nIIII\n";
+        let nameless_r2: &[u8] = b"@\nGGGG\n+\nIIII\n@\nTTTT\n+\nIIII\n";
+        let sam: &[u8] = b"@HD\tVN:1.6\n\
+            a\t4\t*\t0\t0\t*\t*\t0\t0\tGGGG\tIIII\n\
+            b\t4\t*\t0\t0\t*\t*\t0\t0\tTTTT\tIIII\n";
+        let (bam, cram) = bam_and_cram(sam);
+        let expected = vec![vec!["AAAA", "GGGG"], vec!["CCCC", "TTTT"]];
+        for threads in [0, 3] {
+            assert_eq!(zipped_bases(&[r1, r2], false, threads).unwrap(), expected);
+            assert_eq!(
+                zipped_bases(&[nameless_r1, nameless_r2], false, threads).unwrap(),
+                expected
+            );
+            for single_end in [sam, &bam, &cram] {
+                assert_eq!(
+                    zipped_bases(&[r1, single_end], false, threads).unwrap(),
+                    expected
+                );
+            }
+        }
     }
 
     #[test]

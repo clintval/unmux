@@ -501,6 +501,8 @@ struct DemuxCmd {
     /// SAM/BAM/CRAM records (flag 0x1). Both are otherwise auto-detected,
     /// and SAM/BAM/CRAM mates must be adjacent and are ordered by their flags
     /// (except in an aligned read-group split, which keeps records whole).
+    /// With several inputs, where a read takes one record from each, an input
+    /// holding both mates of a pair is refused, as they would be split.
     #[arg(long, verbatim_doc_comment)]
     per_record: bool,
 
