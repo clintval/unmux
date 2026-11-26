@@ -844,7 +844,7 @@ fn write_fastq<W: Write>(
 ) -> Result<()> {
     let quals = read
         .quals
-        .context("cannot write FASTQ output for a record with no qualities (a FASTA input)")?;
+        .context("cannot write FASTQ output for a record with no qualities (a FASTA input, or QUAL `*` in SAM/BAM/CRAM)")?;
     let seq = record.sequence_mut();
     seq.clear();
     seq.extend_from_slice(read.bases);

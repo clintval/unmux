@@ -928,8 +928,8 @@ pub(crate) const ALIGNMENT_TAGS: &[[u8; 2]] = &[
 
 /// Convert an alignment record into an [`InputRecord`], carrying its
 /// non-alignment tags through. Alignment-derived tags ([`ALIGNMENT_TAGS`]) are
-/// stripped, since the output is unmapped. An empty quality string (SAM `*`)
-/// becomes no qualities.
+/// stripped, since the output is unmapped. A read with bases and QUAL `*` has
+/// no qualities, while an empty read has an empty quality string.
 ///
 /// A reverse-strand record (flag `0x10`) stores `SEQ` as the reverse complement
 /// of the sequenced read and `QUAL` in reversed order; this restores the
@@ -938,7 +938,7 @@ pub(crate) const ALIGNMENT_TAGS: &[[u8; 2]] = &[
 fn alignment_to_input(record: &RecordBuf) -> InputRecord {
     let raw_quals = record.quality_scores().as_ref();
     let mut bases = record.sequence().as_ref().to_vec();
-    let mut quals = (!raw_quals.is_empty()).then(|| raw_quals.to_vec());
+    let mut quals = (!raw_quals.is_empty() || bases.is_empty()).then(|| raw_quals.to_vec());
     if record.flags().is_reverse_complemented() {
         bases = bases
             .iter()
