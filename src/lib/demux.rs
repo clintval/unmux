@@ -3311,7 +3311,8 @@ fn left_out_tags<'a>(
 /// has a column stream with its default quality tag, which is dropped from the
 /// carried tags when that tag is rewritten without qualities. A `left_out` tag
 /// is dropped from the carried tags, along with its explicit and default
-/// quality tags unless another carried tag keeps one (a `CY` with a `CR`).
+/// quality tags unless another carried tag that this record does not rewrite
+/// keeps one (a `CY` with a `CR`).
 fn merge_data(
     carried: Option<&Data>,
     tag_data: &Data,
@@ -3332,8 +3333,9 @@ fn merge_data(
     let is_left_out = |tag: &[u8; 2]| left_out.iter().any(|(name, _)| tag_bytes(name) == *tag);
     let keeps_quality = |quality: &str| {
         data.iter().any(|(tag, _)| {
+            let kept = tag_data.get(&tag).is_none();
             let tag = <[u8; 2]>::from(tag);
-            !is_left_out(&tag)
+            kept && !is_left_out(&tag)
                 && std::str::from_utf8(&tag).is_ok_and(|tag| default_qual_tag(tag) == Some(quality))
         })
     };
