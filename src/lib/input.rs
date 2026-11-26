@@ -12,10 +12,12 @@
 //! and extraction consume. SAM/BAM/CRAM inputs carry their record tags through
 //! for the writer to re-emit. A single FASTX input is auto-detected as
 //! interleaved, and a single SAM/BAM/CRAM input as paired when its first record
-//! has flag `0x1` (two mates per fragment). An input path of `-` reads stdin (at
-//! most one). CRAM input decodes against a `--reference` FASTA when given,
-//! which must match the CRAM's `@SQ` lines; a CRAM that needs one and has none
-//! fails at its first reference-compressed slice.
+//! has flag `0x1` (two mates per fragment). With several inputs, a mate in any
+//! input is refused instead, as one record per input would split its mates
+//! across fragments. An input path of `-` reads stdin (at most one). CRAM input
+//! decodes against a `--reference` FASTA when given, which must match the
+//! CRAM's `@SQ` lines; a CRAM that needs one and has none fails at its first
+//! reference-compressed slice.
 //!
 //! With decode threads to spare, BAM input inflates its BGZF blocks on a worker
 //! pool and CRAM input decodes its containers on one. BAM records leave the
@@ -1281,11 +1283,16 @@ pub struct ReadGroupInfo {
 }
 
 /// Reads logical records across all inputs. With several `--in` files, one
-/// record is pulled from each in lockstep; a single FASTX input is
-/// auto-detected as interleaved and a single SAM/BAM/CRAM input as paired (two
-/// mates per fragment) unless `--per-record` opts out.
+/// record is pulled from each in lockstep, and an interleaved or paired input
+/// is refused; a single FASTX input is auto-detected as interleaved and a
+/// single SAM/BAM/CRAM input as paired (two mates per fragment). `--per-record`
+/// opts out of both.
 pub struct FragmentReader {
     readers: Vec<FormatReader>,
+    /// The input paths, in `--in` order.
+    paths: Vec<PathBuf>,
+    /// Per input of several, the last FASTX name and the mate flags seen, or `None` under `--per-record`.
+    seen: Option<Vec<(Vec<u8>, Flags)>>,
     /// The sniffed format of each input, in `--in` order (blend-compatible by
     /// construction).
     formats: Vec<SniffedFormat>,
@@ -1409,6 +1416,8 @@ impl FragmentReader {
 
         Ok(Self {
             readers,
+            paths: paths.to_vec(),
+            seen: (!per_record).then(|| vec![(Vec::new(), Flags::empty()); paths.len()]),
             formats,
             interleaved,
             paired,
@@ -1518,8 +1527,9 @@ impl FragmentReader {
     /// fragment; multiple inputs are zipped one record each. Returns `None`
     /// once every input is exhausted together. A file that ends before the
     /// others, input segments whose read names disagree, a paired record not
-    /// followed by its mate, or a mix of paired and unpaired records is a
-    /// fail-fast error (each would silently mispair records).
+    /// followed by its mate, a mix of paired and unpaired records, or a mate
+    /// in one of several inputs is a fail-fast error (each would silently
+    /// mispair records).
     pub fn next_fragment(&mut self) -> Result<Option<Fragment>> {
         match self.next_pending_fragment()? {
             Some(pending) => pending.decode(&mut RecordBuf::default()).map(Some),
@@ -1557,8 +1567,11 @@ impl FragmentReader {
 
         let mut maybe: SmallVec<[Option<PendingRecord>; 4]> =
             SmallVec::with_capacity(self.readers.len());
-        for reader in &mut self.readers {
-            let read = reader.read_pending(self.keep_alignments)?;
+        for i in 0..self.readers.len() {
+            let read = self.readers[i].read_pending(self.keep_alignments)?;
+            if let Some((record, flags)) = &read {
+                self.check_unpaired(i, record.name(), *flags)?;
+            }
             maybe.push(read.map(|(record, _)| record));
         }
         let present = maybe.iter().filter(|record| record.is_some()).count();
@@ -1576,6 +1589,48 @@ impl FragmentReader {
                 .collect::<SmallVec<[&[u8]; 4]>>(),
         )?;
         Ok(Some(PendingFragment { records }))
+    }
+
+    /// Refuse record `name` of input `i` of several once that input has held both mates of a pair.
+    fn check_unpaired(&mut self, i: usize, name: &[u8], flags: Flags) -> Result<()> {
+        let Some(seen) = self.seen.as_mut() else {
+            return Ok(());
+        };
+        let (last, mates) = &mut seen[i];
+        let shown = |name: &[u8]| String::from_utf8_lossy(name).into_owned();
+        let (found, split) = if self.readers[i].header().is_some() {
+            if flags.is_segmented() {
+                *mates |= flags & (Flags::FIRST_SEGMENT | Flags::LAST_SEGMENT);
+            }
+            if !mates.contains(Flags::FIRST_SEGMENT | Flags::LAST_SEGMENT) {
+                return Ok(());
+            }
+            let found = format!(
+                "holds both first (0x40) and last (0x80) mates of paired records, as of `{}`",
+                shown(name)
+            );
+            (found, "samtools fastq -1/-2")
+        } else {
+            let key = mate_key(name);
+            if key.is_empty() || key != mate_key(last) {
+                last.clear();
+                last.extend_from_slice(name);
+                return Ok(());
+            }
+            let found = format!(
+                "is interleaved (`{}` is followed by its mate `{}`)",
+                shown(last),
+                shown(name)
+            );
+            (found, "seqtk seq -1/-2")
+        };
+        bail!(
+            "input file {i} ({}) {found}, but with several inputs a read takes one record from \
+             each, which would split its mates across reads; give each mate as its own input \
+             (e.g. from `{split}`) or this input alone, or pass --per-record to treat each \
+             record as single-end",
+            self.paths[i].display()
+        )
     }
 
     /// The fragment that `first` starts in a single alignment input that is `paired` or not.
