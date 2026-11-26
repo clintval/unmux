@@ -395,7 +395,7 @@ pub struct TagBinding {
     pub qual_sep: Option<String>,
     /// Whether `qual-sep=` was set rather than left to its default.
     pub qual_sep_set: bool,
-    /// `raw=true`: emit the observed (as-sequenced) bases for this tag rather
+    /// `raw=true`: emit the observed (uncorrected) bases for this tag rather
     /// than the corrected form. Default `false`: a tag emits the
     /// error-corrected barcode when its stream came from a matched keeplist
     /// `@grp`. No effect on a stream that was never corrected.

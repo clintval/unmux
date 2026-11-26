@@ -87,8 +87,8 @@ pub type GroupHits = [Option<GroupHit>];
 
 /// The error-corrected form of a matched `@grp` stream: the canonical tag bases
 /// with the observed qualities length-fitted. Carried alongside the observed
-/// bases so a SAM tag can emit the corrected sequence (the default) while the
-/// record body keeps what was sequenced.
+/// bases so a `--tag`/`--template` can emit the corrected sequence (the
+/// default) or, with `raw=true`, the observed one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Corrected {
     /// The canonical (corrected) bases.
@@ -100,15 +100,17 @@ pub struct Corrected {
 /// An extracted stream: the observed bases and (optional) qualities, both
 /// already trimmed and, for a span measured from a reverse-strand match,
 /// reverse-complemented into the matched tag's orientation, plus an optional
-/// error-corrected form. `bases`/`quals` are always the bases as sequenced;
-/// `corrected` is populated only for a matched keeplist `@grp` self-span, and a
-/// `--tag`/`--template` consults it unless `raw=true` selects the observed
-/// bytes.
+/// error-corrected form. `bases`/`quals` always hold the observed, uncorrected
+/// values; `corrected` is populated only for a matched keeplist `@grp`
+/// self-span, and a `--tag`/`--template` consults it unless `raw=true` selects
+/// the observed bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Extracted {
-    /// The observed (as-sequenced) bases.
+    /// The observed (uncorrected) bases, in the matched tag's orientation for a
+    /// span measured from a reverse-strand match.
     pub bases: Vec<u8>,
-    /// The observed qualities, when the segment carried them.
+    /// The observed qualities, in the same order as `bases`, when the segment
+    /// carried them.
     pub quals: Option<Vec<u8>>,
     /// The error-corrected form, populated only for a matched keeplist `@grp`
     /// self-span; `None` otherwise.
