@@ -6389,4 +6389,27 @@ mod tests {
             "XX"
         );
     }
+
+    #[test]
+    fn test_merge_data_keeps_no_carried_quality_tag_for_a_rewritten_tag() {
+        let data = |tags: &[&str]| -> Data {
+            tags.iter()
+                .map(|tag| (Tag::from(tag_bytes(tag)), Value::from(tag.to_string())))
+                .collect()
+        };
+        let merged = |carried: &[&str], written: &[&str], left_out: &[(&str, Option<&str>)]| {
+            merge_data(Some(&data(carried)), &data(written), &[], left_out)
+                .iter()
+                .map(|(tag, _)| String::from_utf8(<[u8; 2]>::from(tag).to_vec()).unwrap())
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let cr = &[("CR", None)];
+        assert_eq!(merged(&["CB", "CR", "CY"], &["CB"], cr), "CB");
+        assert_eq!(merged(&["CB", "CY", "CR"], &["CB"], cr), "CB");
+        assert_eq!(merged(&["CR", "CB", "CY"], &["CR"], &[("CB", None)]), "CR");
+        assert_eq!(merged(&["CB", "CR", "CY"], &["CB", "CY"], cr), "CB CY");
+        assert_eq!(merged(&["CB", "CR", "CY"], &[], cr), "CB CY");
+        assert_eq!(merged(&["CR", "CB", "CY"], &[], &[("CB", None)]), "CR CY");
+    }
 }

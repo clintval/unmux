@@ -313,3 +313,18 @@ Feature: SAM tag emission with quality tag pairing and separators
       r1	4	*	0	255	*	*	0	0	AACGTGCAGGGG	ABCDEFGHIJKL	CB:Z:AACG	CR:Z:AACGTGCA	CY:Z:ABCDEFGH	RG:Z:p
       r2	4	*	0	255	*	*	0	0	TTTTTTTTGGGG	ABCDEFGHIJKL	CB:Z:TTTT	CY:Z:ABCD	RG:Z:p
       """
+
+  Scenario: a carried CY goes when CB is rewritten without one and CR is left out
+    Given a file "in.sam" containing:
+      """
+      @HD	VN:1.6
+      r1	4	*	0	0	*	*	0	0	AACGTGCAGGGG	ABCDEFGHIJKL	CB:Z:OLDCB	CR:Z:OLDCR	CY:Z:OLDCY
+      r2	4	*	0	0	*	*	0	0	TTTTTTTTGGGG	ABCDEFGHIJKL	CB:Z:OLDCB	CR:Z:OLDCR	CY:Z:OLDCY
+      """
+    When I run `unmux in.sam --pool p --group bc={x=AACGTGCA} --group bc::loc=0:0:8 --extract b=@bc --extract u=0:0:4 --tag CB=u --tag CB::qual=none --tag CR=b --out out.sam`
+    Then the exit code is 0
+    And the records of "out.sam" are:
+      """
+      r1	4	*	0	255	*	*	0	0	AACGTGCAGGGG	ABCDEFGHIJKL	CB:Z:AACG	CR:Z:AACGTGCA	CY:Z:ABCDEFGH	RG:Z:p
+      r2	4	*	0	255	*	*	0	0	TTTTTTTTGGGG	ABCDEFGHIJKL	CB:Z:TTTT	RG:Z:p
+      """
