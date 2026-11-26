@@ -106,6 +106,7 @@ fn placeholder_value(placeholder: Placeholder, ctx: &PathContext) -> String {
 
 /// Assemble the `--tag` SAM data fields for one record from its extracted
 /// streams. Each binding's sequence tag is its streams' bases joined by `sep`.
+/// A stream with fallbacks (`a|b`) takes the first of them that is present.
 /// A tag is written only when every one of its streams is present: a stream is
 /// absent when its anchoring group did not match, and then the tag and its
 /// quality tag are left out, so a partial match never yields a shorter value
@@ -124,7 +125,12 @@ pub fn build_tag_data(bindings: &[TagBinding], streams: &HashMap<&str, Extracted
         let present: Vec<_> = binding
             .streams
             .iter()
-            .filter_map(|s| streams.get(s.name.as_str()).map(|e| (s, e)))
+            .zip(&binding.fallbacks)
+            .filter_map(|(first, fallbacks)| {
+                std::iter::once(first)
+                    .chain(fallbacks)
+                    .find_map(|s| streams.get(s.name.as_str()).map(|e| (s, e)))
+            })
             .collect();
         if present.len() != binding.streams.len() {
             continue;
@@ -855,6 +861,7 @@ mod tests {
                     },
                 })
                 .collect(),
+            fallbacks: vec![Vec::new(); streams.len()],
             qual,
             sep: sep.map(str::to_string),
             qual_sep: sep.map(|_| " ".to_string()),

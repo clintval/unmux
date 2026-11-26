@@ -100,6 +100,7 @@ pub(crate) const CARGO_STYLING: Styles = Styles::styled()
 ///   @RG[::F[::F]]    an input read-group `--group` source (SAM/BAM/CRAM only);
 ///                    bare = by RG ID, or by subfield(s), e.g. `@RG::SM::LB`.
 ///   +                concat streams (`cb+umi`) or 'AND' samples (`gA::a+gB::b`).
+///   |                fall back to the next stream when one is absent (`--tag` only).
 ///   ~                reverse-complement the stream (`~cb`, `BC=~bc`).
 ///   ,                list separator ('OR' a tag pool & attribute lists).
 ///   %XX              percent-escape a byte in a tag sep/qual-sep value, a
@@ -303,18 +304,21 @@ struct DemuxCmd {
     /// (default: '`-`') and qualities with `qual-sep` (default: a space).
     /// Default `qual` tags pre-exist for: `CB`/`CY` `CR`/`CY` `RX`/`QX` `BC`/`QT` `OX`/`BZ`.
     ///
-    /// A tag is written only when every stream in it is present; otherwise
-    /// the tag, its quality tag, and any input copies of them are left out.
+    /// A stream may name others after '`|`' to use, in order, when it is
+    /// absent, and '`|`' binds tighter than '`+`'. A tag is written only when
+    /// every stream in it, or one of its fallbacks, is present; otherwise the
+    /// tag, its quality tag, and any input copies of them are left out.
     ///
-    /// A tag built from an `@grp::COLUMN` or `%sample::COLUMN` stream has no
-    /// quality tag, since qualities could not line up with its text: the
-    /// default one is left out (a carried one is dropped), and setting
-    /// `qual=TAG` is an error. Such a stream cannot take `~`, and `raw` does
-    /// not change it.
+    /// A tag built from an `@grp::COLUMN` or `%sample::COLUMN` stream, or a
+    /// record's tag that falls back to one, has no quality tag, since
+    /// qualities could not line up with its text: the default one is left out
+    /// (a carried one is dropped), and setting `qual=TAG` is an error. Such a
+    /// stream cannot take `~`, and `raw` does not change it.
     ///
     ///   --tag RX=umi             UMI tag (auto quality tag `QX`)
     ///   --tag CB=bc1+bc2+bc3     join three barcode streams
     ///   --tag xc=cell+bc2+bc3    join column text and barcode streams
+    ///   --tag CB=cell|bc1+bc2    column text if the row has it, else bc1
     ///   --tag CB::sep=_          join sequences with '`_`' not '`-`'
     ///   --tag CB::qual=CY        name the paired quality tag
     ///   --tag CB::qual=none      emit no quality tag

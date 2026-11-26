@@ -810,7 +810,7 @@ fn log_blank_sample_column(
     let tags: Vec<&str> = plan
         .tags
         .iter()
-        .filter(|tag| tag.streams.iter().any(|s| s.name == stream))
+        .filter(|tag| tag.all_streams().any(|s| s.name == stream))
         .map(|tag| tag.tag.as_str())
         .collect();
     if blank == 0 || tags.is_empty() {
@@ -1787,15 +1787,13 @@ fn run_engine(plan: &DemuxPlan, command_line: Option<&str>) -> Result<()> {
     // Streams referenced exactly once across templates + tags can be MOVED into
     // their (sole) output body instead of copied (see Engine::movable_streams).
     let mut stream_refs: HashMap<&str, usize> = HashMap::new();
-    for streams in plan
+    for stream in plan
         .templates
         .iter()
-        .map(|t| &t.streams)
-        .chain(plan.tags.iter().map(|t| &t.streams))
+        .flat_map(|t| t.streams.iter())
+        .chain(plan.tags.iter().flat_map(|t| t.all_streams()))
     {
-        for stream in streams {
-            *stream_refs.entry(stream.name.as_str()).or_insert(0) += 1;
-        }
+        *stream_refs.entry(stream.name.as_str()).or_insert(0) += 1;
     }
     let movable_streams: HashSet<&str> = stream_refs
         .iter()
