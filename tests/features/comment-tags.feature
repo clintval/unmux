@@ -123,6 +123,21 @@ Feature: Lifting SAM tags from FASTX read-name comments
       read1	4	*	0	255	*	*	0	0	ACGTACGT	*	ML:B:C,200,100	xh:H:CAFE	RG:Z:in
       """
 
+  Scenario: a nameless record keeps its empty name and its tags through a FASTA round trip
+    Given a file "in.sam" containing:
+      """
+      @HD	VN:1.6
+      *	4	*	0	0	*	*	0	0	ACGT	IIII	xa:A:Q	ML:B:C,1,2
+      """
+    When I run `unmux in.sam --out mid.fa`
+    Then the exit code is 0
+    When I run `unmux mid.fa --out out.sam`
+    Then the exit code is 0
+    And the records of "out.sam" are:
+      """
+      *	4	*	0	255	*	*	0	0	ACGT	*	xa:A:Q	ML:B:C,1,2	RG:Z:mid
+      """
+
   Scenario Outline: a comment tag that a BAM record cannot hold stops the run: <field>
     Given a file "in.fq" containing:
       """

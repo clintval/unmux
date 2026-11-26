@@ -2619,6 +2619,17 @@ mod tests {
     }
 
     #[test]
+    fn test_read_fasta_keeps_a_nameless_record_nameless() {
+        let file = temp_with(b"> xa:A:Q\tML:B:C,1,2\nACGT\n");
+        let record = read_all(&file).remove(0).records.remove(0);
+        assert_eq!(record.name, b"");
+        let data = record.tags.expect("comment tags are lifted");
+        assert_eq!(data.get(b"xa"), Some(&Value::Character(b'Q')));
+        let ml = Value::Array(Array::UInt8(vec![1, 2]));
+        assert_eq!(data.get(b"ML"), Some(&ml));
+    }
+
+    #[test]
     fn test_read_fastx_refuses_a_tag_repeated_in_one_comment() {
         for comment in ["ns:i:5\tns:i:6", "RX:Z:A\tRX:Z:B", "ns:i:5\tBC:Z:A\tns:Z:x"] {
             let tag = &comment[..2];
