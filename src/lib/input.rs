@@ -2613,6 +2613,23 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_read_fastx_refuses_a_tag_repeated_in_one_comment() {
+        for comment in ["ns:i:5\tns:i:6", "RX:Z:A\tRX:Z:B", "ns:i:5\tBC:Z:A\tns:Z:x"] {
+            let tag = &comment[..2];
+            for (kind, text) in [
+                ("FASTQ", format!("@r1\t{comment}\nACGT\n+\nIIII\n")),
+                ("FASTA", format!(">r1 {comment}\nACGT\n")),
+            ] {
+                let error = read_error(&text);
+                let expected = format!(
+                    "malformed {kind} record `r1`: the comment tag `{tag}` appears more than once"
+                );
+                assert!(error.contains(&expected), "{comment}: {error}");
+            }
+        }
+    }
+
     /// The tags lifted from the first record of the FASTX `text`.
     fn first_record_tags(text: &str) -> Option<Data> {
         read_all(&temp_with(text.as_bytes()))

@@ -147,3 +147,4 @@ Feature: Lifting SAM tags from FASTX read-name comments
       | CO:Z:café        | CO:Z |
       | xf:f:nan         | xf:f |
       | xf:f:1e40        | xf:f |
+      | RX:Z:GGGG        | RX   |
