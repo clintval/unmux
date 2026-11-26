@@ -870,9 +870,7 @@ type OutDestination = (Option<PathBuf>, Vec<Target>, OutputFormat);
 /// The SAM/BAM/CRAM `--out` destinations and the fan-out targets whose records
 /// land in each (a single-file `--out` collects every target; a `%sample`
 /// pattern splits them), in first-seen order. FASTX destinations have no
-/// header, so they are excluded. Shared by the `@RG` header precompute and the
-/// pooling exclusion (the SAM/CRAM `--out` files among these stay on the inline
-/// single-EOF path; BAM `--out` is pooled).
+/// header, so they are excluded.
 fn out_destinations(
     plan: &DemuxPlan,
     routing: &Routing,
@@ -1929,8 +1927,7 @@ struct PreparedRead {
 }
 
 impl PreparedRead {
-    /// Borrow this prepared record as the writer's [`OutputRead`], just before
-    /// the (serial) write.
+    /// Borrow this prepared record as the writer's [`OutputRead`], just before the write.
     fn as_output(&self) -> OutputRead<'_> {
         OutputRead {
             name: &self.name,
@@ -3508,11 +3505,10 @@ mod tests {
 
     #[test]
     fn test_low_thread_output_matches_high_thread() {
-        // --threads 1 (serial) and 2 (pipelined) must produce the same
+        // --threads 1 and 2 must produce the same
         // demultiplexed records as a high-thread run. Plain FASTQ is
-        // byte-identical across every thread count. Compressed output (inline
-        // BAM at 1/2/3 vs pooled BGZF at 16) can frame BGZF blocks differently,
-        // so those compare decoded records via read_back rather than raw bytes.
+        // byte-identical across every thread count. Compressed output is
+        // compared as decoded records via read_back rather than raw bytes.
         let dir = tempfile::tempdir().unwrap();
         let n = READ_CHUNK + 137; // spans a chunk boundary plus a partial tail
         let mut fq = Vec::new();
@@ -3551,8 +3547,7 @@ mod tests {
             );
         }
 
-        // Compressed BAM: compare decoded records (inline vs pooled BGZF
-        // framing may differ).
+        // Compressed BAM: compare decoded records.
         let ref_bam = dir.path().join("ref.bam");
         run(16, &ref_bam);
         let ref_records = read_back(&ref_bam);
@@ -4978,9 +4973,8 @@ mod tests {
     }
 
     #[test]
-    fn test_pooled_fastx_gz_is_bgzf_and_round_trips() {
-        // A gzipped-FASTX fan-out goes through the BGZF compressor pool: each
-        // .fq.gz is BGZF-framed (valid gzip), round-trips its reads, and a
+    fn test_fastx_gz_is_bgzf_and_round_trips() {
+        // Each .fq.gz of a gzipped-FASTX fan-out is BGZF-framed (valid gzip), round-trips its reads, and a
         // zero-read sample is an empty but valid BGZF file (the EOF block
         // only).
         let dir = tempfile::tempdir().unwrap();
@@ -5080,11 +5074,8 @@ mod tests {
     }
 
     #[test]
-    fn test_pooled_bam_unassigned_bin_round_trips() {
-        // A BAM `--unassigned` bin is pooled (file-backed BAM), so it exercises
-        // the pooled BAM writer's bytes directly: it must be a valid BAM that
-        // reads back, proving the pooled bam writer carries no double-BGZF and
-        // the EOF is sound.
+    fn test_bam_unassigned_bin_round_trips() {
+        // A BAM `--unassigned` bin must read back, with one BGZF layer and a sound EOF.
         let dir = tempfile::tempdir().unwrap();
         let input = write_file(dir.path(), "in.fq", b"@a\nGGGG\n+\nIIII\n"); // matches no sample
         let mut args = base_args();
@@ -5114,7 +5105,7 @@ mod tests {
     }
 
     #[test]
-    fn test_pooled_error_path_returns_clean_error_not_panic() {
+    fn test_bgzf_error_path_returns_clean_error_not_panic() {
         // A write error while BGZF outputs are open must surface a clean Err,
         // not a panic. The run errors because a 3-input pass-through emits 3
         // reads per record, which alignment output cannot hold, beside a
@@ -5141,7 +5132,7 @@ mod tests {
     }
 
     #[test]
-    fn test_pooled_fastx_gz_deterministic_across_threads() {
+    fn test_fastx_gz_deterministic_across_threads() {
         // BGZF output is byte-identical regardless of --threads: merging cuts
         // blocks in input order and BGZF block compression is deterministic at
         // a fixed level.
@@ -5205,9 +5196,8 @@ mod tests {
 
     #[test]
     fn test_parallel_output_is_deterministic_across_thread_counts() {
-        // Matching fans across the rayon pool, but the consumer applies results
-        // in input order, so a single-file --out is byte-identical regardless
-        // of --threads. The input spans several READ_CHUNK chunks so
+        // Records are written in input order, so a single-file --out is
+        // byte-identical regardless of --threads. The input spans several READ_CHUNK chunks so
         // cross-chunk ordering is exercised too.
         let dir = tempfile::tempdir().unwrap();
         let n = READ_CHUNK * 2 + 137; // > 2 chunks plus a partial tail
@@ -5247,8 +5237,7 @@ mod tests {
 
     #[test]
     fn test_parallel_bam_output_deterministic_across_thread_counts() {
-        // The encode-on-workers SAM/BAM path: records are encoded on the rayon
-        // matcher workers and appended by the consumer in input order, so a
+        // Records are encoded on the workers and written in input order, so a
         // single-file BAM `--out` is byte-identical regardless of --threads.
         // The input spans several READ_CHUNK chunks so cross-chunk ordering and
         // multi-job parallel encode (with_min_len coarsens each chunk into
@@ -5279,10 +5268,7 @@ mod tests {
             run_demux(args).unwrap();
         };
 
-        // 4 is the pooled-BGZF floor: read-ahead + main + >=1 writer + >=1
-        // matcher. With fewer worker threads than that, compression runs inline
-        // instead of through the pool; here both runs clear the floor, so both
-        // use the pool and the bytes are identical.
+        // Both thread counts must give identical bytes.
         let out_min = dir.path().join("min.bam");
         let out_many = dir.path().join("many.bam");
         run(4, &out_min);
