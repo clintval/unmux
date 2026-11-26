@@ -1,8 +1,9 @@
 //! Input reading: identify each input's format by peeking its first bytes,
 //! transparently handling a gzip layer, then dispatch to the right reader. The
-//! byte-sniffing here uses a single 1 KiB peek to decide FASTA / FASTQ / SAM /
-//! BAM / CRAM and whether the stream is gzip-wrapped, without consuming the
-//! bytes, so the same reader is handed straight to the matching noodles reader.
+//! byte-sniffing here reads the first 1 KiB, decoding a gzip layer until 1 KiB
+//! of content or its end, to decide FASTA / FASTQ / SAM / BAM / CRAM and
+//! whether the stream is gzip-wrapped, then replays the bytes it read so the
+//! matching noodles reader starts from byte 0.
 //!
 //! Above the per-format readers sits the [`FragmentReader`], which opens every
 //! `--in` file and yields one [`Fragment`] (a logical record) by pulling a
@@ -50,9 +51,9 @@ use crate::reference::{quietly, read_container, CramDecoder, Reference};
 pub enum SniffedFormat {
     /// FASTA; first byte `>`.
     Fasta,
-    /// FASTQ; first byte `@`, no tab in the first line.
+    /// FASTQ; first byte `@`, not followed by two uppercase letters and a tab.
     Fastq,
-    /// SAM (text); first byte `@`, first line contains a tab.
+    /// SAM (text); `@`, two uppercase letters, and a tab, as in `@HD\t`.
     Sam,
     /// BAM; `BAM\x01` after BGZF decompression.
     Bam,
@@ -60,9 +61,9 @@ pub enum SniffedFormat {
     Cram,
     /// The first bytes match no known signature.
     Unknown,
-    /// The input is empty (zero bytes of content) and no format could be
-    /// inferred from its file extension; read as zero records rather than
-    /// rejected.
+    /// The input has no content (zero bytes, after any gzip layer) and no
+    /// format could be inferred from its file extension; read as zero records
+    /// rather than rejected.
     Empty,
 }
 
@@ -170,13 +171,13 @@ fn open_source(path: &Path) -> std::io::Result<Box<dyn BufRead + Send>> {
 /// Open `path` (or stdin for `-`) and identify the underlying format by peeking
 /// its first bytes, transparently decoding a gzip layer for the peek only.
 ///
-/// The returned reader is left at byte 0 (its internal buffer holds the peeked
-/// bytes via a non-consuming `fill_buf`, which works over a non-seekable pipe
+/// The returned reader is left at byte 0 (the bytes read to sniff are replayed
+/// in front of the rest of the stream, which works over a non-seekable pipe
 /// too), so the caller can hand it straight to a noodles text reader, a
 /// [`flate2`] decoder, a `bgzf::Reader`, or a `cram::Reader` and start reading
 /// from the start. `gzipped` is `true` iff the outer stream starts with `1f
-/// 8b`; the caller dispatches by `(format, gzipped)`. A gzip-wrapped CRAM is
-/// rejected (it is not a real format).
+/// 8b`; the caller dispatches by `(format, gzipped)`. A gzip layer that fails
+/// to decode is rejected, as is a gzip-wrapped CRAM (it is not a real format).
 pub fn sniff_input(path: &Path) -> std::io::Result<(SniffedFormat, bool, Box<dyn BufRead + Send>)> {
     let mut reader = open_source(path)?;
 
@@ -194,14 +195,20 @@ pub fn sniff_input(path: &Path) -> std::io::Result<(SniffedFormat, bool, Box<dyn
     let is_gzip = head.len() >= 2 && head[0] == 0x1f && head[1] == 0x8b;
 
     let (format, decoded_empty) = if is_gzip {
-        // Decompress a copy of the prefix into scratch space. A decompression
-        // failure (truncated member, bad CRC, ...) falls back to `Unknown`
-        // rather than propagating: the caller's downstream open surfaces a
-        // clearer "failed to read ..." error with the full path.
-        let mut scratch = [0u8; 256];
-        let mut decoder = flate2::bufread::MultiGzDecoder::new(std::io::Cursor::new(&head));
-        let n = decoder.read(&mut scratch).unwrap_or(0);
-        let inner = sniff_bytes(&scratch[..n]);
+        // Decode until 1 KiB of content or the end, keeping each raw byte read for the replay.
+        let mut rest = Recorder::new(&mut reader);
+        let mut decoded = Vec::with_capacity(SNIFF_PREFIX as usize);
+        flate2::bufread::MultiGzDecoder::new(BufReader::new(head.as_slice().chain(&mut rest)))
+            .take(SNIFF_PREFIX)
+            .read_to_end(&mut decoded)
+            .map_err(|error| {
+                std::io::Error::new(
+                    error.kind(),
+                    format!("failed to decompress gzip input: {error}"),
+                )
+            })?;
+        head.extend(Recorder::take(&mut rest));
+        let inner = sniff_bytes(&decoded);
         if inner == SniffedFormat::Cram {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -211,7 +218,7 @@ pub fn sniff_input(path: &Path) -> std::io::Result<(SniffedFormat, bool, Box<dyn
                 ),
             ));
         }
-        (inner, n == 0)
+        (inner, decoded.is_empty())
     } else {
         (sniff_bytes(&head), head.is_empty())
     };
@@ -219,10 +226,11 @@ pub fn sniff_input(path: &Path) -> std::io::Result<(SniffedFormat, bool, Box<dyn
     // An input with no content cannot be byte-sniffed: fall back to the file
     // extension, so an empty file (e.g. an empty `.fastq.gz` from a run that
     // produced no reads) is read as zero records instead of rejected. A
-    // recognized extension picks the concrete format (its reader yields zero
-    // records); an unrecognized one (or stdin) becomes `Empty`, also read as
-    // zero records. Non-empty unrecognized bytes stay `Unknown`, a real error:
-    // the extension is never trusted over real bytes.
+    // recognized extension picks the concrete format (a FASTX or SAM reader
+    // yields zero records, a BAM or CRAM reader fails on the missing header);
+    // an unrecognized one (or stdin) becomes `Empty`, read as zero records.
+    // Non-empty unrecognized bytes stay `Unknown`, a real error: the extension
+    // is never trusted over real bytes.
     let format = if format == SniffedFormat::Unknown && decoded_empty {
         match sniff_from_extension(path) {
             SniffedFormat::Unknown => SniffedFormat::Empty,
