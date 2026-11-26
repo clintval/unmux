@@ -1017,13 +1017,17 @@ fn parse_comment_tags(comment: &[u8]) -> Result<Option<Data>> {
 }
 
 /// One comment field as a SAM tag of a type the writer emits, or `None` when it
-/// is not shaped `XX:T:VALUE`; an integer takes the narrowest BAM type that
-/// holds it and an array keeps its subtype.
+/// is not shaped `XX:T:VALUE`, as when a value other than a `Z` holds a space;
+/// an integer takes the narrowest BAM type that holds it and an array keeps
+/// its subtype.
 fn parse_aux_field(field: &[u8]) -> Result<Option<(Tag, Value)>> {
     let &[name0, name1, b':', ty, b':', ref raw @ ..] = field else {
         return Ok(None);
     };
     if !name0.is_ascii_alphabetic() || !name1.is_ascii_alphanumeric() {
+        return Ok(None);
+    }
+    if ty != b'Z' && raw.contains(&b' ') {
         return Ok(None);
     }
     let value = match ty {
