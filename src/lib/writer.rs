@@ -790,8 +790,9 @@ fn render_array(array: &Array) -> String {
 const MISSING_QUALITY: u8 = 0xFF;
 
 trait AlignmentSink: AlignmentWrite {
-    const NEEDS_MISSING_QUALITIES_FILLED: bool = false;
     const NEEDS_U_STORED_AS_T: bool = false;
+    /// Adjust `record` so this writer stores it as BAM output does.
+    fn prepare(_record: &mut std::borrow::Cow<'_, RecordBuf>) {}
 }
 
 impl<W: Write> AlignmentSink for sam::io::Writer<W> {}
@@ -803,7 +804,13 @@ impl<W: Write> AlignmentSink for bam::io::Writer<W> {
 
 /// The noodles CRAM writer flags every record as storing a quality per base, even one with none.
 impl<W: Write> AlignmentSink for cram::io::Writer<W> {
-    const NEEDS_MISSING_QUALITIES_FILLED: bool = true;
+    fn prepare(record: &mut std::borrow::Cow<'_, RecordBuf>) {
+        // noodles ends a missing name with a second stop byte, which readers take as another name.
+        if record.name().is_none() {
+            *record.to_mut().name_mut() = Some("*".into());
+        }
+        fill_missing_qualities(record);
+    }
 }
 
 /// Write a fragment's records as SAM/BAM alignment records, setting
@@ -827,9 +834,7 @@ fn write_alignments<W: AlignmentSink>(
                 std::borrow::Cow::Owned(build_record(read, record_flags(read, index, reads.len())))
             }
         };
-        if W::NEEDS_MISSING_QUALITIES_FILLED {
-            fill_missing_qualities(&mut record);
-        }
+        W::prepare(&mut record);
         if W::NEEDS_U_STORED_AS_T {
             store_u_as_t(&mut record);
         }
