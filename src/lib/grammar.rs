@@ -418,15 +418,13 @@ impl TagBinding {
             .map(|(stream, _)| stream)
     }
 
-    /// Whether the stream `name` is followed by a fallback in some part of this tag.
-    pub fn falls_back_from(&self, name: &str) -> bool {
+    /// Whether the stream `name` is the last choice of some part of this tag, so
+    /// the tag is left out when it is absent.
+    pub fn is_last_choice(&self, name: &str) -> bool {
         self.streams
             .iter()
             .zip(&self.fallbacks)
-            .any(|(stream, fallbacks)| {
-                let part: Vec<&StreamRef> = std::iter::once(stream).chain(fallbacks).collect();
-                part[..part.len() - 1].iter().any(|s| s.name == name)
-            })
+            .any(|(stream, fallbacks)| fallbacks.last().unwrap_or(stream).name == name)
     }
 
     /// Every stream this tag may read, its fallbacks included.

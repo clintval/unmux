@@ -54,8 +54,9 @@ use crate::matcher::{
 use crate::metrics::Metrics;
 use crate::output::{
     alignment_header, build_tag_data, check_output_collisions, default_read_group_header,
-    insert_string_tag, is_header_text, qual_tag_name, read_group_header, resolve_metrics_path,
-    resolve_pattern, ConstituentReadGroups, Destination, OutputOrigin, PathContext,
+    insert_string_tag, is_header_text, lacks_qualities, qual_tag_name, read_group_header,
+    resolve_metrics_path, resolve_pattern, ConstituentReadGroups, Destination, OutputOrigin,
+    PathContext,
 };
 use crate::pool::{self, End, Readout};
 use crate::qc::{removed_slug, routed_slug, unassigned_slug, Unassigned};
@@ -811,7 +812,7 @@ fn log_blank_sample_column(
         .tags
         .iter()
         .filter(|tag| tag.all_streams().any(|s| s.name == stream))
-        .partition(|tag| tag.falls_back_from(stream));
+        .partition(|tag| !tag.is_last_choice(stream));
     if blank == 0 || (fallen_back.is_empty() && left_out.is_empty()) {
         return;
     }
@@ -3041,6 +3042,17 @@ fn prepare_body(
 
     let tag_data = build_tag_data(&plan.tags, &streams);
     let left_out = left_out_tags(&plan.tags, &tag_data);
+    let text_qualities: Vec<(&str, &str)> = engine
+        .column_tag_qualities
+        .iter()
+        .copied()
+        .filter(|(tag, _)| {
+            plan.tags
+                .iter()
+                .find(|binding| binding.tag == *tag)
+                .is_some_and(|binding| lacks_qualities(binding, &streams))
+        })
+        .collect();
     // An assigned read carries its sample's read group; a pass-through read (no
     // target) carries the default pool read group, so a SAM/BAM/CRAM `--out`
     // matches the default `@RG` in its header. On an `@RG`-split run the record
@@ -3054,14 +3066,7 @@ fn prepare_body(
 
     let mut datas: Vec<Data> = bodies
         .iter()
-        .map(|body| {
-            merge_data(
-                body.carried.as_ref(),
-                &tag_data,
-                engine.column_tag_qualities,
-                &left_out,
-            )
-        })
+        .map(|body| merge_data(body.carried.as_ref(), &tag_data, &text_qualities, &left_out))
         .collect();
     // With `--qc-tag`, every output body of this record carries the
     // routing-outcome slug (assigned with its sample, or pass-through). Built

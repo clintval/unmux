@@ -106,6 +106,21 @@ Feature: Tag stream fallbacks
       | --per-record        |
       | --tag CB::qual=CY   |
 
+  Scenario: with qual=none a record whose tag takes bases keeps its carried quality tag
+    Given a file "carried.sam" containing:
+      """
+      @HD	VN:1.6
+      r1	4	*	0	0	*	*	0	0	AAAAGGGGACGTACGT	ABCDEFGHIJKLMNOP	CB:Z:OLD	CY:Z:III
+      r3	4	*	0	0	*	*	0	0	CCCCGGGGACGTACGT	ABCDEFGHIJKLMNOP	CB:Z:OLD	CY:Z:III
+      """
+    When I run `unmux carried.sam --group a={a1=AAAA,a2=CCCC} --group a::loc=0:0:4 --group b={b1=GGGG,b2=TTTT} --group b::loc=0:4:8 --extract nuc=%sample::nucleus --extract ba=@a --extract bb=@b --tag CB=nuc|ba+bb --tag CB::qual=none --sample-sheet sheet.tsv --out out.sam`
+    Then the exit code is 0
+    And the records of "out.sam" are:
+      """
+      r1	4	*	0	255	*	*	0	0	AAAAGGGGACGTACGT	ABCDEFGHIJKLMNOP	CB:Z:N1-GGGG	RG:Z:s1
+      r3	4	*	0	255	*	*	0	0	CCCCGGGGACGTACGT	ABCDEFGHIJKLMNOP	CB:Z:CCCC-GGGG	CY:Z:III	RG:Z:s2
+      """
+
   Scenario: a named quality tag is allowed when each part of the tag has a choice with bases
     When I run `unmux reads.fq --group a={a1=AAAA,a2=CCCC} --group a::loc=0:0:4 --group b={b1=GGGG,b2=TTTT} --group b::loc=0:4:8 --extract nuc=%sample::nucleus --extract ba=@a --extract bb=@b --extract r=0:8:end --tag CB=nuc|ba+bb --tag CB::qual=xq --template r --sample-sheet sheet.tsv --out out.sam`
     Then the exit code is 0
@@ -124,6 +139,9 @@ Feature: Tag stream fallbacks
     When I run `unmux reads.fq --group a={a1=AAAA,a2=CCCC} --group a::loc=0:0:4 --group b={b1=GGGG,b2=TTTT} --group b::loc=0:4:8 --extract nuc=%sample::nucleus --extract ba=@a --extract bb=@b --extract r=0:8:end --tag CB=nuc|ba+bb --tag xn=nuc --template r --sample-sheet sheet.tsv --out out.sam`
     Then the exit code is 0
     And stderr contains "column "nucleus" is blank in 2 of 4 sheet rows; records they route get no xn tag and fall back to the next stream for CB"
+    When I run `unmux reads.fq --group a={a1=AAAA,a2=CCCC} --group a::loc=0:0:4 --group b={b1=GGGG,b2=TTTT} --group b::loc=0:4:8 --extract nuc=%sample::nucleus --extract ba=@a --extract r=0:8:end --tag CB=nuc|ba+nuc --tag CB::qual=none --template r --sample-sheet sheet.tsv --out out.sam`
+    Then the exit code is 0
+    And stderr contains "column "nucleus" is blank in 2 of 4 sheet rows; records they route get no CB tag"
 
   Scenario: an empty choice around | is an error
     When I run `unmux reads.fq --group a={a1=AAAA,a2=CCCC} --group a::loc=0:0:4 --extract ba=@a --extract bb=0:4:8 --extract r=0:8:end --template r --out out.sam --tag CB=ba|`
