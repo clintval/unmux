@@ -1,10 +1,10 @@
 //! Approximate matching of tag groups against records, built on the `sassy`
 //! SIMD matcher with the `Iupac` profile, so IUPAC ambiguity codes in a TAG
-//! (pattern side) match natively at zero cost. An observed non-ACGT record base
-//! (an `N` no-call or a record-side degenerate) is instead masked to a
-//! never-match sentinel so it is charged against the `dist` budget rather than
-//! matching any tag base for free (splitcode semantics; an all-`N` record falls
-//! to unmatched, not mis-assigned).
+//! (pattern side) match natively at zero cost. A record U matches as T, and any
+//! other non-ACGT record base (an `N` no-call or a record-side degenerate) is
+//! instead masked to a never-match sentinel so it is charged against the `dist`
+//! budget rather than matching any tag base for free (splitcode semantics; an
+//! all-`N` record falls to unmatched, not mis-assigned).
 //!
 //! This is the record-window search primitive: given a [`CompiledGroup`] (its
 //! tag sequences plus the `loc`/`dist`/`bothStrands`/`mode`/`delta`
@@ -688,13 +688,13 @@ pub fn match_group_at(
         if text.is_empty() {
             continue;
         }
-        // Mask non-ACGT observed bases (an `N` no-call or a read-side
-        // degenerate code) to a never-match sentinel so they are charged
-        // against the `dist` budget rather than matching any tag base for free
-        // (a tag-side IUPAC code stays a deliberate wildcard). This masks only
-        // the search window; the original read bases used for extraction and
-        // output are untouched, and the sentinel keeps the window length so
-        // match coordinates still map back to the read.
+        // Read U as T and mask other non-ACGT observed bases (an `N` no-call or
+        // a read-side degenerate code) to a never-match sentinel so they are
+        // charged against the `dist` budget rather than matching any tag base
+        // for free (a tag-side IUPAC code stays a deliberate wildcard). This
+        // masks only the search window; the original read bases used for
+        // extraction and output are untouched, and the sentinel keeps the
+        // window length so match coordinates still map back to the read.
         let masked: Vec<u8> = text.iter().map(|&base| mask_no_call(base)).collect();
         let text = masked.as_slice();
         let window_first = accepted.len();
@@ -1204,12 +1204,15 @@ fn resolve_windows(
 
 /// Map an observed record base to a never-match sentinel (`X`, which the
 /// `Iupac` profile encodes as matching nothing) unless it is a concrete
-/// A/C/G/T. An `N` no-call or a record-side degenerate code is thus a mismatch
-/// against a concrete tag base, matching splitcode (a tag-side IUPAC code
-/// remains a free wildcard, since only the record window is masked).
+/// A/C/G/T, reading an RNA U as T. An `N` no-call or a record-side degenerate
+/// code is thus a mismatch against a concrete tag base, matching splitcode (a
+/// tag-side IUPAC code remains a free wildcard, since only the record window is
+/// masked).
 fn mask_no_call(base: u8) -> u8 {
     match base {
         b'A' | b'C' | b'G' | b'T' | b'a' | b'c' | b'g' | b't' => base,
+        b'U' => b'T',
+        b'u' => b't',
         _ => b'X',
     }
 }
