@@ -320,6 +320,7 @@ fn write_inputs(dir: &Path) {
     broken("bad-prefix.fq", &record[1..]);
     broken("bad-plus.fq", &record.replace("\n+\n", "\nX\n"));
     broken("bad-length.fq", &record.replace("\n+\n", "A\n+\n"));
+    broken("bad-tag.fq", &record.replacen('\n', "\tML:B:C,256\n", 1));
     broken("blank-line.fq", &format!("\n{record}"));
     broken("renamed.fq", &record.replace("@b", "@c"));
     put("no-quals.fq", &big.as_bytes()[..middle - 30]);
@@ -463,7 +464,7 @@ const CELLS: &str = "--group b1={in}/bc.tsv --group b1::loc=0:0:13 --group b1::d
     {BINS} {METRICS}"
 )]
 #[case::mixed_gzip_to_one_bam(
-    "06f378b9f5bcadfc6d57d00bf3d4161f",
+    "486652a48e387baac611dd02e3297c19",
     "{in}/r1.mixed.fq.gz \
     {in}/r2.bgzf.fq.gz {BC} {CUT} --template ~b a+s --tag BC=~s --tag OX=umi+s \
     --sample-from-group bc --out all.bam --unassigned un.bam"
@@ -628,7 +629,7 @@ const CELLS: &str = "--group b1={in}/bc.tsv --group b1::loc=0:0:13 --group b1::d
     {METRICS}"
 )]
 #[case::passed_through_to_bam(
-    "56ba0e2be26532bcd44b563dc4f00223",
+    "4e48279913ee9fbdd3648910daf84cd7",
     "{in}/r1.fq {in}/r2.fq \
     --out out.bam --metrics-summary sum.tsv"
 )]
@@ -638,14 +639,14 @@ const CELLS: &str = "--group b1={in}/bc.tsv --group b1::loc=0:0:13 --group b1::d
     --out out.cram"
 )]
 #[case::passed_through_to_stdout("eb929ab538ffe4b6035b5ca7435f1242", "{in}/r1.fq.gz")]
-#[case::blend_to_stdout("c1bef8ee5fbb6e3c1317a82fdc44940a", "{in}/r1.fq {in}/mates.bam")]
+#[case::blend_to_stdout("9120be8eda0ae6fedab5acad0c483646", "{in}/r1.fq {in}/mates.bam")]
 #[case::stored_blocks(
-    "36673b5e444ea4fe829b1a1ffd72b31a",
+    "542e9365400e385460294996d50cdb4c",
     "{in}/r1.fq {BC} \
     --sample-from-group bc --out %sample.fq.gz --unassigned un.bam --compression 0"
 )]
 #[case::best_compression(
-    "fc7c1f984739bff4eddbf85f4757efd9",
+    "dff767578c94c0b10a686e409013efba",
     "{in}/r1.fq {BC} \
     --sample-from-group bc --out %sample.bam --unassigned un.fq.gz --compression 9"
 )]
@@ -683,6 +684,10 @@ fn outputs_are_pinned_at_every_thread_count(#[case] expected: &str, #[case] args
     "{in}/bad-plus.fq"
 )]
 #[case::lengths("malformed FASTQ record `b40000`", "{in}/bad-length.fq")]
+#[case::comment_tag(
+    "malformed FASTQ record `b40000`: the comment tag `ML:B`",
+    "{in}/bad-tag.fq"
+)]
 #[case::blank_line(
     "failed to read FASTQ record: invalid name prefix",
     "{in}/blank-line.fq"

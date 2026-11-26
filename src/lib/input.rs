@@ -2312,7 +2312,7 @@ mod tests {
     fn parse_comment_tags_lifts_integer_tag() {
         use noodles::sam::alignment::record_buf::data::field::Value;
         let data = parse_comment_tags(b"xi:i:42").expect("integer tag lifts");
-        assert!(matches!(data.get(b"xi"), Some(Value::Int32(42))));
+        assert!(matches!(data.get(b"xi"), Some(Value::UInt8(42))));
     }
 
     #[test]
@@ -2363,6 +2363,124 @@ mod tests {
             .as_ref()
             .expect("comment tags are lifted");
         assert_eq!(z_tag(data, b"BC").as_deref(), Some(&b"GGGG"[..]));
+    }
+
+    /// The tags lifted from `comment` on a one-record FASTQ.
+    fn fastq_comment_tags(comment: &str) -> Data {
+        let file = temp_with(format!("@r1\t{comment}\nACGT\n+\nIIII\n").as_bytes());
+        read_all(&file)
+            .remove(0)
+            .records
+            .remove(0)
+            .tags
+            .expect("comment tags are lifted")
+    }
+
+    /// The error that reading the FASTX `text` stops with.
+    fn read_error(text: &str) -> String {
+        let file = temp_with(text.as_bytes());
+        let error = match FragmentReader::open(&[file.path().to_path_buf()], false) {
+            Ok(mut reader) => std::iter::from_fn(|| reader.next_fragment().transpose())
+                .find_map(Result::err)
+                .unwrap_or_else(|| panic!("reading {text:?} must fail")),
+            Err(error) => error,
+        };
+        format!("{error:#}")
+    }
+
+    #[test]
+    fn test_read_fastq_lifts_integer_tags_in_the_narrowest_bam_type() {
+        for (text, expected) in [
+            ("-2147483648", Value::Int32(i32::MIN)),
+            ("-32769", Value::Int32(-32769)),
+            ("-32768", Value::Int16(i16::MIN)),
+            ("-129", Value::Int16(-129)),
+            ("-128", Value::Int8(i8::MIN)),
+            ("-1", Value::Int8(-1)),
+            ("0", Value::UInt8(0)),
+            ("+42", Value::UInt8(42)),
+            ("255", Value::UInt8(u8::MAX)),
+            ("256", Value::UInt16(256)),
+            ("65535", Value::UInt16(u16::MAX)),
+            ("65536", Value::UInt32(65_536)),
+            ("4000000000", Value::UInt32(4_000_000_000)),
+            ("4294967295", Value::UInt32(u32::MAX)),
+        ] {
+            let data = fastq_comment_tags(&format!("ns:i:{text}"));
+            assert_eq!(data.get(b"ns"), Some(&expected), "ns:i:{text}");
+        }
+    }
+
+    #[test]
+    fn test_read_fastq_lifts_hex_and_array_tags_of_every_subtype() {
+        use noodles::sam::alignment::record_buf::data::field::value::Array;
+        let data = fastq_comment_tags(
+            "xh:H:CAFE\txe:H:\txc:B:c,-128,127\tML:B:C,200,100\txs:B:s,-32768,32767\t\
+             xS:B:S,0,65535\txi:B:i,-2147483648,2147483647\txI:B:I,0,4294967295\t\
+             xf:B:f,1.5,-2.25\txz:B:C",
+        );
+        for (tag, expected) in [
+            (b"xh", Value::Hex("CAFE".into())),
+            (b"xe", Value::Hex("".into())),
+            (b"xc", Value::Array(Array::Int8(vec![i8::MIN, i8::MAX]))),
+            (b"ML", Value::Array(Array::UInt8(vec![200, 100]))),
+            (b"xs", Value::Array(Array::Int16(vec![i16::MIN, i16::MAX]))),
+            (b"xS", Value::Array(Array::UInt16(vec![0, u16::MAX]))),
+            (b"xi", Value::Array(Array::Int32(vec![i32::MIN, i32::MAX]))),
+            (b"xI", Value::Array(Array::UInt32(vec![0, u32::MAX]))),
+            (b"xf", Value::Array(Array::Float(vec![1.5, -2.25]))),
+            (b"xz", Value::Array(Array::UInt8(Vec::new()))),
+        ] {
+            let name = String::from_utf8_lossy(tag);
+            assert_eq!(data.get(tag), Some(&expected), "{name}");
+        }
+    }
+
+    #[test]
+    fn test_read_fasta_lifts_array_and_wide_integer_tags() {
+        use noodles::sam::alignment::record_buf::data::field::value::Array;
+        let file = temp_with(b">read1 ML:B:C,200,100\tns:i:4000000000\nACGTACGT\n");
+        let fragments = read_all(&file);
+        let data = fragments[0].records[0]
+            .tags
+            .as_ref()
+            .expect("comment tags are lifted");
+        let ml = Value::Array(Array::UInt8(vec![200, 100]));
+        assert_eq!(data.get(b"ML"), Some(&ml));
+        assert_eq!(data.get(b"ns"), Some(&Value::UInt32(4_000_000_000)));
+    }
+
+    #[test]
+    fn test_read_fastx_refuses_a_comment_tag_a_bam_record_cannot_hold() {
+        for field in [
+            "ns:i:4294967296",
+            "ns:i:-2147483649",
+            "ns:i:12abc",
+            "ns:i:",
+            "ML:B:C,256",
+            "ML:B:C,-1",
+            "ML:B:I,4294967296",
+            "ML:B:C,1,x",
+            "ML:B:C,",
+            "ML:B:C 1",
+            "ML:B:Q,1",
+            "ML:B:",
+            "xh:H:CAF",
+            "xh:H:cafe",
+            "xa:A:ab",
+            "xa:A:",
+            "xf:f:abc",
+        ] {
+            let tag = &field[..4];
+            for (kind, text) in [
+                ("FASTQ", format!("@r1\tRX:Z:ACGT\t{field}\nACGT\n+\nIIII\n")),
+                ("FASTA", format!(">r1 RX:Z:ACGT\t{field}\nACGT\n")),
+            ] {
+                let error = read_error(&text);
+                let expected = format!("malformed {kind} record `r1`: the comment tag `{tag}`");
+                assert!(error.contains(&expected), "{field}: {error}");
+            }
+        }
     }
 
     #[test]

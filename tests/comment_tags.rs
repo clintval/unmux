@@ -10,10 +10,11 @@
 //! the same comment still lift.
 
 use assert_cmd::Command;
-use noodles::bam;
+use noodles::sam::alignment::record::data::field::Tag;
 use noodles::sam::alignment::record_buf::data::field::Value;
 use noodles::sam::alignment::record_buf::Data;
 use noodles::sam::alignment::RecordBuf;
+use noodles::{bam, sam};
 
 /// The bytes of a `Z` (string) tag, or `None` if the tag is absent or not a
 /// string.
@@ -70,5 +71,53 @@ fn fastq_comment_tags_become_real_sam_tags_in_ubam() {
     assert!(
         r2.data().get(b"RX").is_none() && r2.data().get(b"BC").is_none(),
         "a read with no comment must not gain RX/BC tags"
+    );
+}
+
+/// The tags of a record other than its `RG`, in order.
+fn tags_without_read_group(data: &Data) -> Vec<(Tag, Value)> {
+    data.iter()
+        .filter(|(tag, _)| *tag != Tag::READ_GROUP)
+        .map(|(tag, value)| (tag, value.clone()))
+        .collect()
+}
+
+#[test]
+fn every_tag_type_keeps_its_bam_type_through_a_fastq_round_trip() {
+    let dir = tempfile::tempdir().unwrap();
+    let sam = "@HD\tVN:1.6\n\
+               read1\t4\t*\t0\t0\t*\t*\t0\t0\tACGT\tIIII\txa:A:Q\txn:i:-2147483648\txb:i:42\t\
+               xu:i:4294967295\txf:f:1.5\txz:Z:hello world\txh:H:CAFE\txc:B:c,-128,127\t\
+               ML:B:C,200,100\txs:B:s,-32768,32767\txS:B:S,0,65535\t\
+               xi:B:i,-2147483648,2147483647\txI:B:I,0,4294967295\txF:B:f,1.5,-2.25\txe:B:C\n";
+    std::fs::write(dir.path().join("in.sam"), sam).unwrap();
+
+    // The SAM reader types each integer as the narrowest BAM type that holds it.
+    let mut reader = sam::io::Reader::new(sam.as_bytes());
+    let header = reader.read_header().unwrap();
+    let original = reader.record_bufs(&header).next().unwrap().unwrap();
+
+    for args in [
+        ["in.sam", "--out", "mid.fq"],
+        ["mid.fq", "--out", "out.bam"],
+    ] {
+        Command::cargo_bin("unmux")
+            .unwrap()
+            .current_dir(dir.path())
+            .args(args)
+            .assert()
+            .success();
+    }
+
+    let mut reader = bam::io::Reader::new(std::fs::File::open(dir.path().join("out.bam")).unwrap());
+    let header = reader.read_header().unwrap();
+    let records: Vec<RecordBuf> = reader
+        .record_bufs(&header)
+        .map(|r| r.expect("decode BAM record"))
+        .collect();
+    assert_eq!(records.len(), 1);
+    assert_eq!(
+        tags_without_read_group(records[0].data()),
+        tags_without_read_group(original.data())
     );
 }
