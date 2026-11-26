@@ -6,10 +6,11 @@ Feature: Lifting SAM tags from FASTX read-name comments
   Every type unmux writes reads back: `A`, `f`, `Z`, `H`, `B` arrays of every
   subtype, and `i` from -2147483648 to 4294967295 in the narrowest BAM type that
   holds it. Lifting is per-field: a field that is not shaped like an
-  `XX:T:VALUE` tag (a bare UMI, an Illumina CASAVA string, free text) is skipped
-  while the tags in the same comment still lift, but a tag whose value its type
-  does not allow, or a BAM record cannot hold, stops the run with an error that
-  identifies the record and the tag.
+  `XX:T:VALUE` tag (a bare UMI, an Illumina CASAVA string, free text, or a value
+  other than a `Z` string that holds a space) is skipped while the tags in the
+  same comment still lift. A tag whose value is outside the SAM grammar of its
+  type or a BAM record cannot hold, or a tag given twice in one comment, stops
+  the run with an error that identifies the record and the tag.
 
   Scenario: a single SAM tag in a FASTQ comment becomes a real SAM tag
     Given a file "in.fq" containing:
