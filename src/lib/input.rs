@@ -1020,9 +1020,7 @@ fn parse_comment_tags(comment: &[u8]) -> Result<Option<Data>> {
     Ok((!data.is_empty()).then_some(data))
 }
 
-/// The tag, type, and value of a comment field shaped `XX:T:VALUE` with a type
-/// the writer emits, or `None` for any other field, as when a value other than
-/// a `Z` holds a space.
+/// The tag, type, and value of a field shaped `XX:T:VALUE` with a type the writer emits.
 fn tag_shape(field: &[u8]) -> Option<(Tag, u8, &[u8])> {
     let &[name0, name1, b':', ty @ (b'A' | b'i' | b'f' | b'Z' | b'H' | b'B'), b':', ref raw @ ..] =
         field
