@@ -173,8 +173,10 @@ struct DemuxCmd {
     /// Placeholders fan-out the pool into multiple files including `%pool`,
     /// `%sample`, `%sub_sample`, and `%ordinal`. Outputs that would be one
     /// file are refused: paths differing only in case (one file on a
-    /// case-insensitive file system), two spellings of one file, or a metrics
-    /// file on another output's path.
+    /// case-insensitive file system), two spellings of one file, a metrics
+    /// file on another output's path, or an output that is a file the run
+    /// reads under any name (an input, a tag file, the sample sheet, or the
+    /// reference and its indexes).
     ///
     ///   --out out.bam                   one file with all assigned records
     ///   --out %sample.bam               one file per sample

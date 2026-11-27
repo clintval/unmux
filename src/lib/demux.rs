@@ -1000,7 +1000,7 @@ fn labeled_dests(
     Ok(paths)
 }
 
-/// Refuse outputs that would be one file, before any is created.
+/// Refuse outputs that would be one file with each other or with an input, before any is created.
 fn check_outputs(
     plan: &DemuxPlan,
     routing: &Routing,
@@ -1021,7 +1021,36 @@ fn check_outputs(
             ));
         }
     }
-    check_output_collisions(&outputs)
+    check_output_collisions(&outputs)?;
+    crate::output::check_outputs_over_inputs(&outputs, &read_files(plan))
+}
+
+/// Every file the run reads: the inputs, the tag files, the sample sheet and the reference.
+fn read_files(plan: &DemuxPlan) -> Vec<(PathBuf, crate::output::InputOrigin)> {
+    use crate::output::InputOrigin;
+
+    let mut files: Vec<(PathBuf, InputOrigin)> = plan
+        .inputs
+        .iter()
+        .enumerate()
+        .map(|(index, path)| (path.clone(), InputOrigin::Reads(index)))
+        .collect();
+    for group in &plan.groups {
+        if let GroupSource::File(path) = &group.source {
+            files.push((path.clone(), InputOrigin::TagFile(group.name.clone())));
+        }
+    }
+    if let SampleSpec::Sheet(path, _) = &plan.samples {
+        files.push((path.clone(), InputOrigin::SampleSheet));
+    }
+    if let Some(reference) = &plan.reference {
+        let (fai, gzi) = crate::reference::index_paths(reference);
+        files.push((reference.clone(), InputOrigin::Reference));
+        for index in std::iter::once(fai).chain(gzi) {
+            files.push((index, InputOrigin::ReferenceIndex));
+        }
+    }
+    files
 }
 
 /// The `--out` file path(s) for one target (or `None` for a pure pass-through),

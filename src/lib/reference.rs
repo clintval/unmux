@@ -33,9 +33,7 @@ impl Reference {
     pub fn open(path: &Path, check: bool, threads: usize) -> Result<Self> {
         let context = || format!("failed to open the --reference FASTA {}", path.display());
         File::open(path).with_context(context)?;
-        let mut index_path = OsString::from(path);
-        index_path.push(".fai");
-        let index_path = PathBuf::from(index_path);
+        let (index_path, gzi_path) = index_paths(path);
         let index = fai::fs::read(&index_path).with_context(|| {
             format!(
                 "failed to read the .fai index {} of the --reference FASTA {}; create it with samtools faidx",
@@ -44,10 +42,7 @@ impl Reference {
             )
         })?;
         reject_duplicate_names(&index, &index_path)?;
-        if let Some("gz" | "bgz") = path.extension().and_then(|ext| ext.to_str()) {
-            let mut gzi_path = OsString::from(path);
-            gzi_path.push(".gzi");
-            let gzi_path = PathBuf::from(gzi_path);
+        if let Some(gzi_path) = gzi_path {
             bgzf::gzi::fs::read(&gzi_path).with_context(|| {
                 format!(
                     "failed to read the .gzi index {} of the bgzipped --reference FASTA {}; create it with bgzip -r",
@@ -92,6 +87,20 @@ impl Reference {
         reader.read_sequence(&mut sequence)?;
         Ok(fasta::record::Sequence::from(sequence))
     }
+}
+
+/// The `.fai` index of the FASTA at `path`, and its `.gzi` index when the FASTA is bgzipped.
+pub(crate) fn index_paths(path: &Path) -> (PathBuf, Option<PathBuf>) {
+    let beside = |suffix: &str| {
+        let mut index = OsString::from(path);
+        index.push(suffix);
+        PathBuf::from(index)
+    };
+    let bgzipped = matches!(
+        path.extension().and_then(|ext| ext.to_str()),
+        Some("gz" | "bgz")
+    );
+    (beside(".fai"), bgzipped.then(|| beside(".gzi")))
 }
 
 /// Fail when the `.fai` lists a name twice, since a lookup by name could pick either record.
@@ -967,6 +976,17 @@ mod tests {
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/data")
             .join(name)
+    }
+
+    #[test]
+    fn test_index_paths_add_a_gzi_only_for_a_bgzipped_fasta() {
+        let fai = PathBuf::from("ref.fa.fai");
+        assert_eq!(index_paths(Path::new("ref.fa")), (fai, None));
+        for fasta in ["ref.fa.gz", "ref.fa.bgz"] {
+            let (fai, gzi) = (format!("{fasta}.fai"), format!("{fasta}.gzi"));
+            let expected = (PathBuf::from(fai), Some(PathBuf::from(gzi)));
+            assert_eq!(index_paths(Path::new(fasta)), expected);
+        }
     }
 
     /// Decode a test CRAM, returning its records and the most sequences held after any container.
