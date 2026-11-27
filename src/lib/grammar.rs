@@ -2472,22 +2472,28 @@ fn require_extract(extracts: &HashSet<&str>, name: &str, referrer: &str) -> Resu
 
 /// Non-fatal plan warnings, surfaced by [`parse_demux`] via `log::warn!`.
 /// Returned as strings so the detection logic is unit-testable without a
-/// logger. Two cases: a no-sample run that still defines groups (rule 2: it
+/// logger. Two cases: a no-sample run with a group nothing consumes (rule 2: it
 /// does no demultiplexing), and any single group nothing consumes (rule 1).
 fn plan_warnings(plan: &DemuxPlan) -> Vec<String> {
     let mut warnings = Vec::new();
+    let consumers = Consumers::of(plan);
+    let unused: Vec<&str> = plan
+        .groups
+        .iter()
+        .filter(|group| !consumers.consume(plan, group))
+        .map(|group| group.name.as_str())
+        .collect();
 
-    // Rule 2: groups defined but no sample target -> no demultiplexing happens
-    // (everything passes through to `--out`). Structurally indistinguishable
-    // from an intentional annotate-only run, so this can only be a warning,
-    // never an error.
-    if matches!(plan.samples, SampleSpec::None) && !plan.groups.is_empty() {
-        warnings.push(
+    // Rule 2: a run with no sample target warns only when some group feeds nothing.
+    if matches!(plan.samples, SampleSpec::None) && !unused.is_empty() {
+        let label = if unused.len() == 1 { "group" } else { "groups" };
+        let names: Vec<String> = unused.iter().map(|name| format!("`{name}`")).collect();
+        warnings.push(format!(
             "groups are defined but no `--sample`, `--sample-sheet`, or `--sample-from-group` was \
              given; reads will not be demultiplexed (they pass through to `--out` undemultiplexed). \
-             Add a sample target to name a single sample or split by sample."
-                .to_string(),
-        );
+             Add a sample target to name a single sample or split by sample. Unused {label}: {}.",
+            names.join(", ")
+        ));
     }
 
     // Rule 1: a group that nothing consumes has no effect on output. "Consumed"
@@ -2497,16 +2503,11 @@ fn plan_warnings(plan: &DemuxPlan) -> Vec<String> {
     // any group (resolved later, at load), so suppress the warning entirely
     // under a sheet.
     if !matches!(plan.samples, SampleSpec::Sheet(..)) {
-        let consumers = Consumers::of(plan);
-        for group in &plan.groups {
-            if consumers.consume(plan, group) {
-                continue;
-            }
+        for name in &unused {
             warnings.push(format!(
-                "group `{}` is defined but nothing consumes its matches (no sample selector, \
+                "group `{name}` is defined but nothing consumes its matches (no sample selector, \
                  `--remove`, find constraint, `next`/`prev` link, `match=`, or extract emitted by a \
-                 `--tag`/`--template`); it has no effect on output.",
-                group.name
+                 `--tag`/`--template`); it has no effect on output."
             ));
         }
     }
