@@ -129,6 +129,8 @@ struct DemuxCmd {
     /// inputs at all, file 0 defaults to stdin, so bare unmux reads stdin.
     /// Mutually exclusive with `--in`. Inputs must agree on yes/no qualities
     /// FASTA cannot blend with a quality-containing FASTQ/SAM/BAM/CRAM.
+    /// SAM tags in a FASTX record-name comment are lifted onto the record,
+    /// and a malformed one stops the run.
     ///
     ///   unmux r1.fq r2.fq i1.fq   files 0, 1, 2
     ///   unmux < reads.fq          file 0 from stdin (no args = stdin)

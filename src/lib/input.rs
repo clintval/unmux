@@ -38,6 +38,7 @@ use std::collections::HashMap;
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use noodles::sam::alignment::record::data::field::Tag;
 use noodles::sam::alignment::record::Flags;
+use noodles::sam::alignment::record_buf::data::field::value::Array;
 use noodles::sam::alignment::record_buf::data::field::Value;
 use noodles::sam::alignment::record_buf::Data;
 use noodles::sam::alignment::RecordBuf;
@@ -274,8 +275,8 @@ pub struct InputRecord {
     pub bases: Vec<u8>,
     /// The per-base qualities, when the format carries them.
     pub quals: Option<Vec<u8>>,
-    /// Carried SAM tags from an alignment input (`None` for FASTX), re-emitted
-    /// to the output record.
+    /// Carried SAM tags, from an alignment input or a FASTX read-name comment,
+    /// re-emitted to the output record.
     pub tags: Option<Data>,
     /// Whether the record failed quality control (flag `0x200`).
     pub qc_fail: bool,
@@ -816,23 +817,20 @@ impl FormatReader {
                     .read_sequence(&mut bases)
                     .context("failed to read FASTA sequence")?;
                 let body = definition.trim_start_matches('>');
-                let name = body
-                    .split_whitespace()
-                    .next()
-                    .unwrap_or("")
-                    .as_bytes()
-                    .to_vec();
-                // Lift any SAM tags carried in the description (the definition
-                // remainder after the read name), mirroring the FASTQ path.
-                let comment = body
-                    .trim_start()
-                    .split_once([' ', '\t'])
-                    .map_or("", |(_, rest)| rest);
+                // As in FASTQ, the name ends at the first space or tab, so it may be empty.
+                let (name, comment) = body.split_once([' ', '\t']).unwrap_or((body, ""));
+                let name = name.as_bytes().to_vec();
+                let tags = parse_comment_tags(comment.as_bytes()).with_context(|| {
+                    format!(
+                        "malformed FASTA record `{}`",
+                        String::from_utf8_lossy(&name)
+                    )
+                })?;
                 let input = InputRecord {
                     name,
                     bases,
                     quals: None,
-                    tags: parse_comment_tags(comment.as_bytes()),
+                    tags,
                     qc_fail: false,
                     alignment: None,
                 };
@@ -949,8 +947,15 @@ fn read_fastq<R: BufRead>(
             String::from_utf8_lossy(&first_token(record.name()))
         );
     }
+    let name = first_token(record.name());
+    let tags = parse_comment_tags(record.description()).with_context(|| {
+        format!(
+            "malformed FASTQ record `{}`",
+            String::from_utf8_lossy(&name)
+        )
+    })?;
     Ok(Some(InputRecord {
-        name: first_token(record.name()),
+        name,
         bases: record.sequence().to_vec(),
         quals: Some(
             record
@@ -959,7 +964,7 @@ fn read_fastq<R: BufRead>(
                 .map(|&q| q.saturating_sub(PHRED_OFFSET))
                 .collect(),
         ),
-        tags: parse_comment_tags(record.description()),
+        tags,
         qc_fail: false,
         alignment: None,
     }))
@@ -987,46 +992,127 @@ fn first_token(name: &[u8]) -> Vec<u8> {
         .to_vec()
 }
 
-/// Lift well-formed SAM auxiliary tags out of a FASTX read-name comment, the
-/// inverse of the writer's `render_tags`. Mirrors `samtools import -T`: the
-/// comment is split on tabs and each field that parses as a SAM aux field
-/// (`XX:T:VALUE`) is lifted, while a field that is not a well-formed tag (a bare
-/// UMI, an Illumina CASAVA string, free text) is skipped and the scan
-/// continues. Returns `None` when no tag is lifted, leaving the record tag-free.
-fn parse_comment_tags(comment: &[u8]) -> Option<Data> {
+/// Lift the SAM tags of a FASTX read-name comment, the inverse of the writer's
+/// `render_tags`. A tab-separated field not shaped like a tag (a bare UMI, an
+/// Illumina CASAVA string, free text) is skipped, and a tag whose value its type
+/// does not allow or a BAM record cannot hold, or a tag given twice, is an
+/// error. Returns `None` when no tag is lifted.
+fn parse_comment_tags(comment: &[u8]) -> Result<Option<Data>> {
     let mut data = Data::default();
     for field in comment.split(|&b| b == b'\t') {
-        if let Some((tag, value)) = parse_aux_field(field) {
-            data.insert(tag, value);
+        if let Some((tag, value)) = parse_aux_field(field)? {
+            if data.insert(tag, value).is_some() {
+                bail!(
+                    "the comment tag `{}` appears more than once",
+                    String::from_utf8_lossy(&field[..2])
+                );
+            }
         }
     }
-    (!data.is_empty()).then_some(data)
+    Ok((!data.is_empty()).then_some(data))
 }
 
-/// Parse one `XX:T:VALUE` SAM aux field, supporting the `A`, `i`, `f`, and `Z`
-/// types the writer emits. Returns `None` for any field that does not match the
-/// `<alpha><alphanum>:<type>:<value>` shape or whose value is invalid for its
-/// type, so a non-tag comment field is skipped rather than mangled. A `Z` value
-/// may contain spaces (only tabs separate fields, and the comment is already
-/// split on tabs).
-fn parse_aux_field(field: &[u8]) -> Option<(Tag, Value)> {
-    if field.len() < 5 || field[2] != b':' || field[4] != b':' {
-        return None;
-    }
-    let (b0, b1, ty) = (field[0], field[1], field[3]);
-    // SAM tag names are `[A-Za-z][A-Za-z0-9]`.
-    if !b0.is_ascii_alphabetic() || !b1.is_ascii_alphanumeric() {
-        return None;
-    }
-    let raw = &field[5..];
-    let value = match ty {
-        b'A' if raw.len() == 1 => Value::Character(raw[0]),
-        b'i' => Value::Int32(std::str::from_utf8(raw).ok()?.parse().ok()?),
-        b'f' => Value::Float(std::str::from_utf8(raw).ok()?.parse().ok()?),
-        b'Z' => Value::String(raw.to_vec().into()),
-        _ => return None,
+/// One comment field as a SAM tag of a type the writer emits, or `None` when it
+/// is not shaped `XX:T:VALUE`, as when a value other than a `Z` holds a space;
+/// an integer takes the narrowest BAM type that holds it and an array keeps
+/// its subtype.
+fn parse_aux_field(field: &[u8]) -> Result<Option<(Tag, Value)>> {
+    let &[name0, name1, b':', ty, b':', ref raw @ ..] = field else {
+        return Ok(None);
     };
-    Some((Tag::new(b0, b1), value))
+    if !name0.is_ascii_alphabetic() || !name1.is_ascii_alphanumeric() {
+        return Ok(None);
+    }
+    if ty != b'Z' && raw.contains(&b' ') {
+        return Ok(None);
+    }
+    let value = match ty {
+        b'A' => match *raw {
+            [c] if c.is_ascii_graphic() => Ok(Value::Character(c)),
+            _ => Err("one character from ! to ~"),
+        },
+        b'i' => parse_number(raw)
+            .and_then(|n: i64| Value::try_from(n).ok())
+            .ok_or("an integer from -2147483648 to 4294967295"),
+        b'f' => parse_float(raw)
+            .map(Value::Float)
+            .ok_or("a finite number such as 1.5 or 2e-3"),
+        b'Z' => raw
+            .iter()
+            .all(|b| matches!(b, b' '..=b'~'))
+            .then(|| Value::String(raw.into()))
+            .ok_or("printable ASCII"),
+        b'H' => is_hex(raw)
+            .then(|| Value::Hex(raw.into()))
+            .ok_or("an even number of uppercase hex digits"),
+        b'B' => parse_array(raw)
+            .map(Value::Array)
+            .ok_or("a c, C, s, S, i, I, or f array whose values fit that subtype"),
+        _ => return Ok(None),
+    };
+    match value {
+        Ok(value) => Ok(Some((Tag::new(name0, name1), value))),
+        Err(expected) => bail!(
+            "the comment tag `{}` must be {expected}",
+            String::from_utf8_lossy(&field[..4])
+        ),
+    }
+}
+
+/// The number that `raw` spells in full, or `None` if it is not a `T`.
+fn parse_number<T: std::str::FromStr>(raw: &[u8]) -> Option<T> {
+    std::str::from_utf8(raw).ok()?.parse().ok()
+}
+
+/// A finite float in the SAM grammar `[-+]?[0-9]*\.?[0-9]+([eE][-+]?[0-9]+)?`.
+fn parse_float(raw: &[u8]) -> Option<f32> {
+    fn unsigned(raw: &[u8]) -> &[u8] {
+        raw.strip_prefix(b"-")
+            .or(raw.strip_prefix(b"+"))
+            .unwrap_or(raw)
+    }
+    fn digits(raw: &[u8]) -> bool {
+        !raw.is_empty() && raw.iter().all(u8::is_ascii_digit)
+    }
+    let (mantissa, exponent) = match raw.iter().position(|b| matches!(b, b'e' | b'E')) {
+        Some(at) => (unsigned(&raw[..at]), Some(unsigned(&raw[at + 1..]))),
+        None => (unsigned(raw), None),
+    };
+    let (whole, fraction) = match mantissa.iter().position(|&b| b == b'.') {
+        Some(dot) => (&mantissa[..dot], &mantissa[dot + 1..]),
+        None => (&[][..], mantissa),
+    };
+    if !whole.iter().all(u8::is_ascii_digit) || !digits(fraction) || !exponent.is_none_or(digits) {
+        return None;
+    }
+    parse_number::<f32>(raw).filter(|float| float.is_finite())
+}
+
+/// Whether `raw` is a SAM `H` value: pairs of uppercase hex digits.
+fn is_hex(raw: &[u8]) -> bool {
+    raw.len().is_multiple_of(2) && raw.iter().all(|b| matches!(b, b'0'..=b'9' | b'A'..=b'F'))
+}
+
+/// A SAM `B` value's array, or `None` unless every value fits its subtype.
+fn parse_array(raw: &[u8]) -> Option<Array> {
+    fn values<T>(raw: &[u8], parse: fn(&[u8]) -> Option<T>) -> Option<Vec<T>> {
+        match raw {
+            [] => Some(Vec::new()),
+            [b',', values @ ..] => values.split(|&b| b == b',').map(parse).collect(),
+            _ => None,
+        }
+    }
+    let (subtype, raw) = raw.split_first()?;
+    match subtype {
+        b'c' => values(raw, parse_number).map(Array::Int8),
+        b'C' => values(raw, parse_number).map(Array::UInt8),
+        b's' => values(raw, parse_number).map(Array::Int16),
+        b'S' => values(raw, parse_number).map(Array::UInt16),
+        b'i' => values(raw, parse_number).map(Array::Int32),
+        b'I' => values(raw, parse_number).map(Array::UInt32),
+        b'f' => values(raw, parse_float).map(Array::Float),
+        _ => None,
+    }
 }
 
 /// SAM aux tags that describe an alignment to a reference (scores, edit
@@ -2303,7 +2389,9 @@ mod tests {
 
     #[test]
     fn parse_comment_tags_lifts_valid_sam_tags() {
-        let data = parse_comment_tags(b"RX:Z:ACGT\tBC:Z:GGGG").expect("valid tags lift");
+        let data = parse_comment_tags(b"RX:Z:ACGT\tBC:Z:GGGG")
+            .unwrap()
+            .expect("valid tags lift");
         assert_eq!(z_tag(&data, b"RX").as_deref(), Some(&b"ACGT"[..]));
         assert_eq!(z_tag(&data, b"BC").as_deref(), Some(&b"GGGG"[..]));
     }
@@ -2311,16 +2399,19 @@ mod tests {
     #[test]
     fn parse_comment_tags_lifts_integer_tag() {
         use noodles::sam::alignment::record_buf::data::field::Value;
-        let data = parse_comment_tags(b"xi:i:42").expect("integer tag lifts");
-        assert!(matches!(data.get(b"xi"), Some(Value::Int32(42))));
+        let data = parse_comment_tags(b"xi:i:42")
+            .unwrap()
+            .expect("integer tag lifts");
+        assert!(matches!(data.get(b"xi"), Some(Value::UInt8(42))));
     }
 
     #[test]
     fn parse_comment_tags_skips_non_tag_fields_lenient() {
         // A bare-UMI / free-text field is silently skipped; the valid tag in the
         // same comment still lifts (the samtools-import lenient behavior).
-        let data =
-            parse_comment_tags(b"GATTACA\tRX:Z:ACGT").expect("the valid tag lifts past the junk");
+        let data = parse_comment_tags(b"GATTACA\tRX:Z:ACGT")
+            .unwrap()
+            .expect("the valid tag lifts past the junk");
         assert_eq!(z_tag(&data, b"RX").as_deref(), Some(&b"ACGT"[..]));
         assert!(data.get(b"GA").is_none(), "the junk field is not lifted");
     }
@@ -2329,16 +2420,19 @@ mod tests {
     fn parse_comment_tags_returns_none_for_non_tag_comments() {
         // A bare UMI, an Illumina CASAVA string, a malformed type code, and an
         // empty comment all yield no tags.
-        assert!(parse_comment_tags(b"ACGTACGT").is_none(), "bare UMI");
-        assert!(parse_comment_tags(b"1:N:0:ACGT").is_none(), "CASAVA");
-        assert!(parse_comment_tags(b"RX:?:ACGT").is_none(), "bad type code");
-        assert!(parse_comment_tags(b"").is_none(), "empty comment");
+        let lifted = |comment: &[u8]| parse_comment_tags(comment).unwrap();
+        assert!(lifted(b"ACGTACGT").is_none(), "bare UMI");
+        assert!(lifted(b"1:N:0:ACGT").is_none(), "CASAVA");
+        assert!(lifted(b"RX:?:ACGT").is_none(), "bad type code");
+        assert!(lifted(b"").is_none(), "empty comment");
     }
 
     #[test]
     fn parse_comment_tags_preserves_spaces_in_z_value() {
         // Only tabs separate fields, so a space inside a Z value is kept verbatim.
-        let data = parse_comment_tags(b"CO:Z:hello world").expect("Z tag lifts");
+        let data = parse_comment_tags(b"CO:Z:hello world")
+            .unwrap()
+            .expect("Z tag lifts");
         assert_eq!(z_tag(&data, b"CO").as_deref(), Some(&b"hello world"[..]));
     }
 
@@ -2363,6 +2457,218 @@ mod tests {
             .as_ref()
             .expect("comment tags are lifted");
         assert_eq!(z_tag(data, b"BC").as_deref(), Some(&b"GGGG"[..]));
+    }
+
+    /// The tags lifted from `comment` on a one-record FASTQ.
+    fn fastq_comment_tags(comment: &str) -> Data {
+        let file = temp_with(format!("@r1\t{comment}\nACGT\n+\nIIII\n").as_bytes());
+        read_all(&file)
+            .remove(0)
+            .records
+            .remove(0)
+            .tags
+            .expect("comment tags are lifted")
+    }
+
+    /// The error that reading the FASTX `text` stops with.
+    fn read_error(text: &str) -> String {
+        let file = temp_with(text.as_bytes());
+        let error = match FragmentReader::open(&[file.path().to_path_buf()], false) {
+            Ok(mut reader) => std::iter::from_fn(|| reader.next_fragment().transpose())
+                .find_map(Result::err)
+                .unwrap_or_else(|| panic!("reading {text:?} must fail")),
+            Err(error) => error,
+        };
+        format!("{error:#}")
+    }
+
+    #[test]
+    fn test_read_fastq_lifts_integer_tags_in_the_narrowest_bam_type() {
+        for (text, expected) in [
+            ("-2147483648", Value::Int32(i32::MIN)),
+            ("-32769", Value::Int32(-32769)),
+            ("-32768", Value::Int16(i16::MIN)),
+            ("-129", Value::Int16(-129)),
+            ("-128", Value::Int8(i8::MIN)),
+            ("-1", Value::Int8(-1)),
+            ("0", Value::UInt8(0)),
+            ("+42", Value::UInt8(42)),
+            ("255", Value::UInt8(u8::MAX)),
+            ("256", Value::UInt16(256)),
+            ("65535", Value::UInt16(u16::MAX)),
+            ("65536", Value::UInt32(65_536)),
+            ("4000000000", Value::UInt32(4_000_000_000)),
+            ("4294967295", Value::UInt32(u32::MAX)),
+        ] {
+            let data = fastq_comment_tags(&format!("ns:i:{text}"));
+            assert_eq!(data.get(b"ns"), Some(&expected), "ns:i:{text}");
+        }
+    }
+
+    #[test]
+    fn test_read_fastq_lifts_floats_in_the_sam_grammar() {
+        for (text, expected) in [
+            ("1.5", 1.5),
+            ("-2", -2.0),
+            ("+.5", 0.5),
+            ("1E5", 1e5),
+            ("-1.5e-3", -1.5e-3),
+            ("3e+2", 300.0),
+            ("1e-50", 0.0),
+            ("340000000000000000000000000000000000000", 3.4e38),
+        ] {
+            let data = fastq_comment_tags(&format!("xf:f:{text}\txF:B:f,{text}"));
+            assert_eq!(data.get(b"xf"), Some(&Value::Float(expected)), "{text}");
+            let array = Value::Array(Array::Float(vec![expected]));
+            assert_eq!(data.get(b"xF"), Some(&array), "{text}");
+        }
+    }
+
+    #[test]
+    fn test_read_fastq_lifts_hex_and_array_tags_of_every_subtype() {
+        use noodles::sam::alignment::record_buf::data::field::value::Array;
+        let data = fastq_comment_tags(
+            "xh:H:CAFE\txe:H:\txc:B:c,-128,127\tML:B:C,200,100\txs:B:s,-32768,32767\t\
+             xS:B:S,0,65535\txi:B:i,-2147483648,2147483647\txI:B:I,0,4294967295\t\
+             xf:B:f,1.5,-2.25\txz:B:C",
+        );
+        for (tag, expected) in [
+            (b"xh", Value::Hex("CAFE".into())),
+            (b"xe", Value::Hex("".into())),
+            (b"xc", Value::Array(Array::Int8(vec![i8::MIN, i8::MAX]))),
+            (b"ML", Value::Array(Array::UInt8(vec![200, 100]))),
+            (b"xs", Value::Array(Array::Int16(vec![i16::MIN, i16::MAX]))),
+            (b"xS", Value::Array(Array::UInt16(vec![0, u16::MAX]))),
+            (b"xi", Value::Array(Array::Int32(vec![i32::MIN, i32::MAX]))),
+            (b"xI", Value::Array(Array::UInt32(vec![0, u32::MAX]))),
+            (b"xf", Value::Array(Array::Float(vec![1.5, -2.25]))),
+            (b"xz", Value::Array(Array::UInt8(Vec::new()))),
+        ] {
+            let name = String::from_utf8_lossy(tag);
+            assert_eq!(data.get(tag), Some(&expected), "{name}");
+        }
+    }
+
+    #[test]
+    fn test_read_fasta_lifts_array_and_wide_integer_tags() {
+        use noodles::sam::alignment::record_buf::data::field::value::Array;
+        let file = temp_with(b">read1 ML:B:C,200,100\tns:i:4000000000\nACGTACGT\n");
+        let fragments = read_all(&file);
+        let data = fragments[0].records[0]
+            .tags
+            .as_ref()
+            .expect("comment tags are lifted");
+        let ml = Value::Array(Array::UInt8(vec![200, 100]));
+        assert_eq!(data.get(b"ML"), Some(&ml));
+        assert_eq!(data.get(b"ns"), Some(&Value::UInt32(4_000_000_000)));
+    }
+
+    #[test]
+    fn test_read_fastx_refuses_a_comment_tag_a_bam_record_cannot_hold() {
+        for field in [
+            "ns:i:4294967296",
+            "ns:i:-2147483649",
+            "ns:i:12abc",
+            "ns:i:",
+            "ML:B:C,256",
+            "ML:B:C,-1",
+            "ML:B:I,4294967296",
+            "ML:B:C,1,x",
+            "ML:B:C,",
+            "ML:B:Q,1",
+            "ML:B:",
+            "xh:H:CAF",
+            "xh:H:cafe",
+            "xa:A:ab",
+            "xa:A:",
+            "xa:A:\u{1}",
+            "CO:Z:café",
+            "CO:Z:a\u{1}b",
+            "CO:Z:\u{7f}",
+            "xf:f:abc",
+            "xf:f:nan",
+            "xf:f:NaN",
+            "xf:f:inf",
+            "xf:f:-inf",
+            "xf:f:1e40",
+            "xf:f:1.",
+            "xf:f:1e",
+            "xF:B:f,1.5,nan",
+            "xF:B:f,1e40",
+            "xF:B:f,1.",
+        ] {
+            let tag = &field[..4];
+            for (kind, text) in [
+                ("FASTQ", format!("@r1\tRX:Z:ACGT\t{field}\nACGT\n+\nIIII\n")),
+                ("FASTA", format!(">r1 RX:Z:ACGT\t{field}\nACGT\n")),
+            ] {
+                let error = read_error(&text);
+                let expected = format!("malformed {kind} record `r1`: the comment tag `{tag}`");
+                assert!(error.contains(&expected), "{field}: {error}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_read_fasta_keeps_a_nameless_record_nameless() {
+        let file = temp_with(b"> xa:A:Q\tML:B:C,1,2\nACGT\n");
+        let record = read_all(&file).remove(0).records.remove(0);
+        assert_eq!(record.name, b"");
+        let data = record.tags.expect("comment tags are lifted");
+        assert_eq!(data.get(b"xa"), Some(&Value::Character(b'Q')));
+        let ml = Value::Array(Array::UInt8(vec![1, 2]));
+        assert_eq!(data.get(b"ML"), Some(&ml));
+    }
+
+    #[test]
+    fn test_read_fastx_refuses_a_tag_repeated_in_one_comment() {
+        for comment in ["ns:i:5\tns:i:6", "RX:Z:A\tRX:Z:B", "ns:i:5\tBC:Z:A\tns:Z:x"] {
+            let tag = &comment[..2];
+            for (kind, text) in [
+                ("FASTQ", format!("@r1\t{comment}\nACGT\n+\nIIII\n")),
+                ("FASTA", format!(">r1 {comment}\nACGT\n")),
+            ] {
+                let error = read_error(&text);
+                let expected = format!(
+                    "malformed {kind} record `r1`: the comment tag `{tag}` appears more than once"
+                );
+                assert!(error.contains(&expected), "{comment}: {error}");
+            }
+        }
+    }
+
+    /// The tags lifted from the first record of the FASTX `text`.
+    fn first_record_tags(text: &str) -> Option<Data> {
+        read_all(&temp_with(text.as_bytes()))
+            .remove(0)
+            .records
+            .remove(0)
+            .tags
+    }
+
+    #[test]
+    fn test_read_fastx_skips_a_comment_field_whose_value_holds_a_space() {
+        let mut only_rx = Data::default();
+        only_rx.insert(Tag::new(b'R', b'X'), Value::from("ACGT"));
+        for field in [
+            "ns:i:5 BC:Z:ACGT",
+            "ch:i:12 extra",
+            "ns:i:5 ",
+            "ns:i: 5",
+            "xf:f:1.5 x",
+            "xh:H:CAFE x",
+            "ML:B:C,1,2 MM:Z:C+m,0;",
+            "ML:B:C 1",
+            "xa:A:Q extra",
+            "xa:A: ",
+        ] {
+            for text in [
+                format!("@r1\tRX:Z:ACGT\t{field}\nACGT\n+\nIIII\n"),
+                format!(">r1 RX:Z:ACGT\t{field}\nACGT\n"),
+            ] {
+                assert_eq!(first_record_tags(&text), Some(only_rx.clone()), "{text:?}");
+            }
+        }
     }
 
     #[test]
