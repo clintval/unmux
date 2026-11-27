@@ -9,6 +9,7 @@
 //! input parsing, and tag correction.
 
 use anyhow::{bail, Result};
+use smallvec::SmallVec;
 
 use crate::grammar::{Anchor, Dist, MatchMode};
 
@@ -185,12 +186,12 @@ fn dist_spec(dist: &Dist) -> String {
     }
 }
 
-/// A tag's IUPAC base sets, with the positions meeting each set as bits when it
-/// is at most 64 bases long, and its 3-grams: the concrete ones as bits, the
+/// A tag's IUPAC base sets, with the positions meeting each set as bits in
+/// words of 64 positions, and its 3-grams: the concrete ones as bits, the
 /// windows that may match more than those, and the 3-grams it can hold.
 struct Tag {
     masks: Vec<u8>,
-    sites: Option<[u64; 16]>,
+    sites: Vec<[u64; 16]>,
     concrete: [u32; 4],
     admitting: [u32; 4],
     empty: u32,
@@ -203,12 +204,12 @@ struct Tag {
 impl Tag {
     fn new(seq: &[u8]) -> Self {
         let masks: Vec<u8> = seq.iter().map(|&base| mask(base)).collect();
-        let mut sites = [0u64; 16];
+        let mut sites = vec![[0u64; 16]; masks.len().div_ceil(64)];
         let (mut concrete, mut admitting) = ([0; 4], [0; 4]);
         for (at, &set) in masks.iter().enumerate() {
-            for (meets, bits) in sites.iter_mut().enumerate() {
-                if at < 64 && usize::from(set) & meets != 0 {
-                    *bits |= 1 << at;
+            for (meets, bits) in sites[at / 64].iter_mut().enumerate() {
+                if usize::from(set) & meets != 0 {
+                    *bits |= 1 << (at % 64);
                 }
             }
             for (base, count) in admitting.iter_mut().enumerate() {
@@ -233,7 +234,7 @@ impl Tag {
         let degenerate = masks.iter().any(|set| set.count_ones() > 1);
         Self {
             empty: masks.iter().map(|&set| u32::from(set == 0)).sum(),
-            sites: (masks.len() <= 64).then_some(sites),
+            sites,
             windows: masks.len().saturating_sub(2),
             loose: wild + kept - grams.count_ones() as usize,
             holds: if degenerate { u64::MAX } else { grams },
@@ -246,6 +247,25 @@ impl Tag {
 
     fn len(&self) -> usize {
         self.masks.len()
+    }
+
+    /// The positions meeting each set, when the tag fits one word.
+    fn word(&self) -> Option<&[u64; 16]> {
+        match self.sites.as_slice() {
+            [sites] => Some(sites),
+            _ => None,
+        }
+    }
+
+    /// The 64 positions from `from` on that meet `set`, as bits, with none
+    /// outside the tag.
+    fn bits(&self, set: usize, from: isize) -> u64 {
+        let word = |at: isize| {
+            let sites = usize::try_from(at).ok().and_then(|at| self.sites.get(at));
+            sites.map_or(0, |sites| sites[set])
+        };
+        let (at, shift) = (from.div_euclid(64), from.rem_euclid(64) as u32);
+        word(at) >> shift | word(at + 1).checked_shl(64 - shift).unwrap_or(0)
     }
 }
 
@@ -451,7 +471,7 @@ fn ungapped(
 
 /// How many bases of `inner` share no base with those of `outer` from `offset`.
 fn disjoint(outer: &Tag, inner: &Tag, offset: usize) -> usize {
-    match (&outer.sites, &inner.sites) {
+    match (outer.word(), inner.word()) {
         (Some(x), Some(y)) => {
             let met = [1, 2, 4, 8]
                 .into_iter()
@@ -485,15 +505,15 @@ fn gapped(
         return None;
     }
     let grid = Grid::fill(outer, inner, dist, shape);
-    let gaps = grid.gaps;
+    let (gaps, skips, extras) = (grid.gaps, grid.skips, grid.extras);
     let ends = match shape.free_end {
         true => 0..=outer.len(),
         false => outer.len()..=outer.len(),
     };
     let (spread, split, end, exact) = ends
         .flat_map(|end| {
-            (0..=gaps).flat_map(move |skipped| {
-                (0..=gaps - skipped).map(move |extra| (end, skipped, extra))
+            (0..=skips).flat_map(move |skipped| {
+                (0..=extras.min(gaps - skipped)).map(move |extra| (end, skipped, extra))
             })
         })
         .filter_map(|(end, skipped, extra)| {
@@ -531,43 +551,43 @@ fn shares_grams(outer: &Tag, inner: &Tag, budget: usize) -> bool {
 
 /// Whether `gaps + 1` neighboring diagonals, where an alignment with at most
 /// `gaps` unpaired bases stays, pair all but at most `budget` bases of `inner`
-/// with outer bases they meet; assumed when the diagonals may sit far apart or
-/// a tag is longer than 64 bases.
+/// with outer bases they meet; assumed when that takes many diagonals.
 fn covered(outer: &Tag, inner: &Tag, shape: Shape, gaps: usize, budget: usize) -> bool {
-    let (Some(x), Some(y)) = (&outer.sites, &inner.sites) else {
-        return true;
-    };
-    let (gaps, spare) = (gaps as isize, outer.len() as isize - inner.len() as isize);
+    let gaps = gaps.min(outer.len() + inner.len()) as isize;
     let last = match shape.free_start {
-        true => spare,
+        true => outer.len() as isize - inner.len() as isize,
         false => 0,
     };
-    if last > 0 || gaps > 8 {
+    let words = inner.sites.len();
+    let diagonals = usize::try_from(last + 2 * gaps + 1).unwrap_or(0);
+    if gaps > 8 || diagonals * words > 1024 {
         return true;
     }
-    let met = |diagonal: isize| {
-        let shift = |bits: u64| match diagonal >= 0 {
-            true => bits.checked_shr(diagonal as u32).unwrap_or(0),
-            false => bits
-                .checked_shl(diagonal.unsigned_abs() as u32)
-                .unwrap_or(0),
-        };
-        [1, 2, 4, 8]
-            .into_iter()
-            .fold(0, |met, set| met | shift(x[set]) & y[set])
-    };
+    let met: SmallVec<[u64; 32]> = (-gaps..=last + gaps)
+        .flat_map(|diagonal| (0..words).map(move |word| (diagonal, word)))
+        .map(|(diagonal, word)| {
+            let from = 64 * word as isize + diagonal;
+            [1, 2, 4, 8].into_iter().fold(0, |met, set| {
+                met | outer.bits(set, from) & inner.sites[word][set]
+            })
+        })
+        .collect();
     (-gaps..=last).any(|first| {
-        let paired = (first..=first + gaps).fold(0, |paired, diagonal| paired | met(diagonal));
-        inner.len() - paired.count_ones() as usize <= budget
+        let start = (first + gaps) as usize * words;
+        let paired = (0..words).map(|word| {
+            let window = (0..=gaps as usize).map(|offset| met[start + offset * words + word]);
+            window.fold(0u64, |paired, met| paired | met).count_ones() as usize
+        });
+        inner.len() - paired.sum::<usize>() <= budget
     })
 }
 
 /// Whether an alignment of `inner` within `outer` has at most `budget`
-/// disjoint pairs and unpaired bases, by Myers' bit-vector algorithm; assumed
-/// when `inner` is longer than 64 bases.
+/// disjoint pairs and unpaired bases, by Myers' bit-vector algorithm when
+/// `inner` fits one word.
 fn edits_within(outer: &Tag, inner: &Tag, shape: Shape, budget: usize) -> bool {
-    let Some(sites) = &inner.sites else {
-        return true;
+    let Some(sites) = inner.word() else {
+        return banded_within(outer, inner, shape, budget);
     };
     let last = 1u64 << (inner.len() - 1);
     let (mut pv, mut mv, mut score) = (u64::MAX, 0u64, inner.len());
@@ -590,22 +610,83 @@ fn edits_within(outer: &Tag, inner: &Tag, shape: Shape, budget: usize) -> bool {
     }
 }
 
+/// Whether an alignment of `inner` within `outer` has at most `budget`
+/// disjoint pairs and unpaired bases, by a table over the diagonals that such
+/// an alignment can reach.
+fn banded_within(outer: &Tag, inner: &Tag, shape: Shape, budget: usize) -> bool {
+    let (n, reach) = (outer.len() as isize, budget as isize);
+    let lo = -reach;
+    let hi = reach
+        + match shape.free_start {
+            true => n - inner.len() as isize,
+            false => 0,
+        };
+    let Ok(width) = usize::try_from(hi - lo + 1) else {
+        return false;
+    };
+    let mut row: Vec<usize> = (lo..=hi)
+        .map(|p| match (0..=n).contains(&p) {
+            true if shape.free_start => 0,
+            true => p as usize,
+            false => usize::MAX,
+        })
+        .collect();
+    let mut next = vec![usize::MAX; width];
+    for (j, &base) in inner.masks.iter().enumerate() {
+        for (slot, diagonal) in (lo..=hi).enumerate() {
+            let p = j as isize + 1 + diagonal;
+            next[slot] = usize::MAX;
+            if !(0..=n).contains(&p) {
+                continue;
+            }
+            if p > 0 {
+                let missed = usize::from(outer.masks[p as usize - 1] & base == 0);
+                next[slot] = row[slot].saturating_add(missed);
+            }
+            if slot + 1 < width {
+                next[slot] = next[slot].min(row[slot + 1].saturating_add(1));
+            }
+            if slot > 0 && p > 0 {
+                next[slot] = next[slot].min(next[slot - 1].saturating_add(1));
+            }
+        }
+        if next.iter().all(|&edits| edits > budget) {
+            return false;
+        }
+        std::mem::swap(&mut row, &mut next);
+    }
+    let end = n - inner.len() as isize - lo;
+    match shape.free_end {
+        true => row.iter().any(|&edits| edits <= budget),
+        false => usize::try_from(end)
+            .ok()
+            .and_then(|slot| row.get(slot))
+            .is_some_and(|&edits| edits <= budget),
+    }
+}
+
 /// The fewest disjoint pairs over the alignments of an inner tag within an
 /// outer one, by inner bases placed, outer bases passed, and the outer and
-/// inner bases left unpaired.
+/// inner bases left unpaired, on the diagonals that such alignments can reach.
 struct Grid {
+    lo: isize,
+    width: usize,
     span: usize,
+    skips: usize,
+    extras: usize,
     gaps: usize,
     cells: Vec<usize>,
 }
 
 impl Grid {
-    fn index(&self, j: usize, p: usize, skipped: usize, extra: usize) -> usize {
-        ((j * (self.span + 1) + p) * (self.gaps + 1) + skipped) * (self.gaps + 1) + extra
+    fn index(&self, j: usize, p: usize, skipped: usize, extra: usize) -> Option<usize> {
+        let offset = usize::try_from(p as isize - j as isize - self.lo).ok();
+        let offset = offset.filter(|&offset| offset < self.width && p <= self.span)?;
+        Some(((j * self.width + offset) * (self.skips + 1) + skipped) * (self.extras + 1) + extra)
     }
 
     fn get(&self, j: usize, p: usize, skipped: usize, extra: usize) -> Option<usize> {
-        let subs = self.cells[self.index(j, p, skipped, extra)];
+        let subs = self.cells[self.index(j, p, skipped, extra)?];
         (subs != usize::MAX).then_some(subs)
     }
 
@@ -624,16 +705,29 @@ impl Grid {
 
     fn fill(outer: &Tag, inner: &Tag, dist: &Dist, shape: Shape) -> Self {
         let gaps = 2 * dist.indel;
-        let size = (inner.len() + 1) * (outer.len() + 1) * (gaps + 1) * (gaps + 1);
+        let (skips, extras) = (gaps.min(outer.len()), gaps.min(inner.len()));
+        let lo = -(extras as isize);
+        let hi = match shape.free_start {
+            true => outer.len() as isize - inner.len() as isize + extras as isize,
+            false => skips as isize,
+        };
+        let width = usize::try_from(hi - lo + 1).unwrap_or(0);
+        let size = (inner.len() + 1) * width * (skips + 1) * (extras + 1);
         let mut grid = Grid {
+            lo,
+            width,
             span: outer.len(),
+            skips,
+            extras,
             gaps,
             cells: vec![usize::MAX; size],
         };
         for j in 0..=inner.len() {
-            for p in 0..=outer.len() {
-                for skipped in 0..=gaps {
-                    for extra in 0..=gaps - skipped {
+            let first = (j as isize + lo).max(0);
+            let last = (j as isize + hi).min(outer.len() as isize);
+            for p in (first..=last).map(|p| p as usize) {
+                for skipped in 0..=skips {
+                    for extra in 0..=extras.min(gaps - skipped) {
                         let start = j == 0 && skipped + extra == 0 && (p == 0 || shape.free_start);
                         let mut subs = if start { 0 } else { usize::MAX };
                         if j > 0 && p > 0 {
@@ -651,8 +745,9 @@ impl Grid {
                         if subs > 2 * dist.mismatch || subs + skipped + extra > 2 * dist.total {
                             subs = usize::MAX;
                         }
-                        let at = grid.index(j, p, skipped, extra);
-                        grid.cells[at] = subs;
+                        if let Some(at) = grid.index(j, p, skipped, extra) {
+                            grid.cells[at] = subs;
+                        }
                     }
                 }
             }
@@ -739,7 +834,8 @@ fn split_edits(
 /// Whether `tag`, as IUPAC sets, aligns to `bases` within `dist`, with the
 /// bases before and after it free as `shape` allows.
 fn aligns(tag: &[u8], bases: &[u8], dist: &Dist, shape: Shape) -> bool {
-    let (rows, cols, gaps) = (tag.len() + 1, bases.len() + 1, dist.indel + 1);
+    let gaps = dist.indel.min(tag.len() + bases.len()) + 1;
+    let (rows, cols) = (tag.len() + 1, bases.len() + 1);
     let index = |j: usize, i: usize, q: usize| (j * cols + i) * gaps + q;
     let mut fewest = vec![usize::MAX; rows * cols * gaps];
     for j in 0..rows {
