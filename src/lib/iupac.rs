@@ -8,7 +8,9 @@
 //! primitives ([`complement`], [`reverse_complement`]) shared by extraction,
 //! input parsing, and tag correction.
 
+use std::borrow::Cow;
 use std::cmp::Ordering;
+use std::collections::HashMap;
 
 use anyhow::{bail, Result};
 use smallvec::SmallVec;
@@ -42,6 +44,9 @@ const NEAREST: &str = "set mode=nearest to leave such reads unassigned (recommen
 const TABLE_CELLS: usize = 1 << 20;
 /// Why a pair taken to collide gives no bases that match both tags.
 const TOO_COSTLY: &str = "(too long to compare exactly under this indel budget)";
+/// The most pairs compared one by one for two tags that one read matches with
+/// zero errors before a refusal; plain tags of one length are looked up instead.
+const EXACT_PAIRS: usize = 1 << 20;
 
 /// The 4-bit ACGT membership mask for an IUPAC code (A=1, C=2, G=4, T=8). A
 /// byte that is not a recognized code maps to 0, so it matches nothing and
@@ -223,7 +228,8 @@ pub fn validate_group(name: &str, seqs: &[Vec<u8>], search: &Search) -> Result<V
                 "group `{name}`: tags `{a_s}` and `{b_s}` {verb} both match one read within dist={budget} {witness}"
             );
             if !nearest && !needs_indel {
-                if let Some((i, j, found)) = first_exact(&tags, &flipped, &exact_only, shape) {
+                let exact = exact_pair(seqs, &tags, &flipped, &exact_only, shape, EXACT_PAIRS);
+                if let Some((i, j, found)) = exact {
                     bail!("{}", indistinguishable(name, &seqs[i], &seqs[j], &found));
                 }
                 bail!("{overlap}; with mode=all this silently mis-assigns reads: separate the tags, lower dist, or use mode=nearest, which only warns and lists the colliding pairs");
@@ -273,22 +279,77 @@ pub fn validate_group(name: &str, seqs: &[Vec<u8>], search: &Search) -> Result<V
     Ok(warnings)
 }
 
-/// The first two tags, by index, that one read matches with zero errors, on
-/// one strand when they can be.
-fn first_exact(
+/// Two tags, by index, that one read matches with zero errors, with their
+/// overlap on one strand when they have one. Plain ACGT tags of one length that
+/// fit the window match that way only when equal or, under `bothStrands`,
+/// reverse complements, so they are looked up by sequence; other sets are
+/// compared pair by pair, up to `limit` pairs.
+fn exact_pair(
+    seqs: &[Vec<u8>],
     tags: &[Tag],
     flipped: &[Tag],
     exact_only: &Search,
     shape: Shape,
+    limit: usize,
 ) -> Option<(usize, usize, Overlap)> {
-    (0..tags.len()).find_map(|i| {
-        (i + 1..tags.len()).find_map(|j| {
-            let strands = exact_only.both_strands.then(|| (&flipped[i], &flipped[j]));
-            let found = collision(&tags[i], &tags[j], None, exact_only, shape)
-                .or_else(|| collision(&tags[i], &tags[j], strands, exact_only, shape))?;
-            Some((i, j, found))
-        })
-    })
+    let compare = |(i, j): (usize, usize)| {
+        let strands = exact_only.both_strands.then(|| (&flipped[i], &flipped[j]));
+        let found = collision(&tags[i], &tags[j], None, exact_only, shape)
+            .or_else(|| collision(&tags[i], &tags[j], strands, exact_only, shape))?;
+        Some((i, j, found))
+    };
+    if looked_up(seqs, exact_only.window) {
+        return equal_pair(seqs, exact_only.both_strands).and_then(compare);
+    }
+    (0..tags.len())
+        .flat_map(|i| (i + 1..tags.len()).map(move |j| (i, j)))
+        .take(limit)
+        .find_map(compare)
+}
+
+/// Whether `seqs` are all plain ACGT of one length that fits `window`.
+fn looked_up(seqs: &[Vec<u8>], window: Option<usize>) -> bool {
+    let Some(len) = seqs.first().map(Vec::len) else {
+        return false;
+    };
+    let plain =
+        |seq: &Vec<u8>| seq.len() == len && seq.iter().all(|&base| mask(base).count_ones() == 1);
+    window.is_none_or(|width| width >= len) && seqs.iter().all(plain)
+}
+
+/// The first of `seqs` equal to an earlier one or, with `both_strands`, to its
+/// reverse complement, by index after that earlier one.
+fn equal_pair(seqs: &[Vec<u8>], both_strands: bool) -> Option<(usize, usize)> {
+    fn canonical(seq: &[u8]) -> Cow<'_, [u8]> {
+        match seq.iter().all(|base| b"ACGT".contains(base)) {
+            true => Cow::Borrowed(seq),
+            false => seq
+                .iter()
+                .map(|&base| match base.to_ascii_uppercase() {
+                    b'U' => b'T',
+                    base => base,
+                })
+                .collect(),
+        }
+    }
+    let mut seen: HashMap<Cow<'_, [u8]>, usize> = HashMap::with_capacity(seqs.len());
+    for (j, seq) in seqs.iter().enumerate() {
+        let forward = canonical(seq);
+        let mut back = Vec::new();
+        if both_strands {
+            back.extend_from_slice(&forward);
+            reverse_complement(&mut back);
+        }
+        let earlier = seen.get(&*forward).or_else(|| match both_strands {
+            true => seen.get(back.as_slice()),
+            false => None,
+        });
+        if let Some(&i) = earlier {
+            return Some((i, j));
+        }
+        seen.insert(forward, j);
+    }
+    None
 }
 
 /// The refusal for two tags that one read matches with zero errors, which
@@ -1551,6 +1612,47 @@ mod tests {
         let plain =
             "tags `ACGTACGTACGTACGT` and `ACGTACGTACGTACCA` can both match one read within dist=1";
         assert!(err.contains(plain), "{err}");
+    }
+
+    #[test]
+    fn test_plain_tags_of_one_length_are_looked_up_without_comparing_pairs() {
+        let mut seqs = after_a_close_pair(3_000);
+        seqs.push(seqs[1_500].to_ascii_lowercase());
+        let tags: Vec<Tag> = seqs.iter().map(|seq| Tag::new(seq)).collect();
+        let shape = Shape::of(None);
+        let pair = |seqs: &[Vec<u8>], limit| {
+            exact_pair(seqs, &tags, &[], &unset(dist(0)), shape, limit).map(|(i, j, _)| (i, j))
+        };
+        assert_eq!(
+            pair(&seqs, 0),
+            Some((1_500, 3_002)),
+            "found with no pair compared"
+        );
+        let mut flipped = seqs[1_500].clone();
+        reverse_complement(&mut flipped);
+        let both = Search {
+            both_strands: true,
+            ..unset(dist(0))
+        };
+        let mut seqs = seqs[..3_002].to_vec();
+        seqs.push(flipped);
+        let flipped_tags: Vec<Tag> = seqs.iter().map(|seq| Tag::new(&flip(seq))).collect();
+        let tags: Vec<Tag> = seqs.iter().map(|seq| Tag::new(seq)).collect();
+        let found = exact_pair(&seqs, &tags, &flipped_tags, &both, shape, 0);
+        assert_eq!(found.map(|(i, j, _)| (i, j)), Some((1_500, 3_002)));
+    }
+
+    #[test]
+    fn test_other_sets_are_compared_pair_by_pair_up_to_the_limit() {
+        // ACGN and ACGT, the first and last tags, form the second pair compared.
+        let seqs = seqs(&["ACGN", "TTTT", "ACGT"]);
+        let tags: Vec<Tag> = seqs.iter().map(|seq| Tag::new(seq)).collect();
+        let pair = |limit| {
+            exact_pair(&seqs, &tags, &[], &unset(dist(0)), Shape::of(None), limit)
+                .map(|(i, j, _)| (i, j))
+        };
+        assert_eq!(pair(1), None);
+        assert_eq!(pair(2), Some((0, 2)));
     }
 
     #[test]
