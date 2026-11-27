@@ -256,6 +256,184 @@ Feature: Tag matching with distance tolerance and error handling
     And the file "s1.fq" does not contain "@tie"
     And the file "s2.fq" does not contain "@tie"
 
+  Scenario: A match= group joins its @grp streams corrected, as --tag writes them
+    Given a file "reads.fq" containing:
+      """
+      @exact
+      AAAACCCCGGGGTTTT
+      +
+      IIIIIIIIIIIIIIII
+      @sub1
+      AAAACCCAGGGGTTTT
+      +
+      IIIIIIIIIIIIIIII
+      @sub2
+      AAAACCCCGGGGTTTA
+      +
+      IIIIIIIIIIIIIIII
+      """
+    # Each substituted round is corrected by dist=1, so the exact cell group matches every read.
+    When I run `unmux reads.fq --group r1={a=AAAACCCC} --group r1::loc=0:0:8,dist=1 --group r2={g=GGGGTTTT} --group r2::loc=0:8:16,dist=1 --extract b1=@r1 --extract b2=@r2 --group cell={c1=AAAACCCCGGGGTTTT} --group cell::match=b1+b2 --tag CB=b1+b2 --tag CB::qual=none --sample-from-group cell --out %sample.fq --unassigned un.fq`
+    Then the exit code is 0
+    And the file "c1.fq" contains "@exact CB:Z:AAAACCCC-GGGGTTTT"
+    And the file "c1.fq" contains "@sub1 CB:Z:AAAACCCC-GGGGTTTT"
+    And the file "c1.fq" contains "@sub2 CB:Z:AAAACCCC-GGGGTTTT"
+    And the file "un.fq" does not contain "@sub"
+
+  Scenario: A match= group joins a reverse-strand @grp match as its declared tag
+    Given a file "reads.fq" containing:
+      """
+      @fwd
+      AACGTGAAAA
+      +
+      IIIIIIIIII
+      @rev
+      CACGTTAAAA
+      +
+      IIIIIIIIII
+      """
+    # On @rev, bothStrands finds AACGTG as its reverse complement CACGTT.
+    When I run `unmux reads.fq --group bc={x=AACGTG} --group bc::loc=0:0:6,bothStrands=true --extract b=@bc --group cell={c1=AACGTG} --group cell::match=b --tag CB=b --tag CB::qual=none --sample-from-group cell --out %sample.fq --unassigned un.fq`
+    Then the exit code is 0
+    And the file "c1.fq" contains "@fwd CB:Z:AACGTG"
+    And the file "c1.fq" contains "@rev CB:Z:AACGTG"
+    And the file "un.fq" does not contain "@rev"
+
+  Scenario: A match= group joins plain spans as the observed bases
+    Given a file "reads.fq" containing:
+      """
+      @exact
+      AAAACCCCGGGGTTTT
+      +
+      IIIIIIIIIIIIIIII
+      @sub1
+      AAAACCCAGGGGTTTT
+      +
+      IIIIIIIIIIIIIIII
+      """
+    # A plain span is never corrected, so @sub1 joins its observed AAAACCCAGGGGTTTT.
+    When I run `unmux reads.fq --extract b1=0:0:8 --extract b2=0:8:16 --group cell={c1=AAAACCCCGGGGTTTT} --group cell::match=b1+b2 --sample-from-group cell --out %sample.fq --unassigned un.fq`
+    Then the exit code is 0
+    And the file "c1.fq" contains "@exact"
+    And the file "un.fq" contains "@sub1"
+    And the file "c1.fq" does not contain "@sub1"
+
+  Scenario Outline: A match= group joins an @grp offset stream as the observed bases
+    Given a file "reads.fq" containing:
+      """
+      @off
+      CCAAACGAACGTTTGG
+      +
+      IIIIIIIIIIIIIIII
+      """
+    # The anchor ACGAACGT is corrected to ACGTACGT, but the bases beside it join as read.
+    When I run `unmux reads.fq --group ad={x=ACGTACGT} --group ad::loc=0:4:12,dist=1 --extract u=<span> --group cell={c1=<bases>} --group cell::match=u,minFindsPerGroup=1 --tag XU=u --out out.fq --unassigned un.fq`
+    Then the exit code is 0
+    And the file "out.fq" contains "@off XU:Z:<bases>"
+    And the file "un.fq" does not contain "@off"
+
+    Examples:
+      | span    | bases |
+      | @ad+0:4 | TTGG  |
+      | @ad-0:4 | CCAA  |
+
+  Scenario: A match= group joins an @grpA..@grpB stream as the observed bases
+    Given a file "reads.fq" containing:
+      """
+      @ins
+      AAAGCCCCGTCAGGGGATTT
+      +
+      IIIIIIIIIIIIIIIIIIII
+      """
+    # Both anchors are corrected, but the GTCA between them joins as read.
+    When I run `unmux reads.fq --group a={x=AAAACCCC} --group a::loc=0:0:8,dist=1 --group b={y=GGGGTTTT} --group b::loc=0:12:20,dist=1 --extract ins=@a..@b --group cell={c1=GTCA} --group cell::match=ins,minFindsPerGroup=1 --tag XI=ins --out out.fq --unassigned un.fq`
+    Then the exit code is 0
+    And the file "out.fq" contains "@ins XI:Z:GTCA"
+    And the file "un.fq" does not contain "@ins"
+
+  Scenario: A match= group joins a partial @grp match as the whole tag
+    Given a file "reads.fq" containing:
+      """
+      @part
+      CGATCGTTTT
+      +
+      IIIIIIIIII
+      """
+    # Only CGATCG of the tag ATCGATCG is in the read, but the corrected stream is the whole tag.
+    When I run `unmux reads.fq --group g={x=ATCGATCG} --group g::loc=0:0,partial5=4:0.1 --extract b=@g --group cell={c1=ATCGATCG} --group cell::match=b,minFindsPerGroup=1 --tag CB=b --tag CB::qual=none --out out.fq --unassigned un.fq`
+    Then the exit code is 0
+    And the file "out.fq" contains "@part CB:Z:ATCGATCG"
+    And the file "un.fq" does not contain "@part"
+
+  Scenario: A match= group joins an @grp self-span of a degenerate tag as the observed bases
+    Given a file "reads.fq" containing:
+      """
+      @deg
+      AACGTGCAGGGG
+      +
+      IIIIIIIIIIII
+      """
+    # The stream joins as the read's AACGTGCA, not as the pattern AACGTGNN.
+    When I run `unmux reads.fq --group bc={x=AACGTGNN} --group bc::loc=0:0:8 --extract b=@bc --group cell={c1=AACGTGCA} --group cell::match=b --group cell::minFindsPerGroup=1 --out out.fq --unassigned un.fq`
+    Then the exit code is 0
+    And the file "out.fq" contains "@deg"
+    And the file "un.fq" does not contain "@deg"
+
+  Scenario: A match= group tells reads of one degenerate tag apart by their observed bases
+    Given a file "reads.fq" containing:
+      """
+      @n1
+      AACGTGCATTGACCAG
+      +
+      IIIIIIIIIIIIIIII
+      @n2
+      AACGTGCATTGACCAT
+      +
+      IIIIIIIIIIIIIIII
+      """
+    # Both reads match AACGTGCATTGACCAN, and the base each holds at the N picks its cell.
+    When I run `unmux reads.fq --group bc={x=AACGTGCATTGACCAN} --extract b=@bc --group cell={c1=AACGTGCATTGACCAG,c2=AACGTGCATTGACCAT} --group cell::match=b,dist=1,mode=nearest,minFindsPerGroup=1 --sample-from-group cell --out %sample.fq --unassigned un.fq`
+    Then the exit code is 0
+    And the file "c1.fq" contains "@n1"
+    And the file "c2.fq" contains "@n2"
+    And the file "c1.fq" does not contain "@n2"
+    And the file "c2.fq" does not contain "@n1"
+    And the file "un.fq" does not contain "@n"
+
+  Scenario Outline: A match= group joins a tag written with U or in lowercase against a T cell list
+    Given a file "reads.fq" containing:
+      """
+      @r1
+      ACGTACGTGGGG
+      +
+      IIIIIIIIIIII
+      """
+    # The corrected stream is the tag as written, and the join reads its U as T and ignores case.
+    When I run `unmux reads.fq --group bc={x=<tag>} --group bc::loc=0:0:8 --extract b=@bc --group cell={c1=ACGTACGT} --group cell::match=b,minFindsPerGroup=1 --tag CB=b --tag CB::qual=none --out out.fq --unassigned un.fq`
+    Then the exit code is 0
+    And the file "out.fq" contains "@r1 CB:Z:<tag>"
+    And the file "un.fq" does not contain "@r1"
+
+    Examples:
+      | tag      |
+      | ACGUACGU |
+      | acgtacgt |
+      | acguacgu |
+
+  Scenario: A match= group counts its edits against the corrected join
+    Given a file "reads.fq" containing:
+      """
+      @del
+      AACTGCATTTT
+      +
+      IIIIIIIIIII
+      """
+    # The read lost the G of AACGTGCA, so bc reports one indel and the corrected join none.
+    When I run `unmux reads.fq --group bc={x=AACGTGCA} --group bc::dist=0:1:1 --extract b=@bc --group cell={c1=AACGTGCA} --group cell::match=b,dist=0:1:1 --qc-tag --out out.sam`
+    Then the exit code is 0
+    And the file "out.sam" contains "{"g":"bc","tag":"AACGTGCA","loc":"0:0:7","obs":"AACTGCA","sub":0,"ind":1}"
+    And the file "out.sam" contains "{"g":"cell","tag":"AACGTGCA","sub":0,"ind":0}"
+
   Scenario: IUPAC ambiguity in the tag definition matches any base at the N positions
     Given a file "reads.fq" containing:
       """

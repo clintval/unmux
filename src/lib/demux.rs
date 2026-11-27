@@ -2164,15 +2164,7 @@ fn match_fragment(
         let verdict = match &group.match_streams {
             // A `match=` group matches the joined `--extract` streams, not a
             // read window.
-            Some(streams) => match_joined(
-                group,
-                scratch,
-                streams,
-                &engine.plan.extracts,
-                &segments,
-                &hits,
-                engine.group_index,
-            )?,
+            Some(streams) => match_joined(engine, group, scratch, streams, &segments, &hits)?,
             None => match_group_for(group, scratch, &base_segments, &hits),
         };
         // A failed find constraint (e.g. an unmet minFindsPerGroup) leaves the
@@ -2816,26 +2808,26 @@ fn match_read_group(rg_to_idx: &HashMap<Vec<u8>, usize>, fragment: &Fragment) ->
 }
 
 /// Match a `match=` group against the concatenation of its named `--extract`
-/// streams (no delimiter). A referenced stream that is absent (its anchoring
-/// group did not match, or it resolved to nothing) makes the group a non-match.
-/// The tags are searched within the joined text as a single synthetic segment,
-/// so `dist`/`mode`/`delta`/`bothStrands` apply over the concatenation.
+/// streams (no delimiter), each as [`join_bases`] takes it. A referenced stream
+/// that is absent (its anchoring group did not match, or it resolved to
+/// nothing) makes the group a non-match. The tags are searched within the
+/// joined text as a single synthetic segment, so
+/// `dist`/`mode`/`delta`/`bothStrands` apply over the concatenation.
 fn match_joined(
+    engine: &Engine,
     group: &CompiledGroup,
     scratch: &mut Scratch,
     streams: &[String],
-    extracts: &[crate::grammar::Extract],
     segments: &[Segment],
     hits: &GroupHits,
-    group_index: &HashMap<String, usize>,
 ) -> Result<GroupVerdict> {
     let mut joined = Vec::new();
     for name in streams {
-        let Some(spec) = extracts.iter().find(|e| &e.name == name) else {
+        let Some(spec) = engine.plan.extracts.iter().find(|e| &e.name == name) else {
             return Ok(GroupVerdict::unmatched(group));
         };
-        match extract(&spec.span, segments, hits, group_index)? {
-            Some(extracted) => joined.extend_from_slice(&extracted.bases),
+        match extract_stream(engine, spec, segments, hits)? {
+            Some(extracted) => joined.extend_from_slice(join_bases(&extracted)),
             None => return Ok(GroupVerdict::unmatched(group)),
         }
     }
@@ -2843,6 +2835,14 @@ fn match_joined(
         return Ok(GroupVerdict::unmatched(group));
     }
     Ok(match_verdict(group, scratch, &[joined.as_slice()], None))
+}
+
+/// A stream's bases in a `match=` join: its corrected form unless the tag has an ambiguity code.
+fn join_bases(extracted: &Extracted) -> &[u8] {
+    match &extracted.corrected {
+        Some(corrected) if crate::iupac::degeneracy(&corrected.bases) == 1 => &corrected.bases,
+        _ => &extracted.bases,
+    }
 }
 
 /// Match one group, honoring its sequential prerequisite: a group with no
@@ -3048,6 +3048,24 @@ fn canonical_correction<'a>(engine: &'a Engine, hits: &GroupHits, group: &str) -
     compiled.tags.get(hit.tag_idx).map(Vec::as_slice)
 }
 
+/// Resolve a stream, carrying the matched tag as the corrected form of an `@grp` self-span.
+fn extract_stream(
+    engine: &Engine,
+    spec: &crate::grammar::Extract,
+    segments: &[Segment],
+    hits: &GroupHits,
+) -> Result<Option<Extracted>> {
+    let Some(mut extracted) = extract(&spec.span, segments, hits, engine.group_index)? else {
+        return Ok(None);
+    };
+    if let SpanBody::AnchorMatch { group } = &spec.span.body {
+        if let Some(canonical) = canonical_correction(engine, hits, group) {
+            extracted.corrected = Some(corrected_form(&extracted, canonical));
+        }
+    }
+    Ok(Some(extracted))
+}
+
 /// The matched tag's value for a column stream, or `None` when its group did not
 /// match.
 fn column_value<'a>(engine: &'a Engine, hits: &GroupHits, stream: &str) -> Option<&'a str> {
@@ -3091,20 +3109,7 @@ fn prepare_body(
             }
             continue;
         }
-        if let Some(mut extracted) = extract(&spec.span, segments, hits, engine.group_index)? {
-            // Attach the matched tag's canonical sequence as the stream's
-            // corrected form, so a `raw=false` `--tag`/`--template` emits the
-            // corrected barcode while a `raw=true` one (or any stream with no
-            // corrected form) emits the observed bases. Only the `@grp`
-            // self-span is corrected (anchored-offset and between-anchor spans
-            // are unaffected). The observed span is already in the tag's
-            // orientation, so both forms share it; the read strand is a
-            // use-site choice (`--tag T=~stream` / `--template ~stream`).
-            if let SpanBody::AnchorMatch { group } = &spec.span.body {
-                if let Some(canonical) = canonical_correction(engine, hits, group) {
-                    extracted.corrected = Some(corrected_form(&extracted, canonical));
-                }
-            }
+        if let Some(extracted) = extract_stream(engine, spec, segments, hits)? {
             streams.insert(spec.name.as_str(), extracted);
         }
     }
@@ -4199,6 +4204,32 @@ mod tests {
         let s1 = read_back(&dir.path().join("s1.fq"));
         assert_eq!(s1.len(), 1, "the read routed to sample s1");
         assert_eq!(s1[0].name, b"r");
+        assert!(read_back(&unassigned).is_empty(), "nothing unassigned");
+    }
+
+    #[test]
+    fn test_match_joins_the_corrected_form_of_a_grp_stream() {
+        // The observed ACGTACGA is corrected to ACGTACGT, which the exact cell join matches.
+        let dir = tempfile::tempdir().unwrap();
+        let input = write_file(dir.path(), "in.fq", b"@r\nACGTACGAGGGG\n+\nIIIIIIIIIIII\n");
+        let unassigned = dir.path().join("un.fq");
+        let mut args = base_args();
+        args.inputs = vec![format!("0={}", input.display())];
+        args.groups = vec![
+            "bc={x=ACGTACGT}".to_string(),
+            "bc::loc=0:0:8,dist=1".to_string(),
+            "cell={c1=ACGTACGT}".to_string(),
+            "cell::match=b".to_string(),
+        ];
+        args.extracts = vec!["b=@bc".to_string()];
+        args.sample_from_group = Some("cell".to_string());
+        args.out = Some(format!("{}/%sample.fq", dir.path().display()));
+        args.unassigned = Some(unassigned.display().to_string());
+        run_demux(args).unwrap();
+
+        let c1 = read_back(&dir.path().join("c1.fq"));
+        assert_eq!(c1.len(), 1, "the read routed to cell c1");
+        assert_eq!(c1[0].name, b"r");
         assert!(read_back(&unassigned).is_empty(), "nothing unassigned");
     }
 
