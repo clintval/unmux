@@ -5282,6 +5282,55 @@ mod tests {
     }
 
     #[test]
+    fn test_compile_groups_refuses_a_window_that_no_tag_fits() {
+        let compiles = |groups: &[&str]| {
+            let mut args = base_args();
+            args.inputs = vec!["0=/dev/null".to_string()];
+            args.groups = groups.iter().map(|group| group.to_string()).collect();
+            let plan = crate::grammar::parse_demux(&args).unwrap();
+            let resolved = HashMap::new();
+            let (tag_sets, _) = load_tag_sets(&plan, &resolved).unwrap();
+            compile_groups(&plan, &tag_sets, &resolved).is_ok()
+        };
+        for (attrs, fits) in [
+            ("g::loc=0:0:6", true),
+            ("g::loc=0:0:5", false),
+            ("g::loc=0:-5", false),
+            ("g::loc=0:-12:-7", false),
+            ("g::loc=0:10:2", false),
+            ("g::loc=0:0:5,dist=1:1:2", true),
+            ("g::loc=0:0:4,dist=1:1:2", false),
+            ("g::loc=0:0:4,dist=0:2", true),
+            ("g::loc=0:0:3,partial5=3", true),
+            ("g::loc=0:0:2,partial5=3", false),
+            ("g::loc=0:0:2,partial3=3:0.5", false),
+            ("g::loc=0:0:1,anchor=5p", true),
+            ("g::loc=0:0:6,anchor=3p", true),
+            ("g::loc=0:0:5,anchor=3p", false),
+            ("g::loc=0:2", true),
+            ("g::dist=1", true),
+        ] {
+            assert_eq!(compiles(&["g={a=AACCGG}", attrs]), fits, "{attrs}");
+        }
+        assert!(compiles(&["g={a=AACCGG,b=GTTGTTGT}", "g::loc=0:0:6"]));
+        assert!(!compiles(&["g={a=AACCGG,b=GTTGTTGT}", "g::loc=0:0:5"]));
+        for (link, target, fits) in [
+            ("u::loc=0:0:4,next=g:0-6", "g::dist=0", true),
+            ("u::loc=0:0:4,next=g:2-8", "g::dist=0", true),
+            ("u::loc=0:0:4,next=g:0-5", "g::dist=0", false),
+            ("u::loc=0:0:4,next=g:2-7", "g::dist=0", false),
+            ("u::loc=0:0:4,next=g:0-5", "g::dist=1:1:1", true),
+            ("u::loc=0:0:4,next=g:0-1", "g::anchor=5p", true),
+            ("u::loc=0:0:4,next=g:0-5", "g::anchor=3p", false),
+            ("u::loc=0:0:4,next=g", "g::loc=0:0:5", false),
+            ("u::loc=0:0:4,next=g", "g::dist=0", true),
+        ] {
+            let groups = ["u={a=TTTT}", link, "g={a=AACCGG}", target];
+            assert_eq!(compiles(&groups), fits, "{link} {target}");
+        }
+    }
+
+    #[test]
     fn test_compile_groups_defaults_nearest_delta_to_one() {
         let mut args = base_args();
         args.inputs = vec!["0=/dev/null".to_string()];
