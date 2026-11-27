@@ -241,6 +241,27 @@ Feature: BAM/CRAM provenance headers and demux statistics
     Then the exit code is 0
     And the file "out.fq" contains "@r2"
 
+  Scenario: an unaligned @RG split refuses a shared bin whose read group equals a sample's, line for line
+    Given a file "same.sam" containing:
+      """
+      @HD	VN:1.6
+      @RG	ID:same	SM:same	LB:same
+      r1	4	*	0	0	*	*	0	0	ACGTACGT	IIIIIIII	RG:Z:same
+      r2	4	*	0	0	*	*	0	0	CCCCAAAA	IIIIIIII
+      """
+    When I run `unmux same.sam --group rg=@RG --sample-from-group rg --out o/same.sam --unassigned o/same.sam`
+    Then the exit code is 1
+    And stderr contains "--unassigned records would share read group "same" with a sample in "o/same.sam"; set --pool to another name"
+    And a file "o" does not exist
+
+  Scenario: an aligned @RG split shares its file with a bin under the input read groups
+    Given the test file "aligned.sam"
+    When I run `unmux aligned.sam --group rg=@RG --sample-from-group rg --out out/all.sam --unassigned out/all.sam`
+    Then the exit code is 0
+    And the file "out/all.sam" contains "@RG	ID:rg1	SM:sampleA"
+    And the file "out/all.sam" contains "@RG	ID:rg2	SM:sampleB"
+    And the file "out/all.sam" does not contain "@RG	ID:aligned"
+
   Scenario: the pool read group is checked on stdout that a bin shares, but not on /dev/null
     Given a file "in.sam" containing:
       """
