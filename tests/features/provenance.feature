@@ -2,7 +2,8 @@ Feature: BAM/CRAM provenance headers and demux statistics
   Every output SAM/BAM/CRAM carries exactly one provenance program record with the full
   command line, and per-sample fan-out files carry their read group; a pass-through `--out` and the
   raw `--unassigned`/`--remove` bins carry a default `@RG` whose ID/SM/LB are the pool id, so every
-  record belongs to a read group. Demux statistics are not
+  record belongs to a read group. A file that a bin shares with samples declares the read groups of
+  both. Demux statistics are not
   embedded in output headers (that would force a full per-file rewrite once counts are tallied);
   they go to stderr and the --metrics-per-sample / --metrics-summary TSVs. Header internals are read
   back with `noodles` (the `the BAM header of "..."` steps decode the BGZF-framed header the same way
@@ -137,6 +138,169 @@ Feature: BAM/CRAM provenance headers and demux statistics
     And the file "un.sam" contains "@RG"
     And the file "un.sam" contains "ID:lib01"
     And the file "un.sam" contains "RG:Z:lib01"
+
+  Scenario Outline: a <format> file that a bin shares with a sample declares the bin's read group
+    Given a file "reads.fq" containing:
+      """
+      @r1
+      AAAAAAAACCCCGGGG
+      +
+      IIIIIIIIIIIIIIII
+      @r2
+      TTTTTTTTGGCCATGC
+      +
+      IIIIIIIIIIIIIIII
+      """
+    When I run `unmux reads.fq --pool p --group bc={A=AAAAAAAA,T=TTTTTTTT} --sample s1=bc::A --out out.<format> <bin>`
+    Then the exit code is 0
+    And the <what> "out.<format>" contains "@RG	ID:s1	SM:s1"
+    And the <what> "out.<format>" contains "@RG	ID:p	SM:p	LB:p"
+    And the records of "out.<format>" are:
+      """
+      r1	4	*	0	255	*	*	0	0	AAAAAAAACCCCGGGG	IIIIIIIIIIIIIIII	RG:Z:s1
+      r2	4	*	0	255	*	*	0	0	TTTTTTTTGGCCATGC	IIIIIIIIIIIIIIII	RG:Z:p
+      """
+
+    Examples:
+      | format | what          | bin                    |
+      | sam    | file          | --unassigned out.sam   |
+      | bam    | BAM header of | --remove bc::T=out.bam |
+
+  Scenario: a CRAM file that a bin shares with a sample declares the bin's read group
+    Given a file "reads.fq" containing:
+      """
+      @r1
+      AAAAAAAACCCCGGGG
+      +
+      IIIIIIIIIIIIIIII
+      @r2
+      TTTTTTTTGGCCATGC
+      +
+      IIIIIIIIIIIIIIII
+      """
+    When I run `unmux reads.fq --pool p --group bc={A=AAAAAAAA,T=TTTTTTTT} --sample s1=bc::A --out out.cram --unassigned out.cram`
+    Then the exit code is 0
+    # Splitting the CRAM by the read groups its header declares finds the bin's record under the pool's.
+    When I run `unmux out.cram --group rg=@RG --sample-from-group rg --out split/%sample.sam`
+    Then the exit code is 0
+    And the records of "split/p.sam" are:
+      """
+      r2	4	*	0	255	*	*	0	0	TTTTTTTTGGCCATGC	IIIIIIIIIIIIIIII	RG:Z:p
+      """
+
+  Scenario Outline: SAM on stdout that a bin shares with a sample declares the bin's read group (<outputs>)
+    Given a file "in.sam" containing:
+      """
+      @HD	VN:1.6
+      r1	4	*	0	0	*	*	0	0	AAAAAAAACCCCGGGG	IIIIIIIIIIIIIIII
+      r2	4	*	0	0	*	*	0	0	TTTTTTTTGGCCATGC	IIIIIIIIIIIIIIII
+      """
+    When I run `unmux in.sam --pool p --group bc={A=AAAAAAAA,T=TTTTTTTT} --sample s1=bc::A <outputs>`
+    Then the exit code is 0
+    And stdout contains "@RG	ID:s1	SM:s1"
+    And stdout contains "@RG	ID:p	SM:p	LB:p"
+    And stdout contains "TTTTTTTTGGCCATGC	IIIIIIIIIIIIIIII	RG:Z:p"
+
+    Examples:
+      | outputs                          |
+      | --out - --unassigned -           |
+      | --out - --unassigned /dev/stdout |
+      | --unassigned -                   |
+
+  Scenario: SAM on the default stdout declares the samples' read groups
+    Given a file "in.sam" containing:
+      """
+      @HD	VN:1.6
+      r1	4	*	0	0	*	*	0	0	AAAAAAAACCCCGGGG	IIIIIIIIIIIIIIII
+      r2	4	*	0	0	*	*	0	0	TTTTTTTTGGCCATGC	IIIIIIIIIIIIIIII
+      """
+    When I run `unmux in.sam --pool p --group bc={A=AAAAAAAA,T=TTTTTTTT} --sample s1=bc::A`
+    Then the exit code is 0
+    And stdout contains "@RG	ID:s1	SM:s1"
+    And stdout does not contain "@RG	ID:p"
+    And stdout contains "AAAAAAAACCCCGGGG	IIIIIIIIIIIIIIII	RG:Z:s1"
+
+  Scenario: a SAM file that a bin shares is refused when the pool read group is also a sample's
+    Given a file "reads.fq" containing:
+      """
+      @r1
+      AAAAAAAACCCCGGGG
+      +
+      IIIIIIIIIIIIIIII
+      @r2
+      TTTTTTTTGGCCATGC
+      +
+      IIIIIIIIIIIIIIII
+      """
+    When I run `unmux reads.fq --pool s1 --group bc={A=AAAAAAAA,T=TTTTTTTT} --sample s1=bc::A --out out.sam --unassigned out.sam`
+    Then the exit code is 1
+    And stderr contains "--unassigned records would share read group "s1" with a sample in "out.sam"; set --pool to another name"
+    And a file "out.sam" does not exist
+    # FASTQ has no read groups, so the same samples and bin may share a FASTQ file.
+    When I run `unmux reads.fq --pool s1 --group bc={A=AAAAAAAA,T=TTTTTTTT} --sample s1=bc::A --out out.fq --unassigned out.fq`
+    Then the exit code is 0
+    And the file "out.fq" contains "@r2"
+
+  Scenario: an unaligned @RG split refuses a shared bin whose read group equals a sample's, line for line
+    Given a file "same.sam" containing:
+      """
+      @HD	VN:1.6
+      @RG	ID:same	SM:same	LB:same
+      r1	4	*	0	0	*	*	0	0	ACGTACGT	IIIIIIII	RG:Z:same
+      r2	4	*	0	0	*	*	0	0	CCCCAAAA	IIIIIIII
+      """
+    When I run `unmux same.sam --group rg=@RG --sample-from-group rg --out o/same.sam --unassigned o/same.sam`
+    Then the exit code is 1
+    And stderr contains "--unassigned records would share read group "same" with a sample in "o/same.sam"; set --pool to another name"
+    And a file "o" does not exist
+
+  Scenario: an unaligned @RG split's file that a bin shares gains the pool read group
+    Given a file "in.sam" containing:
+      """
+      @HD	VN:1.6
+      @RG	ID:rg1	SM:sA
+      @RG	ID:rg2	SM:sB
+      q1	4	*	0	0	*	*	0	0	ACGTACGT	IIIIIIII	RG:Z:rg1
+      q2	4	*	0	0	*	*	0	0	CCCCAAAA	IIIIIIII	RG:Z:rg2
+      q3	4	*	0	0	*	*	0	0	GGGGTTTT	IIIIIIII
+      """
+    When I run `unmux in.sam --pool p --group rg=@RG --sample-from-group rg --out o/all.sam --unassigned o/all.sam`
+    Then the exit code is 0
+    And the file "o/all.sam" contains "@RG	ID:rg1	SM:sA"
+    And the file "o/all.sam" contains "@RG	ID:rg2	SM:sB"
+    And the file "o/all.sam" contains "@RG	ID:p	SM:p	LB:p"
+    And the records of "o/all.sam" are:
+      """
+      q1	4	*	0	255	*	*	0	0	ACGTACGT	IIIIIIII	RG:Z:rg1
+      q2	4	*	0	255	*	*	0	0	CCCCAAAA	IIIIIIII	RG:Z:rg2
+      q3	4	*	0	255	*	*	0	0	GGGGTTTT	IIIIIIII	RG:Z:p
+      """
+
+  Scenario: an aligned @RG split shares its file with a bin under the input read groups
+    Given the test file "aligned.sam"
+    When I run `unmux aligned.sam --group rg=@RG --sample-from-group rg --out out/all.sam --unassigned out/all.sam`
+    Then the exit code is 0
+    And the file "out/all.sam" contains "@RG	ID:rg1	SM:sampleA"
+    And the file "out/all.sam" contains "@RG	ID:rg2	SM:sampleB"
+    And the file "out/all.sam" does not contain "@RG	ID:aligned"
+
+  Scenario: the pool read group is checked on stdout that a bin shares, but not on /dev/null
+    Given a file "in.sam" containing:
+      """
+      @HD	VN:1.6
+      r1	4	*	0	0	*	*	0	0	AAAAAAAACCCCGGGG	IIIIIIIIIIIIIIII
+      r2	4	*	0	0	*	*	0	0	TTTTTTTTGGCCATGC	IIIIIIIIIIIIIIII
+      """
+    When I run `unmux in.sam --pool s1 --group bc={A=AAAAAAAA,T=TTTTTTTT} --sample s1=bc::A --out - --unassigned -`
+    Then the exit code is 1
+    And stderr contains "--unassigned records would share read group "s1" with a sample on stdout; set --pool to another name"
+    # Without --out, records go to stdout as with --out -.
+    When I run `unmux in.sam --pool s1 --group bc={A=AAAAAAAA,T=TTTTTTTT} --sample s1=bc::A --unassigned -`
+    Then the exit code is 1
+    And stderr contains "--unassigned records would share read group "s1" with a sample on stdout; set --pool to another name"
+    # /dev/null keeps nothing, so its read groups are not checked.
+    When I run `unmux in.sam --pool s1 --group bc={A=AAAAAAAA,T=TTTTTTTT} --sample s1=bc::A --out /dev/null --unassigned /dev/null`
+    Then the exit code is 0
 
   Scenario: a pass-through FASTQ carries no read group (FASTX has no @RG concept)
     Given a file "reads.fq" containing:

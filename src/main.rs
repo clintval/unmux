@@ -174,9 +174,12 @@ struct DemuxCmd {
     /// `%sample`, `%sub_sample`, and `%ordinal`. Outputs that would be one
     /// file are refused: paths differing only in case (one file on a
     /// case-insensitive file system), two spellings of one file, a metrics
-    /// file on another output's path, or an output that is a file the run
-    /// reads under any name (an input, a tag file, the sample sheet, or the
-    /// reference and its indexes).
+    /// file on another output's path, an `--unassigned` or `--remove` path
+    /// equal to an `--out` path only once placeholders expand, or an output
+    /// that is a file the run reads under any name (an input, a tag file,
+    /// the sample sheet, or the reference and its indexes). Pass the `--out`
+    /// pattern itself to `--unassigned` or `--remove` to keep those records
+    /// in the `--out` file.
     ///
     ///   --out out.bam                   one file with all assigned records
     ///   --out %sample.bam               one file per sample
@@ -461,7 +464,10 @@ struct DemuxCmd {
     /// The only placeholders are `%pool` and `%source` (input file index);
     /// `%source` fans these to one file per input record. Without this flag,
     /// unassigned records are dropped. Unmux warns when unassigned fraction
-    /// reaches ≥20% of the pool.
+    /// reaches ≥20% of the pool. Given the `--out` pattern itself, these
+    /// records share the `--out` file, whose SAM/BAM/CRAM header then also
+    /// declares the pool read group; a run where a sample there has the
+    /// pool's read group ID is refused.
     ///
     ///   --unassigned unmatched.%source.fq.gz   one file per input file
     ///   --unassigned unmatched.fa              all segments in one FASTA
@@ -474,7 +480,9 @@ struct DemuxCmd {
     /// removed (distinct from `--unassigned`). With `=PATH_PATTERN` the removed
     /// records are written to the output path otherwise they are simply
     /// ignored. `SEL` is required. The only placeholders allowed in
-    /// `PATH_PATTERN` are `%pool` and `%source` (input file index).
+    /// `PATH_PATTERN` are `%pool` and `%source` (input file index). Given
+    /// the `--out` pattern itself, removed records share the `--out` file,
+    /// with the read group rules of `--unassigned`.
     ///
     ///   --remove phiX                      drop records matching phiX group
     ///   --remove bc::t99                   drop one specific tag's records

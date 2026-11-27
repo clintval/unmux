@@ -910,8 +910,8 @@ type OutDestination = (Option<PathBuf>, Vec<Target>, OutputFormat);
 
 /// The SAM/BAM/CRAM `--out` destinations and the fan-out targets whose records
 /// land in each (a single-file `--out` collects every target; a `%sample`
-/// pattern splits them), in first-seen order. FASTX destinations have no
-/// header, so they are excluded.
+/// pattern splits them; no `--out` is stdout), in first-seen order. FASTX
+/// destinations have no header, so they are excluded.
 fn out_destinations(
     plan: &DemuxPlan,
     routing: &Routing,
@@ -920,27 +920,28 @@ fn out_destinations(
 ) -> Result<Vec<OutDestination>> {
     let mut by_dest: Vec<OutDestination> = Vec::new();
     let mut index: HashMap<Option<PathBuf>, usize> = HashMap::new();
-    if let Some(pattern) = &plan.out {
-        for target in routing.targets() {
-            let ctx = PathContext {
-                pool,
-                sample: Some(&target.sample),
-                sub_sample: target.sub_sample.as_deref(),
-                ordinal: None,
-                source: None,
-            };
-            let path = resolve_pattern(pattern, &ctx);
-            let format = output_format(path.as_deref(), input_formats)?;
-            if matches!(
-                format,
-                OutputFormat::Sam | OutputFormat::Bam | OutputFormat::Cram
-            ) {
-                match index.get(&path) {
-                    Some(&i) => by_dest[i].1.push(target.clone()),
-                    None => {
-                        index.insert(path.clone(), by_dest.len());
-                        by_dest.push((path, vec![target.clone()], format));
-                    }
+    for target in routing.targets() {
+        let ctx = PathContext {
+            pool,
+            sample: Some(&target.sample),
+            sub_sample: target.sub_sample.as_deref(),
+            ordinal: None,
+            source: None,
+        };
+        let path = plan
+            .out
+            .as_ref()
+            .and_then(|pattern| resolve_pattern(pattern, &ctx));
+        let format = output_format(path.as_deref(), input_formats)?;
+        if matches!(
+            format,
+            OutputFormat::Sam | OutputFormat::Bam | OutputFormat::Cram
+        ) {
+            match index.get(&path) {
+                Some(&i) => by_dest[i].1.push(target.clone()),
+                None => {
+                    index.insert(path.clone(), by_dest.len());
+                    by_dest.push((path, vec![target.clone()], format));
                 }
             }
         }
@@ -1004,11 +1005,25 @@ fn labeled_dests(
             }
         }
     }
-    // The `--unassigned` and `--remove` bins (raw segments; `%source` fans out
-    // over the input files).
+    // The `--unassigned` and `--remove` bins, which share the `--out` writer when given its pattern.
+    let could_share = plan.out.as_ref().is_some_and(|out| {
+        !(out.uses(Placeholder::Sample)
+            || out.uses(Placeholder::SubSample)
+            || out.uses(Placeholder::Ordinal))
+    });
+    let bin = |pattern: &OutputPattern, option: String| {
+        if plan.out.as_ref() == Some(pattern) {
+            OutputOrigin::Records(option)
+        } else {
+            OutputOrigin::Bin {
+                option,
+                could_share,
+            }
+        }
+    };
     if let Some(pattern) = &plan.unassigned {
         for path in bin_paths(pattern, pool, plan.inputs.len()) {
-            paths.push((path, OutputOrigin::Records("--unassigned".to_string())));
+            paths.push((path, bin(pattern, "--unassigned".to_string())));
         }
     }
     for rule in &plan.remove {
@@ -1018,7 +1033,7 @@ fn labeled_dests(
                 RemoveSelector::GroupTag { group, id } => format!("{group}::{id}"),
             };
             for path in bin_paths(pattern, pool, plan.inputs.len()) {
-                paths.push((path, OutputOrigin::Records(format!("--remove {selector}"))));
+                paths.push((path, bin(pattern, format!("--remove {selector}"))));
             }
         }
     }
@@ -1046,8 +1061,8 @@ fn check_outputs(
             ));
         }
     }
-    check_output_collisions(&outputs)?;
-    crate::output::check_outputs_over_inputs(&outputs, &read_files(plan))
+    crate::output::check_outputs_over_inputs(&outputs, &read_files(plan))?;
+    check_output_collisions(&outputs)
 }
 
 /// Every file the run reads: the inputs, the tag files, the sample sheet and the reference.
@@ -1208,6 +1223,7 @@ struct DestinationList<'a> {
     input_formats: &'a [SniffedFormat],
     headers: &'a HashMap<Option<PathBuf>, Header>,
     default_header: &'a Header,
+    keeps_alignments: bool,
 }
 
 impl DestinationList<'_> {
@@ -1225,6 +1241,36 @@ impl DestinationList<'_> {
         self.list.push(dest);
         self.index.insert(path, self.list.len() - 1);
         Ok(self.list.len() - 1)
+    }
+
+    /// Add `option`'s bin destination like [`Self::add`], declaring its records' read groups.
+    fn add_bin(&mut self, path: Option<PathBuf>, option: &str) -> Result<usize> {
+        let at = self.add(path)?;
+        let dest = &mut self.list[at];
+        if !is_alignment_format(dest.format) || is_dev_null(dest.path.as_deref()) {
+            return Ok(at);
+        }
+        let samples = self.headers.get(&dest.path).map(Header::read_groups);
+        for (id, read_group) in self.default_header.read_groups() {
+            let sample = samples.and_then(|samples| samples.get(id));
+            // Aligned records keep their input read groups, which the samples' header shares.
+            if sample.is_some_and(|sample| !self.keeps_alignments || sample != read_group) {
+                let place = match &dest.path {
+                    Some(path) => format!("in \"{}\"", path.display()),
+                    None => "on stdout".to_string(),
+                };
+                bail!(
+                    "{option} records would share read group \"{id}\" with a sample {place}; set \
+                     --pool to another name"
+                );
+            }
+            if !dest.header.read_groups().contains_key(id) {
+                dest.header
+                    .read_groups_mut()
+                    .insert(id.clone(), read_group.clone());
+            }
+        }
+        Ok(at)
     }
 }
 
@@ -1251,15 +1297,16 @@ fn destination_table(
     let unassigned = plan
         .unassigned
         .as_ref()
-        .map(|pattern| bin_layout(pattern, pool, plan.inputs.len(), list))
+        .map(|pattern| bin_layout(pattern, "--unassigned", pool, plan.inputs.len(), list))
         .transpose()?;
     let removes = routing
         .removes()
         .iter()
         .map(|remove| {
+            let option = format!("--remove {}", remove.selector);
             let pattern = remove.pattern.as_ref();
             pattern
-                .map(|pattern| bin_layout(pattern, pool, plan.inputs.len(), list))
+                .map(|pattern| bin_layout(pattern, &option, pool, plan.inputs.len(), list))
                 .transpose()
         })
         .collect::<Result<_>>()?;
@@ -1330,6 +1377,7 @@ fn out_layout(
 /// The layout of a `--unassigned` or `--remove` bin, mirroring [`bin_paths`].
 fn bin_layout(
     pattern: &OutputPattern,
+    option: &str,
     pool: &str,
     num_sources: usize,
     list: &mut DestinationList,
@@ -1343,10 +1391,10 @@ fn bin_layout(
         resolve_pattern(pattern, &ctx)
     };
     if num_sources > 1 && pattern.uses(Placeholder::Source) {
-        let dests = (0..num_sources).map(|source| list.add(path(source)));
+        let dests = (0..num_sources).map(|source| list.add_bin(path(source), option));
         return Ok(BinLayout::PerSource(dests.collect::<Result<_>>()?));
     }
-    Ok(BinLayout::Single(list.add(path(0))?))
+    Ok(BinLayout::Single(list.add_bin(path(0), option)?))
 }
 
 /// Precompute the `@RG`-bearing SAM/BAM header for each distinct `--out`
@@ -1822,6 +1870,7 @@ fn run_engine(plan: &DemuxPlan, command_line: Option<&str>) -> Result<()> {
         input_formats: &input_formats,
         headers: &headers,
         default_header: &default_header,
+        keeps_alignments: keep_alignments,
     };
     let destinations = destination_table(plan, &routing, &pool, read_group, body_count, &mut list)?;
     log_run_shape(plan, &input_formats, &dests);

@@ -58,6 +58,8 @@ struct SassWorld {
     stdout: String,
     /// Captured stderr (lossy UTF-8).
     stderr: String,
+    /// Named pipes held open for the scenario, so a run writing to one never blocks.
+    pipes: Vec<fs::File>,
 }
 
 impl SassWorld {
@@ -174,6 +176,26 @@ async fn given_empty_file(world: &mut SassWorld, name: String) {
         fs::create_dir_all(parent).expect("create fixture parent directory");
     }
     fs::write(&path, b"").expect("write empty fixture file");
+}
+
+#[cfg(unix)]
+#[given(regex = r#"^a named pipe "([^"]+)"$"#)]
+async fn given_named_pipe(world: &mut SassWorld, name: String) {
+    let path = world.work_dir().join(&name);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).expect("create the named pipe's parent directory");
+    }
+    let made = std::process::Command::new("mkfifo")
+        .arg(&path)
+        .status()
+        .expect("run mkfifo");
+    assert!(made.success(), "mkfifo {name:?} failed");
+    let pipe = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .expect("open the named pipe for reading and writing");
+    world.pipes.push(pipe);
 }
 
 #[when(regex = r"^I run `unmux ?(.*)`$")]

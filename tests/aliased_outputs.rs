@@ -53,6 +53,47 @@ fn hard_linked_outputs_are_refused_and_left_unchanged() {
     assert_eq!(std::fs::read_to_string(out.join("b.fq")).unwrap(), "keep");
 }
 
+/// A named pipe at `path`, held open for reading and writing so a run writing to it never blocks.
+fn named_pipe(path: &Path) -> std::fs::File {
+    let made = std::process::Command::new("mkfifo")
+        .arg(path)
+        .status()
+        .unwrap();
+    assert!(made.success(), "mkfifo {}", path.display());
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .unwrap()
+}
+
+#[test]
+fn a_bin_on_a_samples_named_pipe_through_another_directory_spelling_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let real = dir.path().join("real");
+    std::fs::create_dir(&real).unwrap();
+    std::os::unix::fs::symlink("real", dir.path().join("link")).unwrap();
+    let _pipe = named_pipe(&real.join("a.fq"));
+    let absolute = real.join("a.fq").to_string_lossy().into_owned();
+    for bin in [absolute.as_str(), "link/a.fq"] {
+        let args = [
+            "--sample",
+            "a=bc::a",
+            "--out",
+            "real/%sample.fq",
+            "--unassigned",
+            bin,
+        ];
+        let (code, stderr) = unmux(dir.path(), &args);
+        assert_eq!(code, 1, "{bin}: {stderr}");
+        let refused = format!(
+            "outputs \"real/a.fq\" (sample a) and \"{bin}\" (--unassigned) are the same file; give \
+             them distinct paths"
+        );
+        assert!(stderr.contains(&refused), "{bin}: {stderr}");
+    }
+}
+
 #[test]
 fn an_output_through_a_dangling_directory_link_is_refused() {
     let dir = tempfile::tempdir().unwrap();
