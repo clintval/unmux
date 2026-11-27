@@ -433,11 +433,7 @@ fn compile_groups(
         let attrs = &group.attrs;
         let dist = attrs.dist.unwrap_or_default();
         let mode = attrs.mode.unwrap_or(MatchMode::All);
-        // Guard the IUPAC tag set up front: reject a combinatorial explosion,
-        // and refuse two tags that one read can match (only warn under
-        // `mode=nearest`, which leaves such a read unassigned). An `@RG`
-        // group's "tags" are synthetic routing tokens (not DNA), so this
-        // sequence machinery does not apply to it.
+        // An `@RG` group's tags are routing tokens, not DNA, so they are not validated.
         if !is_read_group {
             let search = crate::iupac::Search {
                 dist,

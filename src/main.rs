@@ -192,7 +192,8 @@ struct DemuxCmd {
     /// within `dist`, counting indels, a shorter tag inside a longer one, and
     /// with `bothStrands=true` the reverse strand. With `mode=nearest`, which
     /// leaves such reads unassigned, this is only a warning, unless the read
-    /// matches both tags exactly.
+    /// matches both tags exactly. Matches cut short by `partial5`/`partial3`
+    /// are not checked.
     ///
     /// Sources (`NAME::SOURCE`):
     ///
