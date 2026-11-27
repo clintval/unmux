@@ -816,9 +816,7 @@ impl FormatReader {
                 reader
                     .read_sequence(&mut bases)
                     .context("failed to read FASTA sequence")?;
-                let body = definition.trim_start_matches('>');
-                // As in FASTQ, the name ends at the first space or tab, so it may be empty.
-                let (name, comment) = body.split_once([' ', '\t']).unwrap_or((body, ""));
+                let (name, comment) = split_fasta_definition(definition.trim_start_matches('>'));
                 let name = name.as_bytes().to_vec();
                 let tags = parse_comment_tags(comment.as_bytes()).with_context(|| {
                     format!(
@@ -992,6 +990,16 @@ fn first_token(name: &[u8]) -> Vec<u8> {
         .to_vec()
 }
 
+/// The name and comment after `>`; no name when a tag-shaped first field follows a space or tab.
+fn split_fasta_definition(body: &str) -> (&str, &str) {
+    let trimmed = body.trim_start_matches([' ', '\t']);
+    let field = trimmed.split_once('\t').map_or(trimmed, |(field, _)| field);
+    if trimmed.len() < body.len() && tag_shape(field.as_bytes()).is_some() {
+        return ("", trimmed);
+    }
+    trimmed.split_once([' ', '\t']).unwrap_or((trimmed, ""))
+}
+
 /// Lift the SAM tags of a FASTX read-name comment, the inverse of the writer's
 /// `render_tags`. A tab-separated field not shaped like a tag (a bare UMI, an
 /// Illumina CASAVA string, free text) is skipped, and a tag whose value its type
@@ -1012,20 +1020,26 @@ fn parse_comment_tags(comment: &[u8]) -> Result<Option<Data>> {
     Ok((!data.is_empty()).then_some(data))
 }
 
-/// One comment field as a SAM tag of a type the writer emits, or `None` when it
-/// is not shaped `XX:T:VALUE`, as when a value other than a `Z` holds a space;
-/// an integer takes the narrowest BAM type that holds it and an array keeps
-/// its subtype.
+/// The tag, type, and value of a field shaped `XX:T:VALUE` with a type the writer emits.
+fn tag_shape(field: &[u8]) -> Option<(Tag, u8, &[u8])> {
+    let &[name0, name1, b':', ty @ (b'A' | b'i' | b'f' | b'Z' | b'H' | b'B'), b':', ref raw @ ..] =
+        field
+    else {
+        return None;
+    };
+    let shaped = name0.is_ascii_alphabetic()
+        && name1.is_ascii_alphanumeric()
+        && (ty == b'Z' || !raw.contains(&b' '));
+    shaped.then_some((Tag::new(name0, name1), ty, raw))
+}
+
+/// One comment field as a SAM tag, or `None` when it has no [`tag_shape`]; an
+/// integer takes the narrowest BAM type that holds it and an array keeps its
+/// subtype.
 fn parse_aux_field(field: &[u8]) -> Result<Option<(Tag, Value)>> {
-    let &[name0, name1, b':', ty, b':', ref raw @ ..] = field else {
+    let Some((tag, ty, raw)) = tag_shape(field) else {
         return Ok(None);
     };
-    if !name0.is_ascii_alphabetic() || !name1.is_ascii_alphanumeric() {
-        return Ok(None);
-    }
-    if ty != b'Z' && raw.contains(&b' ') {
-        return Ok(None);
-    }
     let value = match ty {
         b'A' => match *raw {
             [c] if c.is_ascii_graphic() => Ok(Value::Character(c)),
@@ -1048,10 +1062,10 @@ fn parse_aux_field(field: &[u8]) -> Result<Option<(Tag, Value)>> {
         b'B' => parse_array(raw)
             .map(Value::Array)
             .ok_or("a c, C, s, S, i, I, or f array whose values fit that subtype"),
-        _ => return Ok(None),
+        _ => unreachable!("a tag shape has a type the writer emits"),
     };
     match value {
-        Ok(value) => Ok(Some((Tag::new(name0, name1), value))),
+        Ok(value) => Ok(Some((tag, value))),
         Err(expected) => bail!(
             "the comment tag `{}` must be {expected}",
             String::from_utf8_lossy(&field[..4])
@@ -1608,7 +1622,8 @@ impl FragmentReader {
                 if first_is_r1 {
                     interleaved = true;
                 } else if let Some((second, _)) = readers[0].read_next(false)? {
-                    interleaved = mate_key(&second.name) == mate_key(&buffered[0].name);
+                    let key = mate_key(&second.name);
+                    interleaved = !key.is_empty() && key == mate_key(&buffered[0].name);
                     buffered.push(second);
                 }
             }
@@ -2618,6 +2633,75 @@ mod tests {
         assert_eq!(data.get(b"xa"), Some(&Value::Character(b'Q')));
         let ml = Value::Array(Array::UInt8(vec![1, 2]));
         assert_eq!(data.get(b"ML"), Some(&ml));
+    }
+
+    #[test]
+    fn test_read_nameless_fastx_records_as_single_end() {
+        for text in [
+            "@\nACGT\n+\nIIII\n@\nCCGG\n+\nIIII\n",
+            "> xa:A:Q\nACGT\n> xa:A:R\nCCGG\n",
+        ] {
+            let fragments = read_all(&temp_with(text.as_bytes()));
+            let sizes: Vec<usize> = fragments.iter().map(|f| f.records.len()).collect();
+            assert_eq!(sizes, [1, 1], "{text:?}");
+        }
+    }
+
+    #[test]
+    fn test_read_fasta_keeps_a_name_after_a_space_unless_it_is_shaped_like_a_tag() {
+        for (definition, name, tags) in [
+            ("> read1 desc", "read1", ""),
+            (">\t read1 BC:Z:GGGG", "read1", "BC"),
+            ("> xa:A:Q\tML:B:C,1,2", "", "xa ML"),
+            ("> CO:Z:two words\tML:B:C,1", "", "CO ML"),
+            (">xa:A:Q\tML:B:C,1,2", "xa:A:Q", "ML"),
+            ("> ab:A:x description here", "ab:A:x", ""),
+            ("> ab:i:xyz desc", "ab:i:xyz", ""),
+            (">  xa:A:Q\tML:B:C,1,2", "", "xa ML"),
+            ("> read1 desc\r", "read1", ""),
+            ("> xa:A:Q\tML:B:C,1,2\r", "", "xa ML"),
+        ] {
+            let file = temp_with(format!("{definition}\nACGT\n").as_bytes());
+            let record = read_all(&file).remove(0).records.remove(0);
+            assert_eq!(record.name, name.as_bytes(), "{definition:?}");
+            let lifted: Vec<String> = record
+                .tags
+                .iter()
+                .flat_map(Data::iter)
+                .map(|(tag, _)| String::from_utf8_lossy(&<[u8; 2]>::from(tag)).into_owned())
+                .collect();
+            assert_eq!(lifted.join(" "), tags, "{definition:?}");
+        }
+        let error = read_error("> ab:i:xyz\nACGT\n");
+        assert!(
+            error.contains("the comment tag `ab:i` must be an integer"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn test_read_fasta_checks_the_names_after_leading_whitespace() {
+        let r1 = temp_with(b"> read1 desc\nACGT\n");
+        let open = |r2: &tempfile::NamedTempFile| {
+            FragmentReader::open(&[r1.path().to_path_buf(), r2.path().to_path_buf()], false)
+                .unwrap()
+                .next_fragment()
+        };
+        let mate = temp_with(b">\tread1 other\nCCGG\n");
+        let fragment = open(&mate).unwrap().expect("one fragment");
+        let names: Vec<&[u8]> = fragment.records.iter().map(|r| &r.name[..]).collect();
+        assert_eq!(names, [b"read1", b"read1"]);
+        let error = format!(
+            "{:#}",
+            open(&temp_with(b"> read2 desc\nCCGG\n")).unwrap_err()
+        );
+        assert!(
+            error.contains("mismatched read names (`read1` vs `read2`)"),
+            "{error}"
+        );
+
+        let error = read_error("> read1/2 desc\nACGT\n> read1/1 desc\nCCGG\n");
+        assert!(error.contains("starts with a `/2` mate"), "{error}");
     }
 
     #[test]
