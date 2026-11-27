@@ -76,16 +76,15 @@ pub struct Search {
 /// error.
 ///
 /// Two tags collide when one read can match both at one place: some bases, no
-/// longer than the first tag or the search window, that the first tag matches
-/// end to end within `dist` and the second matches within (at their start
-/// under `anchor=5p`, at their end under `anchor=3p`), either tag taken first,
-/// and the second also reverse-complemented when `bothStrands` is set. Each tag
-/// keeps its own substitution, indel, and total caps, and the message gives
-/// bases checked to match both. A collision with zero errors always fails; any
-/// other fails under `mode=all`, which would silently mis-assign such reads,
-/// and warns under `mode=nearest`, which leaves them unassigned unless `delta`
-/// separates the two. Truncated matches (`partial5`/`partial3`) are not
-/// considered.
+/// longer than the search window, that the first tag matches end to end within
+/// `dist` and the second matches within (at their start under `anchor=5p`, at
+/// their end under `anchor=3p`), either tag taken first, and the second also
+/// reverse-complemented when `bothStrands` is set. Each tag keeps its own
+/// substitution, indel, and total caps, and the message gives bases checked to
+/// match both. A collision with zero errors always fails; any other fails under
+/// `mode=all`, which would silently mis-assign such reads, and warns under
+/// `mode=nearest`, which leaves them unassigned unless `delta` separates the
+/// two. Truncated matches (`partial5`/`partial3`) are not considered.
 pub fn validate_group(name: &str, seqs: &[Vec<u8>], search: &Search) -> Result<Vec<String>> {
     let mut warnings = Vec::new();
 
@@ -272,12 +271,16 @@ impl Shape {
     }
 }
 
+/// How uneven and how large two tags' error counts are, then how long the
+/// bases are; smaller is a clearer example of a read that matches both.
+type Spread = (usize, usize, usize);
+
 /// Bases one read can carry that two tags both match.
 struct Overlap {
     bases: Vec<u8>,
     exact: bool,
     flipped: bool,
-    spread: (usize, usize),
+    spread: Spread,
 }
 
 /// The overlap of two tags over the orders and strands the search allows,
@@ -312,9 +315,8 @@ fn collision(
 /// against the budget.
 fn overlap(outer: &Tag, inner: &Tag, search: &Search, shape: Shape) -> Option<Overlap> {
     let dist = &search.dist;
-    let longest = search
-        .window
-        .map_or(outer.len(), |width| width.min(outer.len()));
+    let reach = outer.len() + dist.indel;
+    let longest = search.window.map_or(reach, |width| width.min(reach));
     if inner.len() == 0 || inner.len() > longest + dist.indel {
         return None;
     }
@@ -357,7 +359,7 @@ struct Split {
 struct Candidate {
     steps: Vec<Step>,
     split: Split,
-    spread: (usize, usize),
+    spread: Spread,
     exact: bool,
 }
 
@@ -699,8 +701,8 @@ fn split_edits(
     dist: &Dist,
     outer_len: usize,
     longest: usize,
-) -> Option<((usize, usize), Split)> {
-    let mut best: Option<((usize, usize), Split)> = None;
+) -> Option<(Spread, Split)> {
+    let mut best: Option<(Spread, Split)> = None;
     for outer_skipped in 0..=skipped {
         for outer_extra in 0..=extra {
             let len = (outer_len + outer_extra).saturating_sub(outer_skipped);
@@ -719,7 +721,7 @@ fn split_edits(
             for outer_subs in fewest..=most {
                 let charged = outer_subs + outer_gaps;
                 let rest = subs - outer_subs + inner_gaps;
-                let spread = (charged.abs_diff(rest), charged.max(rest));
+                let spread = (charged.abs_diff(rest), charged.max(rest), len);
                 if best.is_none_or(|(seen, _)| spread < seen) {
                     let split = Split {
                         subs: outer_subs,

@@ -438,8 +438,10 @@ const METRICS: &str =
 const CUT: &str = "--extract a=0:14:end --extract b=1:0:end --extract umi=0:8:14 --extract s=@bc";
 const BINS: &str = "--unassigned un.R%source.fq.gz";
 const CELLS: &str = "--group b1={in}/bc.tsv --group b1::loc=0:0:13 --group b1::dist=1:1:1 \
+     --group b1::mode=nearest \
      --group l={GTGGCCGATGTTTCGC} --group l::loc=0:6:32 --group l::dist=2:1:3 \
-     --group b2={in}/bc.tsv --group b2::dist=1:1:1 --group l::next=b2:0-9 \
+     --group b2={in}/bc.tsv --group b2::dist=1:1:1 --group b2::mode=nearest \
+     --group l::next=b2:0-9 \
      --extract c1=@b1 --extract c2=@b2 --extract umi=@b2+0:6 --extract cdna=1:0:end \
      --extract gap=@b1..@l --extract name=@b1::id";
 
@@ -499,19 +501,20 @@ const CELLS: &str = "--group b1={in}/bc.tsv --group b1::loc=0:0:13 --group b1::d
     "{in}/r1.fq {in}/r2.fq \
     {in}/i1.fq {in}/i2.fq --group bc={in}/bc.tsv --group bc::loc=2:0:8 --group bc::dist=1 \
     --group i5={in}/bc.tsv --group i5::loc=3:0:9 --group i5::dist=1:1:1 \
+    --group i5::mode=nearest \
     --extract a=0:0:end --extract b=1:0:end --extract x=@bc --extract y=@i5 \
     --extract n=%sample::note --extract c=@i5::cell --template a b --tag BC=x+y --tag xn=n \
     --tag xc=c+x --sample-sheet {in}/sheet.tsv --out %sample.cram --rg-tag PL=ILLUMINA {METRICS}"
 )]
 #[case::cells_to_bam(
-    "3020ca779bbbaa1f51543f7b1f30f896",
+    "ea5cdc07bdcdc711909d1fe789248a06",
     "{in}/sc1.fq {in}/sc2.fq {CELLS} \
     --group b1::minFindsPerGroup=1 --template cdna --tag CB=c1+c2 --tag CR=c1+c2 \
     --tag CR::raw=true --tag RX=umi --tag xg=gap --tag xn=name --out out.bam --unassigned un.bam \
     --qc-tag=ZQ {METRICS}"
 )]
 #[case::cells_split_with_removal(
-    "198650b175068301447cd77d9feea281",
+    "cbba12a4024794bca9e461042cb7d372",
     "{in}/sc1.fq {in}/sc2.fq \
     {CELLS} --group ad={GATCGGAAGAGC} --group ad::loc=1:0:end --group ad::dist=1 \
     --remove ad=ad.%source.fq.gz --remove b1::t03 --template cdna+umi --tag CB=c1+c2 --tag RX=umi \
