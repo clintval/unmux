@@ -571,10 +571,8 @@ Feature: Tag matching with distance tolerance and error handling
     When I run `unmux reads.fq --group bc=<tags> --group bc::<attrs> --extract bc=@bc --tag CB=bc --tag BC=bc --tag BC::raw=true --sample-from-group bc --out %sample.fq --unassigned un.fq`
     Then the exit code is 0
     And the file "x.fq" contains "@dna CB:Z:<tag>"
-    And the file "x.fq" contains "@rna CB:Z:<tag>"
-    And the file "x.fq" contains "@lower CB:Z:<tag>"
-    And the file "x.fq" contains "BC:Z:<raw>"
-    And the file "x.fq" contains "BC:Z:<lower>"
+    And the file "x.fq" contains "@rna CB:Z:<tag>	CY:Z:IIIII	BC:Z:<raw>	QT:Z:IIIII"
+    And the file "x.fq" contains "@lower CB:Z:<tag>	CY:Z:IIIII	BC:Z:<lower>	QT:Z:IIIII"
     And the file "un.fq" does not contain "@rna"
     And the file "un.fq" does not contain "@lower"
 
