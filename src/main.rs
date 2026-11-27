@@ -189,11 +189,14 @@ struct DemuxCmd {
     /// several tags into one sample with `--sample NAME=GROUP::ID1,ID2`.
     ///
     /// A set is refused when one read can match two of its tags at one place
-    /// within `dist`, counting indels, a shorter tag inside a longer one, and
-    /// with `bothStrands=true` the reverse strand. With `mode=nearest`, which
-    /// leaves such reads unassigned, this is only a warning, unless the read
-    /// matches both tags exactly. Matches cut short by `partial5`/`partial3`
-    /// are not checked.
+    /// within `dist`, counting a shorter tag inside a longer one and, with
+    /// `bothStrands=true`, the reverse strand. With `mode=nearest`, which
+    /// leaves such reads unassigned, this is only a warning unless the read
+    /// matches both tags exactly. Pairs that one read can match only through
+    /// an indel are refused only when no `mode` is set: add `mode=nearest`
+    /// (recommended) or `mode=all`, which keeps assigning such reads by
+    /// tie-break, to run with warnings that list them. Matches cut short by
+    /// `partial5`/`partial3` are not checked.
     ///
     /// Sources (`NAME::SOURCE`):
     ///
