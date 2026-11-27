@@ -6046,6 +6046,46 @@ mod tests {
     }
 
     #[test]
+    fn test_remove_wins_over_a_find_failure_in_either_group_order() {
+        // `px` holds the phix tag and no i7 tag, which i7 requires.
+        let dir = tempfile::tempdir().unwrap();
+        let input = write_file(
+            dir.path(),
+            "in.fq",
+            b"@s1\nAAAAAAAACCCCCCCC\n+\nIIIIIIIIIIIIIIII\n@px\nTTTTTTTTGGGGGGGG\n+\nIIIIIIIIIIIIIIII\n@un\nTTTTTTTTCCCCCCCC\n+\nIIIIIIIIIIIIIIII\n",
+        );
+        let index = ["i7={s1=AAAAAAAA}", "i7::loc=0:0:8,minFindsPerGroup=1"];
+        let phix = ["phix={p=GGGGGGGG}", "phix::loc=0:8:16"];
+        for groups in [[index, phix].concat(), [phix, index].concat()] {
+            let removed = dir.path().join("removed.fq");
+            let unassigned = dir.path().join("un.fq");
+            let summary = dir.path().join("summary.tsv");
+            let mut args = base_args();
+            args.pool = Some("p".to_string());
+            args.inputs = vec![format!("0={}", input.display())];
+            args.groups = groups.iter().map(|group| group.to_string()).collect();
+            args.samples = vec!["S=i7::s1".to_string()];
+            args.out = Some(dir.path().join("%sample.fq").display().to_string());
+            args.remove = vec![format!("phix={}", removed.display())];
+            args.unassigned = Some(unassigned.display().to_string());
+            args.metrics_summary = Some(summary.clone());
+            run_demux(args).unwrap();
+
+            let names = |path: &Path| -> Vec<Vec<u8>> {
+                read_back(path)
+                    .into_iter()
+                    .map(|record| record.name)
+                    .collect()
+            };
+            assert_eq!(names(&removed), [b"px".to_vec()], "{groups:?}");
+            assert_eq!(names(&unassigned), [b"un".to_vec()], "{groups:?}");
+            let sum = std::fs::read_to_string(&summary).unwrap();
+            let row = sum.lines().nth(1).unwrap();
+            assert!(row.starts_with("p\t3\t1\t0\t1\t1\t"), "{groups:?}: {sum}");
+        }
+    }
+
+    #[test]
     fn test_unassigned_fans_out_by_source() {
         // A required group that does not match leaves the read unassigned;
         // %source fans its two input segments into one file per input.
