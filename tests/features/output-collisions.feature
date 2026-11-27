@@ -70,6 +70,14 @@ Feature: Outputs that would be one file are refused
       | --unassigned o/a.fq   | --unassigned   |
       | --remove bc::T=o/a.fq | --remove bc::T |
 
+  Scenario: a bin on a sample's named pipe only once %sample expands is refused
+    Given a named pipe "o/a.fq"
+    When I run `unmux reads.fq --group bc={A=AAAAAAAA,T=TTTTTTTT} --sample a=bc::A --out o/%sample.fq --unassigned o/a.fq`
+    Then the exit code is 1
+    And stderr contains "outputs "o/a.fq" (sample a) and "o/a.fq" (--unassigned) are the same file; give them distinct paths"
+    When I run `unmux reads.fq --group bc={A=AAAAAAAA,T=TTTTTTTT} --sample a=bc::A --out o/a.fq --unassigned o/a.fq`
+    Then the exit code is 0
+
   Scenario Outline: a bin given another path to the one --out file is refused with the way to share it
     When I run `unmux reads.fq --pool lib --group bc={A=AAAAAAAA,T=TTTTTTTT} <outputs>`
     Then the exit code is 1
