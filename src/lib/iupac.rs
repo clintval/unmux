@@ -23,6 +23,15 @@ const TAG_DEGEN_CAP: u64 = 1 << 20;
 const GROUP_DEGEN_WARN: u64 = 100_000;
 const GROUP_DEGEN_CAP: u64 = 10_000_000;
 
+/// The colliding pairs a `mode=nearest` group warns about one by one.
+const LISTED_PAIRS: usize = 10;
+/// The colliding pairs a `mode=nearest` group counts; past them, only pairs
+/// that one read matches with zero errors are still looked for.
+const COUNTED_PAIRS: usize = 1_000;
+/// What `mode=nearest` does with a read that two tags match.
+const UNASSIGNED: &str =
+    "mode=nearest leaves ambiguous reads unassigned unless delta separates them";
+
 /// The 4-bit ACGT membership mask for an IUPAC code (A=1, C=2, G=4, T=8). A
 /// byte that is not a recognized code maps to 0, so it matches nothing and
 /// never overlaps another tag.
@@ -85,7 +94,9 @@ pub struct Search {
 /// match both. A collision with zero errors always fails; any other fails under
 /// `mode=all`, which would silently mis-assign such reads, and warns under
 /// `mode=nearest`, which leaves them unassigned unless `delta` separates the
-/// two. Truncated matches (`partial5`/`partial3`) are not considered.
+/// two, listing the first pairs and counting the rest up to a limit, past which
+/// only zero-error collisions are looked for. Truncated matches
+/// (`partial5`/`partial3`) are not considered.
 pub fn validate_group(name: &str, seqs: &[Vec<u8>], search: &Search) -> Result<Vec<String>> {
     let mut warnings = Vec::new();
 
@@ -137,10 +148,20 @@ pub fn validate_group(name: &str, seqs: &[Vec<u8>], search: &Search) -> Result<V
             .collect(),
         false => Vec::new(),
     };
+    let exact_only = Search {
+        dist: Dist::default(),
+        ..*search
+    };
+    let budget = dist_spec(&search.dist);
+    let mut colliding = 0;
     for (i, a) in tags.iter().enumerate() {
         for (j, b) in tags.iter().enumerate().skip(i + 1) {
             let strands = search.both_strands.then(|| (&flipped[i], &flipped[j]));
-            let Some(found) = collision(a, b, strands, search, shape) else {
+            let checked = match colliding < COUNTED_PAIRS {
+                true => search,
+                false => &exact_only,
+            };
+            let Some(found) = collision(a, b, strands, checked, shape) else {
                 continue;
             };
             let (a_s, b_s) = (
@@ -157,16 +178,26 @@ pub fn validate_group(name: &str, seqs: &[Vec<u8>], search: &Search) -> Result<V
                 bail!("group `{name}`: tags `{a_s}` and `{b_s}` are indistinguishable (the bases `{bases}` match both with zero errors{strand}); remove one or make them distinct");
             }
             let overlap = format!(
-                "group `{name}`: tags `{a_s}` and `{b_s}` can both match one read within dist={} (the bases `{bases}` match both{strand})",
-                dist_spec(&search.dist)
+                "group `{name}`: tags `{a_s}` and `{b_s}` can both match one read within dist={budget} (the bases `{bases}` match both{strand})"
             );
-            match search.mode {
-                MatchMode::All => bail!("{overlap}; with mode=all this silently mis-assigns reads: separate the tags, lower dist, or use mode=nearest"),
-                MatchMode::Nearest => warnings.push(format!(
-                    "{overlap}; mode=nearest leaves ambiguous reads unassigned unless delta separates them"
-                )),
+            if search.mode == MatchMode::All {
+                bail!("{overlap}; with mode=all this silently mis-assigns reads: separate the tags, lower dist, or use mode=nearest, which only warns and lists the colliding pairs");
+            }
+            colliding += 1;
+            if colliding <= LISTED_PAIRS {
+                warnings.push(format!("{overlap}; {UNASSIGNED}"));
             }
         }
+    }
+    if colliding > LISTED_PAIRS {
+        let more = colliding - LISTED_PAIRS;
+        let counted = match colliding < COUNTED_PAIRS {
+            true => format!("{more} more pairs"),
+            false => format!("at least {more} more pairs (counting stopped at {COUNTED_PAIRS})"),
+        };
+        warnings.push(format!(
+            "group `{name}`: {counted} of tags can both match one read within dist={budget}; {UNASSIGNED}"
+        ));
     }
 
     Ok(warnings)
