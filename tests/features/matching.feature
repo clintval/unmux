@@ -614,3 +614,43 @@ Feature: Tag matching with distance tolerance and error handling
       | link           | groups                                                                          |
       | a match= join  | --extract i=0:2:4 --extract j=0:4:7 --group bc={x=AATTC} --group bc::match=i+j |
       | a next= window | --group ad={a=CC} --group ad::loc=0:0:2,next=bc:0-6 --group bc={x=AATTC}        |
+
+  Scenario Outline: A tag written as <tag> matches on both strands as its T twin does
+    Given a file "reads.fq" containing:
+      """
+      @fwd
+      ACGTACGGAAAA
+      +
+      IIIIIIIIIIII
+      @rev
+      TTTTCCGTACGT
+      +
+      IIIIIIIIIIII
+      @revrna
+      UUUUCCGUACGU
+      +
+      IIIIIIIIIIII
+      """
+    When I run `unmux reads.fq --group bc={a=<tag>} --group bc::bothStrands=true --sample-from-group bc --out %sample.fq --unassigned un.fq`
+    Then the exit code is 0
+    And the file "a.fq" is:
+      """
+      @fwd
+      ACGTACGGAAAA
+      +
+      IIIIIIIIIIII
+      @rev
+      TTTTCCGTACGT
+      +
+      IIIIIIIIIIII
+      @revrna
+      UUUUCCGUACGU
+      +
+      IIIIIIIIIIII
+      """
+
+    Examples:
+      | tag      |
+      | ACGTACGG |
+      | ACGUACGG |
+      | acguacgg |

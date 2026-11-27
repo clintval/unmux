@@ -149,6 +149,8 @@ pub struct CompiledGroup {
     pub name: String,
     /// Tag sequences in definition order (bases / IUPAC, uppercase).
     pub tags: Vec<Vec<u8>>,
+    /// The tags as `sassy` searches them, with U read as T, since it complements no U.
+    pub(crate) patterns: Vec<Vec<u8>>,
     /// The error budget.
     pub dist: Dist,
     /// The optional search window; `None` searches every file's whole record.
@@ -246,6 +248,7 @@ impl CompiledGroup {
     pub fn new(name: impl Into<String>, tags: Vec<Vec<u8>>) -> Self {
         Self {
             name: name.into(),
+            patterns: search_patterns(&tags),
             tags,
             dist: Dist::default(),
             loc: None,
@@ -270,8 +273,8 @@ impl CompiledGroup {
     /// Precompute the `sassy` v2 batched search batches: group the tags by
     /// length and, for each length bucket of at least [`BATCHED_MIN_TAGS`] tags
     /// up to [`BATCHED_MAX_LEN`] bp, `encode_patterns` once for reuse across
-    /// every record. Idempotent: it rebuilds [`CompiledGroup::encoded`] from
-    /// the current tags.
+    /// every record. Idempotent: it rebuilds the search patterns and
+    /// [`CompiledGroup::encoded`] from the current tags.
     ///
     /// Forward-strand groups only. Two cases skip batching and stay on per-tag
     /// `search()`: partial (overhang) groups, because the batched path is
@@ -287,6 +290,7 @@ impl CompiledGroup {
     /// speedup is preserved for the common case; rc stays per-tag until the two
     /// `sassy` paths agree. A small or over-long bucket also stays per-tag.
     pub fn encode(&mut self) {
+        self.patterns = search_patterns(&self.tags);
         self.encoded.clear();
         self.batched_tags.clear();
         // TODO(upstream sassy): file an issue against `sassy` (0.2.3) that
@@ -316,8 +320,10 @@ impl CompiledGroup {
             if tag_indices.len() < BATCHED_MIN_TAGS {
                 continue;
             }
-            let patterns: Vec<Vec<u8>> =
-                tag_indices.iter().map(|&i| self.tags[i].clone()).collect();
+            let patterns: Vec<Vec<u8>> = tag_indices
+                .iter()
+                .map(|&i| self.patterns[i].clone())
+                .collect();
             let encoded = searcher.encode_patterns(&patterns);
             self.encoded.push(EncodedBatch {
                 tag_indices,
@@ -743,13 +749,7 @@ pub fn match_group_at(
         if text.is_empty() {
             continue;
         }
-        // Read U as T and mask other non-ACGT observed bases (an `N` no-call or
-        // a read-side degenerate code) to a never-match sentinel so they are
-        // charged against the `dist` budget rather than matching any tag base
-        // for free (a tag-side IUPAC code stays a deliberate wildcard). This
-        // masks only the search window; the original read bases used for
-        // extraction and output are untouched, and the sentinel keeps the
-        // window length so match coordinates still map back to the read.
+        // Search a masked copy of the same length; extraction and output keep the read's bases.
         let masked: Vec<u8> = text.iter().map(|&base| mask_no_call(base)).collect();
         let text = masked.as_slice();
         let window_first = accepted.len();
@@ -783,13 +783,13 @@ pub fn match_group_at(
 
         // Per-tag path for tags not in a batch (small or over-long buckets, and
         // partial groups).
-        for (tag_idx, tag) in group.tags.iter().enumerate() {
-            if tag.is_empty() || batched.contains(&tag_idx) {
+        for (tag_idx, pattern) in group.patterns.iter().enumerate() {
+            if pattern.is_empty() || batched.contains(&tag_idx) {
                 continue;
             }
-            for m in searcher.search(tag, text, search_budget(group, tag.len())) {
+            for m in searcher.search(pattern, text, search_budget(group, pattern.len())) {
                 let (subs, indels) = count_edits(&m);
-                if !accept_match(group, tag.len(), &m, subs, indels) {
+                if !accept_match(group, pattern.len(), &m, subs, indels) {
                     dropped.push((tag_idx, strand_of(m.strand)));
                     continue;
                 }
@@ -1270,6 +1270,18 @@ fn mask_no_call(base: u8) -> u8 {
         b'u' => b't',
         _ => b'X',
     }
+}
+
+/// The [`CompiledGroup::patterns`] for `tags`.
+pub(crate) fn search_patterns(tags: &[Vec<u8>]) -> Vec<Vec<u8>> {
+    let read_u_as_t = |&base: &u8| match base {
+        b'U' => b'T',
+        b'u' => b't',
+        base => base,
+    };
+    tags.iter()
+        .map(|tag| tag.iter().map(read_u_as_t).collect())
+        .collect()
 }
 
 /// The per-overhang-base cost for partial matching. At `1.0` a truncated tag
@@ -2372,6 +2384,27 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_match_group_tag_u_matches_on_both_strands() {
+        for tag in ["ACGTACGG", "ACGUACGG", "acguacgg"] {
+            let mut g = group(&[tag]);
+            g.revcomp = true;
+            for (read, strand, span) in [
+                ("ACGTACGGAAAA", MatchStrand::Forward, (0, 8)),
+                ("TTTTCCGTACGT", MatchStrand::ReverseComplement, (4, 12)),
+            ] {
+                let best = outcome(&g, read)
+                    .best
+                    .unwrap_or_else(|| panic!("{tag} finds no match in {read}"));
+                assert_eq!(
+                    (best.strand, (best.start, best.end), best.cost),
+                    (strand, span, 0),
+                    "{tag} in {read}"
+                );
+            }
+        }
+    }
+
     /// The read with each T and t written as U and u.
     fn as_rna(read: &[u8]) -> Vec<u8> {
         read.iter()
@@ -2384,7 +2417,7 @@ mod tests {
     }
 
     #[test]
-    fn test_read_u_bases_match_as_t_bases_do() {
+    fn test_u_bases_in_reads_and_tags_match_as_t_bases_do() {
         let mut rng = Rng(0x75);
         let codes = b"ACGTACGTACGTRYKMSWBDHVN";
         for trial in 0..2000 {
@@ -2398,7 +2431,11 @@ mod tests {
             let tags = (0..count)
                 .map(|_| {
                     let len = if batched { length } else { 3 + rng.below(5) };
-                    rng.sample(len, codes)
+                    let mut tag = rng.sample(len, codes);
+                    if rng.below(4) == 0 {
+                        tag.make_ascii_lowercase();
+                    }
+                    tag
                 })
                 .collect();
             let mut g = CompiledGroup::new("g", tags);
@@ -2429,11 +2466,18 @@ mod tests {
                 g.match_streams = Some(vec!["i7".to_string(), "i5".to_string()]);
             }
             g.encode();
+            let mut rna_tags = g.clone();
+            rna_tags.tags = g.tags.iter().map(|tag| as_rna(tag)).collect();
+            rna_tags.encode();
             let len = rng.below(24);
             let read = rng.sample(len, b"ACGTacgtN");
             let rna = as_rna(&read);
             let dna = match_group(&g, &mut Scratch::new(), &[&read]);
-            let tags: Vec<_> = g.tags.iter().map(|t| String::from_utf8_lossy(t)).collect();
+            let tags: Vec<_> = rna_tags
+                .tags
+                .iter()
+                .map(|t| String::from_utf8_lossy(t))
+                .collect();
             let context = format!(
                 "{} as {} for {tags:?} {:?} {:?} {:?} rc={} {:?} {:?}",
                 String::from_utf8_lossy(&read),
@@ -2445,16 +2489,22 @@ mod tests {
                 g.partial5,
                 g.partial3,
             );
-            assert_eq!(
-                match_group(&g, &mut Scratch::new(), &[&rna]),
-                dna,
-                "{context}"
-            );
-            assert_eq!(
-                match_verdict(&g, &mut Scratch::new(), &[&rna], g.loc.as_ref()),
-                GroupVerdict::of(&g, &dna),
-                "{context}"
-            );
+            for (pair, group, read) in [
+                ("T tags, U read", &g, &rna),
+                ("U tags, T read", &rna_tags, &read),
+                ("U tags, U read", &rna_tags, &rna),
+            ] {
+                assert_eq!(
+                    match_group(group, &mut Scratch::new(), &[read]),
+                    dna,
+                    "{pair}: {context}"
+                );
+                assert_eq!(
+                    match_verdict(group, &mut Scratch::new(), &[read], group.loc.as_ref()),
+                    GroupVerdict::of(group, &dna),
+                    "{pair}: {context}"
+                );
+            }
         }
     }
 

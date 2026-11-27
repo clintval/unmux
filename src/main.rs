@@ -194,9 +194,9 @@ struct DemuxCmd {
     /// Tag-group definition or attributes (repeatable; accumulates).
     ///
     /// `NAME=SOURCE` is the UMI/barcode/adapter set; `NAME::ATTRS` constrains
-    /// matching. Tags may use IUPAC codes, and a U in a read matches as T. A
-    /// matched `@grp` span is error-corrected by default. Each tag in a set
-    /// needs its own ID; pool several tags into one sample with
+    /// matching. Tags may use IUPAC codes, and a U in a read or a tag matches
+    /// as T. A matched `@grp` span is error-corrected by default. Each tag in a
+    /// set needs its own ID; pool several tags into one sample with
     /// `--sample NAME=GROUP::ID1,ID2`.
     ///
     /// A set is refused when one read can match two of its tags at one place
