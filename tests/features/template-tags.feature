@@ -122,6 +122,43 @@ Feature: Input tags on --template records
       """
     And stderr does not contain "per-base tags"
 
+  Scenario Outline: a stream from a reverse-strand match turns per-base tags into its orientation
+    Given a file "in.sam" containing:
+      """
+      @HD	VN:1.6
+      r1	4	*	0	0	*	*	0	0	AACGTGTCCCAAAA	ABCDEFGHIJKLMN	ch:i:7	OQ:Z:abcdefghijklmn	MM:Z:C+m?,0;	ML:B:C,200
+      """
+    When I run `unmux in.sam --out tagged.bam`
+    Then the exit code is 0
+    When I run `unmux tagged.bam --pool p --group bc={x=GGGAC} --group bc::bothStrands=true --extract ins=@bc+0:end --template <template> --out out.sam`
+    Then the exit code is 0
+    And the records of "out.sam" are:
+      """
+      r1	4	*	0	255	*	*	0	0	<bases>	<quals>	ch:i:7	OQ:Z:<oq>	RG:Z:p
+      """
+    And stderr contains "per-base tags were left out: MM, ML"
+
+    # GGGAC matches the reverse strand at bases 5 to 10, so ins is bases 0 to 5 in its orientation.
+    Examples:
+      | template | bases | quals | oq    |
+      | ins      | ACGTT | EDCBA | edcba |
+      | ~ins     | AACGT | ABCDE | abcde |
+
+  Scenario: a reverse-complemented palindrome that spells its read is not an unchanged copy
+    Given a file "in.sam" containing:
+      """
+      @HD	VN:1.6
+      r1	4	*	0	0	*	*	0	0	ACGTTCCCGGGAACGT	IIIIIIIIIIIIIIII	ch:i:7	OQ:Z:abcdefghijklmnop	MM:Z:C+m?,0;	ML:B:C,200
+      """
+    # GGGA matches the reverse strand at bases 4 to 8, so head is bases 0 to 4, ACGT, reverse-complemented.
+    When I run `unmux in.sam --pool p --group bc={x=GGGA} --group bc::bothStrands=true --extract head=@bc+0:end --extract rest=0:4:end --template head+rest --out out.sam`
+    Then the exit code is 0
+    And the records of "out.sam" are:
+      """
+      r1	4	*	0	255	*	*	0	0	ACGTTCCCGGGAACGT	IIIIIIIIIIIIIIII	ch:i:7	OQ:Z:dcbaefghijklmnop	RG:Z:p
+      """
+    And stderr contains "per-base tags were left out: MM, ML"
+
   Scenario Outline: a record keeps MM and ML only when it is its read unchanged
     Given a file "in.sam" containing:
       """

@@ -841,11 +841,24 @@ mod tests {
                     ..extracted
                 })
             };
-            assert_eq!(
-                unsourced(extract(&span, &read, &hits, &index).unwrap()),
-                unsourced(extract(&span, &flipped, &flipped_hits, &flipped_index).unwrap()),
-                "{value} {pairs:?}"
-            );
+            let mirror = |source: StreamSource| StreamSource {
+                start: len - source.end,
+                end: len - source.start,
+                reversed: !source.reversed,
+                ..source
+            };
+            let forward = extract(&span, &read, &hits, &index).unwrap();
+            let backward = extract(&span, &flipped, &flipped_hits, &flipped_index).unwrap();
+            if let (Some(forward), Some(backward)) = (&forward, &backward) {
+                if !forward.bases.is_empty() {
+                    assert_eq!(
+                        forward.source.map(mirror),
+                        backward.source,
+                        "{value} {pairs:?}"
+                    );
+                }
+            }
+            assert_eq!(unsourced(forward), unsourced(backward), "{value} {pairs:?}");
         };
         let spans: Vec<MatchSpan> = (0..len)
             .flat_map(|start| (start + 1..=len).map(move |end| at(start, end)))
