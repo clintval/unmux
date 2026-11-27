@@ -70,6 +70,27 @@ Feature: Outputs that would be one file are refused
       | --unassigned o/a.fq   | --unassigned   |
       | --remove bc::T=o/a.fq | --remove bc::T |
 
+  Scenario: paired outputs per %ordinal and a bin per %source are refused where the numbers meet
+    Given a file "r1.fq" containing:
+      """
+      @r1
+      AAAAAAAACCCCGGGG
+      +
+      IIIIIIIIIIIIIIII
+      """
+    And a file "r2.fq" containing:
+      """
+      @r1
+      GGGGCCCCAAAATTTT
+      +
+      IIIIIIIIIIIIIIII
+      """
+    When I run `unmux r1.fq r2.fq --group bc={A=AAAAAAAA,T=TTTTTTTT} --group bc::loc=0:0:8 --sample a=bc::A --out s.R%ordinal.fq --unassigned s.R%source.fq`
+    Then the exit code is 1
+    And stderr contains "outputs "s.R1.fq" (sample a) and "s.R1.fq" (--unassigned) are the same file; give them distinct paths"
+    And stderr does not contain "the --out pattern itself"
+    And a file "s.R0.fq" does not exist
+
   Scenario: a bin on a sample's named pipe only once %sample expands is refused
     Given a named pipe "o/a.fq"
     When I run `unmux reads.fq --group bc={A=AAAAAAAA,T=TTTTTTTT} --sample a=bc::A --out o/%sample.fq --unassigned o/a.fq`
@@ -102,8 +123,17 @@ Feature: Outputs that would be one file are refused
   Scenario Outline: a bin given the --out pattern itself shares the --out file
     When I run `unmux reads.fq --pool lib --group bc={A=AAAAAAAA,T=TTTTTTTT} --sample a=bc::A <outputs>`
     Then the exit code is 0
-    And the file "<path>" contains "@r1"
-    And the file "<path>" contains "@r2"
+    And the file "<path>" is:
+      """
+      @r1
+      AAAAAAAACCCCGGGG
+      +
+      IIIIIIIIIIIIIIII
+      @r2
+      TTTTTTTTGGCCATGC
+      +
+      IIIIIIIIIIIIIIII
+      """
 
     Examples:
       | outputs                                   | path     |
@@ -114,8 +144,17 @@ Feature: Outputs that would be one file are refused
   Scenario: bins share a file with each other, also once placeholders expand
     When I run `unmux reads.fq --pool lib --group bc={A=AAAAAAAA,T=TTTTTTTT,G=GGGGGGGG} --sample g=bc::G --out o/%sample.fq --unassigned o/lib.fq --remove bc::T=o/%pool.fq`
     Then the exit code is 0
-    And the file "o/lib.fq" contains "@r1"
-    And the file "o/lib.fq" contains "@r2"
+    And the file "o/lib.fq" is:
+      """
+      @r1
+      AAAAAAAACCCCGGGG
+      +
+      IIIIIIIIIIIIIIII
+      @r2
+      TTTTTTTTGGCCATGC
+      +
+      IIIIIIIIIIIIIIII
+      """
 
   Scenario: a metrics file sharing a path with a sample output is refused
     When I run `unmux reads.fq --group bc={A=AAAAAAAA} --sample a=bc::A --out o/%sample.fq --metrics-summary o/a.fq`
