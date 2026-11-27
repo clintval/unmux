@@ -93,6 +93,12 @@ Feature: Outputs that would be one file are refused
       | --sample a=bc::A --out o/all.fq --unassigned o/./all.fq | o/all.fq | sample a | o/./all.fq | --unassigned   |
       | --sample a=bc::A --out o/all.fq --unassigned o/all.fq/  | o/all.fq | sample a | o/all.fq/  | --unassigned   |
 
+  Scenario: an output over an input is refused before any way to share it is suggested
+    When I run `unmux reads.fq --group bc={A=AAAAAAAA,T=TTTTTTTT} --sample a=bc::A --out %pool.fq --unassigned reads.fq`
+    Then the exit code is 1
+    And stderr contains "output "reads.fq" (sample a) is input 0 (reads.fq); give it a distinct path"
+    And stderr does not contain "the --out pattern itself"
+
   Scenario Outline: a bin given the --out pattern itself shares the --out file
     When I run `unmux reads.fq --pool lib --group bc={A=AAAAAAAA,T=TTTTTTTT} --sample a=bc::A <outputs>`
     Then the exit code is 0
