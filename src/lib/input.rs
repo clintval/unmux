@@ -816,9 +816,7 @@ impl FormatReader {
                 reader
                     .read_sequence(&mut bases)
                     .context("failed to read FASTA sequence")?;
-                let body = definition.trim_start_matches('>');
-                // As in FASTQ, the name ends at the first space or tab, so it may be empty.
-                let (name, comment) = body.split_once([' ', '\t']).unwrap_or((body, ""));
+                let (name, comment) = split_fasta_definition(definition.trim_start_matches('>'));
                 let name = name.as_bytes().to_vec();
                 let tags = parse_comment_tags(comment.as_bytes()).with_context(|| {
                     format!(
@@ -992,6 +990,19 @@ fn first_token(name: &[u8]) -> Vec<u8> {
         .to_vec()
 }
 
+/// The read name and comment of a FASTA definition after its `>`, split at the
+/// first space or tab. After leading whitespace the first word is still the
+/// name, unless it has a [`tag_shape`], which marks a nameless record.
+fn split_fasta_definition(body: &str) -> (&str, &str) {
+    let trimmed = body.trim_start_matches([' ', '\t']);
+    let (word, rest) = trimmed.split_once([' ', '\t']).unwrap_or((trimmed, ""));
+    if trimmed.len() < body.len() && tag_shape(word.as_bytes()).is_some() {
+        ("", trimmed)
+    } else {
+        (word, rest)
+    }
+}
+
 /// Lift the SAM tags of a FASTX read-name comment, the inverse of the writer's
 /// `render_tags`. A tab-separated field not shaped like a tag (a bare UMI, an
 /// Illumina CASAVA string, free text) is skipped, and a tag whose value its type
@@ -1012,20 +1023,28 @@ fn parse_comment_tags(comment: &[u8]) -> Result<Option<Data>> {
     Ok((!data.is_empty()).then_some(data))
 }
 
-/// One comment field as a SAM tag of a type the writer emits, or `None` when it
-/// is not shaped `XX:T:VALUE`, as when a value other than a `Z` holds a space;
-/// an integer takes the narrowest BAM type that holds it and an array keeps
-/// its subtype.
+/// The tag, type, and value of a comment field shaped `XX:T:VALUE` with a type
+/// the writer emits, or `None` for any other field, as when a value other than
+/// a `Z` holds a space.
+fn tag_shape(field: &[u8]) -> Option<(Tag, u8, &[u8])> {
+    let &[name0, name1, b':', ty @ (b'A' | b'i' | b'f' | b'Z' | b'H' | b'B'), b':', ref raw @ ..] =
+        field
+    else {
+        return None;
+    };
+    let shaped = name0.is_ascii_alphabetic()
+        && name1.is_ascii_alphanumeric()
+        && (ty == b'Z' || !raw.contains(&b' '));
+    shaped.then_some((Tag::new(name0, name1), ty, raw))
+}
+
+/// One comment field as a SAM tag, or `None` when it has no [`tag_shape`]; an
+/// integer takes the narrowest BAM type that holds it and an array keeps its
+/// subtype.
 fn parse_aux_field(field: &[u8]) -> Result<Option<(Tag, Value)>> {
-    let &[name0, name1, b':', ty, b':', ref raw @ ..] = field else {
+    let Some((tag, ty, raw)) = tag_shape(field) else {
         return Ok(None);
     };
-    if !name0.is_ascii_alphabetic() || !name1.is_ascii_alphanumeric() {
-        return Ok(None);
-    }
-    if ty != b'Z' && raw.contains(&b' ') {
-        return Ok(None);
-    }
     let value = match ty {
         b'A' => match *raw {
             [c] if c.is_ascii_graphic() => Ok(Value::Character(c)),
@@ -1048,10 +1067,10 @@ fn parse_aux_field(field: &[u8]) -> Result<Option<(Tag, Value)>> {
         b'B' => parse_array(raw)
             .map(Value::Array)
             .ok_or("a c, C, s, S, i, I, or f array whose values fit that subtype"),
-        _ => return Ok(None),
+        _ => unreachable!("a tag shape has a type the writer emits"),
     };
     match value {
-        Ok(value) => Ok(Some((Tag::new(name0, name1), value))),
+        Ok(value) => Ok(Some((tag, value))),
         Err(expected) => bail!(
             "the comment tag `{}` must be {expected}",
             String::from_utf8_lossy(&field[..4])
