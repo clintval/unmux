@@ -1149,12 +1149,13 @@ pub(crate) const ALIGNMENT_TAGS: &[[u8; 2]] = &[
 /// A reverse-strand record (flag `0x10`) stores `SEQ` as the reverse complement
 /// of the sequenced read and `QUAL` in reversed order; this restores the
 /// original read orientation so matching and extraction see the sequenced
-/// bases.
+/// bases, and turns back the per-base tags that aligners reverse with them.
 fn alignment_to_input(record: &RecordBuf) -> InputRecord {
     let raw_quals = record.quality_scores().as_ref();
     let mut bases = record.sequence().as_ref().to_vec();
     let mut quals = (!raw_quals.is_empty() || bases.is_empty()).then(|| raw_quals.to_vec());
-    if record.flags().is_reverse_complemented() {
+    let reverse = record.flags().is_reverse_complemented();
+    if reverse {
         bases = bases
             .iter()
             .rev()
@@ -1171,7 +1172,10 @@ fn alignment_to_input(record: &RecordBuf) -> InputRecord {
             let bytes: &[u8; 2] = tag.as_ref();
             !ALIGNMENT_TAGS.contains(bytes)
         })
-        .map(|(tag, value)| (tag, value.clone()))
+        .map(|(tag, value)| match reverse {
+            true => (tag, crate::per_base::sequenced(tag, value)),
+            false => (tag, value.clone()),
+        })
         .collect();
     InputRecord {
         name: record.name().map(|n| n.to_vec()).unwrap_or_default(),

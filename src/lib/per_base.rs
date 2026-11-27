@@ -160,3 +160,35 @@ pub(crate) fn follow(
         _ => return None,
     })
 }
+
+/// The number of entries of a text or array value.
+fn entries(value: &Value) -> Option<usize> {
+    Some(match value {
+        Value::String(text) => text.len(),
+        Value::Array(Array::Int8(values)) => values.len(),
+        Value::Array(Array::UInt8(values)) => values.len(),
+        Value::Array(Array::Int16(values)) => values.len(),
+        Value::Array(Array::UInt16(values)) => values.len(),
+        Value::Array(Array::Int32(values)) => values.len(),
+        Value::Array(Array::UInt32(values)) => values.len(),
+        Value::Array(Array::Float(values)) => values.len(),
+        _ => return None,
+    })
+}
+
+/// A tag's value in sequencing order, for a record whose `SEQ` an aligner reverse-complemented.
+pub(crate) fn sequenced(tag: Tag, value: &Value) -> Value {
+    let turned = per_base(tag, value).and_then(|(_, per_base)| match per_base {
+        PerBase::Reversed | PerBase::Complemented => {
+            let len = entries(value)?;
+            let whole = Slice {
+                start: 0,
+                end: len,
+                flipped: true,
+            };
+            follow(value, per_base, &[whole], len)
+        }
+        PerBase::Dropped | PerBase::Native => None,
+    });
+    turned.unwrap_or_else(|| value.clone())
+}
