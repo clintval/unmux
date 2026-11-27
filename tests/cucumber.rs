@@ -127,6 +127,20 @@ async fn given_file(world: &mut SassWorld, name: String, step: &Step) {
     fs::write(&path, content).expect("write fixture file");
 }
 
+#[given(regex = r#"^a file "([^"]+)" with (\d+) copies of each record of:$"#)]
+async fn given_repeated_records(world: &mut SassWorld, name: String, copies: usize, step: &Step) {
+    let docstring = step.docstring.clone().unwrap_or_default();
+    let mut content = String::new();
+    for line in docstring.trim().lines() {
+        let repeats = if line.starts_with('@') { 1 } else { copies };
+        for _ in 0..repeats {
+            content.push_str(line);
+            content.push('\n');
+        }
+    }
+    fs::write(world.work_dir().join(&name), content).expect("write fixture file");
+}
+
 #[given(regex = r#"^the test file "([^"]+)"$"#)]
 async fn given_test_file(world: &mut SassWorld, name: String) {
     let source = Path::new(env!("CARGO_MANIFEST_DIR"))

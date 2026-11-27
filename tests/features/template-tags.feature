@@ -47,8 +47,22 @@ Feature: Input tags on --template records
       r2	4	*	0	255	*	*	0	0	GCATGCAA	IIIIIIII	np:i:12	rq:f:0.999	zm:i:42	ip:B:C,3,4,5,6,7,8,9,10	RG:Z:p
       r3	4	*	0	255	*	*	0	0	ATCCATGG	IIIIIIII	OQ:Z:CDEFGHIJ	RX:Z:GGGG	QX:Z:FFFF	RG:Z:p
       """
-    And stderr contains "--template changed the bases of some records, so their per-base tags were left out: MM, ML, MN, fi, mv"
-    And stderr contains "per-base tags were left out" exactly once
+    And stderr contains "--template left out per-base tags from 2 records that did not copy a read exactly: MM, ML, MN, fi, mv"
+    And stderr contains "--template left out per-base tags from" exactly once
+
+  Scenario: the per-base warning is the same at 1 and 4 threads
+    Given a file "in.sam" with 2000 copies of each record of:
+      """
+      @HD	VN:1.6
+      r1	4	*	0	0	*	*	0	0	ACGTACGTCG	IIIIIIIIII	MM:Z:C+m?,0;	ML:B:C,200
+      r2	4	*	0	0	*	*	0	0	ACGTACGTCG	IIIIIIIIII	mv:B:c,5,1,0,1,1,0,1,1,0,1,1
+      """
+    When I run `unmux in.sam --pool p --extract r=0:2:end --template r --out one.sam --threads 1`
+    Then the exit code is 0
+    And stderr contains "--template left out per-base tags from 4000 records that did not copy a read exactly: MM, ML, mv"
+    When I run `unmux in.sam --pool p --extract r=0:2:end --template r --out four.sam --threads 4`
+    Then the exit code is 0
+    And stderr contains "--template left out per-base tags from 4000 records that did not copy a read exactly: MM, ML, mv"
 
   Scenario: a trimming template leaves out PacBio pulse and pileup tags
     Given a file "in.sam" containing:
@@ -62,7 +76,7 @@ Feature: Input tags on --template records
       """
       r1	4	*	0	255	*	*	0	0	GTACGTCG	IIIIIIII	zm:i:42	RG:Z:p
       """
-    And stderr contains "per-base tags were left out: sa, sx, pc, pq, pg, pm, pd, px, pe, sf, bs, pb"
+    And stderr contains "--template left out per-base tags from 1 record that did not copy a read exactly: sa, sx, pc, pq, pg, pm, pd, px, pe, sf, bs, pb"
 
   Scenario: a trimmed record keeps the matching slices of OQ and ip
     Given a file "in.sam" containing:
@@ -90,7 +104,7 @@ Feature: Input tags on --template records
       """
       r1	4	*	0	255	*	*	0	0	ACGGGTTT	HGFEDCBA	ch:i:7	OQ:Z:hgfedcba	E2:Z:CTTAACGG	cd:B:s,8,7,6,5,4,3,2,1	RG:Z:p
       """
-    And stderr contains "--template changed the bases of some records, so their per-base tags were left out: MM, ML"
+    And stderr contains "--template left out per-base tags from 1 record that did not copy a read exactly: MM, ML"
 
   Scenario: a per-base tag whose length is not its read's is left out of a changed record
     Given a file "in.sam" containing:
@@ -104,7 +118,7 @@ Feature: Input tags on --template records
       """
       r1	4	*	0	255	*	*	0	0	GTACGT	IIIIII	ch:i:7	RG:Z:p
       """
-    And stderr contains "--template changed the bases of some records, so their per-base tags were left out: OQ, ip; OQ, ip did not match the read's length"
+    And stderr contains "--template left out per-base tags from 1 record that did not copy a read exactly: OQ, ip; OQ, ip did not match the read's length"
 
   Scenario: fgbio consensus tags follow a trimmed, flipped read, while PacBio's same-named per-read tags stay
     Given a file "in.sam" containing:
@@ -136,7 +150,7 @@ Feature: Input tags on --template records
       """
       r1	4	*	0	255	*	*	0	0	<bases>	<quals>	ch:i:7	OQ:Z:<oq>	RG:Z:p
       """
-    And stderr contains "per-base tags were left out: MM, ML"
+    And stderr contains "--template left out per-base tags from 1 record that did not copy a read exactly: MM, ML"
 
     # GGGAC matches the reverse strand at bases 5 to 10, so ins is bases 0 to 5 in its orientation.
     Examples:
@@ -157,7 +171,7 @@ Feature: Input tags on --template records
       """
       r1	4	*	0	255	*	*	0	0	ACGTTCCCGGGAACGT	IIIIIIIIIIIIIIII	ch:i:7	OQ:Z:dcbaefghijklmnop	RG:Z:p
       """
-    And stderr contains "per-base tags were left out: MM, ML"
+    And stderr contains "--template left out per-base tags from 1 record that did not copy a read exactly: MM, ML"
 
   Scenario Outline: a record keeps MM and ML only when it is its read unchanged
     Given a file "in.sam" containing:
@@ -191,7 +205,7 @@ Feature: Input tags on --template records
       """
       r1	4	*	0	255	*	*	0	0	ACGACGACGACG	IIIIIIIIIIII	ch:i:7	OQ:Z:DEFGHIJKLABC	RG:Z:p
       """
-    And stderr contains "per-base tags were left out: MM, ML"
+    And stderr contains "--template left out per-base tags from 1 record that did not copy a read exactly: MM, ML"
 
   Scenario Outline: per-base tags stay with the observed bases of a whole-read barcode, not its corrected form
     Given a file "in.sam" containing:
@@ -240,7 +254,7 @@ Feature: Input tags on --template records
       """
       q1	4	*	0	255	*	*	0	0	GGGGAAAA	JJJJIIII	RX:Z:GG-TT	ZA:Z:two	RG:Z:p
       """
-    And stderr contains "per-base tags were left out: OQ"
+    And stderr contains "--template left out per-base tags from 1 record that did not copy a read exactly: OQ"
 
   Scenario Outline: an empty stream supplies no segment of a template record
     Given a file "in.sam" containing:
