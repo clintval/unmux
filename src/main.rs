@@ -464,7 +464,10 @@ struct DemuxCmd {
     /// The only placeholders are `%pool` and `%source` (input file index);
     /// `%source` fans these to one file per input record. Without this flag,
     /// unassigned records are dropped. Unmux warns when unassigned fraction
-    /// reaches ≥20% of the pool.
+    /// reaches ≥20% of the pool. Given the `--out` pattern itself, these
+    /// records share the `--out` file, whose SAM/BAM/CRAM header then also
+    /// declares the pool read group; a run where a sample there has the
+    /// pool's read group ID is refused.
     ///
     ///   --unassigned unmatched.%source.fq.gz   one file per input file
     ///   --unassigned unmatched.fa              all segments in one FASTA
@@ -477,7 +480,9 @@ struct DemuxCmd {
     /// removed (distinct from `--unassigned`). With `=PATH_PATTERN` the removed
     /// records are written to the output path otherwise they are simply
     /// ignored. `SEL` is required. The only placeholders allowed in
-    /// `PATH_PATTERN` are `%pool` and `%source` (input file index).
+    /// `PATH_PATTERN` are `%pool` and `%source` (input file index). Given
+    /// the `--out` pattern itself, removed records share the `--out` file,
+    /// with the read group rules of `--unassigned`.
     ///
     ///   --remove phiX                      drop records matching phiX group
     ///   --remove bc::t99                   drop one specific tag's records
