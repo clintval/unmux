@@ -8,6 +8,11 @@
 //! primitives ([`complement`], [`reverse_complement`]) shared by extraction,
 //! input parsing, and tag correction.
 
+use std::borrow::Cow;
+use std::cell::Cell;
+use std::cmp::Ordering;
+use std::collections::HashMap;
+
 use anyhow::{bail, Result};
 use smallvec::SmallVec;
 
@@ -35,6 +40,23 @@ const UNASSIGNED: &str =
 const TIE_BREAK: &str = "with mode=all such a read goes to one of the tags by tie-break";
 /// The mode recommended for tags that one read can match only through an indel.
 const NEAREST: &str = "set mode=nearest to leave such reads unassigned (recommended)";
+/// The most cells a table of one tag's alignments within another may hold; a
+/// pair that needs a larger one is taken to collide through an indel.
+const TABLE_CELLS: usize = 1 << 20;
+/// The most cells the tables of one group may hold in all; past them, a pair
+/// that needs a table is taken to collide through an indel.
+const GROUP_CELLS: usize = 1 << 27;
+/// Why a pair taken to collide gives no bases that match both tags.
+const TOO_COSTLY: &str = "(too costly to compare exactly under this indel budget)";
+
+thread_local! {
+    /// The cells left for the tables of the group checked on this thread, kept
+    /// here so that the comparison every pair goes through takes no budget.
+    static CELLS_LEFT: Cell<usize> = const { Cell::new(GROUP_CELLS) };
+}
+/// The most pairs compared one by one for two tags that one read matches with
+/// zero errors before a refusal; plain tags of one length are looked up instead.
+const EXACT_PAIRS: usize = 1 << 20;
 
 /// The 4-bit ACGT membership mask for an IUPAC code (A=1, C=2, G=4, T=8). A
 /// byte that is not a recognized code maps to 0, so it matches nothing and
@@ -96,14 +118,18 @@ pub struct Search {
 /// their end under `anchor=3p`), either tag taken first, and the second also
 /// reverse-complemented when `bothStrands` is set. Each tag keeps its own
 /// substitution, indel, and total caps, and the message gives bases checked to
-/// match both, without an indel when that is enough. A collision with zero
-/// errors always fails. One that needs no indel fails under `mode=all`, written
-/// or not, which would assign such reads by tie-break; one that needs an indel
-/// fails only when no mode is written, asking for one. The rest are warnings:
-/// the first pairs are listed and the rest counted up to a limit, past which
-/// only collisions that would fail are looked for, and under `mode=all` a last
-/// warning recommends `mode=nearest`. Truncated matches (`partial5`/`partial3`)
-/// are not considered.
+/// match both, without an indel when that is enough; a pair whose table of
+/// alignments would hold more than `TABLE_CELLS` cells, or more than the
+/// group has left of `GROUP_CELLS`, is taken to collide through an indel
+/// instead.
+/// A collision with zero errors always fails, before any other refusal, and
+/// points at `bothStrands` when only opposite strands match.
+/// One that needs no indel fails under `mode=all`, written or not, which would
+/// assign such reads by tie-break; one that needs an indel fails only when no
+/// mode is written, asking for one. The rest are warnings: the first pairs are
+/// listed and the rest counted up to a limit, past which only collisions that
+/// would fail are looked for, and under `mode=all` a last warning recommends
+/// `mode=nearest`. Truncated matches (`partial5`/`partial3`) are not considered.
 pub fn validate_group(name: &str, seqs: &[Vec<u8>], search: &Search) -> Result<Vec<String>> {
     let mut warnings = Vec::new();
 
@@ -174,7 +200,8 @@ pub fn validate_group(name: &str, seqs: &[Vec<u8>], search: &Search) -> Result<V
         false => (&substitutions, TIE_BREAK),
     };
     let budget = dist_spec(&search.dist);
-    let (mut colliding, mut example) = (0, None);
+    CELLS_LEFT.set(GROUP_CELLS);
+    let (mut colliding, mut compared, mut example) = (0, 0, None);
     for (i, a) in tags.iter().enumerate() {
         for (j, b) in tags.iter().enumerate().skip(i + 1) {
             let strands = search.both_strands.then(|| (&flipped[i], &flipped[j]));
@@ -195,25 +222,37 @@ pub fn validate_group(name: &str, seqs: &[Vec<u8>], search: &Search) -> Result<V
                 String::from_utf8_lossy(&seqs[i]),
                 String::from_utf8_lossy(&seqs[j]),
             );
-            let bases = String::from_utf8_lossy(&found.bases);
+            let bases = found.bases.as_deref().map(String::from_utf8_lossy);
             let strand = if found.flipped {
                 ", one on each strand"
             } else {
                 ""
             };
             if found.exact {
-                bail!("group `{name}`: tags `{a_s}` and `{b_s}` are indistinguishable (the bases `{bases}` match both with zero errors{strand}); remove one or make them distinct");
+                let found = collision(a, b, None, &exact_only, shape).unwrap_or(found);
+                bail!("{}", indistinguishable(name, &seqs[i], &seqs[j], &found));
             }
-            let witness = format!("(the bases `{bases}` match both{strand})");
+            let (verb, witness) = match bases {
+                Some(bases) => ("can", format!("(the bases `{bases}` match both{strand})")),
+                None => ("may", TOO_COSTLY.to_string()),
+            };
             let overlap = format!(
-                "group `{name}`: tags `{a_s}` and `{b_s}` can both match one read within dist={budget} {witness}"
+                "group `{name}`: tags `{a_s}` and `{b_s}` {verb} both match one read within dist={budget} {witness}"
             );
             if !nearest && !needs_indel {
+                let exact = exact_pair(seqs, &tags, &flipped, &exact_only, shape, EXACT_PAIRS);
+                if let Some((i, j, found)) = exact {
+                    bail!("{}", indistinguishable(name, &seqs[i], &seqs[j], &found));
+                }
                 bail!("{overlap}; with mode=all this silently mis-assigns reads: separate the tags, lower dist, or use mode=nearest, which only warns and lists the colliding pairs");
             }
             colliding += 1;
+            compared += usize::from(found.bases.is_some());
             if search.mode.is_none() {
-                example.get_or_insert(format!("`{a_s}` and `{b_s}` {witness}"));
+                let first_compared = found.bases.is_some() && compared == 1;
+                if example.is_none() || first_compared {
+                    example = Some(format!("`{a_s}` and `{b_s}` {witness}"));
+                }
             } else if colliding <= LISTED_PAIRS {
                 warnings.push(format!("{overlap}; {consequence}"));
             }
@@ -225,9 +264,10 @@ pub fn validate_group(name: &str, seqs: &[Vec<u8>], search: &Search) -> Result<V
         let noun = if count == 1 { "pair" } else { "pairs" };
         format!("{at_least}{count} {kind}{noun}")
     };
+    let verb = if compared == colliding { "can" } else { "may" };
     if let Some(pair) = example {
         bail!(
-            "group `{name}`: {} of tags can both match one read within dist={budget} only through an indel, such as {pair}; {NEAREST}, or write mode=all to keep assigning each to one of the tags by tie-break",
+            "group `{name}`: {} of tags {verb} both match one read within dist={budget} only through an indel, such as {pair}; {NEAREST}, or write mode=all to keep assigning each to one of the tags by tie-break",
             pairs(colliding, "")
         );
     }
@@ -237,18 +277,119 @@ pub fn validate_group(name: &str, seqs: &[Vec<u8>], search: &Search) -> Result<V
             false => format!(" (counting stopped at {COUNTED_PAIRS})"),
         };
         warnings.push(format!(
-            "group `{name}`: {}{stopped} of tags can both match one read within dist={budget}; {consequence}",
+            "group `{name}`: {}{stopped} of tags {verb} both match one read within dist={budget}; {consequence}",
             pairs(colliding - LISTED_PAIRS, "more ")
         ));
     }
     if !nearest && colliding > 0 {
         warnings.push(format!(
-            "group `{name}`: {} of tags can match one read only through an indel; {NEAREST}",
+            "group `{name}`: {} of tags {verb} match one read only through an indel; {NEAREST}",
             pairs(colliding, "")
         ));
     }
 
     Ok(warnings)
+}
+
+/// Two tags, by index, that one read matches with zero errors, with their
+/// overlap on one strand when they have one. Plain ACGT tags of one length that
+/// fit the window match that way only when equal or, under `bothStrands`,
+/// reverse complements, so they are looked up by sequence; other sets are
+/// compared pair by pair, up to `limit` pairs.
+fn exact_pair(
+    seqs: &[Vec<u8>],
+    tags: &[Tag],
+    flipped: &[Tag],
+    exact_only: &Search,
+    shape: Shape,
+    limit: usize,
+) -> Option<(usize, usize, Overlap)> {
+    let compare = |(i, j): (usize, usize)| {
+        let strands = exact_only.both_strands.then(|| (&flipped[i], &flipped[j]));
+        let found = collision(&tags[i], &tags[j], None, exact_only, shape)
+            .or_else(|| collision(&tags[i], &tags[j], strands, exact_only, shape))?;
+        Some((i, j, found))
+    };
+    if looked_up(seqs, exact_only.window) {
+        return equal_pair(seqs, exact_only.both_strands).and_then(compare);
+    }
+    (0..tags.len())
+        .flat_map(|i| (i + 1..tags.len()).map(move |j| (i, j)))
+        .take(limit)
+        .find_map(compare)
+}
+
+/// Whether `seqs` are all plain ACGT of one length that fits `window`.
+fn looked_up(seqs: &[Vec<u8>], window: Option<usize>) -> bool {
+    let Some(len) = seqs.first().map(Vec::len) else {
+        return false;
+    };
+    let plain =
+        |seq: &Vec<u8>| seq.len() == len && seq.iter().all(|&base| mask(base).count_ones() == 1);
+    window.is_none_or(|width| width >= len) && seqs.iter().all(plain)
+}
+
+/// The first of `seqs` equal to an earlier one or, with `both_strands`, to its
+/// reverse complement, by index after that earlier one.
+fn equal_pair(seqs: &[Vec<u8>], both_strands: bool) -> Option<(usize, usize)> {
+    fn canonical(seq: &[u8]) -> Cow<'_, [u8]> {
+        match seq.iter().all(|base| b"ACGT".contains(base)) {
+            true => Cow::Borrowed(seq),
+            false => seq
+                .iter()
+                .map(|&base| match base.to_ascii_uppercase() {
+                    b'U' => b'T',
+                    base => base,
+                })
+                .collect(),
+        }
+    }
+    let mut seen: HashMap<Cow<'_, [u8]>, usize> = HashMap::with_capacity(seqs.len());
+    for (j, seq) in seqs.iter().enumerate() {
+        let forward = canonical(seq);
+        let mut back = Vec::new();
+        if both_strands {
+            back.extend_from_slice(&forward);
+            reverse_complement(&mut back);
+        }
+        let earlier = seen.get(&*forward).or_else(|| match both_strands {
+            true => seen.get(back.as_slice()),
+            false => None,
+        });
+        if let Some(&i) = earlier {
+            return Some((i, j));
+        }
+        seen.insert(forward, j);
+    }
+    None
+}
+
+/// The refusal for two tags that one read matches with zero errors, which
+/// points at `bothStrands` when only opposite strands match.
+fn indistinguishable(name: &str, a: &[u8], b: &[u8], found: &Overlap) -> String {
+    let (a_s, b_s) = (String::from_utf8_lossy(a), String::from_utf8_lossy(b));
+    let bases = String::from_utf8_lossy(found.bases.as_deref().unwrap_or_default());
+    if !found.flipped {
+        return format!("group `{name}`: tags `{a_s}` and `{b_s}` are indistinguishable (the bases `{bases}` match both with zero errors); remove one or make them distinct");
+    }
+    let plain = a.iter().chain(b).all(|&base| mask(base).count_ones() == 1);
+    let relation = match (a.len().cmp(&b.len()), plain) {
+        (Ordering::Equal, true) => {
+            format!("tags `{a_s}` and `{b_s}` are reverse complements of each other")
+        }
+        (Ordering::Equal, false) => {
+            format!("tags `{a_s}` and `{b_s}` each match the other's reverse complement")
+        }
+        (order, _) => {
+            let (short, long) = match order {
+                Ordering::Less => (&a_s, &b_s),
+                _ => (&b_s, &a_s),
+            };
+            let within = if plain { "lies" } else { "matches" };
+            format!("tag `{short}` {within} within the reverse complement of `{long}`")
+        }
+    };
+    format!("group `{name}`: {relation} (the bases `{bases}` match both with zero errors, one on each strand), so bothStrands=true cannot tell them apart; drop bothStrands to match each tag on the forward strand only, or remove one of them")
 }
 
 /// The `dist` attribute as written, leaving out the fields at their defaults.
@@ -376,10 +517,24 @@ type Spread = (usize, usize, usize);
 
 /// Bases one read can carry that two tags both match.
 struct Overlap {
-    bases: Vec<u8>,
+    /// The bases, or `None` when the tags were too costly to compare exactly
+    /// and are taken to collide through an indel.
+    bases: Option<Vec<u8>>,
     exact: bool,
     flipped: bool,
     spread: Spread,
+}
+
+impl Overlap {
+    /// Two tags taken to collide, ranked behind any overlap with bases.
+    fn unchecked() -> Self {
+        Overlap {
+            bases: None,
+            exact: false,
+            flipped: false,
+            spread: (usize::MAX, usize::MAX, usize::MAX),
+        }
+    }
 }
 
 /// The overlap of two tags over the orders and strands the search allows,
@@ -416,18 +571,21 @@ fn overlap(outer: &Tag, inner: &Tag, search: &Search, shape: Shape) -> Option<Ov
     let dist = &search.dist;
     let reach = outer.len() + dist.indel;
     let longest = search.window.map_or(reach, |width| width.min(reach));
-    if inner.len() == 0 || inner.len() > longest + dist.indel {
+    if inner.len() == 0 || inner.len().max(outer.len()) > longest + dist.indel {
         return None;
     }
     let found = match dist.indel {
         0 => ungapped(outer, inner, dist, shape, longest)?,
-        _ => gapped(outer, inner, dist, shape, longest)?,
+        _ => match gapped(outer, inner, dist, shape, longest)? {
+            Gapped::Found(found) => found,
+            Gapped::TooLarge => return Some(Overlap::unchecked()),
+        },
     };
     let bases = found.bases(outer, inner);
     let fits = aligns(&outer.masks, &bases, dist, Shape::PINNED)
         && aligns(&inner.masks, &bases, dist, shape);
     fits.then_some(Overlap {
-        bases,
+        bases: Some(bases),
         exact: found.exact,
         flipped: false,
         spread: found.spread,
@@ -566,15 +724,18 @@ fn disjoint(outer: &Tag, inner: &Tag, offset: usize) -> usize {
     }
 }
 
+/// What the table over two tags' alignments found, when there is one.
+enum Gapped {
+    /// An alignment whose edits split within the budget.
+    Found(Candidate),
+    /// No table was filled, as it would hold more than [`TABLE_CELLS`] cells or
+    /// more than the group has left of [`GROUP_CELLS`].
+    TooLarge,
+}
+
 /// The alignment of `inner` within `outer`, indels allowed, whose edits split
 /// most evenly within `dist`.
-fn gapped(
-    outer: &Tag,
-    inner: &Tag,
-    dist: &Dist,
-    shape: Shape,
-    longest: usize,
-) -> Option<Candidate> {
+fn gapped(outer: &Tag, inner: &Tag, dist: &Dist, shape: Shape, longest: usize) -> Option<Gapped> {
     let budget = 2 * dist.total;
     if unmatched(outer, inner) > budget
         || !shares_grams(outer, inner, budget)
@@ -583,6 +744,18 @@ fn gapped(
     {
         return None;
     }
+    tabled(outer, inner, dist, shape, longest)
+}
+
+/// The alignment that a table finds for a pair the filters let through, kept
+/// out of line so that the path every pair takes stays small.
+#[inline(never)]
+fn tabled(outer: &Tag, inner: &Tag, dist: &Dist, shape: Shape, longest: usize) -> Option<Gapped> {
+    let (size, left) = (Grid::size(outer, inner, dist, shape), CELLS_LEFT.get());
+    if size > TABLE_CELLS || size > left {
+        return Some(Gapped::TooLarge);
+    }
+    CELLS_LEFT.set(left - size);
     let grid = Grid::fill(outer, inner, dist, shape);
     let (gaps, skips, extras) = (grid.gaps, grid.skips, grid.extras);
     let ends = match shape.free_end {
@@ -606,12 +779,12 @@ fn gapped(
             ))
         })
         .min_by_key(|&(spread, ..)| spread)?;
-    Some(Candidate {
+    Some(Gapped::Found(Candidate {
         steps: grid.trace(outer, inner, shape, end),
         split,
         spread,
         exact,
-    })
+    }))
 }
 
 /// How many bases of `inner` no base of `outer` can pair with, a lower bound on
@@ -782,14 +955,30 @@ impl Grid {
         Some(subs + usize::from(outer.masks[p - 1] & inner.masks[j - 1] == 0))
     }
 
-    fn fill(outer: &Tag, inner: &Tag, dist: &Dist, shape: Shape) -> Self {
+    /// The lowest and highest diagonals, and the most skipped and extra bases,
+    /// that the alignments of `inner` within `outer` can reach.
+    fn bounds(outer: &Tag, inner: &Tag, dist: &Dist, shape: Shape) -> (isize, isize, usize, usize) {
         let gaps = 2 * dist.indel;
         let (skips, extras) = (gaps.min(outer.len()), gaps.min(inner.len()));
-        let lo = -(extras as isize);
         let hi = match shape.free_start {
             true => outer.len() as isize - inner.len() as isize + extras as isize,
             false => skips as isize,
         };
+        (-(extras as isize), hi, skips, extras)
+    }
+
+    /// How many cells the table of `inner` within `outer` holds.
+    fn size(outer: &Tag, inner: &Tag, dist: &Dist, shape: Shape) -> usize {
+        let (lo, hi, skips, extras) = Grid::bounds(outer, inner, dist, shape);
+        let width = usize::try_from(hi - lo + 1).unwrap_or(0);
+        [inner.len() + 1, width, skips + 1, extras + 1]
+            .into_iter()
+            .fold(1, usize::saturating_mul)
+    }
+
+    fn fill(outer: &Tag, inner: &Tag, dist: &Dist, shape: Shape) -> Self {
+        let gaps = 2 * dist.indel;
+        let (lo, hi, skips, extras) = Grid::bounds(outer, inner, dist, shape);
         let width = usize::try_from(hi - lo + 1).unwrap_or(0);
         let size = (inner.len() + 1) * width * (skips + 1) * (extras + 1);
         let mut grid = Grid {
@@ -1312,6 +1501,211 @@ mod tests {
         );
     }
 
+    /// Two 150 bp tags two substitutions apart, which one read matches through indels.
+    fn long_pair() -> Vec<Vec<u8>> {
+        let tag = Rng(0x1093).sample(150, b"ACGT");
+        let mut other = tag.clone();
+        for at in [40, 110] {
+            other[at] = if other[at] == b'A' { b'C' } else { b'A' };
+        }
+        vec![tag, other]
+    }
+
+    #[test]
+    fn test_long_tags_too_costly_to_compare_are_taken_to_collide() {
+        let tags = long_pair();
+        let w = validate_group("g", &tags, &search(budget(0, 8), MatchMode::Nearest)).unwrap();
+        let unchecked = "may both match one read within dist=0:8 (too costly to compare exactly under this indel budget)";
+        assert!(w.len() == 1 && w[0].contains(unchecked), "{w:?}");
+        let err = validate_group("g", &tags, &unset(budget(0, 8)))
+            .unwrap_err()
+            .to_string();
+        let refusal = "group `g`: 1 pair of tags may both match one read within dist=0:8 only through an indel, such as";
+        assert!(err.starts_with(refusal), "{err}");
+    }
+
+    #[test]
+    fn test_long_tags_under_a_smaller_indel_budget_are_compared_exactly() {
+        let w = validate_group("g", &long_pair(), &search(budget(0, 7), MatchMode::Nearest));
+        let w = w.unwrap();
+        let checked = "can both match one read within dist=0:7 (the bases `";
+        assert!(w.len() == 1 && w[0].contains(checked), "{w:?}");
+    }
+
+    #[test]
+    fn test_reverse_complement_tags_point_at_both_strands() {
+        // ATACCAACGC and GCGTTGGTAT, two Illumina UD i7 indexes, are reverse complements.
+        let tags = seqs(&["ATACCAACGC", "GCGTTGGTAT"]);
+        for mode in [MatchMode::All, MatchMode::Nearest] {
+            let both = Search {
+                both_strands: true,
+                ..search(dist(0), mode)
+            };
+            let err = validate_group("g", &tags, &both).unwrap_err().to_string();
+            let reason = "tags `ATACCAACGC` and `GCGTTGGTAT` are reverse complements of each other (the bases `ATACCAACGC` match both with zero errors, one on each strand), so bothStrands=true cannot tell them apart; drop bothStrands to match each tag on the forward strand only, or remove one of them";
+            assert!(err.ends_with(reason), "{err}");
+        }
+        // ACGT is its own reverse complement, but it also lies within ACGTAC on one strand.
+        let both = Search {
+            both_strands: true,
+            ..unset(dist(0))
+        };
+        let err = validate_group("g", &seqs(&["ACGT", "ACGTAC"]), &both)
+            .unwrap_err()
+            .to_string();
+        let same = err.contains("are indistinguishable") && !err.contains("bothStrands");
+        assert!(same, "{err}");
+    }
+
+    #[test]
+    fn test_a_zero_error_pair_is_reported_before_a_pair_that_needs_substitutions() {
+        // AAAA and AATT differ by two substitutions, and every read holding GGGGCC holds GGGG.
+        let tags = seqs(&["AAAA", "AATT", "GGGGCC", "GGGG"]);
+        for checked in [unset(dist(1)), search(dist(1), MatchMode::All)] {
+            let err = validate_group("g", &tags, &checked)
+                .unwrap_err()
+                .to_string();
+            let reason = "tags `GGGGCC` and `GGGG` are indistinguishable";
+            assert!(err.contains(reason), "{err}");
+        }
+        let tags = seqs(&["AAACCCGG", "CCGGGTTA", "ATACCAACGC", "GCGTTGGTAT"]);
+        let both = Search {
+            both_strands: true,
+            ..unset(dist(1))
+        };
+        let err = validate_group("g", &tags, &both).unwrap_err().to_string();
+        let reason = "tags `ATACCAACGC` and `GCGTTGGTAT` are reverse complements of each other";
+        assert!(err.contains(reason), "{err}");
+    }
+
+    #[test]
+    fn test_iupac_tags_that_meet_on_opposite_strands_are_not_called_reverse_complements() {
+        // The reverse complement of CCTY is RAGG, and R holds the A of AAGG.
+        let both = Search {
+            both_strands: true,
+            ..unset(dist(0))
+        };
+        let err = validate_group("g", &seqs(&["AAGG", "CCTY"]), &both)
+            .unwrap_err()
+            .to_string();
+        let reason = "tags `AAGG` and `CCTY` each match the other's reverse complement (the bases `AAGG` match both with zero errors, one on each strand)";
+        assert!(err.contains(reason), "{err}");
+    }
+
+    /// Plain 16 bp tags at least three substitutions apart, after two that one
+    /// substitution each turns into the same read.
+    fn after_a_close_pair(count: usize) -> Vec<Vec<u8>> {
+        let mut tags = seqs(&["ACGTACGTACGTACGT", "ACGTACGTACGTACCA"]);
+        tags.extend(spread_barcodes(count, 16, 3));
+        tags
+    }
+
+    #[test]
+    fn test_a_zero_error_pair_among_thousands_of_plain_tags_is_found() {
+        let mut tags = after_a_close_pair(3_000);
+        tags.push(tags[1_500].clone());
+        let shown = String::from_utf8_lossy(&tags[1_500]).into_owned();
+        let err = validate_group("g", &tags, &unset(dist(1)))
+            .unwrap_err()
+            .to_string();
+        let reason = format!("tags `{shown}` and `{shown}` are indistinguishable");
+        assert!(err.contains(&reason), "{err}");
+        tags.pop();
+        let mut flipped = tags[1_500].clone();
+        reverse_complement(&mut flipped);
+        let flipped_shown = String::from_utf8_lossy(&flipped).into_owned();
+        tags.push(flipped);
+        let both = Search {
+            both_strands: true,
+            ..unset(dist(1))
+        };
+        let err = validate_group("g", &tags, &both).unwrap_err().to_string();
+        let reason = format!("tags `{shown}` and `{flipped_shown}` are reverse complements");
+        assert!(err.contains(&reason), "{err}");
+    }
+
+    #[test]
+    fn test_a_zero_error_pair_past_the_pair_limit_gives_the_plain_refusal() {
+        // A 12 bp tag at the start of a 16 bp one is the last pair, past the first 2^20.
+        let mut tags = after_a_close_pair(1_496);
+        let long = Rng(0x7a11).sample(16, b"ACGT");
+        tags.extend([long.clone(), long[..12].to_vec()]);
+        assert!(tags.len() * (tags.len() - 1) / 2 > 1 << 20);
+        let err = validate_group("g", &tags, &unset(dist(1)))
+            .unwrap_err()
+            .to_string();
+        let plain =
+            "tags `ACGTACGTACGTACGT` and `ACGTACGTACGTACCA` can both match one read within dist=1";
+        assert!(err.contains(plain), "{err}");
+    }
+
+    #[test]
+    fn test_plain_tags_of_one_length_are_looked_up_without_comparing_pairs() {
+        let mut seqs = after_a_close_pair(3_000);
+        seqs.push(seqs[1_500].to_ascii_lowercase());
+        let tags: Vec<Tag> = seqs.iter().map(|seq| Tag::new(seq)).collect();
+        let shape = Shape::of(None);
+        let pair = |seqs: &[Vec<u8>], limit| {
+            exact_pair(seqs, &tags, &[], &unset(dist(0)), shape, limit).map(|(i, j, _)| (i, j))
+        };
+        assert_eq!(
+            pair(&seqs, 0),
+            Some((1_500, 3_002)),
+            "found with no pair compared"
+        );
+        let mut flipped = seqs[1_500].clone();
+        reverse_complement(&mut flipped);
+        let both = Search {
+            both_strands: true,
+            ..unset(dist(0))
+        };
+        let mut seqs = seqs[..3_002].to_vec();
+        seqs.push(flipped);
+        let flipped_tags: Vec<Tag> = seqs.iter().map(|seq| Tag::new(&flip(seq))).collect();
+        let tags: Vec<Tag> = seqs.iter().map(|seq| Tag::new(seq)).collect();
+        let found = exact_pair(&seqs, &tags, &flipped_tags, &both, shape, 0);
+        assert_eq!(found.map(|(i, j, _)| (i, j)), Some((1_500, 3_002)));
+    }
+
+    #[test]
+    fn test_other_sets_are_compared_pair_by_pair_up_to_the_limit() {
+        // ACGN and ACGT, the first and last tags, form the second pair compared.
+        let seqs = seqs(&["ACGN", "TTTT", "ACGT"]);
+        let tags: Vec<Tag> = seqs.iter().map(|seq| Tag::new(seq)).collect();
+        let pair = |limit| {
+            exact_pair(&seqs, &tags, &[], &unset(dist(0)), Shape::of(None), limit)
+                .map(|(i, j, _)| (i, j))
+        };
+        assert_eq!(pair(1), None);
+        assert_eq!(pair(2), Some((0, 2)));
+    }
+
+    #[test]
+    fn test_a_pair_that_cannot_fit_the_window_is_never_taken_to_collide() {
+        // A 150 bp tag needs at least 142 bases under eight indels, more than the window holds.
+        let mut tags = long_pair();
+        tags[1].truncate(120);
+        let narrow = Search {
+            window: Some(141),
+            ..search(budget(0, 8), MatchMode::Nearest)
+        };
+        assert!(validate_group("g", &tags, &narrow).unwrap().is_empty());
+        let narrow = Search {
+            window: Some(141),
+            ..unset(budget(0, 8))
+        };
+        assert!(validate_group("g", &tags, &narrow).is_ok());
+    }
+
+    #[test]
+    fn test_totals_say_may_when_any_counted_pair_was_not_compared_exactly() {
+        let mut tags = long_pair();
+        tags.push(b"ACGTTGCAACGT".to_vec());
+        let w = validate_group("g", &tags, &search(budget(0, 8), MatchMode::All)).unwrap();
+        let total = "group `g`: 3 pairs of tags may match one read only through an indel";
+        assert!(w.last().is_some_and(|w| w.starts_with(total)), "{w:?}");
+    }
+
     /// Every 4-mer; two of them collide at dist=1 when they differ at two or fewer positions.
     fn every_4mer() -> Vec<Vec<u8>> {
         let base = |code: usize, at: usize| b"ACGT"[code >> (2 * at) & 3];
@@ -1435,11 +1829,12 @@ mod tests {
                 continue;
             };
             reported += 1;
+            let bases = overlap.bases.expect("short tags are compared exactly");
             let mut group = crate::matcher::CompiledGroup::new("g", vec![a.clone(), b.clone()]);
             group.dist = search.dist;
             group.revcomp = search.both_strands;
             group.anchor = search.anchor;
-            let read = [overlap.bases.as_slice()];
+            let read = [bases.as_slice()];
             let mut scratch = crate::matcher::Scratch::new();
             let outcome = crate::matcher::match_group(&group, &mut scratch, &read);
             for tag_idx in 0..2 {
@@ -1447,7 +1842,7 @@ mod tests {
                     outcome.accepted.iter().any(|m| m.tag_idx == tag_idx),
                     "tag {tag_idx} of {:?} misses {:?} under {search:?}: {outcome:?}",
                     seqs_shown(&[&a, &b]),
-                    String::from_utf8_lossy(&overlap.bases),
+                    String::from_utf8_lossy(&bases),
                 );
             }
         }
@@ -1599,8 +1994,61 @@ mod tests {
             indel: 40,
             total: 40,
         };
-        let grid = Grid::fill(&outer, &inner, &huge, Shape::of(None));
+        let shape = Shape::of(None);
+        let grid = Grid::fill(&outer, &inner, &huge, shape);
         assert!(grid.cells.len() <= 9 * 17 * 9 * 9, "{}", grid.cells.len());
+    }
+
+    #[test]
+    fn test_a_table_past_the_cell_cap_is_never_filled() {
+        // One base in fifty differs, so the filters pass and only the table could tell.
+        let tag = Rng(0x500).sample(500, b"ACGT");
+        let other: Vec<u8> = (tag.iter().enumerate())
+            .map(|(at, &base)| match at % 50 {
+                25 if base == b'A' => b'C',
+                25 => b'A',
+                _ => base,
+            })
+            .collect();
+        let huge = budget(0, 50);
+        let (outer, inner) = (Tag::new(&tag), Tag::new(&other));
+        let shape = Shape::of(None);
+        let size = Grid::size(&outer, &inner, &huge, shape);
+        assert!(size > 500 * TABLE_CELLS, "{size}");
+        let checked = search(huge, MatchMode::Nearest);
+        CELLS_LEFT.set(GROUP_CELLS);
+        let found = collision(&outer, &inner, None, &checked, shape).unwrap();
+        assert!(found.bases.is_none());
+        assert_eq!(CELLS_LEFT.get(), GROUP_CELLS, "no table was filled");
+        let tags = vec![tag, other];
+        let w = validate_group("g", &tags, &checked).unwrap();
+        assert!(w.len() == 1 && w[0].contains(TOO_COSTLY), "{w:?}");
+    }
+
+    #[test]
+    fn test_pairs_past_the_group_cell_budget_are_taken_to_collide() {
+        // Deleting the last base of either tag leaves ACGTA, one indel from both.
+        let (a, b) = (Tag::new(b"ACGTAC"), Tag::new(b"ACGTAG"));
+        let (checked, shape) = (search(budget(0, 1), MatchMode::Nearest), Shape::of(None));
+        let size = Grid::size(&a, &b, &checked.dist, shape);
+        CELLS_LEFT.set(size - 1);
+        let found = collision(&a, &b, None, &checked, shape).unwrap();
+        assert!(
+            found.bases.is_none(),
+            "taken to collide once the budget runs short"
+        );
+        assert_eq!(CELLS_LEFT.get(), size - 1, "no table was filled");
+        CELLS_LEFT.set(4 * size);
+        let found = collision(&a, &b, None, &checked, shape).unwrap();
+        assert_eq!(found.bases.as_deref(), Some(&b"ACGTA"[..]));
+        assert_eq!(CELLS_LEFT.get(), 2 * size, "both orders drew a table");
+        let tags = seqs(&["ACGTAC", "ACGTAG"]);
+        assert!(validate_group("g", &tags, &checked).unwrap()[0].contains("can both match"));
+        assert_eq!(
+            CELLS_LEFT.get(),
+            GROUP_CELLS - 2 * size,
+            "each group starts afresh"
+        );
     }
 
     /// Whether bases exist, no longer than the search window, that `outer`
