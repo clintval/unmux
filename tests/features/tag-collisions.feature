@@ -4,8 +4,11 @@ Feature: Tags that one read can match together are refused or warned about
   Before a run, unmux compares every pair of tags under the group's search: the substitution,
   indel, and total caps of its dist, a shorter tag within a longer one (at its start under
   anchor=5p and at its end under anchor=3p), and, with bothStrands=true, each tag against the
-  reverse complement of the other. Such a pair is refused under mode=all and warned about under
-  mode=nearest, and a pair that one read matches with zero errors is refused under either mode.
+  reverse complement of the other. A pair that one read matches with zero errors is refused under
+  either mode. A pair that one read can match without an indel is refused under mode=all and
+  warned about under mode=nearest. A pair that one read can match only through an indel is
+  refused when the group gives no mode, asking for one, and warned about under mode=all or
+  mode=nearest written out, where mode=all also counts such pairs and recommends mode=nearest.
   Each message gives bases that match both tags.
 
   Background:
@@ -17,20 +20,39 @@ Feature: Tags that one read can match together are refused or warned about
       IIIIIIIIIIIIIIII
       """
 
-  Scenario Outline: an indel budget that lets one read match two tags is refused under mode=all
+  Scenario Outline: a pair that one read can match only through an indel is refused until the group gives a mode
     # Deleting the last base of either tag leaves ACGTA, so r1 is one deletion from both tags.
     When I run `unmux reads.fq --group bc=<set> --group bc::dist=0:1,loc=0:0:8 --sample-from-group bc --out %sample.fq --unassigned un.fq`
     Then the exit code is 1
-    And stderr contains "can both match one read within dist=0:1 (the bases `ACGTA` match both)"
-    And stderr contains "with mode=all this silently mis-assigns reads"
-    And stderr contains "or use mode=nearest, which only warns and lists the colliding pairs"
+    And stderr contains "1 pair of tags can both match one read within dist=0:1 only through an indel, such as"
+    And stderr contains "(the bases `ACGTA` match both)"
+    And stderr contains "set mode=nearest to leave such reads unassigned (recommended), or write mode=all to keep assigning each to one of the tags by tie-break"
 
     Examples:
       | set                 |
       | {a=ACGTAC,b=ACGTAG} |
       | {b=ACGTAG,a=ACGTAC} |
 
-  Scenario Outline: bases one indel longer than either tag can match both, so such a pair is refused
+  Scenario: with mode=all written out such a pair runs with a warning and the read goes to a tag by tie-break
+    When I run `unmux reads.fq --group bc={a=ACGTAC,b=ACGTAG} --group bc::dist=0:1,loc=0:0:8,mode=all --sample-from-group bc --out %sample.fq --unassigned un.fq`
+    Then the exit code is 0
+    And stderr contains "tags `ACGTAC` and `ACGTAG` can both match one read within dist=0:1 (the bases `ACGTA` match both); with mode=all such a read goes to one of the tags by tie-break"
+    And stderr contains "1 pair of tags can match one read only through an indel; set mode=nearest to leave such reads unassigned (recommended)"
+    And the file "a.fq" contains "@r1"
+
+  Scenario Outline: a pair that one read can match without an indel is refused under mode=all despite an indel budget
+    # AAAAGCCC is one substitution from each tag, so the read needs no indel.
+    When I run `unmux reads.fq --group bc={a=AAAACCCC,b=AAAAGGCC} --group bc::<attrs> --sample-from-group bc --out %sample.fq`
+    Then the exit code is 1
+    And stderr contains "tags `AAAACCCC` and `AAAAGGCC` can both match one read within dist=1:1 (the bases `AAAAGCCC` match both)"
+    And stderr contains "with mode=all this silently mis-assigns reads"
+
+    Examples:
+      | attrs             |
+      | dist=1:1          |
+      | dist=1:1,mode=all |
+
+  Scenario Outline: bases one indel longer than either tag can match both, so such a pair is caught
     # ACTGTACGT is ACGTACGT with one base inserted, and ACTGTACA with its last base deleted.
     Given a file "shift.fq" containing:
       """
@@ -41,7 +63,8 @@ Feature: Tags that one read can match together are refused or warned about
       """
     When I run `unmux shift.fq --group bc=<set> --group bc::dist=0:1,loc=0:0:12,anchor=5p --sample-from-group bc --out %sample.fq`
     Then the exit code is 1
-    And stderr contains "can both match one read within dist=0:1 (the bases `ACTGTACGT` match both)"
+    And stderr contains "1 pair of tags can both match one read within dist=0:1 only through an indel"
+    And stderr contains "(the bases `ACTGTACGT` match both)"
 
     Examples:
       | set                     |
@@ -54,6 +77,14 @@ Feature: Tags that one read can match together are refused or warned about
     Then the exit code is 0
     And stderr contains "tags `AAAAA` and `AAAAC` can both match one read within dist=1"
     And stderr contains "5 more pairs of tags can both match one read within dist=1"
+
+  Scenario: under mode=all written out the pairs that need an indel are listed and counted
+    # Without substitutions each pair needs an indel, as AAAA is one deletion from every tag.
+    When I run `unmux reads.fq --group bc={a=AAAAA,b=AAAAC,c=AAAAG,d=AAAAT,e=AAACA,f=AAAGA} --group bc::dist=0:1,mode=all --sample-from-group bc --out %sample.fq --unassigned un.fq`
+    Then the exit code is 0
+    And stderr contains "tags `AAAAA` and `AAAAC` can both match one read within dist=0:1"
+    And stderr contains "5 more pairs of tags can both match one read within dist=0:1; with mode=all such a read goes to one of the tags by tie-break"
+    And stderr contains "15 pairs of tags can match one read only through an indel; set mode=nearest to leave such reads unassigned (recommended)"
 
   Scenario: the same indel budget under mode=nearest is a warning and the read is left unassigned
     When I run `unmux reads.fq --group bc={a=ACGTAC,b=ACGTAG} --group bc::dist=0:1,loc=0:0:8,mode=nearest --sample-from-group bc --out %sample.fq --unassigned un.fq`

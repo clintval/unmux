@@ -1019,23 +1019,93 @@ mod tests {
     }
 
     #[test]
-    fn test_indel_budget_overlap_is_mode_aware() {
+    fn test_indel_budget_overlap_is_a_warning_under_either_mode_written_out() {
         // Deleting the last base of either tag leaves ACGTA, one indel from both.
         let tags = ["ACGTAC", "ACGTAG"];
-        let err = check(&tags, budget(0, 1), MatchMode::All)
+        let pair = "within dist=0:1 (the bases `ACGTA` match both)";
+        let w = check(&tags, budget(0, 1), MatchMode::All).unwrap();
+        assert_eq!(w.len(), 2, "a pair and a count: {w:?}");
+        let tie_break = "with mode=all such a read goes to one of the tags by tie-break";
+        assert!(w[0].contains(pair) && w[0].ends_with(tie_break), "{w:?}");
+        let count = "group `g`: 1 pair of tags can match one read only through an indel; set mode=nearest to leave such reads unassigned (recommended)";
+        assert_eq!(w[1], count);
+        let w = check(&tags, budget(0, 1), MatchMode::Nearest).unwrap();
+        assert_eq!(w.len(), 1, "a pair: {w:?}");
+        let unassigned = "mode=nearest leaves ambiguous reads unassigned";
+        assert!(w[0].contains(pair) && w[0].contains(unassigned), "{w:?}");
+    }
+
+    #[test]
+    fn test_substitutions_alone_still_refuse_a_pair_under_mode_all_with_an_indel_budget() {
+        // AAAAGCCC is one substitution from each tag, so the read needs no indel.
+        let tags = ["AAAACCCC", "AAAAGGCC"];
+        let err = check(&tags, budget(1, 1), MatchMode::All)
             .unwrap_err()
             .to_string();
         assert!(
-            err.contains("within dist=0:1 (the bases `ACGTA` match both)"),
+            err.contains("within dist=1:1 (the bases `AAAAGCCC` match both)"),
             "{err}"
         );
-        assert!(err.contains("mode=all"), "{err}");
-        let w = check(&tags, budget(0, 1), MatchMode::Nearest).unwrap();
-        assert_eq!(w.len(), 1, "one collision warning: {w:?}");
         assert!(
-            w[0].contains("mode=nearest leaves ambiguous reads unassigned"),
-            "{}",
-            w[0]
+            err.contains("with mode=all this silently mis-assigns reads"),
+            "{err}"
+        );
+        let w = check(&tags, budget(1, 1), MatchMode::Nearest).unwrap();
+        assert_eq!(w.len(), 1, "no count of pairs that need an indel: {w:?}");
+    }
+
+    #[test]
+    fn test_pair_matched_without_an_indel_is_shown_with_bases_that_need_none() {
+        // ACGTA is one deletion from both tags, and ACGTAC is one substitution from ACGTAG.
+        let err = check(&["ACGTAC", "ACGTAG"], budget(1, 1), MatchMode::All)
+            .unwrap_err()
+            .to_string();
+        let bases = "within dist=1:1 (the bases `ACGTAC` match both)";
+        assert!(err.contains(bases), "{err}");
+    }
+
+    #[test]
+    fn test_mode_all_lists_the_pairs_that_need_an_indel_and_counts_them() {
+        // With no substitutions every pair needs an indel: AAAA is one deletion from each tag.
+        let tags = ["AAAAA", "AAAAC", "AAAAG", "AAAAT", "AAACA", "AAAGA"];
+        let w = check(&tags, budget(0, 1), MatchMode::All).unwrap();
+        assert_eq!(w.len(), 12, "ten pairs and two counts: {w:?}");
+        let tie_break = "with mode=all such a read goes to one of the tags by tie-break";
+        assert!(w[..10].iter().all(|w| w.ends_with(tie_break)), "{w:?}");
+        let more = "group `g`: 5 more pairs of tags can both match one read within dist=0:1;";
+        assert!(w[10].starts_with(more), "{w:?}");
+        let count = "group `g`: 15 pairs of tags can match one read only through an indel; set mode=nearest to leave such reads unassigned (recommended)";
+        assert_eq!(w[11], count);
+    }
+
+    #[test]
+    fn test_mode_all_stops_counting_but_still_refuses_pairs_without_an_indel() {
+        // Barcodes three substitutions apart collide only through an indel.
+        let mut tags = spread_barcodes(96, 8, 3);
+        let w = validate_group("g", &tags, &search(budget(1, 1), MatchMode::All)).unwrap();
+        assert_eq!(w.len(), 12, "ten pairs and two counts: {w:?}");
+        let more = "at least 990 more pairs (counting stopped at 1000)";
+        assert!(w[10].contains(more), "{w:?}");
+        let count = "at least 1000 pairs of tags can match one read only through an indel";
+        assert!(w[11].contains(count), "{w:?}");
+        let other = |base: u8| if base == b'C' { b'A' } else { b'C' };
+        let last = tags[95].clone();
+        let mut near = last.clone();
+        near[0] = other(near[0]);
+        near[7] = other(near[7]);
+        tags.push(near.clone());
+        let err = validate_group("g", &tags, &search(budget(1, 1), MatchMode::All))
+            .unwrap_err()
+            .to_string();
+        let pair = format!(
+            "tags `{}` and `{}` can both match one read within dist=1:1",
+            String::from_utf8_lossy(&last),
+            String::from_utf8_lossy(&near)
+        );
+        assert!(err.contains(&pair), "{err}");
+        assert!(
+            err.contains("with mode=all this silently mis-assigns reads"),
+            "{err}"
         );
     }
 
@@ -1150,10 +1220,10 @@ mod tests {
             dist: budget(0, 1),
             ..shaped(Some(Anchor::FivePrime), false, None)
         };
-        let err = validate_group("g", &tags, &five).unwrap_err().to_string();
+        let w = validate_group("g", &tags, &five).unwrap();
         assert!(
-            err.contains("within dist=0:1 (the bases `ACTGTACGT` match both)"),
-            "{err}"
+            w[0].contains("within dist=0:1 (the bases `ACTGTACGT` match both)"),
+            "{w:?}"
         );
     }
 
