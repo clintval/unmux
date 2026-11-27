@@ -205,3 +205,23 @@ Feature: Split an existing multi-read-group input by its @RG header
     And the file "out/rg1.sam" contains "RG:Z:rg1"
     And the file "out/rg2.sam" contains "RG:Z:rg2"
     And the file "out/rg1.sam" does not contain "RG:Z:rg2"
+
+  Scenario: a split record keeps its original RG:Z and input tags under --template
+    Given a file "in.sam" containing:
+      """
+      @HD	VN:1.6
+      @RG	ID:rg1	SM:sampleA
+      @RG	ID:rg2	SM:sampleB
+      r1	4	*	0	0	*	*	0	0	AAAACCCC	IIIIIIII	RG:Z:rg1	RX:Z:GGGG
+      r2	4	*	0	0	*	*	0	0	CCCCAAAA	IIIIIIII	RG:Z:rg2	RX:Z:TTTT
+      """
+    When I run `unmux in.sam --group rg=@RG --sample-from-group rg --extract body=0:2:end --template body --out out/%sample.sam`
+    Then the exit code is 0
+    And the records of "out/rg1.sam" are:
+      """
+      r1	4	*	0	255	*	*	0	0	AACCCC	IIIIII	RG:Z:rg1	RX:Z:GGGG
+      """
+    And the records of "out/rg2.sam" are:
+      """
+      r2	4	*	0	255	*	*	0	0	CCAAAA	IIIIII	RG:Z:rg2	RX:Z:TTTT
+      """

@@ -987,6 +987,7 @@ mod tests {
             bases: bases.to_vec(),
             quals: quals.map(<[u8]>::to_vec),
             corrected: None,
+            source: None,
         }
     }
 

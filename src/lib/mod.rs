@@ -18,6 +18,7 @@ pub mod iupac;
 pub mod matcher;
 pub mod metrics;
 pub mod output;
+mod per_base;
 mod pool;
 pub mod qc;
 pub mod readgroup;
