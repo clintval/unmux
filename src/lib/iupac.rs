@@ -561,7 +561,7 @@ fn overlap(outer: &Tag, inner: &Tag, search: &Search, shape: Shape) -> Option<Ov
     let dist = &search.dist;
     let reach = outer.len() + dist.indel;
     let longest = search.window.map_or(reach, |width| width.min(reach));
-    if inner.len() == 0 || inner.len() > longest + dist.indel {
+    if inner.len() == 0 || inner.len().max(outer.len()) > longest + dist.indel {
         return None;
     }
     let found = match dist.indel {
