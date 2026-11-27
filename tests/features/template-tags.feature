@@ -78,6 +78,47 @@ Feature: Input tags on --template records
       """
     And stderr contains "--template left out per-base tags from 1 record that did not copy a read exactly: sa, sx, pc, pq, pg, pm, pd, px, pe, sf, bs, pb"
 
+  Scenario: PacBio's per-base sm follows a flipped, trimmed read, while its per-pulse pt and Ultima's flow tags are left out
+    Given a file "in.sam" containing:
+      """
+      @HD	VN:1.6
+      r1	4	*	0	0	*	*	0	0	ACGTACGTCG	IIIIIIIIII	zm:i:42	sm:B:C,1,2,3,4,5,6,7,8,9,10	pt:Z:---C--A----	tp:B:c,0,1,0,-1,0,0,1,0,0,0	t0:Z:IIIIIIIIII
+      """
+    When I run `unmux in.sam --pool p --extract r=0:2:end --template ~r --out out.sam`
+    Then the exit code is 0
+    And the records of "out.sam" are:
+      """
+      r1	4	*	0	255	*	*	0	0	CGACGTAC	IIIIIIII	zm:i:42	sm:B:C,10,9,8,7,6,5,4,3	RG:Z:p
+      """
+    And stderr contains "--template left out per-base tags from 1 record that did not copy a read exactly: pt, tp, t0"
+
+  Scenario: Dorado's per-read pa array stays on a trimmed record, while PacBio's per-pulse pa is left out
+    Given a file "in.fq" containing:
+      """
+      @r1	pa:B:i,1,2,3
+      ACGTACGTCG
+      +
+      IIIIIIIIII
+      @r2	pa:B:S,1,2,3,4,5,6,7,8,9,10,11
+      ACGTACGTCG
+      +
+      IIIIIIIIII
+      """
+    When I run `unmux in.fq --extract r=0:2:end --template r --out out.fq`
+    Then the exit code is 0
+    And the file "out.fq" is:
+      """
+      @r1 pa:B:i,1,2,3
+      GTACGTCG
+      +
+      IIIIIIII
+      @r2
+      GTACGTCG
+      +
+      IIIIIIII
+      """
+    And stderr contains "--template left out per-base tags from 1 record that did not copy a read exactly: pa"
+
   Scenario: a trimmed record keeps the matching slices of OQ and ip
     Given a file "in.sam" containing:
       """
