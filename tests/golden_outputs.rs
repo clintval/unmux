@@ -439,8 +439,10 @@ const METRICS: &str =
 const CUT: &str = "--extract a=0:14:end --extract b=1:0:end --extract umi=0:8:14 --extract s=@bc";
 const BINS: &str = "--unassigned un.R%source.fq.gz";
 const CELLS: &str = "--group b1={in}/bc.tsv --group b1::loc=0:0:13 --group b1::dist=1:1:1 \
+     --group b1::mode=all \
      --group l={GTGGCCGATGTTTCGC} --group l::loc=0:6:32 --group l::dist=2:1:3 \
-     --group b2={in}/bc.tsv --group b2::dist=1:1:1 --group l::next=b2:0-9 \
+     --group b2={in}/bc.tsv --group b2::dist=1:1:1 --group b2::mode=all \
+     --group l::next=b2:0-9 \
      --extract c1=@b1 --extract c2=@b2 --extract umi=@b2+0:6 --extract cdna=1:0:end \
      --extract gap=@b1..@l --extract name=@b1::id";
 
@@ -500,6 +502,7 @@ const CELLS: &str = "--group b1={in}/bc.tsv --group b1::loc=0:0:13 --group b1::d
     "{in}/r1.fq {in}/r2.fq \
     {in}/i1.fq {in}/i2.fq --group bc={in}/bc.tsv --group bc::loc=2:0:8 --group bc::dist=1 \
     --group i5={in}/bc.tsv --group i5::loc=3:0:9 --group i5::dist=1:1:1 \
+    --group i5::mode=all \
     --extract a=0:0:end --extract b=1:0:end --extract x=@bc --extract y=@i5 \
     --extract n=%sample::note --extract c=@i5::cell --template a b --tag BC=x+y --tag xn=n \
     --tag xc=c+x --sample-sheet {in}/sheet.tsv --out %sample.cram --rg-tag PL=ILLUMINA {METRICS}"
@@ -534,10 +537,19 @@ const CELLS: &str = "--group b1={in}/bc.tsv --group b1::loc=0:0:13 --group b1::d
     --sample-from-group bc --out %sample.bam --unassigned un.bam --qc-tag {METRICS}"
 )]
 #[case::anywhere_on_both_strands_with_indels(
-    "8ffee180c8c1edd157527c206fb50d5d",
+    "3290bf76cfbc0afe3ef371b7e3ab5ccc",
     "{in}/any.fq \
     --group bc={in}/bc.tsv --group bc::dist=1:1:1 --group bc::bothStrands=true \
+    --group bc::mode=nearest \
     --group bc::maxFindsPerTag=1 --extract s=@bc --extract r=0:0:end --template r --tag CB=s \
+    --sample-from-group bc --out %sample.bam --unassigned un.bam --qc-tag {METRICS}"
+)]
+#[case::anywhere_on_both_strands_with_indels_apart(
+    "187e0d973d99cc6865a78abc2b33019b",
+    "{in}/any.fq \
+    --group bc={a=AACCGGTT,b=ACGTACGT,c=AGTCAGTC,d=ATATCGCG,e=CAGTTGAC,f=CCAATTGG,g=GGTTAACC,h=TACGCATG,i=TTGGCCAA} \
+    --group bc::dist=0:1 --group bc::bothStrands=true --group bc::maxFindsPerTag=1 \
+    --extract s=@bc --extract r=0:0:end --template r --tag CB=s \
     --sample-from-group bc --out %sample.bam --unassigned un.bam --qc-tag {METRICS}"
 )]
 #[case::anywhere_exact_and_unique(
