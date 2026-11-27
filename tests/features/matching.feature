@@ -567,28 +567,26 @@ Feature: Tag matching with distance tolerance and error handling
       +
       IIIIIIIII
       """
-    # CB holds the corrected form, which is the tag, and BC the raw form, which is the read's bases.
+    # CB holds the corrected form, which is the tag, and BC the raw form: the read's bases, in the tag's orientation.
     When I run `unmux reads.fq --group bc=<tags> --group bc::<attrs> --extract bc=@bc --tag CB=bc --tag BC=bc --tag BC::raw=true --sample-from-group bc --out %sample.fq --unassigned un.fq`
     Then the exit code is 0
     And the file "x.fq" contains "@dna CB:Z:<tag>"
-    And the file "x.fq" contains "@rna CB:Z:<tag>"
-    And the file "x.fq" contains "@lower CB:Z:<tag>"
-    And the file "x.fq" contains "BC:Z:AAUUC"
-    And the file "x.fq" contains "BC:Z:aauuc"
+    And the file "x.fq" contains "@rna CB:Z:<tag>	CY:Z:IIIII	BC:Z:<raw>	QT:Z:IIIII"
+    And the file "x.fq" contains "@lower CB:Z:<tag>	CY:Z:IIIII	BC:Z:<lower>	QT:Z:IIIII"
     And the file "un.fq" does not contain "@rna"
     And the file "un.fq" does not contain "@lower"
 
     Examples:
-      | search                  | tags                                                                      | attrs                        | tag   |
-      | a sliding search        | {x=AATTC}                                                                 | dist=0                       | AATTC |
-      | a loc window            | {x=AATTC}                                                                 | loc=0:1:8                    | AATTC |
-      | an indel budget         | {x=AATTC}                                                                 | dist=1:1                     | AATTC |
-      | anchor=5p               | {x=AATTC}                                                                 | loc=0:2:9,anchor=5p          | AATTC |
-      | anchor=5p and indels    | {x=AATTC}                                                                 | loc=0:2:9,anchor=5p,dist=0:1 | AATTC |
-      | anchor=3p               | {x=AATTC}                                                                 | loc=0:0:7,anchor=3p          | AATTC |
-      | an IUPAC tag            | {x=AAKKC}                                                                 | dist=0                       | AAKKC |
-      | bothStrands             | {x=GAATT}                                                                 | bothStrands=true             | GAATT |
-      | nine tags of one length | {x=AATTC,a=CCCCC,b=GGGGG,c=ACACA,d=CACAC,e=GAGAG,f=AGAGA,g=CGCGC,h=GCGCG} | dist=0                       | AATTC |
+      | search                  | tags                                                                      | attrs                        | tag   | raw   | lower |
+      | a sliding search        | {x=AATTC}                                                                 | dist=0                       | AATTC | AAUUC | aauuc |
+      | a loc window            | {x=AATTC}                                                                 | loc=0:1:8                    | AATTC | AAUUC | aauuc |
+      | an indel budget         | {x=AATTC}                                                                 | dist=1:1                     | AATTC | AAUUC | aauuc |
+      | anchor=5p               | {x=AATTC}                                                                 | loc=0:2:9,anchor=5p          | AATTC | AAUUC | aauuc |
+      | anchor=5p and indels    | {x=AATTC}                                                                 | loc=0:2:9,anchor=5p,dist=0:1 | AATTC | AAUUC | aauuc |
+      | anchor=3p               | {x=AATTC}                                                                 | loc=0:0:7,anchor=3p          | AATTC | AAUUC | aauuc |
+      | an IUPAC tag            | {x=AAKKC}                                                                 | dist=0                       | AAKKC | AAUUC | aauuc |
+      | bothStrands             | {x=GAATT}                                                                 | bothStrands=true             | GAATT | GAATT | gaatt |
+      | nine tags of one length | {x=AATTC,a=CCCCC,b=GGGGG,c=ACACA,d=CACAC,e=GAGAG,f=AGAGA,g=CGCGC,h=GCGCG} | dist=0                       | AATTC | AAUUC | aauuc |
 
   Scenario Outline: A U or u read base matches a T tag base as T does in <link>
     Given a file "reads.fq" containing:

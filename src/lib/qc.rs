@@ -12,8 +12,10 @@
 //! bases>,"loc":"<file>:<start>:<end>","obs":<observed
 //! bases>,"sub":<substitutions>,"ind":<indels>[,"str":"-"]}`. `loc` is the
 //! matched record span (0-based, file-relative) and `obs` the observed bases
-//! there; both are absent for a `match=` group (a synthetic joined value, not a
-//! record span). `str` is present only for a reverse-complement match.
+//! there, in read orientation even for a reverse-complement match, where a
+//! `raw=true` stream of the same span is in the tag's orientation; both are
+//! absent for a `match=` group (a synthetic joined value, not a record span).
+//! `str` is present only for a reverse-complement match.
 //! Unassigned also carries a `reason`: `find_constraint` adds the offending
 //! `group`, the failed `constraint`, and the observed `found` vs the `limit`;
 //! `missing_stream` adds the `stream`. Removed carries `rule` (the `--remove`

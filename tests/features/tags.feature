@@ -255,24 +255,25 @@ Feature: SAM tag emission with quality tag pairing and separators
     Given a file "test.fq" containing:
       """
       @r1
-      GGGGGGGGGGCACGATAAAA
+      GGGGGGGGGGCACAGTTAAAA
       +
-      IIIIIIIIII56789:IIII
+      IIIIIIIIII56789:;IIII
       """
-    # CACGAT is one substitution from the reverse complement of AACGTG, so the corrected qualities
-    # of CB run in reverse (:98765) while CR and its CY keep the observed order.
-    When I run `unmux test.fq --pool p --group g={AACGTG} --group g::loc=0:10:16,bothStrands=true,dist=1 --extract bc=@g <flags> --out out.sam`
+    # CACAGTT is AACGTG's reverse complement with an A inserted, so the raw CR is 7 bases with 7 qualities in
+    # the tag's orientation, while the corrected CB's qualities are cut to its 6 bases. CY holds the CR
+    # qualities where CR is written and the CB qualities otherwise.
+    When I run `unmux test.fq --pool p --group g={AACGTG} --group g::loc=0:10:17,bothStrands=true,dist=1:1 --extract bc=@g <flags> --out out.sam`
     Then the exit code is 0
     And the records of "out.sam" are:
       """
-      r1	4	*	0	255	*	*	0	0	GGGGGGGGGGCACGATAAAA	IIIIIIIIII56789:IIII	<tags>	RG:Z:p
+      r1	4	*	0	255	*	*	0	0	GGGGGGGGGGCACAGTTAAAA	IIIIIIIIII56789:;IIII	<tags>	RG:Z:p
       """
 
     Examples:
-      | flags                                      | tags                                  |
-      | --tag CB=bc --tag CR=bc --tag CR::raw=true | CB:Z:AACGTG	CY:Z:56789:	CR:Z:CACGAT |
-      | --tag CR=bc --tag CR::raw=true --tag CB=bc | CR:Z:CACGAT	CY:Z:56789:	CB:Z:AACGTG |
-      | --tag CB=bc                                | CB:Z:AACGTG	CY:Z::98765             |
+      | flags                                      | tags                                    |
+      | --tag CB=bc --tag CR=bc --tag CR::raw=true | CB:Z:AACGTG	CY:Z:;:98765	CR:Z:AACTGTG |
+      | --tag CR=bc --tag CR::raw=true --tag CB=bc | CR:Z:AACTGTG	CY:Z:;:98765	CB:Z:AACGTG |
+      | --tag CB=bc                                | CB:Z:AACGTG	CY:Z:;:9876               |
 
   Scenario Outline: CY holds the CB qualities on a record where CR is left out
     Given a file "test.fq" containing:

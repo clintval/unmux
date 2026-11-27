@@ -108,13 +108,14 @@ pub enum MatchMode {
 }
 
 /// A `next=GROUP[:lo-hi]` sequential link to a downstream group. An absent
-/// window is a plain ordering prerequisite; a window `lo-hi` is relative to
-/// this group's matched end and replaces the downstream group's `loc`.
+/// window is a plain ordering prerequisite; a window `lo-hi` is measured past
+/// this group's match, in that match's orientation, and replaces the downstream
+/// group's `loc`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NextLink {
     /// The downstream group that must match after this one.
     pub group: String,
-    /// An optional relative window `[matchEnd+lo, matchEnd+hi]` for the
+    /// An optional relative window `lo..hi` bases past the match for the
     /// downstream group.
     pub window: Option<(usize, usize)>,
 }
@@ -271,7 +272,9 @@ pub enum SpanBody {
     /// `@grp-0:9` is the 9 bp immediately left of the match (a UMI upstream of
     /// a barcode). The trailing number is a length, not an end; both directions
     /// clamp at the record edge (`:end` reaches the record end for `+`, or the
-    /// record start for `-`).
+    /// record start for `-`). From a reverse-strand match both are measured in
+    /// the tag's orientation, so `+` steps toward the record start, and the span
+    /// is reverse-complemented into that orientation.
     AnchorOffset {
         /// The anchoring group.
         group: String,
@@ -283,7 +286,8 @@ pub enum SpanBody {
         /// The span length.
         len: AnchorLen,
     },
-    /// `@grpA..@grpB`: the region between two matched anchors.
+    /// The region between two matched anchors (`@grpA..@grpB`), in the
+    /// orientation of `grpA`'s match.
     Between {
         /// The upstream anchor (region starts at its match end).
         from: String,
@@ -303,8 +307,7 @@ pub struct Extract {
 
 /// A reference to an extract stream in a `--tag` or `--template`. A leading `~`
 /// reverse-complements this stream's contribution at this use site (rc the
-/// bases, reverse the quals); the stream itself is defined orientation-neutral
-/// by its `--extract`.
+/// bases, reverse the quals); the stream itself is defined by its `--extract`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamRef {
     /// The extract stream name.
@@ -392,8 +395,8 @@ pub struct TagBinding {
     pub qual_sep: Option<String>,
     /// Whether `qual-sep=` was set rather than left to its default.
     pub qual_sep_set: bool,
-    /// `raw=true`: emit the observed (as-sequenced) bases for this tag rather
-    /// than the corrected form. Default `false`: a tag emits the
+    /// Whether the tag emits the observed (uncorrected) bases rather than the
+    /// corrected form (`raw=true`). Default `false`: a tag emits the
     /// error-corrected barcode when its stream came from a matched keeplist
     /// `@grp`. No effect on a stream that was never corrected.
     pub raw: bool,

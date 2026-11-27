@@ -71,6 +71,114 @@ Feature: Tag groups and sequential matching across multiple groups
       IIIIIIIIIIIIIIIII
       """
 
+  Scenario: a relative next= window past a reverse-strand match is taken in that match's orientation
+    Given a file "reads.fq" containing:
+      """
+      @fwd
+      AAACCCGATTACATTTTTTTTTT
+      +
+      IIIIIIIIIIIIIIIIIIIIIII
+      @rev
+      AAAAAAAAAATGTAATCGGGTTTCCCCCCC
+      +
+      IIIIIIIIIIIIIIIIIIIIIIIIIIIIII
+      """
+    # g1 (AAACCC) matches @fwd at [0,6) and the reverse strand of @rev at [17,23). Past the match in its own
+    # orientation, the window of @rev is [7,17), searched on g1's strand, where TGTAATC is GATTACA
+    # reverse-complemented. In read orientation the window would be @rev's [23,30), all C, and @rev would be
+    # unassigned.
+    When I run `unmux reads.fq --group g1={AAACCC} --group g1::bothStrands=true,next=g2:0-10 --group g2={u=GATTACA} --sample-from-group g2 --out %sample.fq --unassigned un.fq`
+    Then the exit code is 0
+    And the file "u.fq" is:
+      """
+      @fwd
+      AAACCCGATTACATTTTTTTTTT
+      +
+      IIIIIIIIIIIIIIIIIIIIIII
+      @rev
+      AAAAAAAAAATGTAATCGGGTTTCCCCCCC
+      +
+      IIIIIIIIIIIIIIIIIIIIIIIIIIIIII
+      """
+    And the file "un.fq" does not contain "@rev"
+
+  Scenario: a bothStrands target of a relative next= window keeps both strands past a reverse-strand match
+    Given a file "reads.fq" containing:
+      """
+      @fwd
+      AAACCCTGTAATCTT
+      +
+      IIIIIIIIIIIIIII
+      @rev
+      AAGATTACAGGGTTT
+      +
+      IIIIIIIIIIIIIII
+      """
+    # In @fwd, g2's GATTACA follows g1 reverse-complemented (TGTAATC); @rev is @fwd reverse-complemented.
+    # g2 searches both strands of the window past g1 in g1's orientation, so it finds GATTACA in both
+    # reads: on the strand opposite g1's in each, as it does in @fwd with a forward g1.
+    When I run `unmux reads.fq --group g1={AAACCC} --group g1::bothStrands=true,next=g2:0-10 --group g2={u=GATTACA} --group g2::bothStrands=true --sample-from-group g2 --out %sample.fq --unassigned un.fq`
+    Then the exit code is 0
+    And the file "u.fq" is:
+      """
+      @fwd
+      AAACCCTGTAATCTT
+      +
+      IIIIIIIIIIIIIII
+      @rev
+      AAGATTACAGGGTTT
+      +
+      IIIIIIIIIIIIIII
+      """
+
+  Scenario: an anchor=5p target past a reverse-strand match is pinned at the window edge in that match's orientation
+    Given a file "reads.fq" containing:
+      """
+      @hit1
+      AGAGACGTACCGTGTCC
+      +
+      IIIIIIIIIIIIIIIII
+      @miss1
+      AGAGTCGTACCGTGTCC
+      +
+      IIIIIIIIIIIIIIIII
+      @miss2
+      AGAGTCGTTACGTGTCC
+      +
+      IIIIIIIIIIIIIIIII
+      @hit2
+      AGAGACGTTACGTGTCC
+      +
+      IIIIIIIIIIIIIIIII
+      """
+    # Each read ends in GTCC, the anchor GGAC reverse-complemented, so the 8-base window past it in its own
+    # orientation is [5,13), read toward the read start. These are the reads of the scenario above with GGAC
+    # and CTCT flanks, reverse-complemented, and they split the same way.
+    When I run `unmux reads.fq --threads 1 --group up={u=GGAC} --group up::bothStrands=true,next=bc:0-8 --group bc={a=ACGTACGT} --group bc::dist=0:1:1,anchor=5p --sample s1=bc::a --out %sample.fq --unassigned un.fq`
+    Then the exit code is 0
+    And the file "s1.fq" is:
+      """
+      @hit1
+      AGAGACGTACCGTGTCC
+      +
+      IIIIIIIIIIIIIIIII
+      @hit2
+      AGAGACGTTACGTGTCC
+      +
+      IIIIIIIIIIIIIIIII
+      """
+    And the file "un.fq" is:
+      """
+      @miss1
+      AGAGTCGTACCGTGTCC
+      +
+      IIIIIIIIIIIIIIIII
+      @miss2
+      AGAGTCGTTACGTGTCC
+      +
+      IIIIIIIIIIIIIIIII
+      """
+
   Scenario: prev=GROUP makes an upstream match a prerequisite for searching the downstream group
     Given a file "reads.fq" containing:
       """
