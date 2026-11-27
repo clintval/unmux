@@ -64,7 +64,7 @@ Feature: Input tags on --template records
     Then the exit code is 0
     And stderr contains "--template left out per-base tags from 4000 records that did not copy a read exactly: MM, ML, mv"
 
-  Scenario: a trimming template leaves out PacBio pulse and pileup tags
+  Scenario: a trimming template cuts PacBio's per-base sx and leaves out its run-length sa and pulse tags
     Given a file "in.sam" containing:
       """
       @HD	VN:1.6
@@ -74,21 +74,21 @@ Feature: Input tags on --template records
     Then the exit code is 0
     And the records of "out.sam" are:
       """
-      r1	4	*	0	255	*	*	0	0	GTACGTCG	IIIIIIII	zm:i:42	RG:Z:p
+      r1	4	*	0	255	*	*	0	0	GTACGTCG	IIIIIIII	zm:i:42	sx:B:C,0,1,0,0,0,0,0,0	RG:Z:p
       """
-    And stderr contains "--template left out per-base tags from 1 record that did not copy a read exactly: sa, sx, pc, pq, pg, pm, pd, px, pe, sf, bs, pb"
+    And stderr contains "--template left out per-base tags from 1 record that did not copy a read exactly: sa, pc, pq, pg, pm, pd, px, pe, sf, bs, pb"
 
-  Scenario: PacBio's per-base sm follows a flipped, trimmed read, while its per-pulse pt and Ultima's flow tags are left out
+  Scenario: PacBio's per-base sm and sx follow a flipped, trimmed read, while its per-pulse pt and Ultima's flow tags are left out
     Given a file "in.sam" containing:
       """
       @HD	VN:1.6
-      r1	4	*	0	0	*	*	0	0	ACGTACGTCG	IIIIIIIIII	zm:i:42	sm:B:C,1,2,3,4,5,6,7,8,9,10	pt:Z:---C--A----	tp:B:c,0,1,0,-1,0,0,1,0,0,0	t0:Z:IIIIIIIIII
+      r1	4	*	0	0	*	*	0	0	ACGTACGTCG	IIIIIIIIII	zm:i:42	sm:B:C,1,2,3,4,5,6,7,8,9,10	sx:B:C,0,0,0,1,0,0,0,0,0,2	pt:Z:---C--A----	tp:B:c,0,1,0,-1,0,0,1,0,0,0	t0:Z:IIIIIIIIII
       """
     When I run `unmux in.sam --pool p --extract r=0:2:end --template ~r --out out.sam`
     Then the exit code is 0
     And the records of "out.sam" are:
       """
-      r1	4	*	0	255	*	*	0	0	CGACGTAC	IIIIIIII	zm:i:42	sm:B:C,10,9,8,7,6,5,4,3	RG:Z:p
+      r1	4	*	0	255	*	*	0	0	CGACGTAC	IIIIIIII	zm:i:42	sm:B:C,10,9,8,7,6,5,4,3	sx:B:C,2,0,0,0,0,0,1,0	RG:Z:p
       """
     And stderr contains "--template left out per-base tags from 1 record that did not copy a read exactly: pt, tp, t0"
 
