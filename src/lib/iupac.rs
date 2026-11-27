@@ -106,8 +106,8 @@ pub struct Search {
 /// match both, without an indel when that is enough; a pair whose table of
 /// alignments would hold more than `TABLE_CELLS` cells is taken to collide
 /// through an indel instead.
-/// A collision with zero errors always fails, and points at `bothStrands`
-/// when only opposite strands match.
+/// A collision with zero errors always fails, before any other refusal, and
+/// points at `bothStrands` when only opposite strands match.
 /// One that needs no indel fails under `mode=all`, written or not, which would
 /// assign such reads by tie-break; one that needs an indel fails only when no
 /// mode is written, asking for one. The rest are warnings: the first pairs are
@@ -223,6 +223,9 @@ pub fn validate_group(name: &str, seqs: &[Vec<u8>], search: &Search) -> Result<V
                 "group `{name}`: tags `{a_s}` and `{b_s}` {verb} both match one read within dist={budget} {witness}"
             );
             if !nearest && !needs_indel {
+                if let Some((i, j, found)) = first_exact(&tags, &flipped, &exact_only, shape) {
+                    bail!("{}", indistinguishable(name, &seqs[i], &seqs[j], &found));
+                }
                 bail!("{overlap}; with mode=all this silently mis-assigns reads: separate the tags, lower dist, or use mode=nearest, which only warns and lists the colliding pairs");
             }
             colliding += 1;
@@ -268,6 +271,24 @@ pub fn validate_group(name: &str, seqs: &[Vec<u8>], search: &Search) -> Result<V
     }
 
     Ok(warnings)
+}
+
+/// The first two tags, by index, that one read matches with zero errors, on
+/// one strand when they can be.
+fn first_exact(
+    tags: &[Tag],
+    flipped: &[Tag],
+    exact_only: &Search,
+    shape: Shape,
+) -> Option<(usize, usize, Overlap)> {
+    (0..tags.len()).find_map(|i| {
+        (i + 1..tags.len()).find_map(|j| {
+            let strands = exact_only.both_strands.then(|| (&flipped[i], &flipped[j]));
+            let found = collision(&tags[i], &tags[j], None, exact_only, shape)
+                .or_else(|| collision(&tags[i], &tags[j], strands, exact_only, shape))?;
+            Some((i, j, found))
+        })
+    })
 }
 
 /// The refusal for two tags that one read matches with zero errors, which
