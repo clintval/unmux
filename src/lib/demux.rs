@@ -504,7 +504,10 @@ fn compile_groups(
     Ok((ordered, group_index))
 }
 
-/// A warning when tags slide within an edit budget over a fixed window wider than the longest one.
+/// The estimated share of reads with a barcode error past which shifted tags are warned about.
+const WIDE_WINDOW_SHARE: f64 = 0.003;
+
+/// A warning when, often enough to matter, another tag can match reads at a shifted position.
 fn wide_window_warning(
     index: usize,
     groups: &[CompiledGroup],
@@ -512,57 +515,147 @@ fn wide_window_warning(
     routing: &Routing,
 ) -> Option<String> {
     let group = &groups[index];
-    let edits = group.dist.total > 0 && group.dist.mismatch + group.dist.indel > 0;
-    let indels = group.dist.indel > 0;
-    // With indels allowed, narrowing cuts off barcodes with indels, so mode=nearest is the advice.
-    let advice_followed = indels && group.mode == MatchMode::Nearest;
-    if !edits
-        || advice_followed
-        || group.tags.len() < 2
-        || group.anchor.is_some()
-        || group.read_group.is_some()
+    let dist = group.dist;
+    let edits = dist.total > 0 && dist.mismatch + dist.indel > 0;
+    if !edits || group.anchor.is_some() || group.read_group.is_some() {
+        return None;
+    }
+    let (width, window) = search_width(group, plan)?;
+    let mut lengths = std::collections::BTreeMap::new();
+    for tag in group.tags.iter().filter(|tag| !tag.is_empty()) {
+        *lengths.entry(tag.len()).or_insert(0usize) += 1;
+    }
+    let (&shortest, &longest) = (lengths.keys().next()?, lengths.keys().next_back()?);
+    let wider = width.checked_sub(shortest).filter(|&wider| wider > 0)?;
+    let share = shifted_share(&lengths, width, &dist, group.revcomp);
+    let nearest = group.mode == MatchMode::Nearest;
+    let best = longest + 2 * dist.indel;
+    if share <= WIDE_WINDOW_SHARE
+        || (nearest && dist.indel > 0 && width <= best)
+        || (!nearest && only_removed(index, groups, plan, routing))
     {
         return None;
     }
+    let narrow = if width > longest {
+        Some(format!("narrow {window} to {longest} bp"))
+    } else if group.match_streams.is_none() {
+        Some("pin the tags with anchor=5p".to_string())
+    } else {
+        None
+    };
+    let advice = match (nearest, dist.indel > 0, narrow) {
+        (false, false, Some(narrow)) => {
+            format!("use mode=nearest, or {narrow}, losing reads whose barcode an indel upstream shifts")
+        }
+        (false, true, _) if width > best => format!(
+            "use mode=nearest with {window} narrowed to {best} bp, which measured best with an indel budget"
+        ),
+        (false, _, _) => "use mode=nearest".to_string(),
+        (true, true, _) => {
+            format!("narrow {window} to {best} bp, which measured best with an indel budget")
+        }
+        (true, false, Some(narrow)) => format!("{narrow} if no indel upstream shifts the barcode"),
+        (true, false, None) => return None,
+    };
+    let tags = if shortest == longest {
+        "the tags"
+    } else {
+        "the shortest tag"
+    };
+    let outcome = if nearest {
+        "mode=nearest leaves those reads unmatched"
+    } else {
+        "the leftmost match wins"
+    };
+    Some(format!(
+        "group `{}`: the {window} window is {wider} bp wider than {tags}, so for an estimated {:.1}% of reads with an error in the barcode another tag matches at a shifted position as closely as the true tag, and {outcome}; {advice}",
+        group.name,
+        100.0 * share
+    ))
+}
+
+/// The width a group's tags slide over when it is the same for every record, and its name.
+fn search_width(group: &CompiledGroup, plan: &DemuxPlan) -> Option<(usize, String)> {
     let relative = group
         .prereq
         .as_ref()
         .and_then(|prereq| prereq.window.as_ref());
-    let (width, window) = match (relative, &group.loc) {
-        (Some(relative), _) => (
-            relative.hi.saturating_sub(relative.lo),
-            format!("next={}:{}-{}", group.name, relative.lo, relative.hi),
-        ),
-        (None, Some(loc)) => {
-            let width = match (loc.start, loc.end.unwrap_or(Endpoint::ReadEnd)) {
-                (Endpoint::FromStart(start), Endpoint::FromStart(end)) => end.saturating_sub(start),
-                (Endpoint::FromEnd(start), Endpoint::FromEnd(end)) => start.saturating_sub(end),
-                (Endpoint::FromEnd(start), Endpoint::ReadEnd) => start,
-                // A window whose width varies with the record has no fixed slack to warn about.
-                _ => return None,
-            };
-            (width, "loc".to_string())
-        }
-        (None, None) => return None,
-    };
-    let longest = group.tags.iter().map(Vec::len).max()?;
-    let wider = width.checked_sub(longest).filter(|&wider| wider > 0)?;
-    if only_removed(index, groups, plan, routing) {
-        return None;
+    if let Some(relative) = relative {
+        let name = format!("next={}:{}-{}", group.name, relative.lo, relative.hi);
+        return Some((relative.hi.saturating_sub(relative.lo), name));
     }
-    let narrow = format!("narrow {window} to {longest} bp");
-    let (outcome, advice) = match (group.mode, indels) {
-        (MatchMode::All, false) => (
-            "the leftmost match wins",
-            format!("{narrow} or use mode=nearest"),
-        ),
-        (MatchMode::All, true) => ("the leftmost match wins", "use mode=nearest".to_string()),
-        (MatchMode::Nearest, _) => ("be left unassigned", narrow),
+    if let Some(loc) = &group.loc {
+        let width = fixed_width(loc.start, loc.end.unwrap_or(Endpoint::ReadEnd))?;
+        return Some((width, "loc".to_string()));
+    }
+    let streams = group.match_streams.as_ref()?;
+    let mut width = 0;
+    for stream in streams {
+        let extract = plan
+            .extracts
+            .iter()
+            .find(|extract| &extract.name == stream)?;
+        width += match &extract.span.body {
+            SpanBody::File { start, end, .. } => fixed_width(*start, *end)?,
+            SpanBody::AnchorOffset {
+                len: crate::grammar::AnchorLen::Bases(len),
+                ..
+            } => *len,
+            _ => return None,
+        };
+    }
+    Some((width, format!("match={}", streams.join("+"))))
+}
+
+/// The width from `start` to `end` when it is the same for every record long enough to hold it.
+fn fixed_width(start: Endpoint, end: Endpoint) -> Option<usize> {
+    match (start, end) {
+        (Endpoint::FromStart(start), Endpoint::FromStart(end)) => Some(end.saturating_sub(start)),
+        (Endpoint::FromEnd(start), Endpoint::FromEnd(end)) => Some(start.saturating_sub(end)),
+        (Endpoint::FromEnd(start), Endpoint::ReadEnd) => Some(start),
+        _ => None,
+    }
+}
+
+/// The estimated share of reads with one barcode error that a shifted tag matches as closely.
+fn shifted_share(
+    lengths: &std::collections::BTreeMap<usize, usize>,
+    width: usize,
+    dist: &crate::grammar::Dist,
+    both_strands: bool,
+) -> f64 {
+    // A tag's chance of matching random bases as is or by one substitution, insertion or deletion.
+    let chance = |len: usize| {
+        let bases = len as f64;
+        let subs = if dist.mismatch > 0 { 3.0 * bases } else { 0.0 };
+        let indels = if dist.indel > 0 {
+            4.0 * bases + 2.0
+        } else {
+            0.0
+        };
+        (1.0 + subs + indels) / 4f64.powf(bases)
     };
-    Some(format!(
-        "group `{}`: the {window} window is {wider} bp wider than the longest tag, so a read can match another tag at a shifted position as closely as its true tag within dist and {outcome}; {advice}",
-        group.name
-    ))
+    let claims = |own: usize| -> f64 {
+        lengths
+            .iter()
+            .map(|(&len, &count)| {
+                // A tag no longer than the barcode reaches past it only from a shifted start.
+                let (others, starts) = if len <= own {
+                    (count - usize::from(len == own), width - own)
+                } else {
+                    (count, (width + 1).saturating_sub(len))
+                };
+                (others * starts) as f64 * chance(len)
+            })
+            .sum()
+    };
+    let worst = lengths
+        .keys()
+        .filter(|&&own| own <= width)
+        .map(|&own| claims(own))
+        .fold(0.0, f64::max);
+    let strands = if both_strands { 2.0 } else { 1.0 };
+    1.0 - (-strands * worst).exp()
 }
 
 /// Whether whole-group `--remove` rules alone read a group's match, which any of its tags satisfies.
