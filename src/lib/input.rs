@@ -2640,6 +2640,18 @@ mod tests {
     }
 
     #[test]
+    fn test_read_nameless_fastx_records_as_single_end() {
+        for text in [
+            "@\nACGT\n+\nIIII\n@\nCCGG\n+\nIIII\n",
+            "> xa:A:Q\nACGT\n> xa:A:R\nCCGG\n",
+        ] {
+            let fragments = read_all(&temp_with(text.as_bytes()));
+            let sizes: Vec<usize> = fragments.iter().map(|f| f.records.len()).collect();
+            assert_eq!(sizes, [1, 1], "{text:?}");
+        }
+    }
+
+    #[test]
     fn test_read_fasta_keeps_a_name_after_a_space_unless_it_is_shaped_like_a_tag() {
         for (definition, name, tags) in [
             ("> read1 desc", "read1", ""),

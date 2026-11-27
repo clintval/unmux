@@ -139,6 +139,42 @@ Feature: Lifting SAM tags from FASTX read-name comments
       *	4	*	0	255	*	*	0	0	ACGT	*	xa:A:Q	ML:B:C,1,2	RG:Z:mid
       """
 
+  Scenario: two nameless records read back from FASTA as single-end records, not a pair
+    Given a file "in.sam" containing:
+      """
+      @HD	VN:1.6
+      *	4	*	0	0	*	*	0	0	ACGT	IIII	xa:A:Q
+      *	4	*	0	0	*	*	0	0	CCGG	IIII	xa:A:R
+      """
+    When I run `unmux in.sam --out two.fa`
+    Then the exit code is 0
+    When I run `unmux two.fa --out back.sam`
+    Then the exit code is 0
+    And the records of "back.sam" are:
+      """
+      *	4	*	0	255	*	*	0	0	ACGT	*	xa:A:Q	RG:Z:two
+      *	4	*	0	255	*	*	0	0	CCGG	*	xa:A:R	RG:Z:two
+      """
+
+  Scenario: three nameless records read back from FASTA as single-end records
+    Given a file "in.sam" containing:
+      """
+      @HD	VN:1.6
+      *	4	*	0	0	*	*	0	0	ACGT	IIII	xa:A:Q
+      *	4	*	0	0	*	*	0	0	CCGG	IIII	xa:A:R
+      *	4	*	0	0	*	*	0	0	TTAA	IIII	xa:A:S
+      """
+    When I run `unmux in.sam --out three.fa`
+    Then the exit code is 0
+    When I run `unmux three.fa --out back.sam`
+    Then the exit code is 0
+    And the records of "back.sam" are:
+      """
+      *	4	*	0	255	*	*	0	0	ACGT	*	xa:A:Q	RG:Z:three
+      *	4	*	0	255	*	*	0	0	CCGG	*	xa:A:R	RG:Z:three
+      *	4	*	0	255	*	*	0	0	TTAA	*	xa:A:S	RG:Z:three
+      """
+
   Scenario: a FASTA name after a space is kept unless it is shaped like a tag
     Given a file "in.fa" containing:
       """
