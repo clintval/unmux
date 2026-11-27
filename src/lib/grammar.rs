@@ -390,6 +390,8 @@ pub struct TagBinding {
     /// multi-stream tag that emits a quality tag (defaults to a single space);
     /// `None` otherwise.
     pub qual_sep: Option<String>,
+    /// Whether `qual-sep=` was set rather than left to its default.
+    pub qual_sep_set: bool,
     /// `raw=true`: emit the observed (as-sequenced) bases for this tag rather
     /// than the corrected form. Default `false`: a tag emits the
     /// error-corrected barcode when its stream came from a matched keeplist
@@ -1578,6 +1580,7 @@ fn finish_tag(builder: TagBuilder) -> Result<TagBinding> {
     } else {
         builder.sep
     };
+    let qual_sep_set = builder.qual_sep.is_some();
     let qual_sep = if streams.len() >= 2 && emits_qual {
         Some(builder.qual_sep.unwrap_or_else(|| " ".to_string()))
     } else {
@@ -1590,6 +1593,7 @@ fn finish_tag(builder: TagBuilder) -> Result<TagBinding> {
         qual,
         sep,
         qual_sep,
+        qual_sep_set,
         raw: builder.raw.unwrap_or(false),
     })
 }
@@ -2563,6 +2567,20 @@ fn plan_warnings(plan: &DemuxPlan) -> Vec<String> {
                  quality tag `{qual}` is left out; set `{tag}::qual=none` to silence this.",
                 tag = tag.tag
             ));
+        }
+    }
+    let default_cy = |name: &str| {
+        plan.tags
+            .iter()
+            .find(|tag| tag.tag == name && tag.qual == QualTag::Default)
+    };
+    if let (Some(cb), Some(_)) = (default_cy("CB"), default_cy("CR")) {
+        if cb.qual_sep_set && cb.streams.len() >= 2 {
+            warnings.push(
+                "tag `CB` sets `qual-sep`, which applies only to records where `CR` writes no \
+                 `CY`, since `CY` holds the `CR` qualities on the others"
+                    .to_string(),
+            );
         }
     }
 

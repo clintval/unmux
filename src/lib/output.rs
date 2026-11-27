@@ -888,6 +888,7 @@ mod tests {
             qual,
             sep: sep.map(str::to_string),
             qual_sep: sep.map(|_| " ".to_string()),
+            qual_sep_set: false,
             raw: false,
         }
     }
