@@ -460,13 +460,13 @@ const CELLS: &str = "--group b1={in}/bc.tsv --group b1::loc=0:0:13 --group b1::d
     --unassigned un.fq {METRICS}"
 )]
 #[case::gzip_members_to_bam(
-    "780e7c43337676fbb2d2ad75407ba5ed",
+    "93295da0dc4af0dea6df9093f8414be1",
     "{in}/r1.members.fq.gz {in}/r2.fq \
     {BC} {CUT} --template a b --tag BC=s --tag RX=umi --sample-from-group bc --out %sample.bam \
     {BINS} {METRICS}"
 )]
 #[case::mixed_gzip_to_one_bam(
-    "b80e2d0ce792212a4ffd039ffab3a874",
+    "624b8b89926fa48501d34acc623ac393",
     "{in}/r1.mixed.fq.gz \
     {in}/r2.bgzf.fq.gz {BC} {CUT} --template ~b a+s --tag BC=~s --tag OX=umi+s \
     --sample-from-group bc --out all.bam --unassigned un.bam"
@@ -478,7 +478,7 @@ const CELLS: &str = "--group b1={in}/bc.tsv --group b1::loc=0:0:13 --group b1::d
     --sample-from-group bc --out %sample.R%ordinal.fa.gz --unassigned un.R%source.fa {METRICS}"
 )]
 #[case::interleaved_to_sam(
-    "f0433e2dbea8bda1f3a96cfcde1385ad",
+    "222e06281ae410af5e271b0cc22dd062",
     "{in}/inter.fq {BC} \
     --extract a=0:8:end --extract b=1:0:end --template a b --sample-from-group bc \
     --out %sample.sam --unassigned un.sam --qc-tag"
@@ -508,7 +508,7 @@ const CELLS: &str = "--group b1={in}/bc.tsv --group b1::loc=0:0:13 --group b1::d
     --tag xc=c+x --sample-sheet {in}/sheet.tsv --out %sample.cram --rg-tag PL=ILLUMINA {METRICS}"
 )]
 #[case::cells_to_bam(
-    "3020ca779bbbaa1f51543f7b1f30f896",
+    "d1c03d2ec28be5a03f34e1f0371bfdcd",
     "{in}/sc1.fq {in}/sc2.fq {CELLS} \
     --group b1::minFindsPerGroup=1 --template cdna --tag CB=c1+c2 --tag CR=c1+c2 \
     --tag CR::raw=true --tag RX=umi --tag xg=gap --tag xn=name --out out.bam --unassigned un.bam \
@@ -530,14 +530,14 @@ const CELLS: &str = "--group b1={in}/bc.tsv --group b1::loc=0:0:13 --group b1::d
     {METRICS}"
 )]
 #[case::anywhere_with_indels(
-    "25cee929a2301ce5f9eaeab14b9b21d4",
+    "b935414b7cc2b0a4b1a01471b39e2623",
     "{in}/any.fq \
     --group bc={in}/bc.tsv --group bc::dist=1:1:2 --group bc::mode=nearest --group bc::delta=1 \
     --extract s=@bc --extract r=@bc+0:end --template r --tag CB=s --tag CR=s --tag CR::raw=true \
     --sample-from-group bc --out %sample.bam --unassigned un.bam --qc-tag {METRICS}"
 )]
 #[case::anywhere_on_both_strands_with_indels(
-    "3290bf76cfbc0afe3ef371b7e3ab5ccc",
+    "bf5d926a160e61783f6dbda18436be63",
     "{in}/any.fq \
     --group bc={in}/bc.tsv --group bc::dist=1:1:1 --group bc::bothStrands=true \
     --group bc::mode=nearest \
@@ -545,7 +545,7 @@ const CELLS: &str = "--group b1={in}/bc.tsv --group b1::loc=0:0:13 --group b1::d
     --sample-from-group bc --out %sample.bam --unassigned un.bam --qc-tag {METRICS}"
 )]
 #[case::anywhere_on_both_strands_with_indels_apart(
-    "187e0d973d99cc6865a78abc2b33019b",
+    "b33e26e12be76b5f7a3fe6420ea9d3cf",
     "{in}/any.fq \
     --group bc={a=AACCGGTT,b=ACGTACGT,c=AGTCAGTC,d=ATATCGCG,e=CAGTTGAC,f=CCAATTGG,g=GGTTAACC,h=TACGCATG,i=TTGGCCAA} \
     --group bc::dist=0:1 --group bc::bothStrands=true --group bc::maxFindsPerTag=1 \
@@ -559,14 +559,14 @@ const CELLS: &str = "--group b1={in}/bc.tsv --group b1::loc=0:0:13 --group b1::d
     --sample-from-group bc --out %sample.fq --unassigned un.fq {METRICS}"
 )]
 #[case::few_tags_anywhere(
-    "bb0e282c22013fc791e998307987fce3",
+    "37a715883cb0433ff7b76f2fb0edfeae",
     "{in}/any.fq \
     --group x={a=AACCGGTT,b=ACGTNCGT,c=TTGGCCAAG} --group x::dist=2 --group x::bothStrands=true \
     --group x::mode=nearest --extract r=0:0:end --extract s=@x --template r --tag CB=s \
     --sample-from-group x --out %sample.sam --unassigned un.sam --qc-tag {METRICS}"
 )]
 #[case::partial_ends(
-    "f741a1e4f72f26ee8ddcd3821cf7168d",
+    "1b1297829ced425558ce06aaf44164ea",
     "{in}/any.fq --group bc={in}/bc.tsv \
     --group bc::dist=1 --group bc::partial5=5 --group bc::partial3=5:0.2 \
     --group bc::bothStrands=true --group bc::mode=nearest --extract s=@bc --extract r=0:0:end \
@@ -595,19 +595,19 @@ const CELLS: &str = "--group b1={in}/bc.tsv --group b1::loc=0:0:13 --group b1::d
     --unassigned un.fa {METRICS}"
 )]
 #[case::sam_to_bam(
-    "2666949efb0b1fd030b104814a71db91",
+    "34e48fefa48da8dedce930f5dc273d52",
     "{in}/flat.sam {BC} --extract a=0:8:end \
     --extract s=@bc --template a --tag CB=s --sample-from-group bc --out %sample.bam \
     --unassigned un.bam {METRICS}"
 )]
 #[case::bam_tagged_whole(
-    "b849f8ae89ae3681b57954e7a96b663e",
+    "001fba68e1eea1954fc2cf7815dde6fc",
     "{in}/flat.bam {BC} --extract s=@bc \
     --tag CB=s --tag CB::qual=none --tag xc=c --extract c=@bc::cell --out out.bam --qc-tag \
     {METRICS}"
 )]
 #[case::paired_bam_to_bam(
-    "6b73a2c3e3da3c0b52edee8291ce13cd",
+    "1cf50f172fcf437f49f43edb1f82b405",
     "{in}/pairs.bam {BC} \
     --extract a=0:8:end --extract b=1:0:end --extract s=@bc --template a b --tag BC=s \
     --sample-from-group bc --out %sample.bam --unassigned un.bam {METRICS}"
@@ -618,13 +618,13 @@ const CELLS: &str = "--group b1={in}/bc.tsv --group b1::loc=0:0:13 --group b1::d
     --out out.R%ordinal.fq.gz"
 )]
 #[case::cram_to_bam(
-    "ad72804ef25e959e48b251adcc2d7e3d",
+    "9cacebfa1c105e8cb63cd034ca9ca3cc",
     "{in}/flat.cram {BC} --extract a=0:8:end \
     --extract s=@bc --template a --tag CB=s --sample-from-group bc --out %sample.bam \
     --unassigned un.fq.gz {METRICS}"
 )]
 #[case::bam_split_by_read_group(
-    "bd17f030bf4b970b51e0a156ed02c4b4",
+    "c58f0daafb88466f600065616b3e377f",
     "{in}/flat.bam \
     --group rg=@RG::SM::LB --sample-from-group rg --out %sample.%sub_sample.bam \
     --unassigned un.sam {METRICS}"
@@ -641,7 +641,7 @@ const CELLS: &str = "--group b1={in}/bc.tsv --group b1::loc=0:0:13 --group b1::d
     {METRICS}"
 )]
 #[case::passed_through_to_bam(
-    "4e48279913ee9fbdd3648910daf84cd7",
+    "016a57d1c165664c855830093855e9cb",
     "{in}/r1.fq {in}/r2.fq \
     --out out.bam --metrics-summary sum.tsv"
 )]
@@ -651,14 +651,14 @@ const CELLS: &str = "--group b1={in}/bc.tsv --group b1::loc=0:0:13 --group b1::d
     --out out.cram"
 )]
 #[case::passed_through_to_stdout("eb929ab538ffe4b6035b5ca7435f1242", "{in}/r1.fq.gz")]
-#[case::blend_to_stdout("9120be8eda0ae6fedab5acad0c483646", "{in}/r1.fq {in}/mates.bam")]
+#[case::blend_to_stdout("6ffa65ea4bd2653e6f132993e72a2838", "{in}/r1.fq {in}/mates.bam")]
 #[case::stored_blocks(
-    "542e9365400e385460294996d50cdb4c",
+    "66f3fa36956864018dd415e585897fe5",
     "{in}/r1.fq {BC} \
     --sample-from-group bc --out %sample.fq.gz --unassigned un.bam --compression 0"
 )]
 #[case::best_compression(
-    "dff767578c94c0b10a686e409013efba",
+    "7bb01e9a7b5f430c4c436ec064e73acd",
     "{in}/r1.fq {BC} \
     --sample-from-group bc --out %sample.bam --unassigned un.fq.gz --compression 9"
 )]
@@ -669,7 +669,7 @@ const CELLS: &str = "--group b1={in}/bc.tsv --group b1::loc=0:0:13 --group b1::d
     --out %sample.fq.gz {BINS} {METRICS}"
 )]
 #[case::many_batches_to_bam(
-    "9afa6ea077aa82e26c2d8646f0d7ca19",
+    "dd6b21d311d07f4bd028344fb98b8f76",
     "{in}/big.bgzf.fq.gz {BC} \
     --extract s=@bc --tag BC=s --sample-from-group bc --out all.bam --unassigned un.fq.gz \
     {METRICS}"

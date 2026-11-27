@@ -21,7 +21,7 @@ Feature: Input tags on --template records
     Then the exit code is 0
     And the records of "out.sam" are:
       """
-      r1	4	*	0	255	*	*	0	0	ACGTACGTCG	IIIIIIIIII	MM:Z:C+m?,0,0;	ML:B:C,200,10	qs:f:20	ch:i:7	np:i:12	rq:f:0.999	zm:i:42	RG:Z:p
+      r1	4	*	0	0	*	*	0	0	ACGTACGTCG	IIIIIIIIII	MM:Z:C+m?,0,0;	ML:B:C,200,10	qs:f:20	ch:i:7	np:i:12	rq:f:0.999	zm:i:42	RG:Z:p
       """
     And stderr does not contain "per-base tags"
 
@@ -43,9 +43,9 @@ Feature: Input tags on --template records
     Then the exit code is 0
     And the records of "out.sam" are:
       """
-      r1	4	*	0	255	*	*	0	0	GTACGTCG	IIIIIIII	qs:f:20	ch:i:7	st:Z:2023-06-22T07:17:48.308+00:00	sm:f:96.5	pt:i:23	RG:Z:p
-      r2	4	*	0	255	*	*	0	0	GCATGCAA	IIIIIIII	np:i:12	rq:f:0.999	zm:i:42	ip:B:C,3,4,5,6,7,8,9,10	RG:Z:p
-      r3	4	*	0	255	*	*	0	0	ATCCATGG	IIIIIIII	OQ:Z:CDEFGHIJ	RX:Z:GGGG	QX:Z:FFFF	RG:Z:p
+      r1	4	*	0	0	*	*	0	0	GTACGTCG	IIIIIIII	qs:f:20	ch:i:7	st:Z:2023-06-22T07:17:48.308+00:00	sm:f:96.5	pt:i:23	RG:Z:p
+      r2	4	*	0	0	*	*	0	0	GCATGCAA	IIIIIIII	np:i:12	rq:f:0.999	zm:i:42	ip:B:C,3,4,5,6,7,8,9,10	RG:Z:p
+      r3	4	*	0	0	*	*	0	0	ATCCATGG	IIIIIIII	OQ:Z:CDEFGHIJ	RX:Z:GGGG	QX:Z:FFFF	RG:Z:p
       """
     And stderr contains "--template left out per-base tags from 2 records that did not copy a read exactly: MM, ML, MN, fi, mv"
     And stderr contains "--template left out per-base tags from" exactly once
@@ -74,7 +74,7 @@ Feature: Input tags on --template records
     Then the exit code is 0
     And the records of "out.sam" are:
       """
-      r1	4	*	0	255	*	*	0	0	GTACGTCG	IIIIIIII	zm:i:42	sx:B:C,0,1,0,0,0,0,0,0	RG:Z:p
+      r1	4	*	0	0	*	*	0	0	GTACGTCG	IIIIIIII	zm:i:42	sx:B:C,0,1,0,0,0,0,0,0	RG:Z:p
       """
     And stderr contains "--template left out per-base tags from 1 record that did not copy a read exactly: sa, pc, pq, pg, pm, pd, px, pe, sf, bs, pb"
 
@@ -88,7 +88,7 @@ Feature: Input tags on --template records
     Then the exit code is 0
     And the records of "out.sam" are:
       """
-      r1	4	*	0	255	*	*	0	0	CGACGTAC	IIIIIIII	zm:i:42	sm:B:C,10,9,8,7,6,5,4,3	sx:B:C,2,0,0,0,0,0,1,0	RG:Z:p
+      r1	4	*	0	0	*	*	0	0	CGACGTAC	IIIIIIII	zm:i:42	sm:B:C,10,9,8,7,6,5,4,3	sx:B:C,2,0,0,0,0,0,1,0	RG:Z:p
       """
     And stderr contains "--template left out per-base tags from 1 record that did not copy a read exactly: pt, tp, t0"
 
@@ -129,7 +129,7 @@ Feature: Input tags on --template records
     Then the exit code is 0
     And the records of "out.sam" are:
       """
-      r1	4	*	0	255	*	*	0	0	GTACGT	IIIIII	ch:i:7	OQ:Z:CDEFGH	ip:B:C,30,40,50,60,70,80	RG:Z:p
+      r1	4	*	0	0	*	*	0	0	GTACGT	IIIIII	ch:i:7	OQ:Z:CDEFGH	ip:B:C,30,40,50,60,70,80	RG:Z:p
       """
     And stderr does not contain "per-base tags"
 
@@ -143,7 +143,7 @@ Feature: Input tags on --template records
     Then the exit code is 0
     And the records of "out.sam" are:
       """
-      r1	4	*	0	255	*	*	0	0	ACGGGTTT	HGFEDCBA	ch:i:7	OQ:Z:hgfedcba	E2:Z:CTTAACGG	cd:B:s,8,7,6,5,4,3,2,1	RG:Z:p
+      r1	4	*	0	0	*	*	0	0	ACGGGTTT	HGFEDCBA	ch:i:7	OQ:Z:hgfedcba	E2:Z:CTTAACGG	cd:B:s,8,7,6,5,4,3,2,1	RG:Z:p
       """
     And stderr contains "--template left out per-base tags from 1 record that did not copy a read exactly: MM, ML"
 
@@ -157,7 +157,7 @@ Feature: Input tags on --template records
     Then the exit code is 0
     And the records of "out.sam" are:
       """
-      r1	4	*	0	255	*	*	0	0	GTACGT	IIIIII	ch:i:7	RG:Z:p
+      r1	4	*	0	0	*	*	0	0	GTACGT	IIIIII	ch:i:7	RG:Z:p
       """
     And stderr contains "--template left out per-base tags from 1 record that did not copy a read exactly: OQ, ip; OQ, ip did not match the read's length"
 
@@ -173,8 +173,8 @@ Feature: Input tags on --template records
     Then the exit code is 0
     And the records of "out.sam" are:
       """
-      f	4	*	0	255	*	*	0	0	GTACGTCG	CDEFGHIJ	OQ:Z:cdefghij	RG:Z:p
-      r	4	*	0	255	*	*	0	0	GTACGTCG	CDEFGHIJ	OQ:Z:cdefghij	RG:Z:p
+      f	4	*	0	0	*	*	0	0	GTACGTCG	CDEFGHIJ	OQ:Z:cdefghij	RG:Z:p
+      r	4	*	0	0	*	*	0	0	GTACGTCG	CDEFGHIJ	OQ:Z:cdefghij	RG:Z:p
       """
     And stderr contains "--template left out per-base tags from 2 records that did not copy a read exactly: MM, ML"
 
@@ -189,8 +189,8 @@ Feature: Input tags on --template records
     Then the exit code is 0
     And the records of "out.sam" are:
       """
-      r1	4	*	0	255	*	*	0	0	CGACGTACG	IIIIIIIII	zm:i:42	ac:B:i,1,0,1,0	bc:B:S,3,3	bq:i:100	bt:Z:ACGTACGT	RG:Z:p
-      r2	4	*	0	255	*	*	0	0	CCGTT	IIIII	ac:Z:CCGTT	bc:Z:TCGTT	aq:Z:FEDCB	bq:Z:fedcb	ad:B:s,6,5,4,3,2	cu:B:s,3,0,2,0,1	bt:B:s,1,2,3,4,5	RG:Z:p
+      r1	4	*	0	0	*	*	0	0	CGACGTACG	IIIIIIIII	zm:i:42	ac:B:i,1,0,1,0	bc:B:S,3,3	bq:i:100	bt:Z:ACGTACGT	RG:Z:p
+      r2	4	*	0	0	*	*	0	0	CCGTT	IIIII	ac:Z:CCGTT	bc:Z:TCGTT	aq:Z:FEDCB	bq:Z:fedcb	ad:B:s,6,5,4,3,2	cu:B:s,3,0,2,0,1	bt:B:s,1,2,3,4,5	RG:Z:p
       """
     And stderr does not contain "per-base tags"
 
@@ -206,7 +206,7 @@ Feature: Input tags on --template records
     Then the exit code is 0
     And the records of "out.sam" are:
       """
-      r1	4	*	0	255	*	*	0	0	<bases>	<quals>	ch:i:7	OQ:Z:<oq>	RG:Z:p
+      r1	4	*	0	0	*	*	0	0	<bases>	<quals>	ch:i:7	OQ:Z:<oq>	RG:Z:p
       """
     And stderr contains "--template left out per-base tags from 1 record that did not copy a read exactly: MM, ML"
 
@@ -227,7 +227,7 @@ Feature: Input tags on --template records
     Then the exit code is 0
     And the records of "out.sam" are:
       """
-      r1	4	*	0	255	*	*	0	0	ACGTTCCCGGGAACGT	IIIIIIIIIIIIIIII	ch:i:7	OQ:Z:dcbaefghijklmnop	RG:Z:p
+      r1	4	*	0	0	*	*	0	0	ACGTTCCCGGGAACGT	IIIIIIIIIIIIIIII	ch:i:7	OQ:Z:dcbaefghijklmnop	RG:Z:p
       """
     And stderr contains "--template left out per-base tags from 1 record that did not copy a read exactly: MM, ML"
 
@@ -241,7 +241,7 @@ Feature: Input tags on --template records
     Then the exit code is 0
     And the records of "out.sam" are:
       """
-      r1	4	*	0	255	*	*	0	0	<bases>	IIII	<tags>	RG:Z:p
+      r1	4	*	0	0	*	*	0	0	<bases>	IIII	<tags>	RG:Z:p
       """
 
     # ACGT is its own reverse complement, so only its orientation tells ~r apart from r.
@@ -261,7 +261,7 @@ Feature: Input tags on --template records
     Then the exit code is 0
     And the records of "out.sam" are:
       """
-      r1	4	*	0	255	*	*	0	0	ACGACGACGACG	IIIIIIIIIIII	ch:i:7	OQ:Z:DEFGHIJKLABC	RG:Z:p
+      r1	4	*	0	0	*	*	0	0	ACGACGACGACG	IIIIIIIIIIII	ch:i:7	OQ:Z:DEFGHIJKLABC	RG:Z:p
       """
     And stderr contains "--template left out per-base tags from 1 record that did not copy a read exactly: MM, ML"
 
@@ -275,7 +275,7 @@ Feature: Input tags on --template records
     Then the exit code is 0
     And the records of "out.sam" are:
       """
-      r1	4	*	0	255	*	*	0	0	ACGTACGT	IIIIIIII	<tags>	RG:Z:p
+      r1	4	*	0	0	*	*	0	0	ACGTACGT	IIIIIIII	<tags>	RG:Z:p
       """
 
     Examples:
@@ -294,8 +294,8 @@ Feature: Input tags on --template records
     Then the exit code is 0
     And the records of "out.sam" are:
       """
-      q1	77	*	0	255	*	*	0	0	AAAACCCC	IIIIIIII	RX:Z:GG-TT	ZA:Z:one	OQ:Z:ABCDEFGH	RG:Z:p
-      q1	141	*	0	255	*	*	0	0	GGTTTT	JJJJJJ	RX:Z:GG-TT	ZA:Z:two	OQ:Z:FEDCBA	RG:Z:p
+      q1	77	*	0	0	*	*	0	0	AAAACCCC	IIIIIIII	RX:Z:GG-TT	ZA:Z:one	OQ:Z:ABCDEFGH	RG:Z:p
+      q1	141	*	0	0	*	*	0	0	GGTTTT	JJJJJJ	RX:Z:GG-TT	ZA:Z:two	OQ:Z:FEDCBA	RG:Z:p
       """
     And stderr does not contain "per-base tags"
 
@@ -310,7 +310,7 @@ Feature: Input tags on --template records
     Then the exit code is 0
     And the records of "out.sam" are:
       """
-      q1	4	*	0	255	*	*	0	0	GGGGAAAA	JJJJIIII	RX:Z:GG-TT	ZA:Z:two	RG:Z:p
+      q1	4	*	0	0	*	*	0	0	GGGGAAAA	JJJJIIII	RX:Z:GG-TT	ZA:Z:two	RG:Z:p
       """
     And stderr contains "--template left out per-base tags from 1 record that did not copy a read exactly: OQ"
 
@@ -325,7 +325,7 @@ Feature: Input tags on --template records
     Then the exit code is 0
     And the records of "out.sam" are:
       """
-      q1	4	*	0	255	*	*	0	0	<bases>	<tags>	RG:Z:p
+      q1	4	*	0	0	*	*	0	0	<bases>	<tags>	RG:Z:p
       """
     And stderr does not contain "per-base tags"
 
@@ -345,8 +345,8 @@ Feature: Input tags on --template records
     Then the exit code is 0
     And the records of "out.sam" are:
       """
-      q1	77	*	0	255	*	*	0	0	AAAACCCC	IIIIIIII	ZA:Z:one	RG:Z:p
-      q1	141	*	0	255	*	*	0	0	*	*	ZA:Z:two	RG:Z:p
+      q1	77	*	0	0	*	*	0	0	AAAACCCC	IIIIIIII	ZA:Z:one	RG:Z:p
+      q1	141	*	0	0	*	*	0	0	*	*	ZA:Z:two	RG:Z:p
       """
 
   Scenario: FASTQ comment tags stay on a trimmed record
@@ -379,6 +379,6 @@ Feature: Input tags on --template records
     Then the exit code is 0
     And the records of "out.sam" are:
       """
-      r1	4	*	0	255	*	*	0	0	CCCCGGGG	IIIIIIII	CB:Z:x	ch:i:7	RG:Z:p
-      r2	4	*	0	255	*	*	0	0	CCCCGGGG	IIIIIIII	ch:i:8	RG:Z:p
+      r1	4	*	0	0	*	*	0	0	CCCCGGGG	IIIIIIII	CB:Z:x	ch:i:7	RG:Z:p
+      r2	4	*	0	0	*	*	0	0	CCCCGGGG	IIIIIIII	ch:i:8	RG:Z:p
       """

@@ -240,7 +240,7 @@ Feature: SAM tag emission with quality tag pairing and separators
     Then the exit code is 0
     And the records of "out.sam" are:
       """
-      r1	4	*	0	255	*	*	0	0	AAAACCCCGGGG	IIII5555????	<tags>	RG:Z:p
+      r1	4	*	0	0	*	*	0	0	AAAACCCCGGGG	IIII5555????	<tags>	RG:Z:p
       """
 
     Examples:
@@ -266,7 +266,7 @@ Feature: SAM tag emission with quality tag pairing and separators
     Then the exit code is 0
     And the records of "out.sam" are:
       """
-      r1	4	*	0	255	*	*	0	0	GGGGGGGGGGCACAGTTAAAA	IIIIIIIIII56789:;IIII	<tags>	RG:Z:p
+      r1	4	*	0	0	*	*	0	0	GGGGGGGGGGCACAGTTAAAA	IIIIIIIIII56789:;IIII	<tags>	RG:Z:p
       """
 
     Examples:
@@ -291,8 +291,8 @@ Feature: SAM tag emission with quality tag pairing and separators
     Then the exit code is 0
     And the records of "out.sam" are:
       """
-      r1	4	*	0	255	*	*	0	0	AAAACCCCGGGG	IIII5555????	<r1>	RG:Z:p
-      r2	4	*	0	255	*	*	0	0	AAAATTTTGGGG	IIII5555????	CB:Z:GGGG	CY:Z:????	RG:Z:p
+      r1	4	*	0	0	*	*	0	0	AAAACCCCGGGG	IIII5555????	<r1>	RG:Z:p
+      r2	4	*	0	0	*	*	0	0	AAAATTTTGGGG	IIII5555????	CB:Z:GGGG	CY:Z:????	RG:Z:p
       """
 
     Examples:
@@ -317,8 +317,8 @@ Feature: SAM tag emission with quality tag pairing and separators
     Then the exit code is 0
     And the records of "out.sam" are:
       """
-      r1	4	*	0	255	*	*	0	0	AAAACCCCGGGG	IIII5555????	<r1>	RG:Z:p
-      r2	4	*	0	255	*	*	0	0	AAAATTTTGGGG	IIII5555????	<r2>	RG:Z:p
+      r1	4	*	0	0	*	*	0	0	AAAACCCCGGGG	IIII5555????	<r1>	RG:Z:p
+      r2	4	*	0	0	*	*	0	0	AAAATTTTGGGG	IIII5555????	<r2>	RG:Z:p
       """
 
     Examples:
@@ -337,8 +337,8 @@ Feature: SAM tag emission with quality tag pairing and separators
     Then the exit code is 0
     And the records of "out.sam" are:
       """
-      r1	4	*	0	255	*	*	0	0	AACGTGCAGGGG	ABCDEFGHIJKL	CB:Z:AACG	CR:Z:AACGTGCA	CY:Z:ABCDEFGH	RG:Z:p
-      r2	4	*	0	255	*	*	0	0	TTTTTTTTGGGG	ABCDEFGHIJKL	CB:Z:TTTT	CY:Z:ABCD	RG:Z:p
+      r1	4	*	0	0	*	*	0	0	AACGTGCAGGGG	ABCDEFGHIJKL	CB:Z:AACG	CR:Z:AACGTGCA	CY:Z:ABCDEFGH	RG:Z:p
+      r2	4	*	0	0	*	*	0	0	TTTTTTTTGGGG	ABCDEFGHIJKL	CB:Z:TTTT	CY:Z:ABCD	RG:Z:p
       """
 
   Scenario: a carried CY goes when CB is rewritten without one and CR is left out
@@ -352,8 +352,8 @@ Feature: SAM tag emission with quality tag pairing and separators
     Then the exit code is 0
     And the records of "out.sam" are:
       """
-      r1	4	*	0	255	*	*	0	0	AACGTGCAGGGG	ABCDEFGHIJKL	CB:Z:AACG	CR:Z:AACGTGCA	CY:Z:ABCDEFGH	RG:Z:p
-      r2	4	*	0	255	*	*	0	0	TTTTTTTTGGGG	ABCDEFGHIJKL	CB:Z:TTTT	RG:Z:p
+      r1	4	*	0	0	*	*	0	0	AACGTGCAGGGG	ABCDEFGHIJKL	CB:Z:AACG	CR:Z:AACGTGCA	CY:Z:ABCDEFGH	RG:Z:p
+      r2	4	*	0	0	*	*	0	0	TTTTTTTTGGGG	ABCDEFGHIJKL	CB:Z:TTTT	RG:Z:p
       """
 
   Scenario: a CB qual-sep is warned about where CR writes the CY it would join
@@ -369,5 +369,5 @@ Feature: SAM tag emission with quality tag pairing and separators
     And stderr contains "tag `CB` sets `qual-sep`, which applies only to records where `CR` writes no `CY`, since `CY` holds the `CR` qualities on the others"
     And the records of "out.sam" are:
       """
-      r1	4	*	0	255	*	*	0	0	AAAACCCCGGGG	IIII5555????	CB:Z:AAAA-CCCC	CY:Z:IIII 5555	CR:Z:AAAA-CCCC	RG:Z:p
+      r1	4	*	0	0	*	*	0	0	AAAACCCCGGGG	IIII5555????	CB:Z:AAAA-CCCC	CY:Z:IIII 5555	CR:Z:AAAA-CCCC	RG:Z:p
       """

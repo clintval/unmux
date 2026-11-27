@@ -157,8 +157,8 @@ Feature: BAM/CRAM provenance headers and demux statistics
     And the <what> "out.<format>" contains "@RG	ID:p	SM:p	LB:p"
     And the records of "out.<format>" are:
       """
-      r1	4	*	0	255	*	*	0	0	AAAAAAAACCCCGGGG	IIIIIIIIIIIIIIII	RG:Z:s1
-      r2	4	*	0	255	*	*	0	0	TTTTTTTTGGCCATGC	IIIIIIIIIIIIIIII	RG:Z:p
+      r1	4	*	0	0	*	*	0	0	AAAAAAAACCCCGGGG	IIIIIIIIIIIIIIII	RG:Z:s1
+      r2	4	*	0	0	*	*	0	0	TTTTTTTTGGCCATGC	IIIIIIIIIIIIIIII	RG:Z:p
       """
 
     Examples:
@@ -185,7 +185,7 @@ Feature: BAM/CRAM provenance headers and demux statistics
     Then the exit code is 0
     And the records of "split/p.sam" are:
       """
-      r2	4	*	0	255	*	*	0	0	TTTTTTTTGGCCATGC	IIIIIIIIIIIIIIII	RG:Z:p
+      r2	4	*	0	0	*	*	0	0	TTTTTTTTGGCCATGC	IIIIIIIIIIIIIIII	RG:Z:p
       """
 
   Scenario Outline: SAM on stdout that a bin shares with a sample declares the bin's read group (<outputs>)
@@ -271,9 +271,9 @@ Feature: BAM/CRAM provenance headers and demux statistics
     And the file "o/all.sam" contains "@RG	ID:p	SM:p	LB:p"
     And the records of "o/all.sam" are:
       """
-      q1	4	*	0	255	*	*	0	0	ACGTACGT	IIIIIIII	RG:Z:rg1
-      q2	4	*	0	255	*	*	0	0	CCCCAAAA	IIIIIIII	RG:Z:rg2
-      q3	4	*	0	255	*	*	0	0	GGGGTTTT	IIIIIIII	RG:Z:p
+      q1	4	*	0	0	*	*	0	0	ACGTACGT	IIIIIIII	RG:Z:rg1
+      q2	4	*	0	0	*	*	0	0	CCCCAAAA	IIIIIIII	RG:Z:rg2
+      q3	4	*	0	0	*	*	0	0	GGGGTTTT	IIIIIIII	RG:Z:p
       """
 
   Scenario: an aligned @RG split shares its file with a bin under the input read groups

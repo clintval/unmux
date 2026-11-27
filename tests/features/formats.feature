@@ -148,10 +148,10 @@ Feature: Input and output format handling
     Then the exit code is 0
     And the records of "out.sam" are:
       """
-      read1	77	*	0	255	*	*	0	0	ACGTACGT	IIIIIIII	RG:Z:p
-      read1	141	*	0	255	*	*	0	0	TTTTGGGG	JJJJJJJJ	RG:Z:p
-      read2	77	*	0	255	*	*	0	0	CCCCAAAA	IIIIIIII	RG:Z:p
-      read2	141	*	0	255	*	*	0	0	GGGGTTTT	JJJJJJJJ	RG:Z:p
+      read1	77	*	0	0	*	*	0	0	ACGTACGT	IIIIIIII	RG:Z:p
+      read1	141	*	0	0	*	*	0	0	TTTTGGGG	JJJJJJJJ	RG:Z:p
+      read2	77	*	0	0	*	*	0	0	CCCCAAAA	IIIIIIII	RG:Z:p
+      read2	141	*	0	0	*	*	0	0	GGGGTTTT	JJJJJJJJ	RG:Z:p
       """
     And stderr contains "2 reads (0 assigned, 2 pass-through"
 
@@ -218,10 +218,10 @@ Feature: Input and output format handling
     Then the exit code is 0
     And the records of "back.sam" are:
       """
-      read1	77	*	0	255	*	*	0	0	ACGTACGT	IIIIIIII	RG:Z:p
-      read1	141	*	0	255	*	*	0	0	TTTTGGGG	JJJJJJJJ	RG:Z:p
-      read2	77	*	0	255	*	*	0	0	CCCCAAAA	IIIIIIII	RG:Z:p
-      read2	141	*	0	255	*	*	0	0	GGGGTTTT	JJJJJJJJ	RG:Z:p
+      read1	77	*	0	0	*	*	0	0	ACGTACGT	IIIIIIII	RG:Z:p
+      read1	141	*	0	0	*	*	0	0	TTTTGGGG	JJJJJJJJ	RG:Z:p
+      read2	77	*	0	0	*	*	0	0	CCCCAAAA	IIIIIIII	RG:Z:p
+      read2	141	*	0	0	*	*	0	0	GGGGTTTT	JJJJJJJJ	RG:Z:p
       """
 
     Examples:
@@ -250,10 +250,10 @@ Feature: Input and output format handling
     Then the exit code is 0
     And the records of "out.sam" are:
       """
-      read1	77	*	0	255	*	*	0	0	ACGTACGT	IIIIIIII	RG:Z:p
-      read1	141	*	0	255	*	*	0	0	TTTTGGGG	JJJJJJJJ	RG:Z:p
-      read2	77	*	0	255	*	*	0	0	CCCCAAAA	IIIIIIII	RG:Z:p
-      read2	141	*	0	255	*	*	0	0	GGGGTTTT	JJJJJJJJ	RG:Z:p
+      read1	77	*	0	0	*	*	0	0	ACGTACGT	IIIIIIII	RG:Z:p
+      read1	141	*	0	0	*	*	0	0	TTTTGGGG	JJJJJJJJ	RG:Z:p
+      read2	77	*	0	0	*	*	0	0	CCCCAAAA	IIIIIIII	RG:Z:p
+      read2	141	*	0	0	*	*	0	0	GGGGTTTT	JJJJJJJJ	RG:Z:p
       """
     When I run `unmux swapped.sam --out out.R%ordinal.fq`
     Then the exit code is 0
@@ -292,8 +292,8 @@ Feature: Input and output format handling
     Then the exit code is 0
     And the records of "out.sam" are:
       """
-      q1	77	*	0	255	*	*	0	0	AAAACCCC	ABCDEFGH	RG:Z:p
-      q1	141	*	0	255	*	*	0	0	ACGTACGT	ABCDEFGH	RG:Z:p
+      q1	77	*	0	0	*	*	0	0	AAAACCCC	ABCDEFGH	RG:Z:p
+      q1	141	*	0	0	*	*	0	0	ACGTACGT	ABCDEFGH	RG:Z:p
       """
 
   Scenario: A mapped SAM pair outside an aligned read-group split becomes an unmapped pair
@@ -310,9 +310,66 @@ Feature: Input and output format handling
     Then the exit code is 0
     And the records of "out.sam" are:
       """
-      q1	77	*	0	255	*	*	0	0	ACGTACGT	ABCDEFGH	RG:Z:p
-      q1	141	*	0	255	*	*	0	0	AAAACCCC	ABCDEFGH	RG:Z:p
+      q1	77	*	0	0	*	*	0	0	ACGTACGT	ABCDEFGH	RG:Z:p
+      q1	141	*	0	0	*	*	0	0	AAAACCCC	ABCDEFGH	RG:Z:p
       """
+
+  Scenario Outline: A record written unmapped from <input> to <format> has MAPQ 0, with or without a template
+    Given a file "reads.fq" containing:
+      """
+      @q1
+      ACGTACGT
+      +
+      ABCDEFGH
+      """
+    And a file "reads.fa" containing:
+      """
+      >q1
+      ACGTACGT
+      """
+    And a file "unmapped.sam" containing:
+      """
+      @HD	VN:1.6
+      q1	4	*	0	255	*	*	0	0	ACGTACGT	ABCDEFGH
+      """
+    And a file "mapped.sam" containing:
+      """
+      @HD	VN:1.6	SO:coordinate
+      @SQ	SN:chr1	LN:1000
+      q1	0	chr1	100	60	8M	*	0	0	ACGTACGT	ABCDEFGH
+      """
+    # htsjdk refuses an unmapped record whose MAPQ is not 0.
+    When I run `unmux reads.fq --out reads.bam`
+    Then the exit code is 0
+    When I run `unmux reads.fq --out reads.cram`
+    Then the exit code is 0
+    When I run `unmux <input> --pool p --out whole.<format>`
+    Then the exit code is 0
+    And the records of "whole.<format>" are:
+      """
+      q1	4	*	0	0	*	*	0	0	ACGTACGT	<quals>	RG:Z:p
+      """
+    When I run `unmux <input> --pool p --extract r=0:2:end --template r --out cut.<format>`
+    Then the exit code is 0
+    And the records of "cut.<format>" are:
+      """
+      q1	4	*	0	0	*	*	0	0	GTACGT	<cut>	RG:Z:p
+      """
+
+    Examples:
+      | input        | format | quals    | cut    |
+      | reads.fq     | sam    | ABCDEFGH | CDEFGH |
+      | reads.fq     | bam    | ABCDEFGH | CDEFGH |
+      | reads.fa     | sam    | *        | *      |
+      | reads.fa     | bam    | *        | *      |
+      | unmapped.sam | sam    | ABCDEFGH | CDEFGH |
+      | unmapped.sam | bam    | ABCDEFGH | CDEFGH |
+      | mapped.sam   | sam    | ABCDEFGH | CDEFGH |
+      | mapped.sam   | bam    | ABCDEFGH | CDEFGH |
+      | reads.bam    | sam    | ABCDEFGH | CDEFGH |
+      | reads.bam    | bam    | ABCDEFGH | CDEFGH |
+      | reads.cram   | sam    | ABCDEFGH | CDEFGH |
+      | reads.cram   | bam    | ABCDEFGH | CDEFGH |
 
   Scenario: A reverse-strand record's per-base tags are turned back to sequencing order with its bases
     Given a file "mapped.sam" containing:
@@ -327,8 +384,8 @@ Feature: Input and output format handling
     Then the exit code is 0
     And the records of "out.sam" are:
       """
-      f	4	*	0	255	*	*	0	0	ACGGGTTT	HGFEDCBA	OQ:Z:hgfedcba	E2:Z:CTTAACGG	U2:Z:87654321	cd:B:s,8,7,6,5,4,3,2,1	ac:Z:ACGGGTTT	ip:B:C,10,20,30,40,50,60,70,80	MM:Z:C+m?,0;	ML:B:C,200	RG:Z:p
-      r	4	*	0	255	*	*	0	0	ACGGGTTT	HGFEDCBA	OQ:Z:hgfedcba	E2:Z:CTTAACGG	U2:Z:87654321	cd:B:s,8,7,6,5,4,3,2,1	ac:Z:ACGGGTTT	ip:B:C,10,20,30,40,50,60,70,80	MM:Z:C+m?,0;	ML:B:C,200	RG:Z:p
+      f	4	*	0	0	*	*	0	0	ACGGGTTT	HGFEDCBA	OQ:Z:hgfedcba	E2:Z:CTTAACGG	U2:Z:87654321	cd:B:s,8,7,6,5,4,3,2,1	ac:Z:ACGGGTTT	ip:B:C,10,20,30,40,50,60,70,80	MM:Z:C+m?,0;	ML:B:C,200	RG:Z:p
+      r	4	*	0	0	*	*	0	0	ACGGGTTT	HGFEDCBA	OQ:Z:hgfedcba	E2:Z:CTTAACGG	U2:Z:87654321	cd:B:s,8,7,6,5,4,3,2,1	ac:Z:ACGGGTTT	ip:B:C,10,20,30,40,50,60,70,80	MM:Z:C+m?,0;	ML:B:C,200	RG:Z:p
       """
 
   Scenario: File index 1 is the second mate of a paired SAM input
@@ -344,8 +401,8 @@ Feature: Input and output format handling
     Then the exit code is 0
     And the records of "out.sam" are:
       """
-      read1	4	*	0	255	*	*	0	0	ACGTACGT	IIIIIIII	RX:Z:TTTT	QX:Z:JJJJ	RG:Z:p
-      read2	4	*	0	255	*	*	0	0	CCCCAAAA	IIIIIIII	RX:Z:GGGG	QX:Z:JJJJ	RG:Z:p
+      read1	4	*	0	0	*	*	0	0	ACGTACGT	IIIIIIII	RX:Z:TTTT	QX:Z:JJJJ	RG:Z:p
+      read2	4	*	0	0	*	*	0	0	CCCCAAAA	IIIIIIII	RX:Z:GGGG	QX:Z:JJJJ	RG:Z:p
       """
 
   Scenario Outline: The QC-fail flag of a <format> pair is kept on <threads> threads
@@ -363,10 +420,10 @@ Feature: Input and output format handling
     Then the exit code is 0
     And the records of "out.sam" are:
       """
-      read1	589	*	0	255	*	*	0	0	ACGTACGT	IIIIIIII	RG:Z:p
-      read1	653	*	0	255	*	*	0	0	TTTTGGGG	JJJJJJJJ	RG:Z:p
-      read2	77	*	0	255	*	*	0	0	CCCCAAAA	IIIIIIII	RG:Z:p
-      read2	141	*	0	255	*	*	0	0	GGGGTTTT	JJJJJJJJ	RG:Z:p
+      read1	589	*	0	0	*	*	0	0	ACGTACGT	IIIIIIII	RG:Z:p
+      read1	653	*	0	0	*	*	0	0	TTTTGGGG	JJJJJJJJ	RG:Z:p
+      read2	77	*	0	0	*	*	0	0	CCCCAAAA	IIIIIIII	RG:Z:p
+      read2	141	*	0	0	*	*	0	0	GGGGTTTT	JJJJJJJJ	RG:Z:p
       """
 
     Examples:
@@ -391,16 +448,16 @@ Feature: Input and output format handling
     Then the exit code is 0
     And the records of "s1.sam" are:
       """
-      a	516	*	0	255	*	*	0	0	AAAACCCCGGGG	IIIIIIIIIIII	RG:Z:s1
-      d	4	*	0	255	*	*	0	0	AAAACCCCGGGG	IIIIIIIIIIII	RG:Z:s1
+      a	516	*	0	0	*	*	0	0	AAAACCCCGGGG	IIIIIIIIIIII	RG:Z:s1
+      d	4	*	0	0	*	*	0	0	AAAACCCCGGGG	IIIIIIIIIIII	RG:Z:s1
       """
     And the records of "un.sam" are:
       """
-      b	516	*	0	255	*	*	0	0	CCCCGGGGTTTT	IIIIIIIIIIII	RG:Z:p
+      b	516	*	0	0	*	*	0	0	CCCCGGGGTTTT	IIIIIIIIIIII	RG:Z:p
       """
     And the records of "rm.sam" are:
       """
-      c	516	*	0	255	*	*	0	0	GGGGTTTTAAAA	IIIIIIIIIIII	RG:Z:p
+      c	516	*	0	0	*	*	0	0	GGGGTTTTAAAA	IIIIIIIIIIII	RG:Z:p
       """
 
   Scenario: A templated read fails QC when any record of its fragment does
@@ -418,9 +475,9 @@ Feature: Input and output format handling
     Then the exit code is 0
     And the records of "out.sam" are:
       """
-      both	516	*	0	255	*	*	0	0	ACGTACGT	IIIIIIII	RX:Z:TTTT	QX:Z:JJJJ	RG:Z:p
-      last	516	*	0	255	*	*	0	0	CCCCAAAA	IIIIIIII	RX:Z:GGGG	QX:Z:JJJJ	RG:Z:p
-      none	4	*	0	255	*	*	0	0	GGGGAAAA	IIIIIIII	RX:Z:TTTT	QX:Z:JJJJ	RG:Z:p
+      both	516	*	0	0	*	*	0	0	ACGTACGT	IIIIIIII	RX:Z:TTTT	QX:Z:JJJJ	RG:Z:p
+      last	516	*	0	0	*	*	0	0	CCCCAAAA	IIIIIIII	RX:Z:GGGG	QX:Z:JJJJ	RG:Z:p
+      none	4	*	0	0	*	*	0	0	GGGGAAAA	IIIIIIII	RX:Z:TTTT	QX:Z:JJJJ	RG:Z:p
       """
 
   Scenario: --per-record reads each mate of a paired SAM input on its own
@@ -439,8 +496,8 @@ Feature: Input and output format handling
     And stderr contains "2 reads (0 assigned, 2 pass-through"
     And the records of "alone.sam" are:
       """
-      read1	4	*	0	255	*	*	0	0	ACGTACGT	IIIIIIII	RG:Z:p
-      read1	4	*	0	255	*	*	0	0	TTTTGGGG	JJJJJJJJ	RG:Z:p
+      read1	4	*	0	0	*	*	0	0	ACGTACGT	IIIIIIII	RG:Z:p
+      read1	4	*	0	0	*	*	0	0	TTTTGGGG	JJJJJJJJ	RG:Z:p
       """
     When I run `unmux paired.sam --per-record --out alone.R%ordinal.fq`
     Then the exit code is 0
@@ -465,10 +522,10 @@ Feature: Input and output format handling
     Then the exit code is 0
     And the records of "out.sam" are:
       """
-      read1	4	*	0	255	*	*	0	0	ACGTACGT	IIIIIIII	RG:Z:p
-      read2	4	*	0	255	*	*	0	0	CCCCAAAA	IIIIIIII	RG:Z:p
-      read1	4	*	0	255	*	*	0	0	TTTTGGGG	JJJJJJJJ	RG:Z:p
-      read2	4	*	0	255	*	*	0	0	GGGGTTTT	JJJJJJJJ	RG:Z:p
+      read1	4	*	0	0	*	*	0	0	ACGTACGT	IIIIIIII	RG:Z:p
+      read2	4	*	0	0	*	*	0	0	CCCCAAAA	IIIIIIII	RG:Z:p
+      read1	4	*	0	0	*	*	0	0	TTTTGGGG	JJJJJJJJ	RG:Z:p
+      read2	4	*	0	0	*	*	0	0	GGGGTTTT	JJJJJJJJ	RG:Z:p
       """
 
   Scenario: A SAM input that mixes paired and unpaired records is refused
@@ -501,7 +558,7 @@ Feature: Input and output format handling
     Then the exit code is 0
     And the records of "out.sam" are:
       """
-      a	4	*	0	255	*	*	0	0	ACGTACGT	ABCDEFGH	RG:Z:p	RX:Z:	QX:Z:
+      a	4	*	0	0	*	*	0	0	ACGTACGT	ABCDEFGH	RG:Z:p	RX:Z:	QX:Z:
       """
 
     Examples:
@@ -523,7 +580,7 @@ Feature: Input and output format handling
     Then the exit code is 0
     And the records of "out.sam" are:
       """
-      a	4	*	0	255	*	*	0	0	ACGTACGTTT	*	RX:Z:TT	RG:Z:p
+      a	4	*	0	0	*	*	0	0	ACGTACGTTT	*	RX:Z:TT	RG:Z:p
       """
     When I run `unmux unscored.sam --pool p --out out.R%ordinal.fq`
     Then the exit code is 1
@@ -546,10 +603,10 @@ Feature: Input and output format handling
     Then the exit code is 0
     And the records of "pairs.sam" are:
       """
-      q1	77	*	0	255	*	*	0	0	ACGTACGT	IIIIIIII	RG:Z:p
-      q1	141	*	0	255	*	*	0	0	TTTTGGGG	JJJJJJJJ	RG:Z:p
-      q2	77	*	0	255	*	*	0	0	CCCCAAAA	IIIIIIII	RG:Z:p
-      q2	141	*	0	255	*	*	0	0	GGGGTTTT	JJJJJJJJ	RG:Z:p
+      q1	77	*	0	0	*	*	0	0	ACGTACGT	IIIIIIII	RG:Z:p
+      q1	141	*	0	0	*	*	0	0	TTTTGGGG	JJJJJJJJ	RG:Z:p
+      q2	77	*	0	0	*	*	0	0	CCCCAAAA	IIIIIIII	RG:Z:p
+      q2	141	*	0	0	*	*	0	0	GGGGTTTT	JJJJJJJJ	RG:Z:p
       """
 
   Scenario: Two paired SAM inputs are refused unless --per-record reads one record from each
@@ -582,14 +639,14 @@ Feature: Input and output format handling
     Then the exit code is 0
     And the records of "two.sam" are:
       """
-      q1	77	*	0	255	*	*	0	0	ACGTACGT	IIIIIIII	RG:Z:p
-      q1	141	*	0	255	*	*	0	0	AAAA	IIII	RG:Z:p
-      q1	77	*	0	255	*	*	0	0	TTTTGGGG	JJJJJJJJ	RG:Z:p
-      q1	141	*	0	255	*	*	0	0	CCCC	JJJJ	RG:Z:p
-      q2	77	*	0	255	*	*	0	0	CCCCAAAA	IIIIIIII	RG:Z:p
-      q2	141	*	0	255	*	*	0	0	GGGG	IIII	RG:Z:p
-      q2	77	*	0	255	*	*	0	0	GGGGTTTT	JJJJJJJJ	RG:Z:p
-      q2	141	*	0	255	*	*	0	0	TTTT	JJJJ	RG:Z:p
+      q1	77	*	0	0	*	*	0	0	ACGTACGT	IIIIIIII	RG:Z:p
+      q1	141	*	0	0	*	*	0	0	AAAA	IIII	RG:Z:p
+      q1	77	*	0	0	*	*	0	0	TTTTGGGG	JJJJJJJJ	RG:Z:p
+      q1	141	*	0	0	*	*	0	0	CCCC	JJJJ	RG:Z:p
+      q2	77	*	0	0	*	*	0	0	CCCCAAAA	IIIIIIII	RG:Z:p
+      q2	141	*	0	0	*	*	0	0	GGGG	IIII	RG:Z:p
+      q2	77	*	0	0	*	*	0	0	GGGGTTTT	JJJJJJJJ	RG:Z:p
+      q2	141	*	0	0	*	*	0	0	TTTT	JJJJ	RG:Z:p
       """
 
   Scenario: Two interleaved FASTQ inputs are refused unless --per-record reads one record from each
@@ -831,10 +888,10 @@ Feature: Input and output format handling
     Then the exit code is 0
     And the records of "pairs.sam" are:
       """
-      read1	77	*	0	255	*	*	0	0	ACGTACGT	IIIIIIII	RG:Z:p
-      read1	141	*	0	255	*	*	0	0	TTTTGGGG	JJJJJJJJ	RG:Z:p
-      read2	77	*	0	255	*	*	0	0	CCCCAAAA	IIIIIIII	RG:Z:p
-      read2	141	*	0	255	*	*	0	0	GGGGTTTT	JJJJJJJJ	RG:Z:p
+      read1	77	*	0	0	*	*	0	0	ACGTACGT	IIIIIIII	RG:Z:p
+      read1	141	*	0	0	*	*	0	0	TTTTGGGG	JJJJJJJJ	RG:Z:p
+      read2	77	*	0	0	*	*	0	0	CCCCAAAA	IIIIIIII	RG:Z:p
+      read2	141	*	0	0	*	*	0	0	GGGGTTTT	JJJJJJJJ	RG:Z:p
       """
 
     Examples:
@@ -871,8 +928,8 @@ Feature: Input and output format handling
     Then the exit code is 0
     And the records of "back.sam" are:
       """
-      r1	4	*	0	255	*	*	0	0	ACGTACGTAACCGGTTACGT	*	RG:Z:p
-      r2	4	*	0	255	*	*	0	0	TTTTGGGG	*	XY:Z:hello	RG:Z:p
+      r1	4	*	0	0	*	*	0	0	ACGTACGTAACCGGTTACGT	*	RG:Z:p
+      r2	4	*	0	0	*	*	0	0	TTTTGGGG	*	XY:Z:hello	RG:Z:p
       """
     When I run `unmux out.cram --out back.fa`
     Then the exit code is 0
@@ -905,8 +962,8 @@ Feature: Input and output format handling
     Then the exit code is 0
     And the records of "back.sam" are:
       """
-      r1	4	*	0	255	*	*	0	0	ACGTACGTAACCGGTTACGT	*	XY:Z:hello	RG:Z:p
-      r2	4	*	0	255	*	*	0	0	TTTTGGGG	*	RG:Z:p
+      r1	4	*	0	0	*	*	0	0	ACGTACGTAACCGGTTACGT	*	XY:Z:hello	RG:Z:p
+      r2	4	*	0	0	*	*	0	0	TTTTGGGG	*	RG:Z:p
       """
 
     Examples:
@@ -929,10 +986,10 @@ Feature: Input and output format handling
     Then the exit code is 0
     And the records of "back.sam" are:
       """
-      r1	4	*	0	255	*	*	0	0	ACGTACGT	ABCDEFGH	XY:Z:hello	RG:Z:p
-      r2	4	*	0	255	*	*	0	0	GGGGCCCC	*	RG:Z:p
-      r3	4	*	0	255	*	*	0	0	TTTTAAAA	IIIIJJJJ	RG:Z:p
-      r4	4	*	0	255	*	*	0	0	CC	*	XZ:i:7	RG:Z:p
+      r1	4	*	0	0	*	*	0	0	ACGTACGT	ABCDEFGH	XY:Z:hello	RG:Z:p
+      r2	4	*	0	0	*	*	0	0	GGGGCCCC	*	RG:Z:p
+      r3	4	*	0	0	*	*	0	0	TTTTAAAA	IIIIJJJJ	RG:Z:p
+      r4	4	*	0	0	*	*	0	0	CC	*	XZ:i:7	RG:Z:p
       """
 
   Scenario Outline: A SAM record without a name keeps its place in <format> output
@@ -950,10 +1007,10 @@ Feature: Input and output format handling
     Then the exit code is 0
     And the records of "back.sam" are:
       """
-      n1	4	*	0	255	*	*	0	0	AAAA	IIII	RG:Z:p
-      *	4	*	0	255	*	*	0	0	CCCC	IIII	RG:Z:p
-      n3	4	*	0	255	*	*	0	0	GGGG	IIII	RG:Z:p
-      n4	4	*	0	255	*	*	0	0	TTTT	IIII	RG:Z:p
+      n1	4	*	0	0	*	*	0	0	AAAA	IIII	RG:Z:p
+      *	4	*	0	0	*	*	0	0	CCCC	IIII	RG:Z:p
+      n3	4	*	0	0	*	*	0	0	GGGG	IIII	RG:Z:p
+      n4	4	*	0	0	*	*	0	0	TTTT	IIII	RG:Z:p
       """
 
     Examples:
@@ -1013,10 +1070,10 @@ Feature: Input and output format handling
     Then the exit code is 0
     And the records of "back.sam" are:
       """
-      n1	4	*	0	255	*	*	0	0	AAAA	IIII	RG:Z:p
-      *	4	*	0	255	*	*	0	0	CCCC	IIII	RG:Z:p
-      n3	4	*	0	255	*	*	0	0	GGGG	IIII	RG:Z:p
-      n4	4	*	0	255	*	*	0	0	TTTT	IIII	RG:Z:p
+      n1	4	*	0	0	*	*	0	0	AAAA	IIII	RG:Z:p
+      *	4	*	0	0	*	*	0	0	CCCC	IIII	RG:Z:p
+      n3	4	*	0	0	*	*	0	0	GGGG	IIII	RG:Z:p
+      n4	4	*	0	0	*	*	0	0	TTTT	IIII	RG:Z:p
       """
     When I run `unmux nameless.htslib-3.1.cram --out back.fq`
     Then the exit code is 0
@@ -1194,8 +1251,8 @@ Feature: Input and output format handling
     Then the exit code is 0
     And the records of "final.sam" are:
       """
-      trimmed	4	*	0	255	*	*	0	0	*	*	RG:Z:p
-      kept	4	*	0	255	*	*	0	0	ACGT	ABCD	RG:Z:p
+      trimmed	4	*	0	0	*	*	0	0	*	*	RG:Z:p
+      kept	4	*	0	0	*	*	0	0	ACGT	ABCD	RG:Z:p
       """
 
     Examples:
@@ -1232,13 +1289,13 @@ Feature: Input and output format handling
     Then the exit code is 0
     And the records of "out.bam" are:
       """
-      r1	4	*	0	255	*	*	0	0	ACGTACGT	IIIIIIII	RG:Z:p
+      r1	4	*	0	0	*	*	0	0	ACGTACGT	IIIIIIII	RG:Z:p
       """
     When I run `unmux rna.fq --pool p --out out.sam`
     Then the exit code is 0
     And the records of "out.sam" are:
       """
-      r1	4	*	0	255	*	*	0	0	ACGUacgu	IIIIIIII	RG:Z:p
+      r1	4	*	0	0	*	*	0	0	ACGUacgu	IIIIIIII	RG:Z:p
       """
     When I run `unmux rna.fq --out out.fq`
     Then the exit code is 0
@@ -1270,15 +1327,15 @@ Feature: Input and output format handling
     Then the exit code is 0
     And the records of "s.bam" are:
       """
-      a	4	*	0	255	*	*	0	0	GTCC	IIII	RG:Z:s
+      a	4	*	0	0	*	*	0	0	GTCC	IIII	RG:Z:s
       """
     And the records of "un.bam" are:
       """
-      b	4	*	0	255	*	*	0	0	CCCCGTCC	IIIIIIII	RG:Z:rna
+      b	4	*	0	0	*	*	0	0	CCCCGTCC	IIIIIIII	RG:Z:rna
       """
     And the records of "rm.bam" are:
       """
-      c	4	*	0	255	*	*	0	0	GGGGGTCC	IIIIIIII	RG:Z:rna
+      c	4	*	0	0	*	*	0	0	GGGGGTCC	IIIIIIII	RG:Z:rna
       """
 
   Scenario: U and u bases of SAM records, aligned or not, are stored as T in BAM output
@@ -1293,6 +1350,6 @@ Feature: Input and output format handling
     Then the exit code is 0
     And the records of "out.bam" are:
       """
-      q1	4	*	0	255	*	*	0	0	ACGTACGT	ABCDEFGH	RG:Z:p
-      q2	4	*	0	255	*	*	0	0	TTGGCCAA	ABCDEFGH	RG:Z:p
+      q1	4	*	0	0	*	*	0	0	ACGTACGT	ABCDEFGH	RG:Z:p
+      q2	4	*	0	0	*	*	0	0	TTGGCCAA	ABCDEFGH	RG:Z:p
       """

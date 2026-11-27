@@ -38,10 +38,10 @@ Feature: Tag-file column streams
     Then the exit code is 0
     And the records of "out.<ext>" are:
       """
-      r1	4	*	0	255	*	*	0	0	AAAACCCC	KLMNOPQR	BC:Z:AACCGG	QT:Z:ABCDEF	CB:Z:A+B-ACGT	xc:Z:A+B-ACGT-ACGT	xd:Z:A+B	RG:Z:reads
-      r2	4	*	0	255	*	*	0	0	AAAACCCC	KLMNOPQR	BC:Z:AACCGG	QT:Z:ABCDEF	CB:Z:A+B-ACGT	xc:Z:A+B-ACGT-ACGT	xd:Z:A+B	RG:Z:reads
-      r3	4	*	0	255	*	*	0	0	AAAACCCC	KLMNOPQR	BC:Z:TTGGCC	QT:Z:ABCDEF	CB:Z:TTGGCC-TTTT	xc:Z:TTGGCC-TTTT-TTTT	xd:Z:TTGGCC	RG:Z:reads
-      r4	4	*	0	255	*	*	0	0	AAAACCCC	KLMNOPQR	RG:Z:reads
+      r1	4	*	0	0	*	*	0	0	AAAACCCC	KLMNOPQR	BC:Z:AACCGG	QT:Z:ABCDEF	CB:Z:A+B-ACGT	xc:Z:A+B-ACGT-ACGT	xd:Z:A+B	RG:Z:reads
+      r2	4	*	0	0	*	*	0	0	AAAACCCC	KLMNOPQR	BC:Z:AACCGG	QT:Z:ABCDEF	CB:Z:A+B-ACGT	xc:Z:A+B-ACGT-ACGT	xd:Z:A+B	RG:Z:reads
+      r3	4	*	0	0	*	*	0	0	AAAACCCC	KLMNOPQR	BC:Z:TTGGCC	QT:Z:ABCDEF	CB:Z:TTGGCC-TTTT	xc:Z:TTGGCC-TTTT-TTTT	xd:Z:TTGGCC	RG:Z:reads
+      r4	4	*	0	0	*	*	0	0	AAAACCCC	KLMNOPQR	RG:Z:reads
       """
 
     Examples:
@@ -361,9 +361,9 @@ Feature: Tag-file column streams
     Then the exit code is 0
     And the records of "out.<ext>" are:
       """
-      c1	4	*	0	255	*	*	0	0	AACCGGACGT	IIIIIIIIII	CB:Z:A+B	XX:Z:kept	RG:Z:p
-      c2	4	*	0	255	*	*	0	0	AACCGGACGT	IIIIIIIIII	CR:Z:OLD	CB:Z:A+B	CY:Z:III	RG:Z:p
-      c3	4	*	0	255	*	*	0	0	GAGAGAACGT	IIIIIIIIII	RG:Z:p
+      c1	4	*	0	0	*	*	0	0	AACCGGACGT	IIIIIIIIII	CB:Z:A+B	XX:Z:kept	RG:Z:p
+      c2	4	*	0	0	*	*	0	0	AACCGGACGT	IIIIIIIIII	CR:Z:OLD	CB:Z:A+B	CY:Z:III	RG:Z:p
+      c3	4	*	0	0	*	*	0	0	GAGAGAACGT	IIIIIIIIII	RG:Z:p
       """
 
     Examples:
@@ -383,8 +383,8 @@ Feature: Tag-file column streams
     Then the exit code is 0
     And the records of "out.sam" are:
       """
-      c1	4	*	0	255	*	*	0	0	AACCGGACGT	IIIIIIIIII	CB:Z:OLD	CR:Z:A+B	RG:Z:p
-      c2	4	*	0	255	*	*	0	0	AACCGGACGT	IIIIIIIIII	CR:Z:A+B	CB:Z:OLD	RG:Z:p
+      c1	4	*	0	0	*	*	0	0	AACCGGACGT	IIIIIIIIII	CB:Z:OLD	CR:Z:A+B	RG:Z:p
+      c2	4	*	0	0	*	*	0	0	AACCGGACGT	IIIIIIIIII	CR:Z:A+B	CB:Z:OLD	RG:Z:p
       """
 
   Scenario: a default quality tag left out for a column is warned about

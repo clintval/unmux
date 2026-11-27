@@ -39,10 +39,10 @@ Feature: Tag stream fallbacks
     Then the exit code is 0
     And the records of "out.<ext>" are:
       """
-      r1	4	*	0	255	*	*	0	0	ACGTACGT	IJKLMNOP	CB:Z:N1-GGGG	BC:Z:AAAA	QT:Z:ABCD	RG:Z:s1
-      r2	4	*	0	255	*	*	0	0	ACGTACGT	IJKLMNOP	CB:Z:N1-TTTT	BC:Z:AAAA	QT:Z:ABCD	RG:Z:s1
-      r3	4	*	0	255	*	*	0	0	ACGTACGT	IJKLMNOP	CB:Z:CCCC-GGGG	CY:Z:ABCD EFGH	BC:Z:CCCC	QT:Z:ABCD	RG:Z:s2
-      r4	4	*	0	255	*	*	0	0	ACGTACGT	IJKLMNOP	CB:Z:CCCC-TTTT	CY:Z:ABCD EFGH	BC:Z:CCCC	QT:Z:ABCD	RG:Z:s2
+      r1	4	*	0	0	*	*	0	0	ACGTACGT	IJKLMNOP	CB:Z:N1-GGGG	BC:Z:AAAA	QT:Z:ABCD	RG:Z:s1
+      r2	4	*	0	0	*	*	0	0	ACGTACGT	IJKLMNOP	CB:Z:N1-TTTT	BC:Z:AAAA	QT:Z:ABCD	RG:Z:s1
+      r3	4	*	0	0	*	*	0	0	ACGTACGT	IJKLMNOP	CB:Z:CCCC-GGGG	CY:Z:ABCD EFGH	BC:Z:CCCC	QT:Z:ABCD	RG:Z:s2
+      r4	4	*	0	0	*	*	0	0	ACGTACGT	IJKLMNOP	CB:Z:CCCC-TTTT	CY:Z:ABCD EFGH	BC:Z:CCCC	QT:Z:ABCD	RG:Z:s2
       """
 
     Examples:
@@ -65,10 +65,10 @@ Feature: Tag stream fallbacks
     Then the exit code is 0
     And the records of "out.sam" are:
       """
-      r1	4	*	0	255	*	*	0	0	ACGTACGT	IJKLMNOP	CB:Z:N1-GGGG	RG:Z:s1
-      r2	4	*	0	255	*	*	0	0	ACGTACGT	IJKLMNOP	CB:Z:O2-TTTT	RG:Z:s2
-      r3	4	*	0	255	*	*	0	0	ACGTACGT	IJKLMNOP	CB:Z:CCCC-GGGG	CY:Z:ABCD EFGH	RG:Z:s3
-      r4	4	*	0	255	*	*	0	0	ACGTACGT	IJKLMNOP	CB:Z:N4-TTTT	RG:Z:s4
+      r1	4	*	0	0	*	*	0	0	ACGTACGT	IJKLMNOP	CB:Z:N1-GGGG	RG:Z:s1
+      r2	4	*	0	0	*	*	0	0	ACGTACGT	IJKLMNOP	CB:Z:O2-TTTT	RG:Z:s2
+      r3	4	*	0	0	*	*	0	0	ACGTACGT	IJKLMNOP	CB:Z:CCCC-GGGG	CY:Z:ABCD EFGH	RG:Z:s3
+      r4	4	*	0	0	*	*	0	0	ACGTACGT	IJKLMNOP	CB:Z:N4-TTTT	RG:Z:s4
       """
 
   Scenario: a tag is left out when every choice for one of its streams is absent
@@ -82,8 +82,8 @@ Feature: Tag stream fallbacks
     Then the exit code is 0
     And the records of "out.sam" are:
       """
-      r1	4	*	0	255	*	*	0	0	ACGTACGT	IJKLMNOP	xn:Z:N1-GGGG	xb:Z:GGGG	RG:Z:s1
-      r3	4	*	0	255	*	*	0	0	ACGTACGT	IJKLMNOP	xb:Z:GGGG	RG:Z:s2
+      r1	4	*	0	0	*	*	0	0	ACGTACGT	IJKLMNOP	xn:Z:N1-GGGG	xb:Z:GGGG	RG:Z:s1
+      r3	4	*	0	0	*	*	0	0	ACGTACGT	IJKLMNOP	xb:Z:GGGG	RG:Z:s2
       """
 
   Scenario Outline: a carried quality tag is dropped only for records whose tag takes column text
@@ -97,8 +97,8 @@ Feature: Tag stream fallbacks
     Then the exit code is 0
     And the records of "out.sam" are:
       """
-      r1	4	*	0	255	*	*	0	0	AAAAGGGGACGTACGT	ABCDEFGHIJKLMNOP	CB:Z:N1-GGGG	RG:Z:s1
-      r3	4	*	0	255	*	*	0	0	CCCCGGGGACGTACGT	ABCDEFGHIJKLMNOP	CB:Z:CCCC-GGGG	CY:Z:ABCD EFGH	RG:Z:s2
+      r1	4	*	0	0	*	*	0	0	AAAAGGGGACGTACGT	ABCDEFGHIJKLMNOP	CB:Z:N1-GGGG	RG:Z:s1
+      r3	4	*	0	0	*	*	0	0	CCCCGGGGACGTACGT	ABCDEFGHIJKLMNOP	CB:Z:CCCC-GGGG	CY:Z:ABCD EFGH	RG:Z:s2
       """
 
     Examples:
@@ -117,8 +117,8 @@ Feature: Tag stream fallbacks
     Then the exit code is 0
     And the records of "out.sam" are:
       """
-      r1	4	*	0	255	*	*	0	0	AAAAGGGGACGTACGT	ABCDEFGHIJKLMNOP	CB:Z:N1-GGGG	RG:Z:s1
-      r3	4	*	0	255	*	*	0	0	CCCCGGGGACGTACGT	ABCDEFGHIJKLMNOP	CB:Z:CCCC-GGGG	CY:Z:III	RG:Z:s2
+      r1	4	*	0	0	*	*	0	0	AAAAGGGGACGTACGT	ABCDEFGHIJKLMNOP	CB:Z:N1-GGGG	RG:Z:s1
+      r3	4	*	0	0	*	*	0	0	CCCCGGGGACGTACGT	ABCDEFGHIJKLMNOP	CB:Z:CCCC-GGGG	CY:Z:III	RG:Z:s2
       """
 
   Scenario: a named quality tag is allowed when each part of the tag has a choice with bases
@@ -126,10 +126,10 @@ Feature: Tag stream fallbacks
     Then the exit code is 0
     And the records of "out.sam" are:
       """
-      r1	4	*	0	255	*	*	0	0	ACGTACGT	IJKLMNOP	CB:Z:N1-GGGG	RG:Z:s1
-      r2	4	*	0	255	*	*	0	0	ACGTACGT	IJKLMNOP	CB:Z:N1-TTTT	RG:Z:s1
-      r3	4	*	0	255	*	*	0	0	ACGTACGT	IJKLMNOP	CB:Z:CCCC-GGGG	xq:Z:ABCD EFGH	RG:Z:s2
-      r4	4	*	0	255	*	*	0	0	ACGTACGT	IJKLMNOP	CB:Z:CCCC-TTTT	xq:Z:ABCD EFGH	RG:Z:s2
+      r1	4	*	0	0	*	*	0	0	ACGTACGT	IJKLMNOP	CB:Z:N1-GGGG	RG:Z:s1
+      r2	4	*	0	0	*	*	0	0	ACGTACGT	IJKLMNOP	CB:Z:N1-TTTT	RG:Z:s1
+      r3	4	*	0	0	*	*	0	0	ACGTACGT	IJKLMNOP	CB:Z:CCCC-GGGG	xq:Z:ABCD EFGH	RG:Z:s2
+      r4	4	*	0	0	*	*	0	0	ACGTACGT	IJKLMNOP	CB:Z:CCCC-TTTT	xq:Z:ABCD EFGH	RG:Z:s2
       """
     When I run `unmux reads.fq --group a={a1=AAAA,a2=CCCC} --group a::loc=0:0:4 --group b={b1=GGGG,b2=TTTT} --group b::loc=0:4:8 --extract nuc=%sample::nucleus --extract alt=%sample::a --extract ba=@a --extract bb=@b --extract r=0:8:end --tag CB=nuc|ba+alt --tag CB::qual=xq --template r --sample-sheet sheet.tsv --out out.sam`
     Then the exit code is 1

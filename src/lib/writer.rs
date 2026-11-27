@@ -1271,6 +1271,42 @@ mod tests {
     }
 
     #[test]
+    fn test_records_written_unmapped_have_mapping_quality_zero() {
+        use noodles::sam::alignment::record::MappingQuality;
+
+        let fragments = [
+            vec![output_read(b"r1", b"ACGT", Some(&[30; 4]), None)],
+            vec![
+                output_read(b"r2", b"AAAA", None, None),
+                output_read(b"r2", b"CCCC", Some(&[40; 4]), None),
+            ],
+        ];
+        let header = default_header();
+        let sam: Vec<u8> = fragments
+            .iter()
+            .flat_map(|fragment| encode_fragment(OutputFormat::Sam, &header, fragment).unwrap())
+            .collect();
+        let sam = String::from_utf8(sam).unwrap();
+        let mapqs: Vec<_> = sam.lines().map(|line| line.split('\t').nth(4)).collect();
+        assert_eq!(mapqs, [Some("0"); 3], "{sam}");
+
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out.bam");
+        let mut writer = OutputWriter::create(Some(&out), OutputFormat::Bam, 5).unwrap();
+        for fragment in &fragments {
+            writer.write_fragment(fragment).unwrap();
+        }
+        writer.finish().unwrap();
+        let mut reader = bam::io::Reader::new(File::open(&out).unwrap());
+        let header = reader.read_header().unwrap();
+        let mapqs: Vec<_> = reader
+            .record_bufs(&header)
+            .map(|record| record.unwrap().mapping_quality())
+            .collect();
+        assert_eq!(mapqs, [MappingQuality::new(0); 3]);
+    }
+
+    #[test]
     fn test_bam_carries_at_rg_header_and_record_rg() {
         use std::fs::File;
 
