@@ -1004,19 +1004,25 @@ fn split_fasta_definition(body: &str) -> (&str, &str) {
 /// `render_tags`. A tab-separated field not shaped like a tag (a bare UMI, an
 /// Illumina CASAVA string, free text) is skipped, and a tag whose value its type
 /// does not allow or a BAM record cannot hold, or a tag given twice, is an
-/// error. Returns `None` when no tag is lifted.
+/// error. Alignment tags are then dropped, as from alignment input. Returns
+/// `None` when no tag is lifted.
 fn parse_comment_tags(comment: &[u8]) -> Result<Option<Data>> {
-    let mut data = Data::default();
+    let mut fields: Vec<(Tag, Value)> = Vec::new();
     for field in comment.split(|&b| b == b'\t') {
         if let Some((tag, value)) = parse_aux_field(field)? {
-            if data.insert(tag, value).is_some() {
+            if fields.iter().any(|(seen, _)| *seen == tag) {
                 bail!(
                     "the comment tag `{}` appears more than once",
                     String::from_utf8_lossy(&field[..2])
                 );
             }
+            fields.push((tag, value));
         }
     }
+    let data: Data = fields
+        .into_iter()
+        .filter(|(tag, value)| !is_alignment_tag(*tag, value))
+        .collect();
     Ok((!data.is_empty()).then_some(data))
 }
 
@@ -1141,6 +1147,12 @@ pub(crate) const ALIGNMENT_TAGS: &[[u8; 2]] = &[
     *b"UQ", *b"CC", *b"CP", *b"CG", *b"H0", *b"H1", *b"H2", *b"HI", *b"IH", *b"NH", *b"TS",
 ];
 
+/// Whether a field is one of [`ALIGNMENT_TAGS`], with `pa` only as bwa's float, not Dorado's array.
+fn is_alignment_tag(tag: Tag, value: &Value) -> bool {
+    let bytes: &[u8; 2] = tag.as_ref();
+    ALIGNMENT_TAGS.contains(bytes) && (bytes != b"pa" || matches!(value, Value::Float(_)))
+}
+
 /// Convert an alignment record into an [`InputRecord`], carrying its
 /// non-alignment tags through. Alignment-derived tags ([`ALIGNMENT_TAGS`]) are
 /// stripped, since the output is unmapped. A read with bases and QUAL `*` has
@@ -1168,10 +1180,7 @@ fn alignment_to_input(record: &RecordBuf) -> InputRecord {
     let tags: Data = record
         .data()
         .iter()
-        .filter(|(tag, _)| {
-            let bytes: &[u8; 2] = tag.as_ref();
-            !ALIGNMENT_TAGS.contains(bytes)
-        })
+        .filter(|&(tag, value)| !is_alignment_tag(tag, value))
         .map(|(tag, value)| match reverse {
             true => (tag, crate::per_base::sequenced(tag, value)),
             false => (tag, value.clone()),
