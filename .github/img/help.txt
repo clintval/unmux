@@ -41,7 +41,8 @@ Notation (also see param docs below with expressive examples):
                    negative counts from the record END. The FIRST number
                    is the input file index. 1:5:9 = file 1 & bases [5,9).
   @grp             a group's matched span. @grp+off:len & @grp-off:len
-                   step past & before it (trailing number is a LENGTH!).
+                   step past & before it (trailing number is a LENGTH!),
+                   in the matched tag's orientation (see bothStrands).
   @grpA..@grpB     the region between two matched spans.
   @grp::COLUMN     the matched tag's value in a tag-file column, or its id.
   @RG[::F[::F]]    an input read-group --group source (SAM/BAM/CRAM only);
@@ -107,9 +108,12 @@ Options:
           %sample, %sub_sample, and %ordinal. Outputs that would be one
           file are refused: paths differing only in case (one file on a
           case-insensitive file system), two spellings of one file, a metrics
-          file on another output's path, or an output that is a file the run
-          reads under any name (an input, a tag file, the sample sheet, or the
-          reference and its indexes).
+          file on another output's path, an --unassigned or --remove path
+          equal to an --out path only once placeholders expand, or an output
+          that is a file the run reads under any name (an input, a tag file,
+          the sample sheet, or the reference and its indexes). Pass the --out
+          pattern itself to --unassigned or --remove to keep those records
+          in the --out file.
           
             --out out.bam                   one file with all assigned records
             --out %sample.bam               one file per sample
@@ -122,9 +126,9 @@ Options:
           Tag-group definition or attributes (repeatable; accumulates).
           
           NAME=SOURCE is the UMI/barcode/adapter set; NAME::ATTRS constrains
-          matching. Tags may use IUPAC codes, and a U in a read matches as T. A
-          matched @grp span is error-corrected by default. Each tag in a set
-          needs its own ID; pool several tags into one sample with
+          matching. Tags may use IUPAC codes, and a U in a read or a tag matches
+          as T. A matched @grp span is error-corrected by default. Each tag in a
+          set needs its own ID; pool several tags into one sample with
           --sample NAME=GROUP::ID1,ID2.
           
           A set is refused when one read can match two of its tags at one place
@@ -167,6 +171,32 @@ Options:
             bc::anchor=3p            anchor tags' 3-prime base at loc.end
             bc::match=i7+i5          match tags on joined --extract streams
           
+          A reverse-strand match (bothStrands=true) is read in its tag's own
+          orientation, as if the record were reverse-complemented: @grp
+          streams from it are reverse-complemented with their qualities
+          reversed, and offsets and next=G:lo-hi windows step from it in that
+          orientation (+ toward the record start). A windowed next= target
+          matches on that match's strand (or either strand, with its own
+          bothStrands=true); a bare next=G target keeps its own loc and
+          strands. The match itself is still chosen in read coordinates, so
+          where the tag matches the same bases in a record and its reverse
+          complement, the two give the same spans and windowed targets.
+          
+          A match= group joins an @grp self-span error-corrected, as a
+          --tag without raw=true writes it, and any other stream, such as
+          1:0:8 or @grp+0:8, as the observed bases. A self-span whose tag
+          has an ambiguity code, such as N, also joins as the observed bases.
+          
+          When dist allows an edit, a loc, next or match= window wider than a
+          tag lets a read match another tag at a shifted position as closely
+          as its true tag: the leftmost match then wins, or with mode=nearest
+          the read is left unmatched. Unmux warns where it estimates this for
+          over 0.3% of reads with an error, suggesting mode=nearest, a window
+          as wide as the tags if no indel upstream shifts the barcode, or, with
+          an indel budget, a window wider than the tags by twice that budget. A
+          whole-record search, or a window that runs to the record end, has the
+          same risk but is not warned about.
+          
           An @RG source reads the input header's read groups instead of
           matching sequences (SAM/BAM/CRAM only; no barcode attributes, no
           @-span). Pair with --sample-from-group to write one file per
@@ -192,8 +222,14 @@ Options:
           anchored @grp forms take a LENGTH as the trailing number instead.
           
           The @grpA..@grpB form is the bases from the end of grpA's match to
-          the start of grpB's. It is empty, but still present, where a group
-          is unmatched or grpB does not follow grpA in the same input file.
+          the start of grpB's, in grpA's orientation. It is empty, but still
+          present, where a group is unmatched or grpB does not follow grpA in
+          the same input file.
+          
+          A @grp form anchored on a reverse-strand match (bothStrands=true)
+          is taken in the tag's orientation: @grp+off:len steps toward the
+          record start, and the bases are reverse-complemented and the qualities
+          reversed, so the stream reads as the tag does.
           
           The @grp::COLUMN form is the matched tag's text in a column of the
           group's tag file, where a blank means the tag's seq. Header case is
@@ -232,7 +268,9 @@ Options:
           
           SAM/BAM/CRAM allows at most two ordinals; multi-FASTX may have more.
           ::raw=true emits observed bases for a stream from a corrected @grp
-          (default: corrected; no effect on a never-corrected stream).
+          (default: corrected; no effect on a never-corrected stream). On a
+          reverse-strand match, observed bases are in the tag's orientation, as
+          the corrected ones are; the obs of --qc-tag stays in the read's.
           
             --template cdna               one record = the whole cdna stream
             --template cb+umi             concatenate two streams into one
@@ -372,7 +410,10 @@ Options:
           The only placeholders are %pool and %source (input file index);
           %source fans these to one file per input record. Without this flag,
           unassigned records are dropped. Unmux warns when unassigned fraction
-          reaches ≥20% of the pool.
+          reaches ≥20% of the pool. Given the --out pattern itself, these
+          records share the --out file, whose SAM/BAM/CRAM header then also
+          declares the pool read group; a run where a sample there has the
+          pool's read group ID is refused.
           
             --unassigned unmatched.%source.fq.gz   one file per input file
             --unassigned unmatched.fa              all segments in one FASTA
@@ -384,7 +425,9 @@ Options:
           removed (distinct from --unassigned). With =PATH_PATTERN the removed
           records are written to the output path otherwise they are simply
           ignored. SEL is required. The only placeholders allowed in
-          PATH_PATTERN are %pool and %source (input file index).
+          PATH_PATTERN are %pool and %source (input file index). Given
+          the --out pattern itself, removed records share the --out file,
+          with the read group rules of --unassigned.
           
             --remove phiX                      drop records matching phiX group
             --remove bc::t99                   drop one specific tag's records
