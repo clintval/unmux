@@ -418,6 +418,48 @@ fn widest_window(group: &crate::grammar::Group, groups: &[crate::grammar::Group]
     }
 }
 
+/// Refuse a group whose window is too narrow for any of its tags to match in.
+fn refuse_narrow_window(
+    group: &crate::grammar::Group,
+    groups: &[crate::grammar::Group],
+    tags: &[Vec<u8>],
+) -> Result<()> {
+    let Some(width) = widest_window(group, groups) else {
+        return Ok(());
+    };
+    let attrs = &group.attrs;
+    let indel = attrs.dist.unwrap_or_default().indel;
+    // A partial5/partial3 tag may run off the window edge, down to its minimum matched bases.
+    let partial = [attrs.partial5, attrs.partial3]
+        .into_iter()
+        .flatten()
+        .map(|partial| partial.min_match.max(1))
+        .min();
+    let shortest = |tag: &Vec<u8>| {
+        let whole = tag.len().saturating_sub(indel).max(1);
+        partial.map_or(whole, |partial| whole.min(partial))
+    };
+    let needed = tags.iter().map(shortest).min();
+    let Some(needed) = needed.filter(|&needed| needed > width) else {
+        return Ok(());
+    };
+    let name = &group.name;
+    let link = groups.iter().find_map(|upstream| {
+        let next = upstream.attrs.next.as_ref()?;
+        (next.group == *name).then_some((upstream.name.as_str(), next.window?))
+    });
+    let (window, advice) = match link {
+        Some((upstream, (lo, hi))) => (
+            format!("next={name}:{lo}-{hi} window that group `{upstream}` gives it"),
+            format!("widen it to next={name}:{lo}-{}", lo.saturating_add(needed)),
+        ),
+        None => ("loc window".into(), format!("widen loc to {needed} bp")),
+    };
+    bail!(
+        "group `{name}`: the {window} is at most {width} bp wide, and no tag can match in fewer than {needed} bp, so `{name}` could never match; {advice}"
+    )
+}
+
 /// Compile each `--group` into a matcher [`CompiledGroup`] over its loaded tag
 /// set, return them in dependency order (each group after the upstream group
 /// its `next`/`prev` link depends on), and the `name -> canonical index` map
@@ -435,8 +477,10 @@ fn compile_groups(
         let attrs = &group.attrs;
         let dist = attrs.dist.unwrap_or_default();
         let mode = attrs.mode.unwrap_or(MatchMode::All);
+        let tags = tag_sets[&group.name].seqs();
         // An `@RG` group's tags are routing tokens, not DNA, so they are not validated.
         if !is_read_group {
+            refuse_narrow_window(group, &plan.groups, &tags)?;
             let search = crate::iupac::Search {
                 dist,
                 mode: attrs.mode,
@@ -444,13 +488,10 @@ fn compile_groups(
                 both_strands: attrs.revcomp.unwrap_or(false),
                 window: widest_window(group, &plan.groups),
             };
-            for warning in
-                crate::iupac::validate_group(&group.name, &tag_sets[&group.name].seqs(), &search)?
-            {
+            for warning in crate::iupac::validate_group(&group.name, &tags, &search)? {
                 log::warn!("{warning}");
             }
         }
-        let tags = tag_sets[&group.name].seqs();
         let mut compiled_group = CompiledGroup {
             name: group.name.clone(),
             patterns: search_patterns(&tags),
