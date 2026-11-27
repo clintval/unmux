@@ -366,7 +366,7 @@ fn slice(segment: Segment, file: usize, start: usize, end: usize, reverse: bool)
             file,
             start,
             end,
-            reversed: false,
+            reversed: reverse,
         }),
     }
 }
