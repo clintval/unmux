@@ -3837,6 +3837,31 @@ mod tests {
     }
 
     #[test]
+    fn test_alignment_tags_leave_fastx_comments_as_they_leave_alignment_input() {
+        for (comment, kept) in [
+            (
+                "NM:i:3\tAS:i:40\tMD:Z:4\tXA:Z:chr2,+9,4M,1\tpa:f:0.5\tRX:Z:ACGT",
+                &[*b"RX"][..],
+            ),
+            ("pa:B:i,1,2,3\tms:i:50\tMC:Z:4M\tqs:i:10", &[*b"pa", *b"qs"]),
+        ] {
+            let sam = first_record_tags(&format!(
+                "@HD\tVN:1.6\nr1\t4\t*\t0\t0\t*\t*\t0\t0\tACGT\tIIII\t{comment}\n"
+            ))
+            .unwrap();
+            let fastq = first_record_tags(&format!("@r1\t{comment}\nACGT\n+\nIIII\n")).unwrap();
+            let fasta = first_record_tags(&format!(">r1\t{comment}\nACGT\n")).unwrap();
+            let tags: Vec<[u8; 2]> = sam.keys().map(|tag| *tag.as_ref()).collect();
+            assert_eq!(tags, kept, "{comment}");
+            assert_eq!(fastq, sam, "{comment}");
+            assert_eq!(fasta, sam, "{comment}");
+        }
+        assert!(first_record_tags("@r1\tNM:i:3\tMD:Z:4\nACGT\n+\nIIII\n").is_none());
+        let error = read_error("@r1\tNM:i:x\nACGT\n+\nIIII\n");
+        assert!(error.contains("the comment tag `NM:i` must be"), "{error}");
+    }
+
+    #[test]
     fn input_read_groups_reads_sm_lb_and_sq() {
         use std::io::Write;
         let dir = tempfile::tempdir().unwrap();

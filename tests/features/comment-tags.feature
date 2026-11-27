@@ -3,6 +3,8 @@ Feature: Lifting SAM tags from FASTX read-name comments
   convention that unmux itself writes on FASTX output). On input those tags are
   lifted back into real SAM tags, the inverse of that output, so a tag-bearing
   FASTQ converts to a uBAM/SAM with real tags and no extraction configured.
+  Alignment tags such as NM and MD are dropped, as they are from SAM/BAM/CRAM
+  input, while Dorado's `pa:B` poly(A) array is kept on both.
   Every type unmux writes reads back: `A`, `f`, `Z`, `H`, `B` arrays of every
   subtype, and `i` from -2147483648 to 4294967295 in the narrowest BAM type that
   holds it. Lifting is per-field: a field that is not shaped like an
@@ -95,6 +97,90 @@ Feature: Lifting SAM tags from FASTX read-name comments
       """
       read1	4	*	0	0	*	*	0	0	ACGTACGTCC	IIIIIIIIII	MM:Z:C+m,0,1;	ML:B:C,200,100	ns:i:4000000000	RG:Z:mod
       """
+
+  Scenario Outline: the tags of <input> lose NM, MD and bwa's pa:f but keep Dorado's pa:B:i
+    Given a file "in.fq" containing:
+      """
+      @r1	NM:i:10	MD:Z:16^T45	pa:f:0.95	RX:Z:ACGT
+      ACGTACGT
+      +
+      IIIIIIII
+      @r2	pa:B:i,1,2,3	AS:i:8	qs:i:10
+      TTTTGGGG
+      +
+      JJJJJJJJ
+      """
+    And a file "in.fa" containing:
+      """
+      >r1	NM:i:10	MD:Z:16^T45	pa:f:0.95	RX:Z:ACGT
+      ACGTACGT
+      >r2	pa:B:i,1,2,3	AS:i:8	qs:i:10
+      TTTTGGGG
+      """
+    And a file "in.sam" containing:
+      """
+      @HD	VN:1.6
+      r1	4	*	0	0	*	*	0	0	ACGTACGT	IIIIIIII	NM:i:10	MD:Z:16^T45	pa:f:0.95	RX:Z:ACGT
+      r2	4	*	0	0	*	*	0	0	TTTTGGGG	JJJJJJJJ	pa:B:i,1,2,3	AS:i:8	qs:i:10
+      """
+    # bwa writes pa as a float, the score ratio to an ALT hit; Dorado writes its poly(A) positions as pa:B:i.
+    When I run `unmux <input> --pool p --out whole.sam`
+    Then the exit code is 0
+    And the records of "whole.sam" are:
+      """
+      r1	4	*	0	0	*	*	0	0	ACGTACGT	<q1>	RX:Z:ACGT	RG:Z:p
+      r2	4	*	0	0	*	*	0	0	TTTTGGGG	<q2>	pa:B:i,1,2,3	qs:i:10	RG:Z:p
+      """
+    When I run `unmux <input> --pool p --extract r=0:2:end --template r --out cut.sam`
+    Then the exit code is 0
+    And the records of "cut.sam" are:
+      """
+      r1	4	*	0	0	*	*	0	0	GTACGT	<c1>	RX:Z:ACGT	RG:Z:p
+      r2	4	*	0	0	*	*	0	0	TTGGGG	<c2>	pa:B:i,1,2,3	qs:i:10	RG:Z:p
+      """
+
+    Examples:
+      | input  | q1       | q2       | c1     | c2     |
+      | in.fq  | IIIIIIII | JJJJJJJJ | IIIIII | JJJJJJ |
+      | in.fa  | *        | *        | *      | *      |
+      | in.sam | IIIIIIII | JJJJJJJJ | IIIIII | JJJJJJ |
+
+  Scenario Outline: a FASTQ written from <input> input leaves alignment tags out of its comments
+    Given a file "in.fq" containing:
+      """
+      @r1	NM:i:10	MD:Z:16^T45	pa:f:0.95	RX:Z:ACGT
+      ACGTACGT
+      +
+      IIIIIIII
+      @r2	pa:B:i,1,2,3	AS:i:8	qs:i:10
+      TTTTGGGG
+      +
+      JJJJJJJJ
+      """
+    And a file "in.sam" containing:
+      """
+      @HD	VN:1.6
+      r1	4	*	0	0	*	*	0	0	ACGTACGT	IIIIIIII	NM:i:10	MD:Z:16^T45	pa:f:0.95	RX:Z:ACGT
+      r2	4	*	0	0	*	*	0	0	TTTTGGGG	JJJJJJJJ	pa:B:i,1,2,3	AS:i:8	qs:i:10
+      """
+    When I run `unmux <input> --out out.fq`
+    Then the exit code is 0
+    And the file "out.fq" is:
+      """
+      @r1 RX:Z:ACGT
+      ACGTACGT
+      +
+      IIIIIIII
+      @r2 pa:B:i,1,2,3	qs:i:10
+      TTTTGGGG
+      +
+      JJJJJJJJ
+      """
+
+    Examples:
+      | input  |
+      | in.fq  |
+      | in.sam |
 
   Scenario: every SAM tag type survives a SAM to FASTQ to SAM round trip
     Given a file "in.sam" containing:
