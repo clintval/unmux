@@ -614,3 +614,35 @@ Feature: Tag matching with distance tolerance and error handling
       | link           | groups                                                                          |
       | a match= join  | --extract i=0:2:4 --extract j=0:4:7 --group bc={x=AATTC} --group bc::match=i+j |
       | a next= window | --group ad={a=CC} --group ad::loc=0:0:2,next=bc:0-6 --group bc={x=AATTC}        |
+
+  Scenario Outline: A tag written as <tag> matches on both strands as its T twin does
+    Given a file "reads.fq" containing:
+      """
+      @fwd
+      ACGTACGGAAAA
+      +
+      IIIIIIIIIIII
+      @rev
+      TTTTCCGTACGT
+      +
+      IIIIIIIIIIII
+      @revrna
+      UUUUCCGUACGU
+      +
+      IIIIIIIIIIII
+      """
+    # CB holds the corrected form, which is the tag as written, and BC the raw form.
+    When I run `unmux reads.fq --group bc={a=<tag>} --group bc::bothStrands=true --extract bc=@bc --tag CB=bc --tag BC=bc --tag BC::raw=true --sample-from-group bc --out %sample.fq --unassigned un.fq`
+    Then the exit code is 0
+    And the file "a.fq" contains "@fwd CB:Z:<tag>"
+    And the file "a.fq" contains "@rev CB:Z:<tag>"
+    And the file "a.fq" contains "@revrna CB:Z:<tag>"
+    And the file "a.fq" contains "BC:Z:CCGTACGT"
+    And the file "a.fq" contains "BC:Z:CCGUACGU"
+    And the file "un.fq" does not contain "@rev"
+
+    Examples:
+      | tag      |
+      | ACGTACGG |
+      | ACGUACGG |
+      | acguacgg |

@@ -2372,6 +2372,27 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_match_group_tag_u_matches_on_both_strands() {
+        for tag in ["ACGTACGG", "ACGUACGG", "acguacgg"] {
+            let mut g = group(&[tag]);
+            g.revcomp = true;
+            for (read, strand, span) in [
+                ("ACGTACGGAAAA", MatchStrand::Forward, (0, 8)),
+                ("TTTTCCGTACGT", MatchStrand::ReverseComplement, (4, 12)),
+            ] {
+                let best = outcome(&g, read)
+                    .best
+                    .unwrap_or_else(|| panic!("{tag} finds no match in {read}"));
+                assert_eq!(
+                    (best.strand, (best.start, best.end), best.cost),
+                    (strand, span, 0),
+                    "{tag} in {read}"
+                );
+            }
+        }
+    }
+
     /// The read with each T and t written as U and u.
     fn as_rna(read: &[u8]) -> Vec<u8> {
         read.iter()
@@ -2384,7 +2405,7 @@ mod tests {
     }
 
     #[test]
-    fn test_read_u_bases_match_as_t_bases_do() {
+    fn test_u_bases_in_reads_and_tags_match_as_t_bases_do() {
         let mut rng = Rng(0x75);
         let codes = b"ACGTACGTACGTRYKMSWBDHVN";
         for trial in 0..2000 {
@@ -2398,7 +2419,11 @@ mod tests {
             let tags = (0..count)
                 .map(|_| {
                     let len = if batched { length } else { 3 + rng.below(5) };
-                    rng.sample(len, codes)
+                    let mut tag = rng.sample(len, codes);
+                    if rng.below(4) == 0 {
+                        tag.make_ascii_lowercase();
+                    }
+                    tag
                 })
                 .collect();
             let mut g = CompiledGroup::new("g", tags);
@@ -2429,11 +2454,18 @@ mod tests {
                 g.match_streams = Some(vec!["i7".to_string(), "i5".to_string()]);
             }
             g.encode();
+            let mut rna_tags = g.clone();
+            rna_tags.tags = g.tags.iter().map(|tag| as_rna(tag)).collect();
+            rna_tags.encode();
             let len = rng.below(24);
             let read = rng.sample(len, b"ACGTacgtN");
             let rna = as_rna(&read);
             let dna = match_group(&g, &mut Scratch::new(), &[&read]);
-            let tags: Vec<_> = g.tags.iter().map(|t| String::from_utf8_lossy(t)).collect();
+            let tags: Vec<_> = rna_tags
+                .tags
+                .iter()
+                .map(|t| String::from_utf8_lossy(t))
+                .collect();
             let context = format!(
                 "{} as {} for {tags:?} {:?} {:?} {:?} rc={} {:?} {:?}",
                 String::from_utf8_lossy(&read),
@@ -2445,16 +2477,22 @@ mod tests {
                 g.partial5,
                 g.partial3,
             );
-            assert_eq!(
-                match_group(&g, &mut Scratch::new(), &[&rna]),
-                dna,
-                "{context}"
-            );
-            assert_eq!(
-                match_verdict(&g, &mut Scratch::new(), &[&rna], g.loc.as_ref()),
-                GroupVerdict::of(&g, &dna),
-                "{context}"
-            );
+            for (pair, group, read) in [
+                ("T tags, U read", &g, &rna),
+                ("U tags, T read", &rna_tags, &read),
+                ("U tags, U read", &rna_tags, &rna),
+            ] {
+                assert_eq!(
+                    match_group(group, &mut Scratch::new(), &[read]),
+                    dna,
+                    "{pair}: {context}"
+                );
+                assert_eq!(
+                    match_verdict(group, &mut Scratch::new(), &[read], group.loc.as_ref()),
+                    GroupVerdict::of(group, &dna),
+                    "{pair}: {context}"
+                );
+            }
         }
     }
 
