@@ -250,11 +250,10 @@ struct DemuxCmd {
     /// where the tag matches the same bases in a record and its reverse
     /// complement, the two give the same spans and windowed targets.
     ///
-    /// A `match=` group joins each stream as a `--tag` without `raw=true`
-    /// writes it: an `@grp` self-span error-corrected, and any other stream,
-    /// such as `1:0:8` or `@grp+0:8`, as the observed bases. A self-span
-    /// whose tag has IUPAC codes joins as the declared pattern, so its
-    /// degenerate positions, such as `N`, count as mismatches.
+    /// A `match=` group joins an `@grp` self-span error-corrected, as a
+    /// `--tag` without `raw=true` writes it, and any other stream, such as
+    /// `1:0:8` or `@grp+0:8`, as the observed bases. A self-span whose tag
+    /// has an ambiguity code, such as `N`, also joins as the observed bases.
     ///
     /// An `@RG` source reads the input header's read groups instead of
     /// matching sequences (SAM/BAM/CRAM only; no barcode attributes, no
