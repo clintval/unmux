@@ -10,8 +10,9 @@ Feature: Tags that one read can match together are refused or warned about
   match only through an indel is refused when the group gives no mode, asking for one, and warned
   about under mode=all or mode=nearest written out, where mode=all also counts such pairs and
   recommends mode=nearest. Each message gives bases that match both tags, unless the tags are too
-  long to compare exactly under the indel budget. Tags that slide along a read can also both match
-  it at shifted places, which the check does not look for.
+  costly to compare exactly under the indel budget. Tags with no anchor slide along a whole record
+  or a window wider than they are, and two of them can then also both match one read at shifted
+  positions, which the check does not look for.
 
   Background:
     Given a file "reads.fq" containing:
@@ -184,7 +185,7 @@ Feature: Tags that one read can match together are refused or warned about
     # The last two pairs come from published kits: Illumina UD i7 indexes and 10x SI-GA oligos.
     When I run `unmux reads.fq --group bc=<set> --group bc::bothStrands=true,mode=<mode> --sample-from-group bc --out %sample.fq`
     Then the exit code is 1
-    And stderr contains "are reverse complements of each other (the bases `<bases>` match both with zero errors, one on each strand), so bothStrands=true cannot tell them apart; drop bothStrands to match each tag on the forward strand only"
+    And stderr contains "are reverse complements of each other (the bases `<bases>` match both with zero errors, one on each strand), so bothStrands=true cannot tell them apart; drop bothStrands to match each tag on the forward strand only, or remove one of them"
 
     Examples:
       | set                         | mode    | bases      |
@@ -193,6 +194,17 @@ Feature: Tags that one read can match together are refused or warned about
       | {a=ACGTACGG,b=CCGTACGT}     | nearest | ACGTACGG   |
       | {a=ATACCAACGC,b=GCGTTGGTAT} | all     | ATACCAACGC |
       | {a=CTCCTAGT,b=ACTAGGAG}     | nearest | CTCCTAGT   |
+
+  Scenario Outline: a tag within the reverse complement of a longer one is refused with bothStrands=true
+    # The reverse complement of ACGTTT is AAACGT, which starts with AAAC.
+    When I run `unmux reads.fq --group bc=<set> --group bc::bothStrands=true --sample-from-group bc --out %sample.fq`
+    Then the exit code is 1
+    And stderr contains "tag `AAAC` lies within the reverse complement of `ACGTTT` (the bases `ACGTTT` match both with zero errors, one on each strand)"
+
+    Examples:
+      | set               |
+      | {a=ACGTTT,b=AAAC} |
+      | {a=AAAC,b=ACGTTT} |
 
   Scenario: a pair that one read matches with zero errors is reported before one that needs substitutions
     # AAAA and AATT differ by two substitutions, and every read holding GGGGCC holds GGGG.
@@ -255,8 +267,8 @@ Feature: Tags that one read can match together are refused or warned about
     And the file "a.fq" contains "@ra"
     And the file "c.fq" contains "@rc"
 
-  Scenario: sliding tags that both match one read at shifted places are not flagged
-    # ACGTAC starts one base into TACGTACGT and CGTACG two bases in, so the earlier start wins.
+  Scenario Outline: tags that slide can both match one read at shifted positions without being flagged
+    # ACGTAC starts one base into TACGTACGT and CGTACG two bases in, with or without an 8 bp window.
     Given a file "shifted.fq" containing:
       """
       @r1
@@ -264,7 +276,12 @@ Feature: Tags that one read can match together are refused or warned about
       +
       IIIIIIIII
       """
-    When I run `unmux shifted.fq --group bc={a=ACGTAC,b=CGTACG} --sample-from-group bc --out %sample.fq --unassigned un.fq`
+    When I run `unmux shifted.fq --group bc={a=ACGTAC,b=CGTACG} --group bc::<attrs> --sample-from-group bc --out %sample.fq --unassigned un.fq`
     Then the exit code is 0
     And stderr does not contain "can both match one read"
-    And the file "a.fq" contains "@r1"
+    And stderr does not contain "may both match one read"
+
+    Examples:
+      | attrs     |
+      | dist=0    |
+      | loc=0:0:8 |

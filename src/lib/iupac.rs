@@ -1429,7 +1429,7 @@ mod tests {
     fn test_long_tags_too_costly_to_compare_are_taken_to_collide() {
         let tags = long_pair();
         let w = validate_group("g", &tags, &search(budget(0, 8), MatchMode::Nearest)).unwrap();
-        let unchecked = "may both match one read within dist=0:8 (too long to compare exactly under this indel budget)";
+        let unchecked = "may both match one read within dist=0:8 (too costly to compare exactly under this indel budget)";
         assert!(w.len() == 1 && w[0].contains(unchecked), "{w:?}");
         let err = validate_group("g", &tags, &unset(budget(0, 8)))
             .unwrap_err()
@@ -1456,8 +1456,8 @@ mod tests {
                 ..search(dist(0), mode)
             };
             let err = validate_group("g", &tags, &both).unwrap_err().to_string();
-            let reason = "tags `ATACCAACGC` and `GCGTTGGTAT` are reverse complements of each other (the bases `ATACCAACGC` match both with zero errors, one on each strand), so bothStrands=true cannot tell them apart; drop bothStrands to match each tag on the forward strand only";
-            assert!(err.contains(reason), "{err}");
+            let reason = "tags `ATACCAACGC` and `GCGTTGGTAT` are reverse complements of each other (the bases `ATACCAACGC` match both with zero errors, one on each strand), so bothStrands=true cannot tell them apart; drop bothStrands to match each tag on the forward strand only, or remove one of them";
+            assert!(err.ends_with(reason), "{err}");
         }
         // ACGT is its own reverse complement, but it also lies within ACGTAC on one strand.
         let both = Search {
@@ -1490,6 +1490,93 @@ mod tests {
         let err = validate_group("g", &tags, &both).unwrap_err().to_string();
         let reason = "tags `ATACCAACGC` and `GCGTTGGTAT` are reverse complements of each other";
         assert!(err.contains(reason), "{err}");
+    }
+
+    #[test]
+    fn test_iupac_tags_that_meet_on_opposite_strands_are_not_called_reverse_complements() {
+        // The reverse complement of CCTY is RAGG, and R holds the A of AAGG.
+        let both = Search {
+            both_strands: true,
+            ..unset(dist(0))
+        };
+        let err = validate_group("g", &seqs(&["AAGG", "CCTY"]), &both)
+            .unwrap_err()
+            .to_string();
+        let reason = "tags `AAGG` and `CCTY` each match the other's reverse complement (the bases `AAGG` match both with zero errors, one on each strand)";
+        assert!(err.contains(reason), "{err}");
+    }
+
+    /// Plain 16 bp tags at least three substitutions apart, after two that one
+    /// substitution each turns into the same read.
+    fn after_a_close_pair(count: usize) -> Vec<Vec<u8>> {
+        let mut tags = seqs(&["ACGTACGTACGTACGT", "ACGTACGTACGTACCA"]);
+        tags.extend(spread_barcodes(count, 16, 3));
+        tags
+    }
+
+    #[test]
+    fn test_a_zero_error_pair_among_thousands_of_plain_tags_is_found() {
+        let mut tags = after_a_close_pair(3_000);
+        tags.push(tags[1_500].clone());
+        let shown = String::from_utf8_lossy(&tags[1_500]).into_owned();
+        let err = validate_group("g", &tags, &unset(dist(1)))
+            .unwrap_err()
+            .to_string();
+        let reason = format!("tags `{shown}` and `{shown}` are indistinguishable");
+        assert!(err.contains(&reason), "{err}");
+        tags.pop();
+        let mut flipped = tags[1_500].clone();
+        reverse_complement(&mut flipped);
+        let flipped_shown = String::from_utf8_lossy(&flipped).into_owned();
+        tags.push(flipped);
+        let both = Search {
+            both_strands: true,
+            ..unset(dist(1))
+        };
+        let err = validate_group("g", &tags, &both).unwrap_err().to_string();
+        let reason = format!("tags `{shown}` and `{flipped_shown}` are reverse complements");
+        assert!(err.contains(&reason), "{err}");
+    }
+
+    #[test]
+    fn test_a_zero_error_pair_past_the_pair_limit_gives_the_plain_refusal() {
+        // A 12 bp tag at the start of a 16 bp one is the last pair, past the first 2^20.
+        let mut tags = after_a_close_pair(1_496);
+        let long = Rng(0x7a11).sample(16, b"ACGT");
+        tags.extend([long.clone(), long[..12].to_vec()]);
+        assert!(tags.len() * (tags.len() - 1) / 2 > 1 << 20);
+        let err = validate_group("g", &tags, &unset(dist(1)))
+            .unwrap_err()
+            .to_string();
+        let plain =
+            "tags `ACGTACGTACGTACGT` and `ACGTACGTACGTACCA` can both match one read within dist=1";
+        assert!(err.contains(plain), "{err}");
+    }
+
+    #[test]
+    fn test_a_pair_that_cannot_fit_the_window_is_never_taken_to_collide() {
+        // A 150 bp tag needs at least 142 bases under eight indels, more than the window holds.
+        let mut tags = long_pair();
+        tags[1].truncate(120);
+        let narrow = Search {
+            window: Some(141),
+            ..search(budget(0, 8), MatchMode::Nearest)
+        };
+        assert!(validate_group("g", &tags, &narrow).unwrap().is_empty());
+        let narrow = Search {
+            window: Some(141),
+            ..unset(budget(0, 8))
+        };
+        assert!(validate_group("g", &tags, &narrow).is_ok());
+    }
+
+    #[test]
+    fn test_totals_say_may_when_any_counted_pair_was_not_compared_exactly() {
+        let mut tags = long_pair();
+        tags.push(b"ACGTTGCAACGT".to_vec());
+        let w = validate_group("g", &tags, &search(budget(0, 8), MatchMode::All)).unwrap();
+        let total = "group `g`: 3 pairs of tags may match one read only through an indel";
+        assert!(w.last().is_some_and(|w| w.starts_with(total)), "{w:?}");
     }
 
     /// Every 4-mer; two of them collide at dist=1 when they differ at two or fewer positions.
