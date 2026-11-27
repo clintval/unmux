@@ -390,6 +390,8 @@ pub struct TagBinding {
     /// multi-stream tag that emits a quality tag (defaults to a single space);
     /// `None` otherwise.
     pub qual_sep: Option<String>,
+    /// Whether `qual-sep=` was set rather than left to its default.
+    pub qual_sep_set: bool,
     /// `raw=true`: emit the observed (as-sequenced) bases for this tag rather
     /// than the corrected form. Default `false`: a tag emits the
     /// error-corrected barcode when its stream came from a matched keeplist
@@ -430,6 +432,22 @@ impl TagBinding {
     /// Every stream this tag may read, its fallbacks included.
     pub fn all_streams(&self) -> impl Iterator<Item = &StreamRef> {
         self.streams.iter().chain(self.fallbacks.iter().flatten())
+    }
+
+    /// The streams as a `--tag` value gives them, with `|` before each fallback.
+    fn spec(&self) -> String {
+        self.streams
+            .iter()
+            .zip(&self.fallbacks)
+            .map(|(stream, fallbacks)| {
+                std::iter::once(stream)
+                    .chain(fallbacks)
+                    .map(StreamRef::to_string)
+                    .collect::<Vec<_>>()
+                    .join("|")
+            })
+            .collect::<Vec<_>>()
+            .join("+")
     }
 }
 
@@ -691,6 +709,7 @@ pub fn parse_demux(args: &DemuxArgs) -> Result<DemuxPlan> {
             tag.qual = QualTag::Omitted;
         }
     }
+    validate_tag_writers(&plan)?;
     for warning in plan_warnings(&plan) {
         log::warn!("{warning}");
     }
@@ -1504,10 +1523,8 @@ fn parse_separator(value: &str, tag: &str, attr: &str) -> Result<String> {
 /// default.
 pub(crate) fn default_qual_tag(tag: &str) -> Option<&'static str> {
     match tag {
+        // The SAM spec pairs CY with CR; CB borrows it by convention.
         "CB" => Some("CY"),
-        // CR is the raw cellular barcode; its quality has no dedicated SAM tag,
-        // so it shares CY (the cell-barcode quality) by convention, letting
-        // `--tag CR=bc::raw=true` pair a quality with no explicit `qual=`.
         "CR" => Some("CY"),
         "RX" => Some("QX"),
         "BC" => Some("QT"),
@@ -1563,6 +1580,7 @@ fn finish_tag(builder: TagBuilder) -> Result<TagBinding> {
     } else {
         builder.sep
     };
+    let qual_sep_set = builder.qual_sep.is_some();
     let qual_sep = if streams.len() >= 2 && emits_qual {
         Some(builder.qual_sep.unwrap_or_else(|| " ".to_string()))
     } else {
@@ -1575,6 +1593,7 @@ fn finish_tag(builder: TagBuilder) -> Result<TagBinding> {
         qual,
         sep,
         qual_sep,
+        qual_sep_set,
         raw: builder.raw.unwrap_or(false),
     })
 }
@@ -2276,6 +2295,87 @@ fn validate_plan(plan: &DemuxPlan) -> Result<()> {
     Ok(())
 }
 
+/// A source of one SAM tag on an output record.
+#[derive(Clone, Copy)]
+enum TagWriter<'a> {
+    /// The sequence of a `--tag` binding.
+    Sequence(&'a TagBinding),
+    /// The `qual=` tag of a `--tag` binding.
+    Quality(&'a TagBinding),
+    /// The default quality tag of a `--tag` binding.
+    DefaultQuality(&'a TagBinding),
+    /// The `--qc-tag` slug.
+    Qc,
+}
+
+impl TagWriter<'_> {
+    /// The flag behind this writer of `tag`, as given on the command line.
+    fn flag(self, tag: &str) -> String {
+        match self {
+            TagWriter::Sequence(binding) | TagWriter::DefaultQuality(binding) => {
+                format!("`--tag {}={}`", binding.tag, binding.spec())
+            }
+            TagWriter::Quality(binding) => format!("`--tag {}::qual={tag}`", binding.tag),
+            TagWriter::Qc => format!("`--qc-tag={tag}`"),
+        }
+    }
+
+    /// How an error refers to this writer of `tag`.
+    fn describe(self, tag: &str) -> String {
+        match self {
+            TagWriter::DefaultQuality(_) => {
+                format!("as the default quality tag of {}", self.flag(tag))
+            }
+            _ => format!("by {}", self.flag(tag)),
+        }
+    }
+}
+
+/// Refuse a binding of `RG`, which unmux sets itself, and a SAM tag that two writers would set.
+fn validate_tag_writers(plan: &DemuxPlan) -> Result<()> {
+    let mut writers: Vec<(&str, TagWriter)> = Vec::new();
+    for binding in &plan.tags {
+        writers.push((&binding.tag, TagWriter::Sequence(binding)));
+        match &binding.qual {
+            QualTag::Named(qual) => writers.push((qual, TagWriter::Quality(binding))),
+            QualTag::Default => writers.extend(
+                default_qual_tag(&binding.tag)
+                    .map(|qual| (qual, TagWriter::DefaultQuality(binding))),
+            ),
+            QualTag::None | QualTag::Omitted => {}
+        }
+    }
+    writers.extend(plan.qc_tag.as_deref().map(|tag| (tag, TagWriter::Qc)));
+    if let Some(&(tag, writer)) = writers.iter().find(|(tag, _)| *tag == "RG") {
+        bail!(
+            "tag `RG` is reserved for the read group, which unmux sets itself on SAM/BAM/CRAM \
+             output; choose another tag for {}",
+            writer.flag(tag)
+        );
+    }
+    for (index, &(tag, second)) in writers.iter().enumerate() {
+        let Some(&(_, first)) = writers[..index].iter().find(|(seen, _)| *seen == tag) else {
+            continue;
+        };
+        // Only CB and CR default to one tag, CY, which a record takes from CR where it writes one.
+        if let (TagWriter::DefaultQuality(_), TagWriter::DefaultQuality(_)) = (first, second) {
+            continue;
+        }
+        let hint = match (first, second) {
+            (TagWriter::DefaultQuality(binding), _) | (_, TagWriter::DefaultQuality(binding)) => {
+                format!("set `{0}::qual=none` or `{0}::qual=<TAG>`", binding.tag)
+            }
+            _ => "choose another tag for one of them".to_string(),
+        };
+        bail!(
+            "tag `{tag}` would be written twice, {} and {}; {hint}",
+            first.describe(tag),
+            second.describe(tag)
+        );
+    }
+    Ok(())
+}
+
 /// Whether a `%sample::COLUMN` reads the routed target's `sample` or
 /// `sub_sample`, which every sample mode has.
 pub(crate) fn is_reserved_sample_column(column: &str) -> bool {
@@ -2467,6 +2567,20 @@ fn plan_warnings(plan: &DemuxPlan) -> Vec<String> {
                  quality tag `{qual}` is left out; set `{tag}::qual=none` to silence this.",
                 tag = tag.tag
             ));
+        }
+    }
+    let default_cy = |name: &str| {
+        plan.tags
+            .iter()
+            .find(|tag| tag.tag == name && tag.qual == QualTag::Default)
+    };
+    if let (Some(cb), Some(_)) = (default_cy("CB"), default_cy("CR")) {
+        if cb.qual_sep_set && cb.streams.len() >= 2 {
+            warnings.push(
+                "tag `CB` sets `qual-sep`, which applies only to records where `CR` writes no \
+                 `CY`, since `CY` holds the `CR` qualities on the others"
+                    .to_string(),
+            );
         }
     }
 
@@ -4173,6 +4287,205 @@ mod tests {
         assert_eq!(warnings(&["CB=cell", "RX=cell"]).len(), 2);
         assert!(warnings(&["CB=cell", "CB::qual=none"]).is_empty());
         assert!(warnings(&["CB=u", "xc=cell"]).is_empty());
+    }
+
+    fn tag_args(tags: &[&str], qc_tag: Option<&str>) -> DemuxArgs {
+        let mut a = column_args();
+        a.extracts.push("v=0:4:8".to_string());
+        a.tags = tags.iter().map(|tag| tag.to_string()).collect();
+        a.qc_tag = qc_tag.map(str::to_string);
+        a
+    }
+
+    #[test]
+    fn test_a_tag_that_two_writers_would_set_is_an_error() {
+        let refusal = |tag: &str, first: &str, second: &str| {
+            format!(
+                "tag `{tag}` would be written twice, by `{first}` and by `{second}`; choose \
+                 another tag for one of them"
+            )
+        };
+        let read_group = |flag: &str| {
+            format!(
+                "tag `RG` is reserved for the read group, which unmux sets itself on SAM/BAM/CRAM \
+                 output; choose another tag for `{flag}`"
+            )
+        };
+        for (tags, qc_tag, message) in [
+            (
+                &["ZS=cell+u"][..],
+                Some("ZS"),
+                refusal("ZS", "--tag ZS=cell+u", "--qc-tag=ZS"),
+            ),
+            (
+                &["XA=u", "XA::qual=XA"],
+                None,
+                refusal("XA", "--tag XA=u", "--tag XA::qual=XA"),
+            ),
+            (
+                &["XA=u", "XB=v", "XB::qual=XA"],
+                None,
+                refusal("XA", "--tag XA=u", "--tag XB::qual=XA"),
+            ),
+            (
+                &["XA=u", "XA::qual=XQ", "XB=v", "XB::qual=XQ"],
+                None,
+                refusal("XQ", "--tag XA::qual=XQ", "--tag XB::qual=XQ"),
+            ),
+            (
+                &["RX=u", "RX::qual=ZS"],
+                Some("ZS"),
+                refusal("ZS", "--tag RX::qual=ZS", "--qc-tag=ZS"),
+            ),
+            (
+                &["XA=v|u", "XA::qual=XA"],
+                None,
+                refusal("XA", "--tag XA=v|u", "--tag XA::qual=XA"),
+            ),
+            (
+                &["XA=~v|u+u", "XB=v", "XB::qual=XA"],
+                None,
+                refusal("XA", "--tag XA=~v|u+u", "--tag XB::qual=XA"),
+            ),
+            (&["RG=u"], None, read_group("--tag RG=u")),
+            (&["RG=cell|u"], None, read_group("--tag RG=cell|u")),
+            (
+                &["XA=~u", "XA::qual=RG"],
+                None,
+                read_group("--tag XA::qual=RG"),
+            ),
+        ] {
+            let err = parse_demux(&tag_args(tags, qc_tag))
+                .unwrap_err()
+                .to_string();
+            assert_eq!(err, message, "{tags:?}");
+        }
+    }
+
+    #[test]
+    fn test_a_default_quality_tag_that_another_writer_sets_is_an_error_with_a_hint() {
+        let by = |spec: &str| format!("by `--tag {spec}`");
+        let default_of = |spec: &str| format!("as the default quality tag of `--tag {spec}`");
+        let refusal = |tag: &str, first: String, second: String, defaulting: &str| {
+            format!(
+                "tag `{tag}` would be written twice, {first} and {second}; set \
+                 `{defaulting}::qual=none` or `{defaulting}::qual=<TAG>`"
+            )
+        };
+        for (tags, message) in [
+            (
+                &["CY=u", "CB=v"][..],
+                refusal("CY", by("CY=u"), default_of("CB=v"), "CB"),
+            ),
+            (
+                &["CY=u", "CB=cell|v"],
+                refusal("CY", by("CY=u"), default_of("CB=cell|v"), "CB"),
+            ),
+            (
+                &["CB=v", "CY=u"],
+                refusal("CY", default_of("CB=v"), by("CY=u"), "CB"),
+            ),
+            (
+                &["CB=u", "CB::qual=CY", "CR=v"],
+                refusal("CY", by("CB::qual=CY"), default_of("CR=v"), "CR"),
+            ),
+            (
+                &["CB=u", "CR=v", "CR::qual=CY"],
+                refusal("CY", default_of("CB=u"), by("CR::qual=CY"), "CB"),
+            ),
+            (
+                &["CB=u", "CR=v", "CY=cell"],
+                refusal("CY", default_of("CB=u"), by("CY=cell"), "CB"),
+            ),
+            (
+                &["CR=v", "CB=u", "CY=cell"],
+                refusal("CY", default_of("CR=v"), by("CY=cell"), "CR"),
+            ),
+            (
+                &["BC=u+~v", "QT=v"],
+                refusal("QT", default_of("BC=u+~v"), by("QT=v"), "BC"),
+            ),
+            (
+                &["xa=u", "xa::qual=QX", "RX=v"],
+                refusal("QX", by("xa::qual=QX"), default_of("RX=v"), "RX"),
+            ),
+        ] {
+            let err = parse_demux(&tag_args(tags, None)).unwrap_err().to_string();
+            assert_eq!(err, message, "{tags:?}");
+        }
+    }
+
+    #[test]
+    fn test_tags_with_one_writer_each_are_ok() {
+        for (tags, qc_tag) in [
+            (&["CB=u+v", "CB::qual=CY", "RX=u", "RX::qual=QX"][..], None),
+            (&["CB=u", "CB::qual=none", "CY=v"], None),
+            (&["CB=u", "CB::qual=XC", "CY=v"], None),
+            (&["CB=cell", "CY=u"], None),
+            (&["RX=u", "RX::qual=ZQ", "OX=v"], Some("ZS")),
+            (&["rg=u", "XA=v"], Some("XB")),
+        ] {
+            let parsed = parse_demux(&tag_args(tags, qc_tag));
+            assert!(parsed.is_ok(), "{tags:?}: {parsed:?}");
+        }
+    }
+
+    #[test]
+    fn test_cb_and_cr_may_both_default_to_cy() {
+        let qualities = |tags: &[&str]| -> Vec<String> {
+            let plan = parse_demux(&tag_args(tags, None)).unwrap();
+            plan.tags
+                .iter()
+                .map(|tag| {
+                    let qual = crate::output::qual_tag_name(tag).unwrap_or("-");
+                    format!("{}>{qual}", tag.tag)
+                })
+                .collect()
+        };
+        assert_eq!(qualities(&["CB=u", "CR=v"]), ["CB>CY", "CR>CY"]);
+        assert_eq!(qualities(&["CR=v", "CB=u"]), ["CR>CY", "CB>CY"]);
+        assert_eq!(
+            qualities(&["CB=u+v", "CR=u+v", "CR::raw=true"]),
+            ["CB>CY", "CR>CY"]
+        );
+        assert_eq!(qualities(&["CB=u", "CR=cell|v"]), ["CB>CY", "CR>CY"]);
+        assert_eq!(qualities(&["CB=u"]), ["CB>CY"]);
+        assert_eq!(qualities(&["CR=v"]), ["CR>CY"]);
+        assert_eq!(
+            qualities(&["CB=u", "CR=v", "CR::qual=none"]),
+            ["CB>CY", "CR>-"]
+        );
+        assert_eq!(
+            qualities(&["CB=u", "CB::qual=none", "CR=v"]),
+            ["CB>-", "CR>CY"]
+        );
+        assert_eq!(
+            qualities(&["CB=u", "CR=v", "CR::qual=XY"]),
+            ["CB>CY", "CR>XY"]
+        );
+        assert_eq!(qualities(&["CB=u", "CR=cell"]), ["CB>CY", "CR>-"]);
+        assert_eq!(qualities(&["CB=cell", "CR=v"]), ["CB>-", "CR>CY"]);
+    }
+
+    #[test]
+    fn test_warn_once_for_a_cb_qual_sep_where_cr_writes_cy() {
+        let warnings = |tags: &[&str]| {
+            let mut warnings = plan_warnings(&parse_demux(&tag_args(tags, None)).unwrap());
+            warnings.retain(|warning| warning.contains("qual-sep"));
+            warnings
+        };
+        let warning = "tag `CB` sets `qual-sep`, which applies only to records where `CR` writes \
+                       no `CY`, since `CY` holds the `CR` qualities on the others";
+        assert_eq!(warnings(&["CB=u+v", "CB::qual-sep=_", "CR=u+v"]), [warning]);
+        assert_eq!(
+            warnings(&["CR=v|cell", "CB=u+v", "CB::qual-sep=%20"]),
+            [warning]
+        );
+        assert!(warnings(&["CB=u+v", "CR=u+v"]).is_empty());
+        assert!(warnings(&["CB=u+v", "CB::qual-sep=_"]).is_empty());
+        assert!(warnings(&["CB=u", "CB::qual-sep=_", "CR=v"]).is_empty());
+        assert!(warnings(&["CB=u+v", "CB::qual-sep=_", "CR=v", "CR::qual=none"]).is_empty());
+        assert!(warnings(&["CB=u+v", "CB::qual-sep=_", "CR=cell"]).is_empty());
     }
 
     #[test]

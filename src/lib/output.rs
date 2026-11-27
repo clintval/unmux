@@ -115,7 +115,8 @@ fn placeholder_value(placeholder: Placeholder, ctx: &PathContext) -> String {
 /// paired quality tag (from the default seq->qual map, an explicit `qual=`, or
 /// off for `qual=none`) is the streams' qualities re-encoded to ASCII Phred+33
 /// and joined by `qual-sep`; it is emitted only when every stream carries
-/// qualities.
+/// qualities. `CB` and `CR` may both default to `CY`, which a record takes from
+/// `CR` where it writes one, as the SAM spec pairs them, and from `CB` elsewhere.
 pub fn build_tag_data(bindings: &[TagBinding], streams: &HashMap<&str, Extracted>) -> Data {
     let mut data = Data::default();
     for binding in bindings {
@@ -146,9 +147,13 @@ pub fn build_tag_data(bindings: &[TagBinding], streams: &HashMap<&str, Extracted
         );
 
         if let Some(qual_tag) = qual_tag_name(binding) {
-            if present
-                .iter()
-                .all(|(_, stream)| stream.tag_quals(binding.raw).is_some())
+            let left_to_cr = binding.tag == "CB"
+                && binding.qual == QualTag::Default
+                && data.get(&two_byte_tag(qual_tag)).is_some();
+            if !left_to_cr
+                && present
+                    .iter()
+                    .all(|(_, stream)| stream.tag_quals(binding.raw).is_some())
             {
                 let qual_sep = binding.qual_sep.as_deref().unwrap_or_default().as_bytes();
                 let quals: Vec<Vec<u8>> = present
@@ -883,6 +888,7 @@ mod tests {
             qual,
             sep: sep.map(str::to_string),
             qual_sep: sep.map(|_| " ".to_string()),
+            qual_sep_set: false,
             raw: false,
         }
     }
@@ -1005,6 +1011,47 @@ mod tests {
         let bc = binding("BC", &["bc"], QualTag::Default, None);
         let data = build_tag_data(&[bc], &HashMap::new());
         assert!(data.is_empty(), "an absent stream leaves a null tag");
+    }
+
+    #[test]
+    fn test_build_tag_data_cy_holds_the_cr_qualities_where_cr_writes_them() {
+        let cb = binding("CB", &["u"], QualTag::Default, None);
+        let mut cr = binding("CR", &["v"], QualTag::Default, None);
+        cr.fallbacks = vec![vec![StreamRef {
+            name: "n".to_string(),
+            revcomp: false,
+        }]];
+        let tags = |bindings: &[TagBinding], present: &[&str]| {
+            let streams: HashMap<&str, Extracted> = [
+                ("u", extracted(b"AAAA", Some(&[40; 4]))),
+                ("v", extracted(b"CCCC", Some(&[20; 4]))),
+                ("n", extracted(b"cell", None)),
+            ]
+            .into_iter()
+            .filter(|(name, _)| present.contains(name))
+            .collect();
+            build_tag_data(bindings, &streams)
+                .iter()
+                .map(|(tag, value)| {
+                    let tag = String::from_utf8(<[u8; 2]>::from(tag).to_vec()).unwrap();
+                    match value {
+                        Value::String(text) => format!("{tag}:{text}"),
+                        _ => tag,
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let cb_first = [cb.clone(), cr.clone()];
+        let cr_first = [cr, cb];
+        assert_eq!(tags(&cb_first, &["u", "v"]), "CB:AAAA CY:5555 CR:CCCC");
+        assert_eq!(tags(&cr_first, &["u", "v"]), "CR:CCCC CY:5555 CB:AAAA");
+        assert_eq!(tags(&cb_first, &["u"]), "CB:AAAA CY:IIII");
+        assert_eq!(tags(&cr_first, &["u"]), "CB:AAAA CY:IIII");
+        assert_eq!(tags(&cb_first, &["u", "n"]), "CB:AAAA CY:IIII CR:cell");
+        assert_eq!(tags(&cr_first, &["u", "n"]), "CR:cell CB:AAAA CY:IIII");
+        assert_eq!(tags(&cb_first, &["v"]), "CR:CCCC CY:5555");
+        assert_eq!(tags(&cr_first, &["v"]), "CR:CCCC CY:5555");
     }
 
     #[test]

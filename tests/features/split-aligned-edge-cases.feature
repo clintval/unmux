@@ -221,7 +221,7 @@ Feature: Edge cases of an aligned read-group split
       """
     When I run `unmux in.sam --group rg=@RG --sample-from-group rg --extract head=0:0:4 --tag RG=head --out out/%sample.sam`
     Then the exit code is 1
-    And stderr contains "`RG` would overwrite"
+    And stderr contains "tag `RG` is reserved for the read group, which unmux sets itself on SAM/BAM/CRAM output; choose another tag for `--tag RG=head`"
     And a file "out/rg1.sam" does not exist
 
   Scenario: a --tag that would replace an alignment tag is refused
@@ -234,7 +234,7 @@ Feature: Edge cases of an aligned read-group split
       """
     When I run `unmux in.sam --group rg=@RG --sample-from-group rg --extract head=0:0:4 --tag NM=head --out out/%sample.sam`
     Then the exit code is 1
-    And stderr contains "`NM` would overwrite"
+    And stderr contains "`NM` would overwrite an alignment tag of records kept whole"
 
   Scenario: a sequence-matching group is refused, so a secondary cannot be routed apart from its primary
     Given a file "in.sam" containing:

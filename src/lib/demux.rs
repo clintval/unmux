@@ -1426,10 +1426,10 @@ fn passes_alignments_through(
         .flat_map(|binding| std::iter::once(binding.tag.as_str()).chain(qual_tag_name(binding)))
         .chain(plan.qc_tag.as_deref());
     for tag in claimed {
-        if tag == "RG" || crate::input::ALIGNMENT_TAGS.contains(&tag_bytes(tag)) {
+        if crate::input::ALIGNMENT_TAGS.contains(&tag_bytes(tag)) {
             bail!(
-                "--tag/--qc-tag `{tag}` would overwrite a read group or alignment tag of records \
-                 kept whole by this aligned @RG split; choose another tag"
+                "--tag/--qc-tag `{tag}` would overwrite an alignment tag of records kept whole by \
+                 this aligned @RG split; choose another tag"
             );
         }
     }
@@ -3311,7 +3311,8 @@ fn left_out_tags<'a>(
 /// has a column stream with its default quality tag, which is dropped from the
 /// carried tags when that tag is rewritten without qualities. A `left_out` tag
 /// is dropped from the carried tags, along with its explicit and default
-/// quality tags unless another carried tag keeps one (a `CY` with a `CR`).
+/// quality tags unless another carried tag that this record does not rewrite
+/// keeps one (a `CY` with a `CR`).
 fn merge_data(
     carried: Option<&Data>,
     tag_data: &Data,
@@ -3332,8 +3333,9 @@ fn merge_data(
     let is_left_out = |tag: &[u8; 2]| left_out.iter().any(|(name, _)| tag_bytes(name) == *tag);
     let keeps_quality = |quality: &str| {
         data.iter().any(|(tag, _)| {
+            let kept = tag_data.get(&tag).is_none();
             let tag = <[u8; 2]>::from(tag);
-            !is_left_out(&tag)
+            kept && !is_left_out(&tag)
                 && std::str::from_utf8(&tag).is_ok_and(|tag| default_qual_tag(tag) == Some(quality))
         })
     };
@@ -6105,7 +6107,7 @@ mod tests {
 
     #[test]
     fn test_passes_alignments_through_refuses_tags_it_would_overwrite() {
-        for tag in ["RG", "NM", "MD", "MC", "SA"] {
+        for tag in ["NM", "MD", "MC", "SA"] {
             let mut args = base_args();
             args.inputs = vec!["0=in.bam".to_string()];
             args.extracts = vec!["head=0:0:4".to_string()];
@@ -6114,7 +6116,10 @@ mod tests {
             let err = passes_alignments_through(&plan, true, &[OutputFormat::Bam])
                 .unwrap_err()
                 .to_string();
-            assert!(err.contains(&format!("`{tag}` would overwrite")), "{err}");
+            assert!(
+                err.contains(&format!("`{tag}` would overwrite an alignment tag")),
+                "{err}"
+            );
         }
     }
 
@@ -6388,5 +6393,28 @@ mod tests {
             merged(&["xc", "BZ", "XX"], &[], &[("xc", Some("BZ"))]),
             "XX"
         );
+    }
+
+    #[test]
+    fn test_merge_data_keeps_no_carried_quality_tag_for_a_rewritten_tag() {
+        let data = |tags: &[&str]| -> Data {
+            tags.iter()
+                .map(|tag| (Tag::from(tag_bytes(tag)), Value::from(tag.to_string())))
+                .collect()
+        };
+        let merged = |carried: &[&str], written: &[&str], left_out: &[(&str, Option<&str>)]| {
+            merge_data(Some(&data(carried)), &data(written), &[], left_out)
+                .iter()
+                .map(|(tag, _)| String::from_utf8(<[u8; 2]>::from(tag).to_vec()).unwrap())
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let cr = &[("CR", None)];
+        assert_eq!(merged(&["CB", "CR", "CY"], &["CB"], cr), "CB");
+        assert_eq!(merged(&["CB", "CY", "CR"], &["CB"], cr), "CB");
+        assert_eq!(merged(&["CR", "CB", "CY"], &["CR"], &[("CB", None)]), "CR");
+        assert_eq!(merged(&["CB", "CR", "CY"], &["CB", "CY"], cr), "CB CY");
+        assert_eq!(merged(&["CB", "CR", "CY"], &[], cr), "CB CY");
+        assert_eq!(merged(&["CR", "CB", "CY"], &[], &[("CB", None)]), "CR CY");
     }
 }
