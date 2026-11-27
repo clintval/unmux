@@ -2808,10 +2808,10 @@ fn match_read_group(rg_to_idx: &HashMap<Vec<u8>, usize>, fragment: &Fragment) ->
 }
 
 /// Match a `match=` group against the concatenation of its named `--extract`
-/// streams (no delimiter), each as a `--tag` without `raw=true` writes it. A
-/// referenced stream that is absent (its anchoring group did not match, or it
-/// resolved to nothing) makes the group a non-match. The tags are searched
-/// within the joined text as a single synthetic segment, so
+/// streams (no delimiter), each as [`join_bases`] takes it. A referenced stream
+/// that is absent (its anchoring group did not match, or it resolved to
+/// nothing) makes the group a non-match. The tags are searched within the
+/// joined text as a single synthetic segment, so
 /// `dist`/`mode`/`delta`/`bothStrands` apply over the concatenation.
 fn match_joined(
     engine: &Engine,
@@ -2827,7 +2827,7 @@ fn match_joined(
             return Ok(GroupVerdict::unmatched(group));
         };
         match extract_stream(engine, spec, segments, hits)? {
-            Some(extracted) => joined.extend_from_slice(extracted.tag_bases(false)),
+            Some(extracted) => joined.extend_from_slice(join_bases(&extracted)),
             None => return Ok(GroupVerdict::unmatched(group)),
         }
     }
@@ -2835,6 +2835,14 @@ fn match_joined(
         return Ok(GroupVerdict::unmatched(group));
     }
     Ok(match_verdict(group, scratch, &[joined.as_slice()], None))
+}
+
+/// A stream's bases in a `match=` join: its corrected form unless the tag has an ambiguity code.
+fn join_bases(extracted: &Extracted) -> &[u8] {
+    match &extracted.corrected {
+        Some(corrected) if crate::iupac::degeneracy(&corrected.bases) == 1 => &corrected.bases,
+        _ => &extracted.bases,
+    }
 }
 
 /// Match one group, honoring its sequential prerequisite: a group with no
