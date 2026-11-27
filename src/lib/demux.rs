@@ -2183,10 +2183,7 @@ fn run_engine(plan: &DemuxPlan, command_line: Option<&str>) -> Result<()> {
         );
     }
     if !dropped.is_empty() {
-        log::warn!(
-            "--template changed the bases of some records, so their per-base tags were left out: \
-             {dropped}"
-        );
+        log::warn!("--template left out per-base tags from {dropped}");
     }
     if let Some(pattern) = &plan.metrics_per_sample {
         metrics.write_per_sample_tsv(staged.path(&resolve_metrics_path(pattern, &pool)))?;
@@ -2679,7 +2676,7 @@ impl Processed {
     /// through `slots`, by destination the index of its buffer in `bytes`.
     fn add(&mut self, prepared: Prepared, slots: &mut [usize]) {
         tally(&mut self.tally, &prepared);
-        self.dropped |= prepared.dropped;
+        self.dropped.absorb(prepared.dropped);
         for write in prepared.writes {
             match write.payload {
                 WritePayload::Encoded(bytes) => {
@@ -2924,7 +2921,7 @@ impl pool::Stages for DemuxRun<'_> {
             dropped,
         } = &mut *merger;
         metrics.absorb(&done.tally);
-        *dropped |= done.dropped;
+        dropped.absorb(done.dropped);
         for (dest, bytes) in &done.bytes {
             sinks.write(*dest, bytes, blocks)?;
         }
@@ -3593,6 +3590,8 @@ const _: () = assert!(PER_BASE_TAGS.len() <= u64::BITS as usize);
 /// The per-base tags left out of `--template` records, one bit per [`PER_BASE_TAGS`] entry.
 #[derive(Clone, Copy, Default)]
 struct PerBaseTags {
+    /// The records that left out any.
+    records: u64,
     /// Every tag left out.
     left_out: u64,
     /// The tags left out because their length was not the read's.
@@ -3601,7 +3600,13 @@ struct PerBaseTags {
 
 impl PerBaseTags {
     fn is_empty(self) -> bool {
-        self.left_out == 0
+        self.records == 0
+    }
+
+    fn absorb(&mut self, other: Self) {
+        self.records += other.records;
+        self.left_out |= other.left_out;
+        self.mismatched |= other.mismatched;
     }
 }
 
@@ -3616,7 +3621,16 @@ impl std::fmt::Display for PerBaseTags {
                 .collect::<Vec<_>>()
                 .join(", ")
         };
-        f.write_str(&names(self.left_out))?;
+        let records = match self.records {
+            1 => "record",
+            _ => "records",
+        };
+        write!(
+            f,
+            "{} {records} that did not copy a read exactly: {}",
+            self.records,
+            names(self.left_out)
+        )?;
         if self.mismatched != 0 {
             write!(
                 f,
@@ -3625,13 +3639,6 @@ impl std::fmt::Display for PerBaseTags {
             )?;
         }
         Ok(())
-    }
-}
-
-impl std::ops::BitOrAssign for PerBaseTags {
-    fn bitor_assign(&mut self, other: Self) {
-        self.left_out |= other.left_out;
-        self.mismatched |= other.mismatched;
     }
 }
 
@@ -3727,6 +3734,7 @@ fn followed_tags(data: &Data, slices: Option<&[Slice]>, len: usize) -> (Data, Pe
             followed.map(|value| (tag, value))
         })
         .collect();
+    dropped.records = u64::from(dropped.left_out != 0);
     (kept, dropped)
 }
 
@@ -3892,7 +3900,7 @@ fn assemble_bodies(
                 return Some(tags.clone());
             }
             let (kept, left_out) = followed_tags(tags, origin.slices(), record.bases.len());
-            dropped |= left_out;
+            dropped.absorb(left_out);
             Some(kept)
         });
         bodies.push(Body {
