@@ -259,8 +259,7 @@ Feature: SAM tag emission with quality tag pairing and separators
       +
       IIIIIIIIII56789:IIII
       """
-    # CACGAT is one substitution from the reverse complement of AACGTG, so the corrected qualities
-    # of CB run in reverse (:98765) while CR and its CY keep the observed order.
+    # CACGAT is one substitution from AACGTG's reverse complement, so CR and CY run in the tag's orientation.
     When I run `unmux test.fq --pool p --group g={AACGTG} --group g::loc=0:10:16,bothStrands=true,dist=1 --extract bc=@g <flags> --out out.sam`
     Then the exit code is 0
     And the records of "out.sam" are:
@@ -270,8 +269,8 @@ Feature: SAM tag emission with quality tag pairing and separators
 
     Examples:
       | flags                                      | tags                                  |
-      | --tag CB=bc --tag CR=bc --tag CR::raw=true | CB:Z:AACGTG	CY:Z:56789:	CR:Z:CACGAT |
-      | --tag CR=bc --tag CR::raw=true --tag CB=bc | CR:Z:CACGAT	CY:Z:56789:	CB:Z:AACGTG |
+      | --tag CB=bc --tag CR=bc --tag CR::raw=true | CB:Z:AACGTG	CY:Z::98765	CR:Z:ATCGTG |
+      | --tag CR=bc --tag CR::raw=true --tag CB=bc | CR:Z:ATCGTG	CY:Z::98765	CB:Z:AACGTG |
       | --tag CB=bc                                | CB:Z:AACGTG	CY:Z::98765             |
 
   Scenario Outline: CY holds the CB qualities on a record where CR is left out
