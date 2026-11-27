@@ -400,6 +400,40 @@ Feature: Tag matching with distance tolerance and error handling
     And the file "c2.fq" does not contain "@n1"
     And the file "un.fq" does not contain "@n"
 
+  Scenario Outline: A match= group joins a tag written with U or in lowercase against a T cell list
+    Given a file "reads.fq" containing:
+      """
+      @r1
+      ACGTACGTGGGG
+      +
+      IIIIIIIIIIII
+      """
+    # The corrected stream is the tag as written, and the join reads its U as T and ignores case.
+    When I run `unmux reads.fq --group bc={x=<tag>} --group bc::loc=0:0:8 --extract b=@bc --group cell={c1=ACGTACGT} --group cell::match=b,minFindsPerGroup=1 --tag CB=b --tag CB::qual=none --out out.fq --unassigned un.fq`
+    Then the exit code is 0
+    And the file "out.fq" contains "@r1 CB:Z:<tag>"
+    And the file "un.fq" does not contain "@r1"
+
+    Examples:
+      | tag      |
+      | ACGUACGU |
+      | acgtacgt |
+      | acguacgu |
+
+  Scenario: A match= group counts its edits against the corrected join
+    Given a file "reads.fq" containing:
+      """
+      @del
+      AACTGCATTTT
+      +
+      IIIIIIIIIII
+      """
+    # The read lost the G of AACGTGCA, so bc reports one indel and the corrected join none.
+    When I run `unmux reads.fq --group bc={x=AACGTGCA} --group bc::dist=0:1:1 --extract b=@bc --group cell={c1=AACGTGCA} --group cell::match=b,dist=0:1:1 --qc-tag --out out.sam`
+    Then the exit code is 0
+    And the file "out.sam" contains "{"g":"bc","tag":"AACGTGCA","loc":"0:0:7","obs":"AACTGCA","sub":0,"ind":1}"
+    And the file "out.sam" contains "{"g":"cell","tag":"AACGTGCA","sub":0,"ind":0}"
+
   Scenario: IUPAC ambiguity in the tag definition matches any base at the N positions
     Given a file "reads.fq" containing:
       """
