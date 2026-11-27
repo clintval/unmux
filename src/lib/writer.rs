@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use anyhow::{anyhow, bail, Context, Result};
 use noodles::sam::alignment::io::Write as AlignmentWrite;
 use noodles::sam::alignment::record::data::field::Tag;
-use noodles::sam::alignment::record::Flags;
+use noodles::sam::alignment::record::{Flags, MappingQuality};
 use noodles::sam::alignment::record_buf::data::field::value::Array;
 use noodles::sam::alignment::record_buf::data::field::Value;
 use noodles::sam::alignment::record_buf::{Data, QualityScores, Sequence};
@@ -891,13 +891,14 @@ fn store_u_as_t(record: &mut std::borrow::Cow<'_, RecordBuf>) {
     }
 }
 
-/// Build an unmapped alignment record, carrying tags through, adding the `RG`
-/// data field for an assigned record, and omitting an empty name. This is the
-/// per-record SAM/BAM encode step (the input to the writer's
+/// Build an unmapped alignment record with MAPQ 0, carrying tags through, adding
+/// the `RG` data field for an assigned record, and omitting an empty name. This
+/// is the per-record SAM/BAM encode step (the input to the writer's
 /// `write_alignment_record`), exposed so it can be benchmarked in isolation.
 pub fn build_record(read: &OutputRead, flags: Flags) -> RecordBuf {
     let mut builder = RecordBuf::builder()
         .set_flags(flags)
+        .set_mapping_quality(MappingQuality::MIN)
         .set_sequence(Sequence::from(read.bases.to_vec()));
     if !read.name.is_empty() {
         builder = builder.set_name(read.name.to_vec());
