@@ -910,8 +910,8 @@ type OutDestination = (Option<PathBuf>, Vec<Target>, OutputFormat);
 
 /// The SAM/BAM/CRAM `--out` destinations and the fan-out targets whose records
 /// land in each (a single-file `--out` collects every target; a `%sample`
-/// pattern splits them), in first-seen order. FASTX destinations have no
-/// header, so they are excluded.
+/// pattern splits them; no `--out` is stdout), in first-seen order. FASTX
+/// destinations have no header, so they are excluded.
 fn out_destinations(
     plan: &DemuxPlan,
     routing: &Routing,
@@ -920,27 +920,28 @@ fn out_destinations(
 ) -> Result<Vec<OutDestination>> {
     let mut by_dest: Vec<OutDestination> = Vec::new();
     let mut index: HashMap<Option<PathBuf>, usize> = HashMap::new();
-    if let Some(pattern) = &plan.out {
-        for target in routing.targets() {
-            let ctx = PathContext {
-                pool,
-                sample: Some(&target.sample),
-                sub_sample: target.sub_sample.as_deref(),
-                ordinal: None,
-                source: None,
-            };
-            let path = resolve_pattern(pattern, &ctx);
-            let format = output_format(path.as_deref(), input_formats)?;
-            if matches!(
-                format,
-                OutputFormat::Sam | OutputFormat::Bam | OutputFormat::Cram
-            ) {
-                match index.get(&path) {
-                    Some(&i) => by_dest[i].1.push(target.clone()),
-                    None => {
-                        index.insert(path.clone(), by_dest.len());
-                        by_dest.push((path, vec![target.clone()], format));
-                    }
+    for target in routing.targets() {
+        let ctx = PathContext {
+            pool,
+            sample: Some(&target.sample),
+            sub_sample: target.sub_sample.as_deref(),
+            ordinal: None,
+            source: None,
+        };
+        let path = plan
+            .out
+            .as_ref()
+            .and_then(|pattern| resolve_pattern(pattern, &ctx));
+        let format = output_format(path.as_deref(), input_formats)?;
+        if matches!(
+            format,
+            OutputFormat::Sam | OutputFormat::Bam | OutputFormat::Cram
+        ) {
+            match index.get(&path) {
+                Some(&i) => by_dest[i].1.push(target.clone()),
+                None => {
+                    index.insert(path.clone(), by_dest.len());
+                    by_dest.push((path, vec![target.clone()], format));
                 }
             }
         }
