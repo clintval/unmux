@@ -69,6 +69,8 @@ Arguments:
           inputs at all, file 0 defaults to stdin, so bare unmux reads stdin.
           Mutually exclusive with --in. Inputs must agree on yes/no qualities
           FASTA cannot blend with a quality-containing FASTQ/SAM/BAM/CRAM.
+          SAM tags in a FASTX record-name comment are lifted onto the record,
+          and a malformed one stops the run.
           
             unmux r1.fq r2.fq i1.fq   files 0, 1, 2
             unmux < reads.fq          file 0 from stdin (no args = stdin)
@@ -104,8 +106,10 @@ Options:
           Placeholders fan-out the pool into multiple files including %pool,
           %sample, %sub_sample, and %ordinal. Outputs that would be one
           file are refused: paths differing only in case (one file on a
-          case-insensitive file system), two spellings of one file, or a metrics
-          file on another output's path.
+          case-insensitive file system), two spellings of one file, a metrics
+          file on another output's path, or an output that is a file the run
+          reads under any name (an input, a tag file, the sample sheet, or the
+          reference and its indexes).
           
             --out out.bam                   one file with all assigned records
             --out %sample.bam               one file per sample
@@ -235,7 +239,15 @@ Options:
           (default: '-') and qualities with qual-sep (default: a space).
           Default qual tags pre-exist for: CB/CY CR/CY RX/QX BC/QT OX/BZ.
           
-          A stream may name others after '|' to use, in order, when it is
+          A tag that two writers would set is an error. The writers are each
+          binding, its qual tag (named or default), and --qc-tag; where a
+          default qual tag clashes, set qual=none or qual=TAG. The exception
+          is CB and CR, which may both default to CY: a record's CY holds
+          the CR qualities where CR writes them (the SAM spec pairs them) and
+          the CB qualities elsewhere. The tag RG is reserved for the read
+          group, which unmux sets itself on SAM/BAM/CRAM output.
+          
+          A stream may list others after '|' to use, in order, when it is
           absent, and '|' binds tighter than '+'. A tag is written only when
           every stream in it, or one of its fallbacks, is present; otherwise the
           tag, its quality tag, and any input copies of them are left out.
