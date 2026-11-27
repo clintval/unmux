@@ -11,10 +11,11 @@
 //! (`@grpA..@grpB`). A span anchored on a reverse-strand match is measured in
 //! the matched tag's own orientation and reverse-complemented into it, with its
 //! qualities reversed, so a read and its reverse complement give the same
-//! stream; a `~` at the point of use (`--tag T=~stream` / `--template ~stream`)
-//! reverse-complements a stream again. Anchored spans that reference a group
-//! which did not match resolve to no stream (`None`), so the caller can route
-//! the record.
+//! stream wherever the tag matches the same bases in both (the match itself is
+//! chosen in read coordinates); a `~` at the point of use (`--tag T=~stream` /
+//! `--template ~stream`) reverse-complements a stream again. Anchored spans
+//! that reference a group which did not match resolve to no stream (`None`),
+//! so the caller can route the record.
 
 use std::collections::HashMap;
 

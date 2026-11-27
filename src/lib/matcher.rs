@@ -654,7 +654,7 @@ pub fn match_verdict(
 /// reverse-strand match the window lies before it in the read, and `group` is
 /// searched on the reverse complement there, so its strands are taken relative
 /// to the upstream tag and a read and its reverse complement give the same
-/// verdict.
+/// verdict past the same upstream match span.
 pub fn match_verdict_after(
     group: &CompiledGroup,
     scratch: &mut Scratch,

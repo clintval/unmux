@@ -243,8 +243,9 @@ struct DemuxCmd {
     /// orientation (`+` toward the record start). A windowed `next=` target
     /// matches on that match's strand (or either strand, with its own
     /// `bothStrands=true`); a bare `next=G` target keeps its own `loc` and
-    /// strands. Spans and windowed targets thus agree between a record
-    /// and its reverse complement.
+    /// strands. The match itself is still chosen in read coordinates, so
+    /// where the tag matches the same bases in a record and its reverse
+    /// complement, the two give the same spans and windowed targets.
     ///
     /// An `@RG` source reads the input header's read groups instead of
     /// matching sequences (SAM/BAM/CRAM only; no barcode attributes, no
