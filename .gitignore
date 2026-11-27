@@ -17,8 +17,13 @@
 # claude code
 .claude/*
 
-# local planning docs (kept out of the remote)
-/docs/
+# local planning docs (kept out of the remote), except the cookbook and its generator
+/docs/*
+!/docs/recipes.md
+!/docs/recipes/
+
+# inputs and outputs the cookbook generator fetches and writes
+/docs/recipes/cache/
 
 # editor settings
 /.vscode/
