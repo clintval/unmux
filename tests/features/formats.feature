@@ -1078,3 +1078,81 @@ Feature: Input and output format handling
     Then the exit code is 0
     And a file "out.cram" exists
     And the file "out.cram" does not contain "ACGTACGTAACCGGTTACGT"
+
+  Scenario: BAM output stores U and u bases as T, while SAM and FASTQ output keep them
+    Given a file "rna.fq" containing:
+      """
+      @r1
+      ACGUacgu
+      +
+      IIIIIIII
+      """
+    # BAM stores each base as a 4-bit code that has no U.
+    When I run `unmux rna.fq --pool p --out out.bam`
+    Then the exit code is 0
+    And the records of "out.bam" are:
+      """
+      r1	4	*	0	255	*	*	0	0	ACGTACGT	IIIIIIII	RG:Z:p
+      """
+    When I run `unmux rna.fq --pool p --out out.sam`
+    Then the exit code is 0
+    And the records of "out.sam" are:
+      """
+      r1	4	*	0	255	*	*	0	0	ACGUacgu	IIIIIIII	RG:Z:p
+      """
+    When I run `unmux rna.fq --out out.fq`
+    Then the exit code is 0
+    And the file "out.fq" is:
+      """
+      @r1
+      ACGUacgu
+      +
+      IIIIIIII
+      """
+
+  Scenario: Sample, unassigned, and removed BAM outputs store U bases as T
+    Given a file "rna.fq" containing:
+      """
+      @a
+      AAAAGUCC
+      +
+      IIIIIIII
+      @b
+      CCCCGUCC
+      +
+      IIIIIIII
+      @c
+      GGGGGUCC
+      +
+      IIIIIIII
+      """
+    When I run `unmux rna.fq --group bc={x=AAAA,y=GGGG} --group bc::loc=0:0:4 --sample s=bc::x --remove bc::y=rm.bam --extract body=0:4:end --template body --out %sample.bam --unassigned un.bam`
+    Then the exit code is 0
+    And the records of "s.bam" are:
+      """
+      a	4	*	0	255	*	*	0	0	GTCC	IIII	RG:Z:s
+      """
+    And the records of "un.bam" are:
+      """
+      b	4	*	0	255	*	*	0	0	CCCCGTCC	IIIIIIII	RG:Z:rna
+      """
+    And the records of "rm.bam" are:
+      """
+      c	4	*	0	255	*	*	0	0	GGGGGTCC	IIIIIIII	RG:Z:rna
+      """
+
+  Scenario: U and u bases of SAM records, aligned or not, are stored as T in BAM output
+    Given a file "rna.sam" containing:
+      """
+      @HD	VN:1.6	SO:coordinate
+      @SQ	SN:chr1	LN:100
+      q1	0	chr1	10	60	8M	*	0	0	ACGUacgu	ABCDEFGH
+      q2	4	*	0	0	*	*	0	0	UUGGCCAA	ABCDEFGH
+      """
+    When I run `unmux rna.sam --pool p --out out.bam`
+    Then the exit code is 0
+    And the records of "out.bam" are:
+      """
+      q1	4	*	0	255	*	*	0	0	ACGTACGT	ABCDEFGH	RG:Z:p
+      q2	4	*	0	255	*	*	0	0	TTGGCCAA	ABCDEFGH	RG:Z:p
+      """

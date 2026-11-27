@@ -1,10 +1,10 @@
 //! Approximate matching of tag groups against records, built on the `sassy`
 //! SIMD matcher with the `Iupac` profile, so IUPAC ambiguity codes in a TAG
-//! (pattern side) match natively at zero cost. An observed non-ACGT record base
-//! (an `N` no-call or a record-side degenerate) is instead masked to a
-//! never-match sentinel so it is charged against the `dist` budget rather than
-//! matching any tag base for free (splitcode semantics; an all-`N` record falls
-//! to unmatched, not mis-assigned).
+//! (pattern side) match natively at zero cost. A record U matches as T, and any
+//! other non-ACGT record base (an `N` no-call or a record-side degenerate) is
+//! instead masked to a never-match sentinel so it is charged against the `dist`
+//! budget rather than matching any tag base for free (splitcode semantics; an
+//! all-`N` record falls to unmatched, not mis-assigned).
 //!
 //! This is the record-window search primitive: given a [`CompiledGroup`] (its
 //! tag sequences plus the `loc`/`dist`/`bothStrands`/`mode`/`delta`
@@ -688,13 +688,13 @@ pub fn match_group_at(
         if text.is_empty() {
             continue;
         }
-        // Mask non-ACGT observed bases (an `N` no-call or a read-side
-        // degenerate code) to a never-match sentinel so they are charged
-        // against the `dist` budget rather than matching any tag base for free
-        // (a tag-side IUPAC code stays a deliberate wildcard). This masks only
-        // the search window; the original read bases used for extraction and
-        // output are untouched, and the sentinel keeps the window length so
-        // match coordinates still map back to the read.
+        // Read U as T and mask other non-ACGT observed bases (an `N` no-call or
+        // a read-side degenerate code) to a never-match sentinel so they are
+        // charged against the `dist` budget rather than matching any tag base
+        // for free (a tag-side IUPAC code stays a deliberate wildcard). This
+        // masks only the search window; the original read bases used for
+        // extraction and output are untouched, and the sentinel keeps the
+        // window length so match coordinates still map back to the read.
         let masked: Vec<u8> = text.iter().map(|&base| mask_no_call(base)).collect();
         let text = masked.as_slice();
         let window_first = accepted.len();
@@ -1204,12 +1204,15 @@ fn resolve_windows(
 
 /// Map an observed record base to a never-match sentinel (`X`, which the
 /// `Iupac` profile encodes as matching nothing) unless it is a concrete
-/// A/C/G/T. An `N` no-call or a record-side degenerate code is thus a mismatch
-/// against a concrete tag base, matching splitcode (a tag-side IUPAC code
-/// remains a free wildcard, since only the record window is masked).
+/// A/C/G/T, reading an RNA U as T. An `N` no-call or a record-side degenerate
+/// code is thus a mismatch against a concrete tag base, matching splitcode (a
+/// tag-side IUPAC code remains a free wildcard, since only the record window is
+/// masked).
 fn mask_no_call(base: u8) -> u8 {
     match base {
         b'A' | b'C' | b'G' | b'T' | b'a' | b'c' | b'g' | b't' => base,
+        b'U' => b'T',
+        b'u' => b't',
         _ => b'X',
     }
 }
@@ -2303,6 +2306,101 @@ mod tests {
             result.best.is_none(),
             "a read-side R must be a no-call at dist=0: {result:?}"
         );
+    }
+
+    #[test]
+    fn test_match_group_read_u_matches_a_tag_t() {
+        let g = group(&["AATTC"]);
+        for read in ["CCAAUUCCC", "ccaauuccc"] {
+            let best = outcome(&g, read).best.expect("a read U matches a tag T");
+            assert_eq!((best.start, best.end, best.cost), (2, 7, 0), "{read}");
+        }
+    }
+
+    /// The read with each T and t written as U and u.
+    fn as_rna(read: &[u8]) -> Vec<u8> {
+        read.iter()
+            .map(|&base| match base {
+                b'T' => b'U',
+                b't' => b'u',
+                base => base,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_read_u_bases_match_as_t_bases_do() {
+        let mut rng = Rng(0x75);
+        let codes = b"ACGTACGTACGTRYKMSWBDHVN";
+        for trial in 0..2000 {
+            let batched = trial % 4 == 0;
+            let length = 3 + rng.below(5);
+            let count = if batched {
+                BATCHED_MIN_TAGS + rng.below(3)
+            } else {
+                1 + rng.below(4)
+            };
+            let tags = (0..count)
+                .map(|_| {
+                    let len = if batched { length } else { 3 + rng.below(5) };
+                    rng.sample(len, codes)
+                })
+                .collect();
+            let mut g = CompiledGroup::new("g", tags);
+            let (mismatch, indel) = (rng.below(3), rng.below(3));
+            g.dist = Dist {
+                mismatch,
+                indel,
+                total: mismatch + indel,
+            };
+            g.mode = [MatchMode::All, MatchMode::Nearest][rng.below(2)];
+            let partial = Partial {
+                min_match: 2 + rng.below(3),
+                max_mismatch_freq: None,
+            };
+            match rng.below(6) {
+                _ if batched => {}
+                0 => g.anchor = Some(Anchor::FivePrime),
+                1 if indel == 0 => g.anchor = Some(Anchor::ThreePrime),
+                2 => g.partial5 = Some(partial),
+                3 => g.partial3 = Some(partial),
+                _ => {}
+            }
+            g.revcomp = !batched && g.anchor.is_none() && rng.below(2) == 1;
+            if rng.below(2) == 1 {
+                let start = rng.below(4);
+                g.loc = window(start, start + 4 + rng.below(16));
+            } else if rng.below(2) == 1 {
+                g.match_streams = Some(vec!["i7".to_string(), "i5".to_string()]);
+            }
+            g.encode();
+            let len = rng.below(24);
+            let read = rng.sample(len, b"ACGTacgtN");
+            let rna = as_rna(&read);
+            let dna = match_group(&g, &mut Scratch::new(), &[&read]);
+            let tags: Vec<_> = g.tags.iter().map(|t| String::from_utf8_lossy(t)).collect();
+            let context = format!(
+                "{} as {} for {tags:?} {:?} {:?} {:?} rc={} {:?} {:?}",
+                String::from_utf8_lossy(&read),
+                String::from_utf8_lossy(&rna),
+                g.dist,
+                g.loc,
+                g.anchor,
+                g.revcomp,
+                g.partial5,
+                g.partial3,
+            );
+            assert_eq!(
+                match_group(&g, &mut Scratch::new(), &[&rna]),
+                dna,
+                "{context}"
+            );
+            assert_eq!(
+                match_verdict(&g, &mut Scratch::new(), &[&rna], g.loc.as_ref()),
+                GroupVerdict::of(&g, &dna),
+                "{context}"
+            );
+        }
     }
 
     #[test]

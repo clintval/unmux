@@ -791,11 +791,15 @@ const MISSING_QUALITY: u8 = 0xFF;
 
 trait AlignmentSink: AlignmentWrite {
     const NEEDS_MISSING_QUALITIES_FILLED: bool = false;
+    const NEEDS_U_STORED_AS_T: bool = false;
 }
 
 impl<W: Write> AlignmentSink for sam::io::Writer<W> {}
 
-impl<W: Write> AlignmentSink for bam::io::Writer<W> {}
+/// BAM codes each base in 4 bits, with no code for U.
+impl<W: Write> AlignmentSink for bam::io::Writer<W> {
+    const NEEDS_U_STORED_AS_T: bool = true;
+}
 
 /// The noodles CRAM writer flags every record as storing a quality per base, even one with none.
 impl<W: Write> AlignmentSink for cram::io::Writer<W> {
@@ -826,6 +830,9 @@ fn write_alignments<W: AlignmentSink>(
         if W::NEEDS_MISSING_QUALITIES_FILLED {
             fill_missing_qualities(&mut record);
         }
+        if W::NEEDS_U_STORED_AS_T {
+            store_u_as_t(&mut record);
+        }
         writer
             .write_alignment_record(header, record.as_ref())
             .context("failed to write SAM/BAM/CRAM record")?;
@@ -837,6 +844,16 @@ fn fill_missing_qualities(record: &mut std::borrow::Cow<'_, RecordBuf>) {
     let bases = record.sequence().len();
     if bases > 0 && record.quality_scores().is_empty() {
         *record.to_mut().quality_scores_mut() = QualityScores::from(vec![MISSING_QUALITY; bases]);
+    }
+}
+
+fn store_u_as_t(record: &mut std::borrow::Cow<'_, RecordBuf>) {
+    if memchr::memchr2(b'U', b'u', record.sequence().as_ref()).is_some() {
+        for base in record.to_mut().sequence_mut().as_mut() {
+            if matches!(*base, b'U' | b'u') {
+                *base = b'T';
+            }
+        }
     }
 }
 
@@ -1694,6 +1711,60 @@ mod tests {
         let mut back = RecordBuf::default();
         reader.read_record_buf(&read_header, &mut back).unwrap();
         assert_eq!(back, record);
+    }
+
+    #[test]
+    fn test_bam_stores_u_bases_as_t_while_sam_keeps_them() {
+        let text = b"@HD\tVN:1.6\n@SQ\tSN:chr1\tLN:100\n\
+                     r2\t0\tchr1\t10\t60\t4M\t*\t0\t0\tUUgu\tIIII\n";
+        let mut reader = sam::io::Reader::new(&text[..]);
+        let header = reader.read_header().unwrap();
+        let mut record = RecordBuf::default();
+        reader.read_record_buf(&header, &mut record).unwrap();
+        let alignment = Alignment::Record(record);
+        let fragments = [
+            vec![output_read(b"r1", b"ACGUacgu", Some(&[30; 8]), None)],
+            vec![OutputRead {
+                alignment: Some(&alignment),
+                ..output_read(b"", b"", None, None)
+            }],
+        ];
+
+        let dir = tempfile::tempdir().unwrap();
+        let direct = dir.path().join("direct.bam");
+        let mut writer =
+            OutputWriter::create_with_header(Some(&direct), OutputFormat::Bam, 5, header.clone())
+                .unwrap();
+        for fragment in &fragments {
+            writer.write_fragment(fragment).unwrap();
+        }
+        writer.finish().unwrap();
+        let encoded = dir.path().join("encoded.bam");
+        let mut writer =
+            OutputWriter::create_with_header(Some(&encoded), OutputFormat::Bam, 5, header.clone())
+                .unwrap();
+        for fragment in &fragments {
+            let bytes = encode_fragment(OutputFormat::Bam, &header, fragment).unwrap();
+            writer.write_encoded(&bytes).unwrap();
+        }
+        writer.finish().unwrap();
+        for path in [&direct, &encoded] {
+            let mut reader = bam::io::Reader::new(File::open(path).unwrap());
+            let header = reader.read_header().unwrap();
+            let bases: Vec<Vec<u8>> = reader
+                .record_bufs(&header)
+                .map(|record| record.unwrap().sequence().as_ref().to_vec())
+                .collect();
+            assert_eq!(bases, [b"ACGTACGT".to_vec(), b"TTGT".to_vec()], "{path:?}");
+        }
+
+        let sam: Vec<u8> = fragments
+            .iter()
+            .flat_map(|fragment| encode_fragment(OutputFormat::Sam, &header, fragment).unwrap())
+            .collect();
+        let sam = String::from_utf8(sam).unwrap();
+        assert!(sam.contains("\tACGUacgu\t"), "{sam}");
+        assert!(sam.contains("\tUUgu\t"), "{sam}");
     }
 
     #[test]

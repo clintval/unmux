@@ -167,11 +167,12 @@ struct DemuxCmd {
     /// Format set by extension (FASTX/SAM/BAM/CRAM). '`-`' or `/dev/stdout`
     /// writes standard output in the input format. Read groups and SAM tags
     /// are SAM/BAM/CRAM-only; FASTX puts `--tag` values in the record-name
-    /// comment. Missing parent dirs are created. Placeholders fan-out the
-    /// pool into multiple files including `%pool`, `%sample`, `%sub_sample`,
-    /// and `%ordinal`. Outputs that would be one file are refused: paths
-    /// differing only in case (one file on a case-insensitive file system),
-    /// two spellings of one file, or a metrics file on another output's path.
+    /// comment. BAM stores a U base as T. Missing parent dirs are created.
+    /// Placeholders fan-out the pool into multiple files including `%pool`,
+    /// `%sample`, `%sub_sample`, and `%ordinal`. Outputs that would be one
+    /// file are refused: paths differing only in case (one file on a
+    /// case-insensitive file system), two spellings of one file, or a metrics
+    /// file on another output's path.
     ///
     ///   --out out.bam                   one file with all assigned records
     ///   --out %sample.bam               one file per sample
@@ -185,9 +186,10 @@ struct DemuxCmd {
     /// Tag-group definition or attributes (repeatable; accumulates).
     ///
     /// `NAME=SOURCE` is the UMI/barcode/adapter set; `NAME::ATTRS` constrains
-    /// matching. Tags may use IUPAC codes. A matched `@grp` span is
-    /// error-corrected by default. Each tag in a set needs its own ID; pool
-    /// several tags into one sample with `--sample NAME=GROUP::ID1,ID2`.
+    /// matching. Tags may use IUPAC codes, and a U in a read matches as T. A
+    /// matched `@grp` span is error-corrected by default. Each tag in a set
+    /// needs its own ID; pool several tags into one sample with
+    /// `--sample NAME=GROUP::ID1,ID2`.
     ///
     /// Sources (`NAME::SOURCE`):
     ///
