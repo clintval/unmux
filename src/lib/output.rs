@@ -539,19 +539,25 @@ impl std::fmt::Display for OutputOrigin {
 /// Refuse outputs that would be one file: paths differing only in case, or two spellings of one.
 pub fn check_output_collisions(outputs: &[(PathBuf, OutputOrigin)]) -> Result<()> {
     let mut dirs: HashMap<PathBuf, PathBuf> = HashMap::new();
+    let mut by_path: HashMap<&Path, usize> = HashMap::new();
     let mut by_name: HashMap<String, usize> = HashMap::new();
     let mut by_file: HashMap<FileId, usize> = HashMap::new();
     for (index, (path, origin)) in outputs.iter().enumerate() {
-        let Some((name, file)) = file_key(path, &mut dirs) else {
-            continue;
-        };
-        let earlier = by_name
-            .get(&name)
-            .or_else(|| file.and_then(|file| by_file.get(&file)))
-            .copied();
-        by_name.entry(name).or_insert(index);
-        if let Some(file) = file {
-            by_file.entry(file).or_insert(index);
+        // A named pipe or device has no file key, so outputs on it are matched by their exact path.
+        let mut earlier = (path.as_path() != Path::new("/dev/null"))
+            .then(|| *by_path.entry(path.as_path()).or_insert(index))
+            .filter(|&earlier| earlier != index);
+        if let Some((name, file)) = file_key(path, &mut dirs) {
+            earlier = earlier.or_else(|| {
+                by_name
+                    .get(&name)
+                    .or_else(|| file.and_then(|file| by_file.get(&file)))
+                    .copied()
+            });
+            by_name.entry(name).or_insert(index);
+            if let Some(file) = file {
+                by_file.entry(file).or_insert(index);
+            }
         }
         let Some((first, first_origin)) = earlier.map(|earlier| &outputs[earlier]) else {
             continue;
