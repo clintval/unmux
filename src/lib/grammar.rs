@@ -2885,9 +2885,65 @@ mod tests {
         let plan = parse_demux(&a).unwrap();
         let w = plan_warnings(&plan);
         assert!(
-            w.iter().any(|m| m.contains("will not be demultiplexed")),
+            w.iter()
+                .any(|m| m.contains("will not be demultiplexed")
+                    && m.ends_with("Unused group: `g`.")),
             "{w:?}"
         );
+    }
+
+    /// The warnings of a run on one input with `flags`, given as `--flag value` pairs.
+    fn warnings_of(flags: &str) -> Vec<String> {
+        let mut a = args();
+        let mut words = flags.split_whitespace();
+        while let (Some(flag), Some(value)) = (words.next(), words.next()) {
+            let list = match flag {
+                "--group" => &mut a.groups,
+                "--extract" => &mut a.extracts,
+                "--tag" => &mut a.tags,
+                "--template" => &mut a.templates,
+                "--remove" => &mut a.remove,
+                _ => panic!("unknown flag {flag}"),
+            };
+            list.push(value.to_string());
+        }
+        plan_warnings(&parse_demux(&a).unwrap())
+    }
+
+    #[test]
+    fn test_no_sample_warning_lists_only_the_unused_groups() {
+        let w = warnings_of(
+            "--group g={ACGT} --group g::loc=0:0:4 --group h={AAAA} --group i={CCCC} \
+             --extract bc=@g --tag CB=bc",
+        );
+        let undemuxed: Vec<_> = w
+            .iter()
+            .filter(|m| m.contains("will not be demultiplexed"))
+            .collect();
+        assert_eq!(undemuxed.len(), 1, "{w:?}");
+        assert!(undemuxed[0].ends_with("Unused groups: `h`, `i`."), "{w:?}");
+    }
+
+    #[test]
+    fn test_no_sample_warning_skips_groups_that_feed_something() {
+        for flags in [
+            "--group g={ACGT} --group g::loc=0:0:4 --extract bc=@g --tag CB=bc",
+            "--group g=tags.tsv --extract cell=@g::cell --tag xn=cell",
+            "--group g={ACGT} --group g::loc=0:0:4 --extract bc=@g --template bc",
+            "--group g={ACGT} --group g::loc=0:0:4 --group m={ACGT} --group m::match=bc \
+             --extract bc=@g",
+            "--group a={AAAA} --group a::loc=0:0:4,next=b:0-4 --group b={CCCC}",
+            "--group a={AAAA} --group a::loc=0:0:4 --group b={CCCC} --group b::prev=a",
+            "--group g={ACGT} --group g::loc=0:0:4 --remove g",
+            "--group g={x=ACGT} --group g::loc=0:0:4 --remove g::x",
+            "--group g={ACGT} --group g::maxFindsPerTag=1",
+        ] {
+            let w = warnings_of(flags);
+            assert!(
+                !w.iter().any(|m| m.contains("will not be demultiplexed")),
+                "{flags}: {w:?}"
+            );
+        }
     }
 
     #[test]
@@ -3009,27 +3065,24 @@ mod tests {
     }
 
     #[test]
-    fn test_minfinds_group_is_consumed_no_inert_warning() {
-        // A `minFindsPerGroup` keeplist gate is load-bearing -> not inert (no
-        // rule-1 warning).
+    fn test_minfinds_group_is_consumed_no_warning() {
+        // A `minFindsPerGroup` keeplist gate is load-bearing, so the run warns
+        // neither about an inert group nor about a missing sample target.
         let mut a = args();
         a.groups = vec!["g={ACGT}".to_string(), "g::minFindsPerGroup=1".to_string()];
         a.out = Some("out.fq".to_string());
         let plan = parse_demux(&a).unwrap();
         assert!(
-            !plan_warnings(&plan)
-                .iter()
-                .any(|m| m.contains("nothing consumes")),
+            plan_warnings(&plan).is_empty(),
             "{:?}",
             plan_warnings(&plan)
         );
     }
 
     #[test]
-    fn test_group_consumed_via_tag_extract_no_inert_warning() {
-        // Annotate-only: group -> @g extract -> CB tag. `g` is consumed even
-        // without a sample (this is the footgun's structural twin, so it warns
-        // about no-demux but NOT about an inert group).
+    fn test_group_consumed_via_tag_extract_no_warning() {
+        // Annotate-only: group -> @g extract -> CB tag. `g` feeds the tag, so
+        // the run warns neither about an inert group nor about demultiplexing.
         let mut a = args();
         a.groups = vec!["g={ACGT}".to_string(), "g::loc=0:0".to_string()];
         a.extracts = vec!["bc=@g".to_string()];
@@ -3037,11 +3090,7 @@ mod tests {
         a.out = Some("out.fq".to_string());
         let plan = parse_demux(&a).unwrap();
         let w = plan_warnings(&plan);
-        assert!(!w.iter().any(|m| m.contains("nothing consumes")), "{w:?}");
-        assert!(
-            w.iter().any(|m| m.contains("will not be demultiplexed")),
-            "{w:?}"
-        );
+        assert!(w.is_empty(), "{w:?}");
     }
 
     #[test]
