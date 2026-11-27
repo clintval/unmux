@@ -24,7 +24,6 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use noodles::sam::alignment::record::data::field::Tag;
-use noodles::sam::alignment::record_buf::data::field::value::Array;
 use noodles::sam::alignment::record_buf::data::field::Value;
 use noodles::sam::alignment::record_buf::Data;
 use noodles::sam::alignment::RecordBuf;
@@ -59,6 +58,7 @@ use crate::output::{
     resolve_metrics_path, resolve_pattern, ConstituentReadGroups, Destination, OutputOrigin,
     PathContext,
 };
+use crate::per_base::{follow, per_base, PerBase, Slice, PER_BASE_TAGS};
 use crate::pool::{self, End, Readout};
 use crate::qc::{removed_slug, routed_slug, unassigned_slug, Unassigned};
 use crate::sink::{Block, BlockFile, Sinks};
@@ -3514,79 +3514,6 @@ struct Body {
     alignment: Option<Alignment>,
 }
 
-/// How a per-base tag goes onto a template record whose bases are not its read's as they are.
-#[derive(Clone, Copy)]
-enum PerBase {
-    /// Left out.
-    Dropped,
-    /// A text value cut to the record's segments, reversed in a flipped one.
-    ReversedText,
-    /// An array value cut to the record's segments, reversed in a flipped one.
-    ReversedArray,
-    /// A text value of bases cut to the record's segments, reverse-complemented in a flipped one.
-    ComplementedText,
-}
-
-/// SAM tags tied to a read's exact bases or pulses, and how each goes onto a changed record.
-const PER_BASE_TAGS: [([u8; 2], PerBase); 54] = [
-    (*b"MM", PerBase::Dropped),
-    (*b"ML", PerBase::Dropped),
-    (*b"MN", PerBase::Dropped),
-    (*b"OQ", PerBase::ReversedText),
-    (*b"BQ", PerBase::Dropped),
-    (*b"E2", PerBase::ComplementedText),
-    (*b"U2", PerBase::ReversedText),
-    (*b"CQ", PerBase::Dropped),
-    (*b"CS", PerBase::Dropped),
-    (*b"FZ", PerBase::Dropped),
-    (*b"PT", PerBase::Dropped),
-    (*b"BI", PerBase::Dropped),
-    (*b"BD", PerBase::Dropped),
-    (*b"ip", PerBase::ReversedArray),
-    (*b"pw", PerBase::ReversedArray),
-    (*b"fi", PerBase::Dropped),
-    (*b"fp", PerBase::Dropped),
-    (*b"ri", PerBase::Dropped),
-    (*b"rp", PerBase::Dropped),
-    (*b"dq", PerBase::Dropped),
-    (*b"dt", PerBase::Dropped),
-    (*b"iq", PerBase::Dropped),
-    (*b"mq", PerBase::Dropped),
-    (*b"sq", PerBase::Dropped),
-    (*b"sa", PerBase::Dropped),
-    (*b"sx", PerBase::Dropped),
-    (*b"pc", PerBase::Dropped),
-    (*b"pq", PerBase::Dropped),
-    (*b"pg", PerBase::Dropped),
-    (*b"pa", PerBase::Dropped),
-    (*b"pm", PerBase::Dropped),
-    (*b"pd", PerBase::Dropped),
-    (*b"px", PerBase::Dropped),
-    (*b"pe", PerBase::Dropped),
-    (*b"sf", PerBase::Dropped),
-    (*b"bs", PerBase::Dropped),
-    (*b"pb", PerBase::Dropped),
-    (*b"mv", PerBase::Dropped),
-    (*b"cd", PerBase::ReversedArray),
-    (*b"ce", PerBase::ReversedArray),
-    (*b"ad", PerBase::ReversedArray),
-    (*b"ae", PerBase::ReversedArray),
-    (*b"bd", PerBase::ReversedArray),
-    (*b"be", PerBase::ReversedArray),
-    (*b"aq", PerBase::ReversedText),
-    (*b"bq", PerBase::ReversedText),
-    (*b"ac", PerBase::ComplementedText),
-    (*b"bc", PerBase::ComplementedText),
-    (*b"cu", PerBase::ReversedArray),
-    (*b"ct", PerBase::ReversedArray),
-    (*b"au", PerBase::ReversedArray),
-    (*b"at", PerBase::ReversedArray),
-    (*b"bu", PerBase::ReversedArray),
-    (*b"bt", PerBase::ReversedArray),
-];
-
-const _: () = assert!(PER_BASE_TAGS.len() <= u64::BITS as usize);
-
 /// The per-base tags left out of `--template` records, one bit per [`PER_BASE_TAGS`] entry.
 #[derive(Clone, Copy, Default)]
 struct PerBaseTags {
@@ -3617,7 +3544,7 @@ impl std::fmt::Display for PerBaseTags {
                 .iter()
                 .enumerate()
                 .filter(|&(index, _)| bits & 1 << index != 0)
-                .map(|(_, (tag, _))| String::from_utf8_lossy(tag))
+                .map(|(_, (tag, _, _))| String::from_utf8_lossy(tag))
                 .collect::<Vec<_>>()
                 .join(", ")
         };
@@ -3640,73 +3567,6 @@ impl std::fmt::Display for PerBaseTags {
         }
         Ok(())
     }
-}
-
-/// The [`PER_BASE_TAGS`] index and handling of a tag whose value has its per-base type.
-fn per_base(tag: Tag, value: &Value) -> Option<(usize, PerBase)> {
-    let index = PER_BASE_TAGS
-        .iter()
-        .position(|(name, _)| tag.as_ref() == name)?;
-    let per_base = PER_BASE_TAGS[index].1;
-    let typed = match per_base {
-        PerBase::Dropped => true,
-        PerBase::ReversedText | PerBase::ComplementedText => matches!(value, Value::String(_)),
-        PerBase::ReversedArray => matches!(value, Value::Array(_)),
-    };
-    typed.then_some((index, per_base))
-}
-
-/// A record segment: bases `[start, end)` of its read, reverse-complemented when `flipped`.
-#[derive(Clone, Copy)]
-struct Slice {
-    start: usize,
-    end: usize,
-    flipped: bool,
-}
-
-/// The values of a `len`-base read cut to `slices`, reversing each flipped one through `flip`.
-fn cut<T: Copy>(
-    values: &[T],
-    slices: &[Slice],
-    len: usize,
-    flip: impl Fn(T) -> T,
-) -> Option<Vec<T>> {
-    if values.len() != len {
-        return None;
-    }
-    let mut cut = Vec::with_capacity(slices.iter().map(|slice| slice.end - slice.start).sum());
-    for slice in slices {
-        let part = values.get(slice.start..slice.end)?;
-        match slice.flipped {
-            true => cut.extend(part.iter().rev().map(|&value| flip(value))),
-            false => cut.extend_from_slice(part),
-        }
-    }
-    Some(cut)
-}
-
-/// A per-base `value` of a `len`-base read cut to a record's `slices`, if it has `len` entries.
-fn follow(value: &Value, per_base: PerBase, slices: &[Slice], len: usize) -> Option<Value> {
-    use std::convert::identity;
-    Some(match value {
-        Value::String(text) => {
-            let flip: fn(u8) -> u8 = match per_base {
-                PerBase::ComplementedText => crate::iupac::complement,
-                _ => identity,
-            };
-            Value::String(cut(&text[..], slices, len, flip)?.into())
-        }
-        Value::Array(array) => Value::Array(match array {
-            Array::Int8(values) => Array::Int8(cut(values, slices, len, identity)?),
-            Array::UInt8(values) => Array::UInt8(cut(values, slices, len, identity)?),
-            Array::Int16(values) => Array::Int16(cut(values, slices, len, identity)?),
-            Array::UInt16(values) => Array::UInt16(cut(values, slices, len, identity)?),
-            Array::Int32(values) => Array::Int32(cut(values, slices, len, identity)?),
-            Array::UInt32(values) => Array::UInt32(cut(values, slices, len, identity)?),
-            Array::Float(values) => Array::Float(cut(values, slices, len, identity)?),
-        }),
-        _ => return None,
-    })
 }
 
 /// The tags of `data` for a changed record, with per-base ones cut to its `slices` or left out.
