@@ -286,7 +286,7 @@ pub enum SpanBody {
         /// The span length.
         len: AnchorLen,
     },
-    /// `@grpA..@grpB`: the region between two matched anchors, in the
+    /// The region between two matched anchors (`@grpA..@grpB`), in the
     /// orientation of `grpA`'s match.
     Between {
         /// The upstream anchor (region starts at its match end).
@@ -395,8 +395,8 @@ pub struct TagBinding {
     pub qual_sep: Option<String>,
     /// Whether `qual-sep=` was set rather than left to its default.
     pub qual_sep_set: bool,
-    /// `raw=true`: emit the observed (uncorrected) bases for this tag rather
-    /// than the corrected form. Default `false`: a tag emits the
+    /// Whether the tag emits the observed (uncorrected) bases rather than the
+    /// corrected form (`raw=true`). Default `false`: a tag emits the
     /// error-corrected barcode when its stream came from a matched keeplist
     /// `@grp`. No effect on a stream that was never corrected.
     pub raw: bool,
