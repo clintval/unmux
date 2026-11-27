@@ -749,13 +749,7 @@ pub fn match_group_at(
         if text.is_empty() {
             continue;
         }
-        // Read U as T and mask other non-ACGT observed bases (an `N` no-call or
-        // a read-side degenerate code) to a never-match sentinel so they are
-        // charged against the `dist` budget rather than matching any tag base
-        // for free (a tag-side IUPAC code stays a deliberate wildcard). This
-        // masks only the search window; the original read bases used for
-        // extraction and output are untouched, and the sentinel keeps the
-        // window length so match coordinates still map back to the read.
+        // Search a masked copy of the same length; extraction and output keep the read's bases.
         let masked: Vec<u8> = text.iter().map(|&base| mask_no_call(base)).collect();
         let text = masked.as_slice();
         let window_first = accepted.len();
