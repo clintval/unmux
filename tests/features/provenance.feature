@@ -188,23 +188,37 @@ Feature: BAM/CRAM provenance headers and demux statistics
       r2	4	*	0	255	*	*	0	0	TTTTTTTTGGCCATGC	IIIIIIIIIIIIIIII	RG:Z:p
       """
 
-  Scenario Outline: SAM on stdout that a bin shares with a sample declares the bin's read group (<bin>)
+  Scenario Outline: SAM on stdout that a bin shares with a sample declares the bin's read group (<outputs>)
     Given a file "in.sam" containing:
       """
       @HD	VN:1.6
       r1	4	*	0	0	*	*	0	0	AAAAAAAACCCCGGGG	IIIIIIIIIIIIIIII
       r2	4	*	0	0	*	*	0	0	TTTTTTTTGGCCATGC	IIIIIIIIIIIIIIII
       """
-    When I run `unmux in.sam --pool p --group bc={A=AAAAAAAA,T=TTTTTTTT} --sample s1=bc::A --out - <bin>`
+    When I run `unmux in.sam --pool p --group bc={A=AAAAAAAA,T=TTTTTTTT} --sample s1=bc::A <outputs>`
     Then the exit code is 0
     And stdout contains "@RG	ID:s1	SM:s1"
     And stdout contains "@RG	ID:p	SM:p	LB:p"
     And stdout contains "TTTTTTTTGGCCATGC	IIIIIIIIIIIIIIII	RG:Z:p"
 
     Examples:
-      | bin                      |
-      | --unassigned -           |
-      | --unassigned /dev/stdout |
+      | outputs                          |
+      | --out - --unassigned -           |
+      | --out - --unassigned /dev/stdout |
+      | --unassigned -                   |
+
+  Scenario: SAM on the default stdout declares the samples' read groups
+    Given a file "in.sam" containing:
+      """
+      @HD	VN:1.6
+      r1	4	*	0	0	*	*	0	0	AAAAAAAACCCCGGGG	IIIIIIIIIIIIIIII
+      r2	4	*	0	0	*	*	0	0	TTTTTTTTGGCCATGC	IIIIIIIIIIIIIIII
+      """
+    When I run `unmux in.sam --pool p --group bc={A=AAAAAAAA,T=TTTTTTTT} --sample s1=bc::A`
+    Then the exit code is 0
+    And stdout contains "@RG	ID:s1	SM:s1"
+    And stdout does not contain "@RG	ID:p"
+    And stdout contains "AAAAAAAACCCCGGGG	IIIIIIIIIIIIIIII	RG:Z:s1"
 
   Scenario: a SAM file that a bin shares is refused when the pool read group is also a sample's
     Given a file "reads.fq" containing:
@@ -235,6 +249,10 @@ Feature: BAM/CRAM provenance headers and demux statistics
       r2	4	*	0	0	*	*	0	0	TTTTTTTTGGCCATGC	IIIIIIIIIIIIIIII
       """
     When I run `unmux in.sam --pool s1 --group bc={A=AAAAAAAA,T=TTTTTTTT} --sample s1=bc::A --out - --unassigned -`
+    Then the exit code is 1
+    And stderr contains "--unassigned records would share read group "s1" with a sample on stdout; set --pool to another name"
+    # Without --out, records go to stdout as with --out -.
+    When I run `unmux in.sam --pool s1 --group bc={A=AAAAAAAA,T=TTTTTTTT} --sample s1=bc::A --unassigned -`
     Then the exit code is 1
     And stderr contains "--unassigned records would share read group "s1" with a sample on stdout; set --pool to another name"
     # /dev/null keeps nothing, so its read groups are not checked.
