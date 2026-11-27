@@ -437,7 +437,7 @@ fn compile_groups(
         if !is_read_group {
             let search = crate::iupac::Search {
                 dist,
-                mode,
+                mode: attrs.mode,
                 anchor: attrs.anchor,
                 both_strands: attrs.revcomp.unwrap_or(false),
                 window: widest_window(group, &plan.groups),

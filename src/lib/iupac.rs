@@ -23,14 +23,18 @@ const TAG_DEGEN_CAP: u64 = 1 << 20;
 const GROUP_DEGEN_WARN: u64 = 100_000;
 const GROUP_DEGEN_CAP: u64 = 10_000_000;
 
-/// The colliding pairs a `mode=nearest` group warns about one by one.
+/// The colliding pairs a group warns about one by one.
 const LISTED_PAIRS: usize = 10;
-/// The colliding pairs a `mode=nearest` group counts; past them, only pairs
-/// that one read matches with zero errors are still looked for.
+/// The colliding pairs a group counts; past them, only the pairs that would
+/// still be refused are looked for.
 const COUNTED_PAIRS: usize = 1_000;
 /// What `mode=nearest` does with a read that two tags match.
 const UNASSIGNED: &str =
     "mode=nearest leaves ambiguous reads unassigned unless delta separates them";
+/// What an explicit `mode=all` does with a read that two tags match.
+const TIE_BREAK: &str = "with mode=all such a read goes to one of the tags by tie-break";
+/// The mode recommended for tags that one read can match only through an indel.
+const NEAREST: &str = "set mode=nearest to leave such reads unassigned (recommended)";
 
 /// The 4-bit ACGT membership mask for an IUPAC code (A=1, C=2, G=4, T=8). A
 /// byte that is not a recognized code maps to 0, so it matches nothing and
@@ -71,8 +75,9 @@ pub fn degeneracy(seq: &[u8]) -> u64 {
 pub struct Search {
     /// The error budget each tag is matched within.
     pub dist: Dist,
-    /// How matches within the budget are accepted.
-    pub mode: MatchMode,
+    /// How matches within the budget are accepted, or `None` when the group
+    /// leaves it to the default, `mode=all`.
+    pub mode: Option<MatchMode>,
     /// The window edge each tag is pinned to, or `None` to let tags slide.
     pub anchor: Option<Anchor>,
     /// Whether tags also match the reverse-complement strand.
@@ -91,12 +96,14 @@ pub struct Search {
 /// their end under `anchor=3p`), either tag taken first, and the second also
 /// reverse-complemented when `bothStrands` is set. Each tag keeps its own
 /// substitution, indel, and total caps, and the message gives bases checked to
-/// match both. A collision with zero errors always fails; any other fails under
-/// `mode=all`, which would silently mis-assign such reads, and warns under
-/// `mode=nearest`, which leaves them unassigned unless `delta` separates the
-/// two, listing the first pairs and counting the rest up to a limit, past which
-/// only zero-error collisions are looked for. Truncated matches
-/// (`partial5`/`partial3`) are not considered.
+/// match both, without an indel when that is enough. A collision with zero
+/// errors always fails. One that needs no indel fails under `mode=all`, written
+/// or not, which would assign such reads by tie-break; one that needs an indel
+/// fails only when no mode is written, asking for one. The rest are warnings:
+/// the first pairs are listed and the rest counted up to a limit, past which
+/// only collisions that would fail are looked for, and under `mode=all` a last
+/// warning recommends `mode=nearest`. Truncated matches (`partial5`/`partial3`)
+/// are not considered.
 pub fn validate_group(name: &str, seqs: &[Vec<u8>], search: &Search) -> Result<Vec<String>> {
     let mut warnings = Vec::new();
 
@@ -148,22 +155,42 @@ pub fn validate_group(name: &str, seqs: &[Vec<u8>], search: &Search) -> Result<V
             .collect(),
         false => Vec::new(),
     };
+    let subs = search.dist.mismatch.min(search.dist.total);
+    let substitutions = Search {
+        dist: Dist {
+            mismatch: subs,
+            indel: 0,
+            total: subs,
+        },
+        ..*search
+    };
     let exact_only = Search {
         dist: Dist::default(),
         ..*search
     };
+    let nearest = search.mode == Some(MatchMode::Nearest);
+    let (still_refused, consequence) = match nearest {
+        true => (&exact_only, UNASSIGNED),
+        false => (&substitutions, TIE_BREAK),
+    };
     let budget = dist_spec(&search.dist);
-    let mut colliding = 0;
+    let (mut colliding, mut example) = (0, None);
     for (i, a) in tags.iter().enumerate() {
         for (j, b) in tags.iter().enumerate().skip(i + 1) {
             let strands = search.both_strands.then(|| (&flipped[i], &flipped[j]));
             let checked = match colliding < COUNTED_PAIRS {
                 true => search,
-                false => &exact_only,
+                false => still_refused,
             };
             let Some(found) = collision(a, b, strands, checked, shape) else {
                 continue;
             };
+            let plain = match search.dist.indel {
+                0 => None,
+                _ => collision(a, b, strands, &substitutions, shape),
+            };
+            let needs_indel = search.dist.indel > 0 && plain.is_none();
+            let found = plain.unwrap_or(found);
             let (a_s, b_s) = (
                 String::from_utf8_lossy(&seqs[i]),
                 String::from_utf8_lossy(&seqs[j]),
@@ -177,26 +204,47 @@ pub fn validate_group(name: &str, seqs: &[Vec<u8>], search: &Search) -> Result<V
             if found.exact {
                 bail!("group `{name}`: tags `{a_s}` and `{b_s}` are indistinguishable (the bases `{bases}` match both with zero errors{strand}); remove one or make them distinct");
             }
+            let witness = format!("(the bases `{bases}` match both{strand})");
             let overlap = format!(
-                "group `{name}`: tags `{a_s}` and `{b_s}` can both match one read within dist={budget} (the bases `{bases}` match both{strand})"
+                "group `{name}`: tags `{a_s}` and `{b_s}` can both match one read within dist={budget} {witness}"
             );
-            if search.mode == MatchMode::All {
+            if !nearest && !needs_indel {
                 bail!("{overlap}; with mode=all this silently mis-assigns reads: separate the tags, lower dist, or use mode=nearest, which only warns and lists the colliding pairs");
             }
             colliding += 1;
-            if colliding <= LISTED_PAIRS {
-                warnings.push(format!("{overlap}; {UNASSIGNED}"));
+            if search.mode.is_none() {
+                example.get_or_insert(format!("`{a_s}` and `{b_s}` {witness}"));
+            } else if colliding <= LISTED_PAIRS {
+                warnings.push(format!("{overlap}; {consequence}"));
             }
         }
     }
+    let complete = colliding < COUNTED_PAIRS;
+    let pairs = |count: usize, kind: &str| {
+        let at_least = if complete { "" } else { "at least " };
+        let noun = if count == 1 { "pair" } else { "pairs" };
+        format!("{at_least}{count} {kind}{noun}")
+    };
+    if let Some(pair) = example {
+        bail!(
+            "group `{name}`: {} of tags can both match one read within dist={budget} only through an indel, such as {pair}; {NEAREST}, or write mode=all to keep assigning each to one of the tags by tie-break",
+            pairs(colliding, "")
+        );
+    }
     if colliding > LISTED_PAIRS {
-        let more = colliding - LISTED_PAIRS;
-        let counted = match colliding < COUNTED_PAIRS {
-            true => format!("{more} more pairs"),
-            false => format!("at least {more} more pairs (counting stopped at {COUNTED_PAIRS})"),
+        let stopped = match complete {
+            true => String::new(),
+            false => format!(" (counting stopped at {COUNTED_PAIRS})"),
         };
         warnings.push(format!(
-            "group `{name}`: {counted} of tags can both match one read within dist={budget}; {UNASSIGNED}"
+            "group `{name}`: {}{stopped} of tags can both match one read within dist={budget}; {consequence}",
+            pairs(colliding - LISTED_PAIRS, "more ")
+        ));
+    }
+    if !nearest && colliding > 0 {
+        warnings.push(format!(
+            "group `{name}`: {} of tags can match one read only through an indel; {NEAREST}",
+            pairs(colliding, "")
         ));
     }
 
@@ -966,8 +1014,15 @@ mod tests {
 
     fn search(dist: Dist, mode: MatchMode) -> Search {
         Search {
+            mode: Some(mode),
+            ..unset(dist)
+        }
+    }
+
+    fn unset(dist: Dist) -> Search {
+        Search {
             dist,
-            mode,
+            mode: None,
             anchor: None,
             both_strands: false,
             window: None,
@@ -1033,6 +1088,36 @@ mod tests {
         assert_eq!(w.len(), 1, "a pair: {w:?}");
         let unassigned = "mode=nearest leaves ambiguous reads unassigned";
         assert!(w[0].contains(pair) && w[0].contains(unassigned), "{w:?}");
+    }
+
+    #[test]
+    fn test_indel_budget_overlap_without_a_mode_asks_for_one() {
+        let err = validate_group("g", &seqs(&["ACGTAC", "ACGTAG"]), &unset(budget(0, 1)))
+            .unwrap_err()
+            .to_string();
+        let pair = "group `g`: 1 pair of tags can both match one read within dist=0:1 only through an indel, such as `ACGTAC` and `ACGTAG` (the bases `ACGTA` match both)";
+        let hint = "set mode=nearest to leave such reads unassigned (recommended), or write mode=all to keep assigning each to one of the tags by tie-break";
+        assert_eq!(err, format!("{pair}; {hint}"));
+    }
+
+    #[test]
+    fn test_without_a_mode_the_refusal_counts_the_pairs_that_need_an_indel() {
+        let tags = spread_barcodes(96, 8, 3);
+        let err = validate_group("g", &tags, &unset(budget(1, 1)))
+            .unwrap_err()
+            .to_string();
+        let count = "group `g`: at least 1000 pairs of tags can both match one read within dist=1:1 only through an indel, such as";
+        assert!(err.starts_with(count), "{err}");
+    }
+
+    #[test]
+    fn test_without_a_mode_substitutions_alone_refuse_a_pair_as_under_mode_all() {
+        let err = validate_group("g", &seqs(&["AAAACCCC", "AAAAGGCC"]), &unset(budget(1, 1)))
+            .unwrap_err()
+            .to_string();
+        let refusal =
+            "(the bases `AAAAGCCC` match both); with mode=all this silently mis-assigns reads";
+        assert!(err.contains(refusal), "{err}");
     }
 
     #[test]
@@ -1317,7 +1402,7 @@ mod tests {
                 indel,
                 total,
             },
-            mode: MatchMode::All,
+            mode: Some(MatchMode::All),
             anchor,
             both_strands: anchor.is_none() && rng.below(2) == 0,
             window: bounded.then(|| 1 + rng.below(8)),
