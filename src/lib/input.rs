@@ -2659,6 +2659,9 @@ mod tests {
             (">xa:A:Q\tML:B:C,1,2", "xa:A:Q", "ML"),
             ("> ab:A:x description here", "ab:A:x", ""),
             ("> ab:i:xyz desc", "ab:i:xyz", ""),
+            (">  xa:A:Q\tML:B:C,1,2", "", "xa ML"),
+            ("> read1 desc\r", "read1", ""),
+            ("> xa:A:Q\tML:B:C,1,2\r", "", "xa ML"),
         ] {
             let file = temp_with(format!("{definition}\nACGT\n").as_bytes());
             let record = read_all(&file).remove(0).records.remove(0);
@@ -2676,6 +2679,31 @@ mod tests {
             error.contains("the comment tag `ab:i` must be an integer"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn test_read_fasta_checks_the_names_after_leading_whitespace() {
+        let r1 = temp_with(b"> read1 desc\nACGT\n");
+        let open = |r2: &tempfile::NamedTempFile| {
+            FragmentReader::open(&[r1.path().to_path_buf(), r2.path().to_path_buf()], false)
+                .unwrap()
+                .next_fragment()
+        };
+        let mate = temp_with(b">\tread1 other\nCCGG\n");
+        let fragment = open(&mate).unwrap().expect("one fragment");
+        let names: Vec<&[u8]> = fragment.records.iter().map(|r| &r.name[..]).collect();
+        assert_eq!(names, [b"read1", b"read1"]);
+        let error = format!(
+            "{:#}",
+            open(&temp_with(b"> read2 desc\nCCGG\n")).unwrap_err()
+        );
+        assert!(
+            error.contains("mismatched read names (`read1` vs `read2`)"),
+            "{error}"
+        );
+
+        let error = read_error("> read1/2 desc\nACGT\n> read1/1 desc\nCCGG\n");
+        assert!(error.contains("starts with a `/2` mate"), "{error}");
     }
 
     #[test]
