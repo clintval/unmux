@@ -207,7 +207,9 @@ struct DemuxCmd {
     /// an indel are refused only when no `mode` is set: add `mode=nearest`
     /// (recommended) or `mode=all`, which keeps assigning such reads by
     /// tie-break, to run with warnings that list them. Matches cut short by
-    /// `partial5`/`partial3` are not checked.
+    /// `partial5`/`partial3` are not checked. Tags that slide with no `loc`
+    /// can also both match one read at shifted places, as `ACGTAC` and
+    /// `CGTACG` both match `TACGTACGT`, which the check does not flag.
     ///
     /// Sources (`NAME::SOURCE`):
     ///
