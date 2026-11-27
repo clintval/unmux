@@ -35,6 +35,11 @@ const UNASSIGNED: &str =
 const TIE_BREAK: &str = "with mode=all such a read goes to one of the tags by tie-break";
 /// The mode recommended for tags that one read can match only through an indel.
 const NEAREST: &str = "set mode=nearest to leave such reads unassigned (recommended)";
+/// The most cells a table of one tag's alignments within another may hold; a
+/// pair that needs a larger one is taken to collide through an indel.
+const TABLE_CELLS: usize = 1 << 20;
+/// Why a pair taken to collide gives no bases that match both tags.
+const TOO_COSTLY: &str = "(too long to compare exactly under this indel budget)";
 
 /// The 4-bit ACGT membership mask for an IUPAC code (A=1, C=2, G=4, T=8). A
 /// byte that is not a recognized code maps to 0, so it matches nothing and
@@ -96,14 +101,16 @@ pub struct Search {
 /// their end under `anchor=3p`), either tag taken first, and the second also
 /// reverse-complemented when `bothStrands` is set. Each tag keeps its own
 /// substitution, indel, and total caps, and the message gives bases checked to
-/// match both, without an indel when that is enough. A collision with zero
-/// errors always fails. One that needs no indel fails under `mode=all`, written
-/// or not, which would assign such reads by tie-break; one that needs an indel
-/// fails only when no mode is written, asking for one. The rest are warnings:
-/// the first pairs are listed and the rest counted up to a limit, past which
-/// only collisions that would fail are looked for, and under `mode=all` a last
-/// warning recommends `mode=nearest`. Truncated matches (`partial5`/`partial3`)
-/// are not considered.
+/// match both, without an indel when that is enough; a pair whose table of
+/// alignments would hold more than `TABLE_CELLS` cells is taken to collide
+/// through an indel instead.
+/// A collision with zero errors always fails.
+/// One that needs no indel fails under `mode=all`, written or not, which would
+/// assign such reads by tie-break; one that needs an indel fails only when no
+/// mode is written, asking for one. The rest are warnings: the first pairs are
+/// listed and the rest counted up to a limit, past which only collisions that
+/// would fail are looked for, and under `mode=all` a last warning recommends
+/// `mode=nearest`. Truncated matches (`partial5`/`partial3`) are not considered.
 pub fn validate_group(name: &str, seqs: &[Vec<u8>], search: &Search) -> Result<Vec<String>> {
     let mut warnings = Vec::new();
 
@@ -174,7 +181,7 @@ pub fn validate_group(name: &str, seqs: &[Vec<u8>], search: &Search) -> Result<V
         false => (&substitutions, TIE_BREAK),
     };
     let budget = dist_spec(&search.dist);
-    let (mut colliding, mut example) = (0, None);
+    let (mut colliding, mut compared, mut example) = (0, 0, None);
     for (i, a) in tags.iter().enumerate() {
         for (j, b) in tags.iter().enumerate().skip(i + 1) {
             let strands = search.both_strands.then(|| (&flipped[i], &flipped[j]));
@@ -195,25 +202,33 @@ pub fn validate_group(name: &str, seqs: &[Vec<u8>], search: &Search) -> Result<V
                 String::from_utf8_lossy(&seqs[i]),
                 String::from_utf8_lossy(&seqs[j]),
             );
-            let bases = String::from_utf8_lossy(&found.bases);
+            let bases = found.bases.as_deref().map(String::from_utf8_lossy);
             let strand = if found.flipped {
                 ", one on each strand"
             } else {
                 ""
             };
             if found.exact {
+                let bases = bases.unwrap_or_default();
                 bail!("group `{name}`: tags `{a_s}` and `{b_s}` are indistinguishable (the bases `{bases}` match both with zero errors{strand}); remove one or make them distinct");
             }
-            let witness = format!("(the bases `{bases}` match both{strand})");
+            let (verb, witness) = match bases {
+                Some(bases) => ("can", format!("(the bases `{bases}` match both{strand})")),
+                None => ("may", TOO_COSTLY.to_string()),
+            };
             let overlap = format!(
-                "group `{name}`: tags `{a_s}` and `{b_s}` can both match one read within dist={budget} {witness}"
+                "group `{name}`: tags `{a_s}` and `{b_s}` {verb} both match one read within dist={budget} {witness}"
             );
             if !nearest && !needs_indel {
                 bail!("{overlap}; with mode=all this silently mis-assigns reads: separate the tags, lower dist, or use mode=nearest, which only warns and lists the colliding pairs");
             }
             colliding += 1;
+            compared += usize::from(found.bases.is_some());
             if search.mode.is_none() {
-                example.get_or_insert(format!("`{a_s}` and `{b_s}` {witness}"));
+                let first_compared = found.bases.is_some() && compared == 1;
+                if example.is_none() || first_compared {
+                    example = Some(format!("`{a_s}` and `{b_s}` {witness}"));
+                }
             } else if colliding <= LISTED_PAIRS {
                 warnings.push(format!("{overlap}; {consequence}"));
             }
@@ -225,9 +240,10 @@ pub fn validate_group(name: &str, seqs: &[Vec<u8>], search: &Search) -> Result<V
         let noun = if count == 1 { "pair" } else { "pairs" };
         format!("{at_least}{count} {kind}{noun}")
     };
+    let verb = if compared > 0 { "can" } else { "may" };
     if let Some(pair) = example {
         bail!(
-            "group `{name}`: {} of tags can both match one read within dist={budget} only through an indel, such as {pair}; {NEAREST}, or write mode=all to keep assigning each to one of the tags by tie-break",
+            "group `{name}`: {} of tags {verb} both match one read within dist={budget} only through an indel, such as {pair}; {NEAREST}, or write mode=all to keep assigning each to one of the tags by tie-break",
             pairs(colliding, "")
         );
     }
@@ -237,13 +253,13 @@ pub fn validate_group(name: &str, seqs: &[Vec<u8>], search: &Search) -> Result<V
             false => format!(" (counting stopped at {COUNTED_PAIRS})"),
         };
         warnings.push(format!(
-            "group `{name}`: {}{stopped} of tags can both match one read within dist={budget}; {consequence}",
+            "group `{name}`: {}{stopped} of tags {verb} both match one read within dist={budget}; {consequence}",
             pairs(colliding - LISTED_PAIRS, "more ")
         ));
     }
     if !nearest && colliding > 0 {
         warnings.push(format!(
-            "group `{name}`: {} of tags can match one read only through an indel; {NEAREST}",
+            "group `{name}`: {} of tags {verb} match one read only through an indel; {NEAREST}",
             pairs(colliding, "")
         ));
     }
@@ -376,10 +392,24 @@ type Spread = (usize, usize, usize);
 
 /// Bases one read can carry that two tags both match.
 struct Overlap {
-    bases: Vec<u8>,
+    /// The bases, or `None` when the tags were too costly to compare exactly
+    /// and are taken to collide through an indel.
+    bases: Option<Vec<u8>>,
     exact: bool,
     flipped: bool,
     spread: Spread,
+}
+
+impl Overlap {
+    /// Two tags taken to collide, ranked behind any overlap with bases.
+    fn unchecked() -> Self {
+        Overlap {
+            bases: None,
+            exact: false,
+            flipped: false,
+            spread: (usize::MAX, usize::MAX, usize::MAX),
+        }
+    }
 }
 
 /// The overlap of two tags over the orders and strands the search allows,
@@ -421,13 +451,16 @@ fn overlap(outer: &Tag, inner: &Tag, search: &Search, shape: Shape) -> Option<Ov
     }
     let found = match dist.indel {
         0 => ungapped(outer, inner, dist, shape, longest)?,
-        _ => gapped(outer, inner, dist, shape, longest)?,
+        _ => match gapped(outer, inner, dist, shape, longest)? {
+            Gapped::Found(found) => found,
+            Gapped::TooLarge => return Some(Overlap::unchecked()),
+        },
     };
     let bases = found.bases(outer, inner);
     let fits = aligns(&outer.masks, &bases, dist, Shape::PINNED)
         && aligns(&inner.masks, &bases, dist, shape);
     fits.then_some(Overlap {
-        bases,
+        bases: Some(bases),
         exact: found.exact,
         flipped: false,
         spread: found.spread,
@@ -566,15 +599,17 @@ fn disjoint(outer: &Tag, inner: &Tag, offset: usize) -> usize {
     }
 }
 
+/// What the table over two tags' alignments found, when there is one.
+enum Gapped {
+    /// An alignment whose edits split within the budget.
+    Found(Candidate),
+    /// No table was filled, as it would hold more than [`TABLE_CELLS`] cells.
+    TooLarge,
+}
+
 /// The alignment of `inner` within `outer`, indels allowed, whose edits split
 /// most evenly within `dist`.
-fn gapped(
-    outer: &Tag,
-    inner: &Tag,
-    dist: &Dist,
-    shape: Shape,
-    longest: usize,
-) -> Option<Candidate> {
+fn gapped(outer: &Tag, inner: &Tag, dist: &Dist, shape: Shape, longest: usize) -> Option<Gapped> {
     let budget = 2 * dist.total;
     if unmatched(outer, inner) > budget
         || !shares_grams(outer, inner, budget)
@@ -582,6 +617,16 @@ fn gapped(
         || !edits_within(outer, inner, shape, budget)
     {
         return None;
+    }
+    tabled(outer, inner, dist, shape, longest)
+}
+
+/// The alignment that a table finds for a pair the filters let through, kept
+/// out of line so that the path every pair takes stays small.
+#[inline(never)]
+fn tabled(outer: &Tag, inner: &Tag, dist: &Dist, shape: Shape, longest: usize) -> Option<Gapped> {
+    if Grid::size(outer, inner, dist, shape) > TABLE_CELLS {
+        return Some(Gapped::TooLarge);
     }
     let grid = Grid::fill(outer, inner, dist, shape);
     let (gaps, skips, extras) = (grid.gaps, grid.skips, grid.extras);
@@ -606,12 +651,12 @@ fn gapped(
             ))
         })
         .min_by_key(|&(spread, ..)| spread)?;
-    Some(Candidate {
+    Some(Gapped::Found(Candidate {
         steps: grid.trace(outer, inner, shape, end),
         split,
         spread,
         exact,
-    })
+    }))
 }
 
 /// How many bases of `inner` no base of `outer` can pair with, a lower bound on
@@ -782,14 +827,30 @@ impl Grid {
         Some(subs + usize::from(outer.masks[p - 1] & inner.masks[j - 1] == 0))
     }
 
-    fn fill(outer: &Tag, inner: &Tag, dist: &Dist, shape: Shape) -> Self {
+    /// The lowest and highest diagonals, and the most skipped and extra bases,
+    /// that the alignments of `inner` within `outer` can reach.
+    fn bounds(outer: &Tag, inner: &Tag, dist: &Dist, shape: Shape) -> (isize, isize, usize, usize) {
         let gaps = 2 * dist.indel;
         let (skips, extras) = (gaps.min(outer.len()), gaps.min(inner.len()));
-        let lo = -(extras as isize);
         let hi = match shape.free_start {
             true => outer.len() as isize - inner.len() as isize + extras as isize,
             false => skips as isize,
         };
+        (-(extras as isize), hi, skips, extras)
+    }
+
+    /// How many cells the table of `inner` within `outer` holds.
+    fn size(outer: &Tag, inner: &Tag, dist: &Dist, shape: Shape) -> usize {
+        let (lo, hi, skips, extras) = Grid::bounds(outer, inner, dist, shape);
+        let width = usize::try_from(hi - lo + 1).unwrap_or(0);
+        [inner.len() + 1, width, skips + 1, extras + 1]
+            .into_iter()
+            .fold(1, usize::saturating_mul)
+    }
+
+    fn fill(outer: &Tag, inner: &Tag, dist: &Dist, shape: Shape) -> Self {
+        let gaps = 2 * dist.indel;
+        let (lo, hi, skips, extras) = Grid::bounds(outer, inner, dist, shape);
         let width = usize::try_from(hi - lo + 1).unwrap_or(0);
         let size = (inner.len() + 1) * width * (skips + 1) * (extras + 1);
         let mut grid = Grid {
@@ -1512,11 +1573,12 @@ mod tests {
                 continue;
             };
             reported += 1;
+            let bases = overlap.bases.expect("short tags are compared exactly");
             let mut group = crate::matcher::CompiledGroup::new("g", vec![a.clone(), b.clone()]);
             group.dist = search.dist;
             group.revcomp = search.both_strands;
             group.anchor = search.anchor;
-            let read = [overlap.bases.as_slice()];
+            let read = [bases.as_slice()];
             let mut scratch = crate::matcher::Scratch::new();
             let outcome = crate::matcher::match_group(&group, &mut scratch, &read);
             for tag_idx in 0..2 {
@@ -1524,7 +1586,7 @@ mod tests {
                     outcome.accepted.iter().any(|m| m.tag_idx == tag_idx),
                     "tag {tag_idx} of {:?} misses {:?} under {search:?}: {outcome:?}",
                     seqs_shown(&[&a, &b]),
-                    String::from_utf8_lossy(&overlap.bases),
+                    String::from_utf8_lossy(&bases),
                 );
             }
         }
@@ -1676,8 +1738,29 @@ mod tests {
             indel: 40,
             total: 40,
         };
-        let grid = Grid::fill(&outer, &inner, &huge, Shape::of(None));
+        let shape = Shape::of(None);
+        let grid = Grid::fill(&outer, &inner, &huge, shape);
         assert!(grid.cells.len() <= 9 * 17 * 9 * 9, "{}", grid.cells.len());
+    }
+
+    #[test]
+    fn test_a_table_past_the_cell_cap_is_never_filled() {
+        // One base in fifty differs, so the filters pass and only the table could tell.
+        let tag = Rng(0x500).sample(500, b"ACGT");
+        let other: Vec<u8> = (tag.iter().enumerate())
+            .map(|(at, &base)| match at % 50 {
+                25 if base == b'A' => b'C',
+                25 => b'A',
+                _ => base,
+            })
+            .collect();
+        let huge = budget(0, 50);
+        let (outer, inner) = (Tag::new(&tag), Tag::new(&other));
+        let cells = Grid::size(&outer, &inner, &huge, Shape::of(None));
+        assert!(cells > 500 * TABLE_CELLS, "{cells}");
+        let tags = vec![tag, other];
+        let w = validate_group("g", &tags, &search(huge, MatchMode::Nearest)).unwrap();
+        assert!(w.len() == 1 && w[0].contains(TOO_COSTLY), "{w:?}");
     }
 
     /// Whether bases exist, no longer than the search window, that `outer`
