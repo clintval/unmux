@@ -1223,6 +1223,7 @@ struct DestinationList<'a> {
     input_formats: &'a [SniffedFormat],
     headers: &'a HashMap<Option<PathBuf>, Header>,
     default_header: &'a Header,
+    keeps_alignments: bool,
 }
 
 impl DestinationList<'_> {
@@ -1249,24 +1250,24 @@ impl DestinationList<'_> {
         if !is_alignment_format(dest.format) || is_dev_null(dest.path.as_deref()) {
             return Ok(at);
         }
+        let samples = self.headers.get(&dest.path).map(Header::read_groups);
         for (id, read_group) in self.default_header.read_groups() {
-            match dest.header.read_groups().get(id) {
-                None => {
-                    dest.header
-                        .read_groups_mut()
-                        .insert(id.clone(), read_group.clone());
-                }
-                Some(declared) if declared != read_group => {
-                    let place = match &dest.path {
-                        Some(path) => format!("in \"{}\"", path.display()),
-                        None => "on stdout".to_string(),
-                    };
-                    bail!(
-                        "{option} records would share read group \"{id}\" with a sample {place}; \
-                         set --pool to another name"
-                    );
-                }
-                Some(_) => {}
+            let sample = samples.and_then(|samples| samples.get(id));
+            // Aligned records keep their input read groups, which the samples' header shares.
+            if sample.is_some_and(|sample| !self.keeps_alignments || sample != read_group) {
+                let place = match &dest.path {
+                    Some(path) => format!("in \"{}\"", path.display()),
+                    None => "on stdout".to_string(),
+                };
+                bail!(
+                    "{option} records would share read group \"{id}\" with a sample {place}; set \
+                     --pool to another name"
+                );
+            }
+            if !dest.header.read_groups().contains_key(id) {
+                dest.header
+                    .read_groups_mut()
+                    .insert(id.clone(), read_group.clone());
             }
         }
         Ok(at)
@@ -1869,6 +1870,7 @@ fn run_engine(plan: &DemuxPlan, command_line: Option<&str>) -> Result<()> {
         input_formats: &input_formats,
         headers: &headers,
         default_header: &default_header,
+        keeps_alignments: keep_alignments,
     };
     let destinations = destination_table(plan, &routing, &pool, read_group, body_count, &mut list)?;
     log_run_shape(plan, &input_formats, &dests);
