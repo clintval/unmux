@@ -2660,18 +2660,25 @@ mod tests {
             ("> xa:A:Q\tML:B:C,1,2", "", "xa ML"),
             ("> CO:Z:two words\tML:B:C,1", "", "CO ML"),
             (">xa:A:Q\tML:B:C,1,2", "xa:A:Q", "ML"),
+            ("> ab:A:x description here", "ab:A:x", ""),
+            ("> ab:i:xyz desc", "ab:i:xyz", ""),
         ] {
             let file = temp_with(format!("{definition}\nACGT\n").as_bytes());
             let record = read_all(&file).remove(0).records.remove(0);
-            assert_eq!(record.name, name.as_bytes(), "{definition}");
+            assert_eq!(record.name, name.as_bytes(), "{definition:?}");
             let lifted: Vec<String> = record
                 .tags
                 .iter()
                 .flat_map(Data::iter)
                 .map(|(tag, _)| String::from_utf8_lossy(&<[u8; 2]>::from(tag)).into_owned())
                 .collect();
-            assert_eq!(lifted.join(" "), tags, "{definition}");
+            assert_eq!(lifted.join(" "), tags, "{definition:?}");
         }
+        let error = read_error("> ab:i:xyz\nACGT\n");
+        assert!(
+            error.contains("the comment tag `ab:i` must be an integer"),
+            "{error}"
+        );
     }
 
     #[test]
