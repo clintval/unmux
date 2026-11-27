@@ -990,17 +990,14 @@ fn first_token(name: &[u8]) -> Vec<u8> {
         .to_vec()
 }
 
-/// The read name and comment of a FASTA definition after its `>`, split at the
-/// first space or tab. After leading whitespace the first word is still the
-/// name, unless it has a [`tag_shape`], which marks a nameless record.
+/// The name and comment after `>`; no name when a tag-shaped first field follows a space or tab.
 fn split_fasta_definition(body: &str) -> (&str, &str) {
     let trimmed = body.trim_start_matches([' ', '\t']);
-    let (word, rest) = trimmed.split_once([' ', '\t']).unwrap_or((trimmed, ""));
-    if trimmed.len() < body.len() && tag_shape(word.as_bytes()).is_some() {
-        ("", trimmed)
-    } else {
-        (word, rest)
+    let field = trimmed.split_once('\t').map_or(trimmed, |(field, _)| field);
+    if trimmed.len() < body.len() && tag_shape(field.as_bytes()).is_some() {
+        return ("", trimmed);
     }
+    trimmed.split_once([' ', '\t']).unwrap_or((trimmed, ""))
 }
 
 /// Lift the SAM tags of a FASTX read-name comment, the inverse of the writer's
