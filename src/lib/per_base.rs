@@ -15,6 +15,8 @@ pub(crate) enum Kind {
     Text,
     /// A `B` array of any subtype.
     Array,
+    /// A `B:S` array.
+    UInt16s,
 }
 
 /// How a per-base tag follows a read whose bases are cut, reordered or reverse-complemented.
@@ -31,7 +33,7 @@ pub(crate) enum PerBase {
 }
 
 /// Every per-base tag, the type it must have, and how it follows its read.
-pub(crate) const PER_BASE_TAGS: [([u8; 2], Kind, PerBase); 54] = [
+pub(crate) const PER_BASE_TAGS: [([u8; 2], Kind, PerBase); 58] = [
     (*b"MM", Kind::Any, PerBase::Dropped),
     (*b"ML", Kind::Any, PerBase::Dropped),
     (*b"MN", Kind::Any, PerBase::Dropped),
@@ -61,7 +63,7 @@ pub(crate) const PER_BASE_TAGS: [([u8; 2], Kind, PerBase); 54] = [
     (*b"pc", Kind::Any, PerBase::Dropped),
     (*b"pq", Kind::Any, PerBase::Dropped),
     (*b"pg", Kind::Any, PerBase::Dropped),
-    (*b"pa", Kind::Any, PerBase::Dropped),
+    (*b"pa", Kind::UInt16s, PerBase::Dropped),
     (*b"pm", Kind::Any, PerBase::Dropped),
     (*b"pd", Kind::Any, PerBase::Dropped),
     (*b"px", Kind::Any, PerBase::Dropped),
@@ -86,6 +88,10 @@ pub(crate) const PER_BASE_TAGS: [([u8; 2], Kind, PerBase); 54] = [
     (*b"at", Kind::Array, PerBase::Reversed),
     (*b"bu", Kind::Array, PerBase::Reversed),
     (*b"bt", Kind::Array, PerBase::Reversed),
+    (*b"sm", Kind::Array, PerBase::Native),
+    (*b"pt", Kind::Text, PerBase::Dropped),
+    (*b"tp", Kind::Array, PerBase::Dropped),
+    (*b"t0", Kind::Text, PerBase::Dropped),
 ];
 
 const _: () = assert!(PER_BASE_TAGS.len() <= u64::BITS as usize);
@@ -100,6 +106,7 @@ pub(crate) fn per_base(tag: Tag, value: &Value) -> Option<(usize, PerBase)> {
         Kind::Any => true,
         Kind::Text => matches!(value, Value::String(_)),
         Kind::Array => matches!(value, Value::Array(_)),
+        Kind::UInt16s => matches!(value, Value::Array(Array::UInt16(_))),
     };
     typed.then_some((index, per_base))
 }
