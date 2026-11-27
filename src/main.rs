@@ -255,6 +255,16 @@ struct DemuxCmd {
     /// `1:0:8` or `@grp+0:8`, as the observed bases. A self-span whose tag
     /// has an ambiguity code, such as `N`, also joins as the observed bases.
     ///
+    /// When `dist` allows an edit, a `loc`, `next` or `match=` window wider than a
+    /// tag lets a read match another tag at a shifted position as closely
+    /// as its true tag: the leftmost match then wins, or with `mode=nearest`
+    /// the read is left unmatched. Unmux warns where it estimates this for
+    /// over 0.3% of reads with an error, suggesting `mode=nearest`, a window
+    /// as wide as the tags if no indel upstream shifts the barcode, or, with
+    /// an indel budget, a window wider than the tags by twice that budget. A
+    /// whole-record search, or a window that runs to the record end, has the
+    /// same risk but is not warned about.
+    ///
     /// An `@RG` source reads the input header's read groups instead of
     /// matching sequences (SAM/BAM/CRAM only; no barcode attributes, no
     /// `@`-span). Pair with `--sample-from-group` to write one file per
