@@ -99,6 +99,18 @@ Feature: Outputs that would be one file are refused
     When I run `unmux reads.fq --group bc={A=AAAAAAAA,T=TTTTTTTT} --sample a=bc::A --out o/a.fq --unassigned o/a.fq`
     Then the exit code is 0
 
+  Scenario Outline: a bin on another spelling of a sample's named pipe is refused (<bin>)
+    Given a named pipe "o/a.fq"
+    When I run `unmux reads.fq --group bc={A=AAAAAAAA,T=TTTTTTTT} --sample a=bc::A --out o/%sample.fq --unassigned <bin>`
+    Then the exit code is 1
+    And stderr contains "outputs "o/a.fq" (sample a) and "<bin>" (--unassigned) are the same file; give them distinct paths"
+
+    Examples:
+      | bin         |
+      | ./o/a.fq    |
+      | o//a.fq     |
+      | o/x/../a.fq |
+
   Scenario Outline: a bin given another path to the one --out file is refused with the way to share it
     When I run `unmux reads.fq --pool lib --group bc={A=AAAAAAAA,T=TTTTTTTT} <outputs>`
     Then the exit code is 1
