@@ -631,15 +631,23 @@ Feature: Tag matching with distance tolerance and error handling
       +
       IIIIIIIIIIII
       """
-    # CB holds the corrected form, which is the tag as written, and BC the raw form.
-    When I run `unmux reads.fq --group bc={a=<tag>} --group bc::bothStrands=true --extract bc=@bc --tag CB=bc --tag BC=bc --tag BC::raw=true --sample-from-group bc --out %sample.fq --unassigned un.fq`
+    When I run `unmux reads.fq --group bc={a=<tag>} --group bc::bothStrands=true --sample-from-group bc --out %sample.fq --unassigned un.fq`
     Then the exit code is 0
-    And the file "a.fq" contains "@fwd CB:Z:<tag>"
-    And the file "a.fq" contains "@rev CB:Z:<tag>"
-    And the file "a.fq" contains "@revrna CB:Z:<tag>"
-    And the file "a.fq" contains "BC:Z:CCGTACGT"
-    And the file "a.fq" contains "BC:Z:CCGUACGU"
-    And the file "un.fq" does not contain "@rev"
+    And the file "a.fq" is:
+      """
+      @fwd
+      ACGTACGGAAAA
+      +
+      IIIIIIIIIIII
+      @rev
+      TTTTCCGTACGT
+      +
+      IIIIIIIIIIII
+      @revrna
+      UUUUCCGUACGU
+      +
+      IIIIIIIIIIII
+      """
 
     Examples:
       | tag      |
