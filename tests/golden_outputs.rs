@@ -540,6 +540,14 @@ const CELLS: &str = "--group b1={in}/bc.tsv --group b1::loc=0:0:13 --group b1::d
     --group bc::maxFindsPerTag=1 --extract s=@bc --extract r=0:0:end --template r --tag CB=s \
     --sample-from-group bc --out %sample.bam --unassigned un.bam --qc-tag {METRICS}"
 )]
+#[case::anywhere_on_both_strands_with_indels_apart(
+    "187e0d973d99cc6865a78abc2b33019b",
+    "{in}/any.fq \
+    --group bc={a=AACCGGTT,b=ACGTACGT,c=AGTCAGTC,d=ATATCGCG,e=CAGTTGAC,f=CCAATTGG,g=GGTTAACC,h=TACGCATG,i=TTGGCCAA} \
+    --group bc::dist=0:1 --group bc::bothStrands=true --group bc::maxFindsPerTag=1 \
+    --extract s=@bc --extract r=0:0:end --template r --tag CB=s \
+    --sample-from-group bc --out %sample.bam --unassigned un.bam --qc-tag {METRICS}"
+)]
 #[case::anywhere_exact_and_unique(
     "14e0f61dc6b46800628b3fe995adbda7",
     "{in}/any.fq \

@@ -1014,6 +1014,69 @@ mod tests {
     }
 
     #[test]
+    fn test_bases_may_run_an_indel_past_the_longer_tag() {
+        // ACTGTACGT is ACGTACGT with a base inserted and ACTGTACA with its last base deleted.
+        let tags = seqs(&["ACGTACGT", "ACTGTACA"]);
+        let five = Search {
+            dist: budget(0, 1),
+            ..shaped(Some(Anchor::FivePrime), false, None)
+        };
+        let err = validate_group("g", &tags, &five).unwrap_err().to_string();
+        assert!(
+            err.contains("within dist=0:1 (the bases `ACTGTACGT` match both)"),
+            "{err}"
+        );
+    }
+
+    /// Every 4-mer; two of them collide at dist=1 when they differ at two or fewer positions.
+    fn every_4mer() -> Vec<Vec<u8>> {
+        let base = |code: usize, at: usize| b"ACGT"[code >> (2 * at) & 3];
+        (0..256)
+            .map(|code| (0..4).map(|at| base(code, at)).collect())
+            .collect()
+    }
+
+    #[test]
+    fn test_nearest_lists_the_first_colliding_pairs_and_counts_the_rest() {
+        let tags = seqs(&["AAAAA", "AAAAC", "AAAAG", "AAAAT", "AAACA", "AAAGA"]);
+        let w = validate_group("g", &tags, &search(dist(1), MatchMode::Nearest)).unwrap();
+        assert_eq!(w.len(), 11, "ten pairs and a count: {w:?}");
+        assert!(w[..10]
+            .iter()
+            .all(|w| w.contains("can both match one read")));
+        assert!(
+            w[10]
+                .contains("group `g`: 5 more pairs of tags can both match one read within dist=1;"),
+            "{}",
+            w[10]
+        );
+    }
+
+    #[test]
+    fn test_nearest_stops_counting_but_still_refuses_zero_error_pairs() {
+        let mut tags = every_4mer();
+        let w = validate_group("g", &tags, &search(dist(1), MatchMode::Nearest)).unwrap();
+        assert_eq!(w.len(), 11, "ten pairs and a count: {w:?}");
+        assert!(w[10].contains("at least 990 more pairs"), "{}", w[10]);
+        tags.push(tags[255].clone());
+        let err = validate_group("g", &tags, &search(dist(1), MatchMode::Nearest))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("indistinguishable"), "{err}");
+    }
+
+    #[test]
+    fn test_mode_all_points_at_mode_nearest_to_list_the_pairs() {
+        let err = check(&["AAAA", "AATT"], dist(1), MatchMode::All)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("or use mode=nearest, which only warns and lists the colliding pairs"),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn test_base_matching_nothing_is_charged_to_its_own_tag() {
         // X matches no read base, so both tags pay for it and no read is within one of both.
         let tags = seqs(&["AXA", "CXA"]);
@@ -1113,6 +1176,41 @@ mod tests {
             .collect()
     }
 
+    /// `seq` with up to `edits` random substitutions, insertions, and deletions.
+    fn mutate(rng: &mut Rng, seq: &[u8], edits: usize, letters: &[u8]) -> Vec<u8> {
+        let mut seq = seq.to_vec();
+        for _ in 0..rng.below(edits + 1) {
+            let (at, base) = (rng.below(seq.len() + 1), letters[rng.below(letters.len())]);
+            match rng.below(3) {
+                0 if at < seq.len() => seq[at] = base,
+                1 => seq.insert(at, base),
+                _ if at < seq.len() && seq.len() > 1 => drop(seq.remove(at)),
+                _ => {}
+            }
+        }
+        seq
+    }
+
+    /// The fewest disjoint pairs plus unpaired bases over the alignments of
+    /// `inner` within `outer`, by a plain table.
+    fn plain_edits(outer: &[u8], inner: &[u8], shape: Shape) -> usize {
+        let mut row: Vec<usize> = (0..=outer.len())
+            .map(|i| if shape.free_start { 0 } else { i })
+            .collect();
+        for (j, &base) in inner.iter().enumerate() {
+            let mut next = vec![j + 1; outer.len() + 1];
+            for (i, &other) in outer.iter().enumerate() {
+                let missed = usize::from(mask(base) & mask(other) == 0);
+                next[i + 1] = (row[i] + missed).min(row[i + 1] + 1).min(next[i] + 1);
+            }
+            row = next;
+        }
+        match shape.free_end {
+            true => *row.iter().min().unwrap(),
+            false => row[outer.len()],
+        }
+    }
+
     /// The fewest disjoint pairs plus unpaired bases over the alignments of
     /// `inner` within `outer` with at most `gaps` unpaired bases, by a plain table.
     fn plain_fewest(outer: &[u8], inner: &[u8], shape: Shape, gaps: usize) -> usize {
@@ -1157,17 +1255,24 @@ mod tests {
     #[test]
     fn test_edit_bounds_agree_with_a_plain_table() {
         let mut rng = Rng(0xed17);
-        for _ in 0..1500 {
+        for trial in 0..1600 {
             let letters: &[u8] = [&b"ACGT"[..], b"AC", b"ACGTNRX"][rng.below(3)];
-            let len_x = 1 + rng.below(20);
-            let len_y = [len_x, 1 + rng.below(20)][rng.below(2)];
-            let (x, y) = (rng.sample(len_x, letters), rng.sample(len_y, letters));
+            let len_x = match trial % 8 {
+                0 => 65 + rng.below(70),
+                _ => 1 + rng.below(20),
+            };
+            let x = rng.sample(len_x, letters);
+            let len_y = [len_x, 1 + rng.below(len_x + 2)][rng.below(2)];
+            let y = match rng.below(2) {
+                0 => mutate(&mut rng, &x, 6, letters),
+                _ => rng.sample(len_y, letters),
+            };
             let shape = Shape {
                 free_start: rng.below(2) == 0,
                 free_end: rng.below(2) == 0,
             };
             let (outer, inner) = (Tag::new(&x), Tag::new(&y));
-            let fewest = plain_fewest(&x, &y, shape, x.len() + y.len());
+            let fewest = plain_edits(&x, &y, shape);
             let by_gaps: Vec<usize> = (0..5).map(|g| plain_fewest(&x, &y, shape, g)).collect();
             for budget in 0..8 {
                 let shown = seqs_shown(&[&y, &x]);
@@ -1187,11 +1292,39 @@ mod tests {
         }
     }
 
-    /// Whether bases exist, at most `longest` long, that `outer` matches end to
-    /// end and `inner` matches within as the search places it.
+    #[test]
+    fn test_long_tags_far_apart_are_ruled_out_before_the_table() {
+        let mut rng = Rng(0x10ad);
+        let sliding = Shape::of(None);
+        let mut banded = 0;
+        for _ in 0..50 {
+            let (x, y) = (rng.sample(70, b"ACGT"), rng.sample(70, b"ACGT"));
+            let (outer, inner) = (Tag::new(&x), Tag::new(&y));
+            let shown = seqs_shown(&[&y, &x]);
+            assert!(!edits_within(&outer, &inner, sliding, 8), "{shown:?}");
+            banded += usize::from(!covered(&outer, &inner, sliding, 4, 8));
+        }
+        assert!(banded >= 40, "the diagonal band rules out {banded} of 50");
+    }
+
+    #[test]
+    fn test_table_for_an_indel_budget_past_the_tags_stays_small() {
+        let (outer, inner) = (Tag::new(b"ACGTACGT"), Tag::new(b"TGCATGCA"));
+        let huge = Dist {
+            mismatch: 0,
+            indel: 40,
+            total: 40,
+        };
+        let grid = Grid::fill(&outer, &inner, &huge, Shape::of(None));
+        assert!(grid.cells.len() <= 9 * 17 * 9 * 9, "{}", grid.cells.len());
+    }
+
+    /// Whether bases exist, no longer than the search window, that `outer`
+    /// matches end to end and `inner` matches within as the search places it.
     fn bases_exist(outer: &[u8], inner: &[u8], search: &Search) -> bool {
         let (outer, inner) = (Tag::new(outer), Tag::new(inner));
-        let longest = search.window.map_or(outer.len(), |w| w.min(outer.len()));
+        let reach = outer.len() + search.dist.indel;
+        let longest = search.window.map_or(reach, |w| w.min(reach));
         let shape = Shape::of(search.anchor);
         (1..=longest).any(|len| {
             (0..1usize << (2 * len)).any(|code| {

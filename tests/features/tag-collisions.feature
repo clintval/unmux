@@ -23,11 +23,37 @@ Feature: Tags that one read can match together are refused or warned about
     Then the exit code is 1
     And stderr contains "can both match one read within dist=0:1 (the bases `ACGTA` match both)"
     And stderr contains "with mode=all this silently mis-assigns reads"
+    And stderr contains "or use mode=nearest, which only warns and lists the colliding pairs"
 
     Examples:
       | set                 |
       | {a=ACGTAC,b=ACGTAG} |
       | {b=ACGTAG,a=ACGTAC} |
+
+  Scenario Outline: bases one indel longer than either tag can match both, so such a pair is refused
+    # ACTGTACGT is ACGTACGT with one base inserted, and ACTGTACA with its last base deleted.
+    Given a file "shift.fq" containing:
+      """
+      @r1
+      ACTGTACGTGGGGGGGG
+      +
+      IIIIIIIIIIIIIIIII
+      """
+    When I run `unmux shift.fq --group bc=<set> --group bc::dist=0:1,loc=0:0:12,anchor=5p --sample-from-group bc --out %sample.fq`
+    Then the exit code is 1
+    And stderr contains "can both match one read within dist=0:1 (the bases `ACTGTACGT` match both)"
+
+    Examples:
+      | set                     |
+      | {a=ACGTACGT,b=ACTGTACA} |
+      | {b=ACTGTACA,a=ACGTACGT} |
+
+  Scenario: under mode=nearest the first colliding pairs are listed and the rest are counted
+    # The six tags differ only in their last two bases, so all fifteen pairs collide within dist=1.
+    When I run `unmux reads.fq --group bc={a=AAAAA,b=AAAAC,c=AAAAG,d=AAAAT,e=AAACA,f=AAAGA} --group bc::dist=1,mode=nearest --sample-from-group bc --out %sample.fq --unassigned un.fq`
+    Then the exit code is 0
+    And stderr contains "tags `AAAAA` and `AAAAC` can both match one read within dist=1"
+    And stderr contains "5 more pairs of tags can both match one read within dist=1"
 
   Scenario: the same indel budget under mode=nearest is a warning and the read is left unassigned
     When I run `unmux reads.fq --group bc={a=ACGTAC,b=ACGTAG} --group bc::dist=0:1,loc=0:0:8,mode=nearest --sample-from-group bc --out %sample.fq --unassigned un.fq`
