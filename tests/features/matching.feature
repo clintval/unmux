@@ -365,7 +365,7 @@ Feature: Tag matching with distance tolerance and error handling
     And the file "out.fq" contains "@part CB:Z:ATCGATCG"
     And the file "un.fq" does not contain "@part"
 
-  Scenario: A match= group joins an @grp self-span of a degenerate tag as the declared pattern
+  Scenario: A match= group joins an @grp self-span of a degenerate tag as the observed bases
     Given a file "reads.fq" containing:
       """
       @deg
@@ -373,11 +373,32 @@ Feature: Tag matching with distance tolerance and error handling
       +
       IIIIIIIIIIII
       """
-    # The stream joins as AACGTGNN, whose N positions count as mismatches against AACGTGCA.
+    # The stream joins as the read's AACGTGCA, not as the pattern AACGTGNN.
     When I run `unmux reads.fq --group bc={x=AACGTGNN} --group bc::loc=0:0:8 --extract b=@bc --group cell={c1=AACGTGCA} --group cell::match=b --group cell::minFindsPerGroup=1 --out out.fq --unassigned un.fq`
     Then the exit code is 0
-    And the file "un.fq" contains "@deg"
-    And the file "out.fq" does not contain "@deg"
+    And the file "out.fq" contains "@deg"
+    And the file "un.fq" does not contain "@deg"
+
+  Scenario: A match= group tells reads of one degenerate tag apart by their observed bases
+    Given a file "reads.fq" containing:
+      """
+      @n1
+      AACGTGCATTGACCAG
+      +
+      IIIIIIIIIIIIIIII
+      @n2
+      AACGTGCATTGACCAT
+      +
+      IIIIIIIIIIIIIIII
+      """
+    # Both reads match AACGTGCATTGACCAN, and the base each holds at the N picks its cell.
+    When I run `unmux reads.fq --group bc={x=AACGTGCATTGACCAN} --extract b=@bc --group cell={c1=AACGTGCATTGACCAG,c2=AACGTGCATTGACCAT} --group cell::match=b,dist=1,mode=nearest,minFindsPerGroup=1 --sample-from-group cell --out %sample.fq --unassigned un.fq`
+    Then the exit code is 0
+    And the file "c1.fq" contains "@n1"
+    And the file "c2.fq" contains "@n2"
+    And the file "c1.fq" does not contain "@n2"
+    And the file "c2.fq" does not contain "@n1"
+    And the file "un.fq" does not contain "@n"
 
   Scenario: IUPAC ambiguity in the tag definition matches any base at the N positions
     Given a file "reads.fq" containing:
