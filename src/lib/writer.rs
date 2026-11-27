@@ -789,9 +789,15 @@ fn render_array(array: &Array) -> String {
 /// The quality that BAM and CRAM store per base for a record without qualities.
 const MISSING_QUALITY: u8 = 0xFF;
 
+/// The longest read name SAM and BAM allow.
+const MAX_NAME_LENGTH: usize = 254;
+
 trait AlignmentSink: AlignmentWrite {
-    const NEEDS_MISSING_QUALITIES_FILLED: bool = false;
     const NEEDS_U_STORED_AS_T: bool = false;
+    /// Adjust `record` so this writer stores it as BAM output does, or refuse what BAM refuses.
+    fn prepare(_record: &mut std::borrow::Cow<'_, RecordBuf>) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 impl<W: Write> AlignmentSink for sam::io::Writer<W> {}
@@ -801,9 +807,40 @@ impl<W: Write> AlignmentSink for bam::io::Writer<W> {
     const NEEDS_U_STORED_AS_T: bool = true;
 }
 
-/// The noodles CRAM writer flags every record as storing a quality per base, even one with none.
+/// Give noodles' CRAM writer only names BAM allows, `*` for a missing one, and a quality per base.
 impl<W: Write> AlignmentSink for cram::io::Writer<W> {
-    const NEEDS_MISSING_QUALITIES_FILLED: bool = true;
+    fn prepare(record: &mut std::borrow::Cow<'_, RecordBuf>) -> io::Result<()> {
+        check_name(record)?;
+        // noodles ends a missing name with a second stop byte, which readers take as another name.
+        if record.name().is_none() {
+            *record.to_mut().name_mut() = Some("*".into());
+        }
+        fill_missing_qualities(record);
+        Ok(())
+    }
+}
+
+/// Refuse a read name that BAM output refuses, with its error; noodles checks none for CRAM.
+fn check_name(record: &RecordBuf) -> io::Result<()> {
+    let Some(name) = record.name() else {
+        return Ok(());
+    };
+    let reason = if name.len() > MAX_NAME_LENGTH {
+        // The length noodles reports counts the NUL that ends a name in BAM.
+        let length = name.len() + 1;
+        format!("invalid length: expected 1 <= n <= {MAX_NAME_LENGTH}, got {length}")
+    } else if name.is_empty()
+        || name == "*"
+        || name.iter().any(|&b| !b.is_ascii_graphic() || b == b'@')
+    {
+        format!("invalid name: {name}")
+    } else {
+        return Ok(());
+    };
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!("invalid name: {reason}"),
+    ))
 }
 
 /// Write a fragment's records as SAM/BAM alignment records, setting
@@ -827,14 +864,11 @@ fn write_alignments<W: AlignmentSink>(
                 std::borrow::Cow::Owned(build_record(read, record_flags(read, index, reads.len())))
             }
         };
-        if W::NEEDS_MISSING_QUALITIES_FILLED {
-            fill_missing_qualities(&mut record);
-        }
         if W::NEEDS_U_STORED_AS_T {
             store_u_as_t(&mut record);
         }
-        writer
-            .write_alignment_record(header, record.as_ref())
+        W::prepare(&mut record)
+            .and_then(|()| writer.write_alignment_record(header, record.as_ref()))
             .context("failed to write SAM/BAM/CRAM record")?;
     }
     Ok(())
@@ -1612,6 +1646,111 @@ mod tests {
             cram_round_trip(&[vec![read]]),
             "r1\t4\t*\t0\t255\t*\t*\t0\t0\tACGT\t*\tXY:Z:hello\n"
         );
+    }
+
+    /// Write `fragments` as BAM or CRAM and read back each record's name (`*` when it has none)
+    /// and bases with noodles.
+    fn names_and_bases(
+        format: OutputFormat,
+        fragments: &[Vec<OutputRead>],
+    ) -> Vec<(String, String)> {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out");
+        let mut writer = OutputWriter::create(Some(&out), format, 0).unwrap();
+        for fragment in fragments {
+            writer.write_fragment(fragment).unwrap();
+        }
+        writer.finish().unwrap();
+
+        let file = File::open(&out).unwrap();
+        let records: Vec<RecordBuf> = if format == OutputFormat::Cram {
+            let mut reader = cram::io::Reader::new(file);
+            let header = reader.read_header().unwrap();
+            reader.records(&header).collect::<io::Result<_>>().unwrap()
+        } else {
+            let mut reader = bam::io::Reader::new(file);
+            let header = reader.read_header().unwrap();
+            reader
+                .record_bufs(&header)
+                .collect::<io::Result<_>>()
+                .unwrap()
+        };
+        records
+            .iter()
+            .map(|record| {
+                let name = record
+                    .name()
+                    .map_or("*".to_string(), |name| name.to_string());
+                let bases = String::from_utf8(record.sequence().as_ref().to_vec()).unwrap();
+                (name, bases)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_cram_keeps_each_name_with_its_record_around_nameless_records() {
+        let text = b"@HD\tVN:1.6\n*\t4\t*\t0\t0\t*\t*\t0\t0\tACGT\t*\n";
+        let mut reader = sam::io::Reader::new(&text[..]);
+        let header = reader.read_header().unwrap();
+        let mut record = RecordBuf::default();
+        reader.read_record_buf(&header, &mut record).unwrap();
+        let kept = Alignment::Record(record);
+        let quals = [30; 4];
+        let fragments = [
+            vec![output_read(b"n1", b"AAAA", Some(&quals), None)],
+            vec![output_read(b"", b"CCCC", Some(&quals), None)],
+            vec![OutputRead {
+                alignment: Some(&kept),
+                ..output_read(b"", b"", None, None)
+            }],
+            vec![output_read(b"n3", b"GGGG", Some(&quals), None)],
+            vec![output_read(b"n4", b"TTTT", Some(&quals), None)],
+        ];
+        let expected = [
+            ("n1", "AAAA"),
+            ("*", "CCCC"),
+            ("*", "ACGT"),
+            ("n3", "GGGG"),
+            ("n4", "TTTT"),
+        ]
+        .map(|(name, bases)| (name.to_string(), bases.to_string()));
+        assert_eq!(names_and_bases(OutputFormat::Bam, &fragments), expected);
+        assert_eq!(names_and_bases(OutputFormat::Cram, &fragments), expected);
+    }
+
+    #[test]
+    fn test_cram_refuses_the_read_names_bam_refuses_with_the_same_error() {
+        let write = |format: OutputFormat, name: &[u8]| {
+            let dir = tempfile::tempdir().unwrap();
+            let out = dir.path().join("out");
+            let mut writer = OutputWriter::create(Some(&out), format, 0).unwrap();
+            writer
+                .write_fragment(&[output_read(name, b"ACGT", Some(&[30; 4]), None)])
+                .map_err(|e| format!("{e:#}"))
+        };
+        let longest = [b'r'; 254];
+        let too_long = [b'r'; 255];
+        assert!(write(OutputFormat::Cram, &longest).is_ok());
+        assert_eq!(
+            write(OutputFormat::Cram, &too_long).unwrap_err(),
+            "failed to write SAM/BAM/CRAM record: invalid name: invalid length: expected 1 <= n <= 254, got 256"
+        );
+        for name in [
+            &longest[..],
+            &too_long,
+            &[b'r'; 300],
+            b"r@1",
+            b"r 1",
+            b"*",
+            "r\u{e9}".as_bytes(),
+        ] {
+            assert_eq!(
+                write(OutputFormat::Cram, name),
+                write(OutputFormat::Bam, name),
+                "{}",
+                String::from_utf8_lossy(name)
+            );
+        }
     }
 
     #[test]

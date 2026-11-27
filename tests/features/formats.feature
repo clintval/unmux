@@ -918,6 +918,129 @@ Feature: Input and output format handling
       r4	4	*	0	255	*	*	0	0	CC	*	XZ:i:7	RG:Z:p
       """
 
+  Scenario Outline: A SAM record without a name keeps its place in <format> output
+    Given a file "in.sam" containing:
+      """
+      @HD	VN:1.6
+      n1	4	*	0	0	*	*	0	0	AAAA	IIII
+      *	4	*	0	0	*	*	0	0	CCCC	IIII
+      n3	4	*	0	0	*	*	0	0	GGGG	IIII
+      n4	4	*	0	0	*	*	0	0	TTTT	IIII
+      """
+    When I run `unmux in.sam --pool p --out out.<format>`
+    Then the exit code is 0
+    When I run `unmux out.<format> --pool p --out back.sam`
+    Then the exit code is 0
+    And the records of "back.sam" are:
+      """
+      n1	4	*	0	255	*	*	0	0	AAAA	IIII	RG:Z:p
+      *	4	*	0	255	*	*	0	0	CCCC	IIII	RG:Z:p
+      n3	4	*	0	255	*	*	0	0	GGGG	IIII	RG:Z:p
+      n4	4	*	0	255	*	*	0	0	TTTT	IIII	RG:Z:p
+      """
+
+    Examples:
+      | format |
+      | sam    |
+      | bam    |
+      | cram   |
+
+  Scenario: A FASTQ record with an empty name keeps its place in CRAM output
+    Given a file "in.fq" containing:
+      """
+      @n1
+      AAAA
+      +
+      IIII
+      @
+      CCCC
+      +
+      IIII
+      @n3
+      GGGG
+      +
+      IIII
+      @n4
+      TTTT
+      +
+      IIII
+      """
+    When I run `unmux in.fq --pool p --out out.cram`
+    Then the exit code is 0
+    When I run `unmux out.cram --out back.fq`
+    Then the exit code is 0
+    And the file "back.fq" is:
+      """
+      @n1 RG:Z:p
+      AAAA
+      +
+      IIII
+      @ RG:Z:p
+      CCCC
+      +
+      IIII
+      @n3 RG:Z:p
+      GGGG
+      +
+      IIII
+      @n4 RG:Z:p
+      TTTT
+      +
+      IIII
+      """
+
+  Scenario: A record without a name in an htslib CRAM reads back without one
+    Given the test file "nameless.htslib-3.1.cram"
+    # samtools 1.25 wrote this CRAM 3.1 from nameless.sam, storing the missing name as * and a NUL.
+    When I run `unmux nameless.htslib-3.1.cram --pool p --out back.sam`
+    Then the exit code is 0
+    And the records of "back.sam" are:
+      """
+      n1	4	*	0	255	*	*	0	0	AAAA	IIII	RG:Z:p
+      *	4	*	0	255	*	*	0	0	CCCC	IIII	RG:Z:p
+      n3	4	*	0	255	*	*	0	0	GGGG	IIII	RG:Z:p
+      n4	4	*	0	255	*	*	0	0	TTTT	IIII	RG:Z:p
+      """
+    When I run `unmux nameless.htslib-3.1.cram --out back.fq`
+    Then the exit code is 0
+    And the file "back.fq" is:
+      """
+      @n1
+      AAAA
+      +
+      IIII
+      @
+      CCCC
+      +
+      IIII
+      @n3
+      GGGG
+      +
+      IIII
+      @n4
+      TTTT
+      +
+      IIII
+      """
+
+  Scenario Outline: A read name too long for BAM fails <format> output with the same error
+    Given a file "in.fq" containing:
+      """
+      @rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr
+      ACGT
+      +
+      IIII
+      """
+    When I run `unmux in.fq --out out.<format>`
+    Then the exit code is 1
+    And stderr contains "failed to write SAM/BAM/CRAM record: invalid name: invalid length: expected 1 <= n <= 254, got 256"
+    And a file "out.<format>" does not exist
+
+    Examples:
+      | format |
+      | bam    |
+      | cram   |
+
   Scenario: --threads 1 runs fully serially and still demultiplexes
     Given a file "reads.fq" containing:
       """
