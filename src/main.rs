@@ -320,7 +320,9 @@ struct DemuxCmd {
     ///
     /// SAM/BAM/CRAM allows at most two ordinals; multi-FASTX may have more.
     /// `::raw=true` emits observed bases for a stream from a corrected `@grp`
-    /// (default: corrected; no effect on a never-corrected stream).
+    /// (default: corrected; no effect on a never-corrected stream). On a
+    /// reverse-strand match, observed bases are in the tag's orientation, as
+    /// the corrected ones are; the `obs` of `--qc-tag` stays in the read's.
     ///
     ///   --template cdna               one record = the whole cdna stream
     ///   --template cb+umi             concatenate two streams into one
