@@ -1312,6 +1312,83 @@ mod tests {
         );
     }
 
+    /// Two 150 bp tags two substitutions apart, which one read matches through indels.
+    fn long_pair() -> Vec<Vec<u8>> {
+        let tag = Rng(0x1093).sample(150, b"ACGT");
+        let mut other = tag.clone();
+        for at in [40, 110] {
+            other[at] = if other[at] == b'A' { b'C' } else { b'A' };
+        }
+        vec![tag, other]
+    }
+
+    #[test]
+    fn test_long_tags_too_costly_to_compare_are_taken_to_collide() {
+        let tags = long_pair();
+        let w = validate_group("g", &tags, &search(budget(0, 8), MatchMode::Nearest)).unwrap();
+        let unchecked = "may both match one read within dist=0:8 (too long to compare exactly under this indel budget)";
+        assert!(w.len() == 1 && w[0].contains(unchecked), "{w:?}");
+        let err = validate_group("g", &tags, &unset(budget(0, 8)))
+            .unwrap_err()
+            .to_string();
+        let refusal = "group `g`: 1 pair of tags may both match one read within dist=0:8 only through an indel, such as";
+        assert!(err.starts_with(refusal), "{err}");
+    }
+
+    #[test]
+    fn test_long_tags_under_a_smaller_indel_budget_are_compared_exactly() {
+        let w = validate_group("g", &long_pair(), &search(budget(0, 7), MatchMode::Nearest));
+        let w = w.unwrap();
+        let checked = "can both match one read within dist=0:7 (the bases `";
+        assert!(w.len() == 1 && w[0].contains(checked), "{w:?}");
+    }
+
+    #[test]
+    fn test_reverse_complement_tags_point_at_both_strands() {
+        // ATACCAACGC and GCGTTGGTAT, two Illumina UD i7 indexes, are reverse complements.
+        let tags = seqs(&["ATACCAACGC", "GCGTTGGTAT"]);
+        for mode in [MatchMode::All, MatchMode::Nearest] {
+            let both = Search {
+                both_strands: true,
+                ..search(dist(0), mode)
+            };
+            let err = validate_group("g", &tags, &both).unwrap_err().to_string();
+            let reason = "tags `ATACCAACGC` and `GCGTTGGTAT` are reverse complements of each other (the bases `ATACCAACGC` match both with zero errors, one on each strand), so bothStrands=true cannot tell them apart; drop bothStrands to match each tag on the forward strand only";
+            assert!(err.contains(reason), "{err}");
+        }
+        // ACGT is its own reverse complement, but it also lies within ACGTAC on one strand.
+        let both = Search {
+            both_strands: true,
+            ..unset(dist(0))
+        };
+        let err = validate_group("g", &seqs(&["ACGT", "ACGTAC"]), &both)
+            .unwrap_err()
+            .to_string();
+        let same = err.contains("are indistinguishable") && !err.contains("bothStrands");
+        assert!(same, "{err}");
+    }
+
+    #[test]
+    fn test_a_zero_error_pair_is_reported_before_a_pair_that_needs_substitutions() {
+        // AAAA and AATT differ by two substitutions, and every read holding GGGGCC holds GGGG.
+        let tags = seqs(&["AAAA", "AATT", "GGGGCC", "GGGG"]);
+        for checked in [unset(dist(1)), search(dist(1), MatchMode::All)] {
+            let err = validate_group("g", &tags, &checked)
+                .unwrap_err()
+                .to_string();
+            let reason = "tags `GGGGCC` and `GGGG` are indistinguishable";
+            assert!(err.contains(reason), "{err}");
+        }
+        let tags = seqs(&["AAACCCGG", "CCGGGTTA", "ATACCAACGC", "GCGTTGGTAT"]);
+        let both = Search {
+            both_strands: true,
+            ..unset(dist(1))
+        };
+        let err = validate_group("g", &tags, &both).unwrap_err().to_string();
+        let reason = "tags `ATACCAACGC` and `GCGTTGGTAT` are reverse complements of each other";
+        assert!(err.contains(reason), "{err}");
+    }
+
     /// Every 4-mer; two of them collide at dist=1 when they differ at two or fewer positions.
     fn every_4mer() -> Vec<Vec<u8>> {
         let base = |code: usize, at: usize| b"ACGT"[code >> (2 * at) & 3];
