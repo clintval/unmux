@@ -539,15 +539,16 @@ impl std::fmt::Display for OutputOrigin {
 /// Refuse outputs that would be one file: paths differing only in case, or two spellings of one.
 pub fn check_output_collisions(outputs: &[(PathBuf, OutputOrigin)]) -> Result<()> {
     let mut dirs: HashMap<PathBuf, PathBuf> = HashMap::new();
-    let mut by_path: HashMap<&Path, usize> = HashMap::new();
+    let mut by_path: HashMap<PathBuf, usize> = HashMap::new();
     let mut by_name: HashMap<String, usize> = HashMap::new();
     let mut by_file: HashMap<FileId, usize> = HashMap::new();
     for (index, (path, origin)) in outputs.iter().enumerate() {
-        // A named pipe or device has no file key, so outputs on it are matched by their exact path.
-        let mut earlier = (path.as_path() != Path::new("/dev/null"))
-            .then(|| *by_path.entry(path.as_path()).or_insert(index))
+        let written = written_path(path, &mut dirs);
+        // A named pipe or device has no file key, so outputs on it are matched by the path written.
+        let mut earlier = (written != Path::new("/dev/null"))
+            .then(|| *by_path.entry(written.clone()).or_insert(index))
             .filter(|&earlier| earlier != index);
-        if let Some((name, file)) = file_key(path, &mut dirs) {
+        if let Some((name, file)) = file_key(written) {
             earlier = earlier.or_else(|| {
                 by_name
                     .get(&name)
@@ -708,21 +709,22 @@ fn stdin_file() -> Option<FileId> {
     None
 }
 
-/// The case-folded absolute path `path` writes and its existing file, or `None` if not regular.
-fn file_key(path: &Path, dirs: &mut HashMap<PathBuf, PathBuf>) -> Option<(String, Option<FileId>)> {
-    let resolved = match path.file_name() {
-        Some(name) => {
-            let parent = path.parent().unwrap_or(Path::new(""));
-            let candidate = dirs
-                .entry(parent.to_path_buf())
-                .or_insert_with(|| resolve(parent, &mut 0))
-                .join(name);
-            match std::fs::symlink_metadata(&candidate) {
-                Ok(metadata) if metadata.file_type().is_symlink() => resolve(&candidate, &mut 0),
-                _ => candidate,
-            }
-        }
-        None => resolve(path, &mut 0),
+/// The absolute path `path` writes, its directory resolved through `.`, `..` and symbolic links.
+fn written_path(path: &Path, dirs: &mut HashMap<PathBuf, PathBuf>) -> PathBuf {
+    let Some(name) = path.file_name() else {
+        return resolve(path, &mut 0);
+    };
+    let parent = path.parent().unwrap_or(Path::new(""));
+    dirs.entry(parent.to_path_buf())
+        .or_insert_with(|| resolve(parent, &mut 0))
+        .join(name)
+}
+
+/// The case-folded path an output writes at `written` and its file, or `None` if not regular.
+fn file_key(written: PathBuf) -> Option<(String, Option<FileId>)> {
+    let resolved = match std::fs::symlink_metadata(&written) {
+        Ok(metadata) if metadata.file_type().is_symlink() => resolve(&written, &mut 0),
+        _ => written,
     };
     let file = match std::fs::metadata(&resolved) {
         Ok(metadata) if !metadata.is_file() => return None,
