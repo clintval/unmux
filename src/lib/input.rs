@@ -1627,7 +1627,8 @@ impl FragmentReader {
                 if first_is_r1 {
                     interleaved = true;
                 } else if let Some((second, _)) = readers[0].read_next(false)? {
-                    interleaved = mate_key(&second.name) == mate_key(&buffered[0].name);
+                    let key = mate_key(&second.name);
+                    interleaved = !key.is_empty() && key == mate_key(&buffered[0].name);
                     buffered.push(second);
                 }
             }
