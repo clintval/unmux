@@ -1061,8 +1061,8 @@ fn check_outputs(
             ));
         }
     }
-    check_output_collisions(&outputs)?;
-    crate::output::check_outputs_over_inputs(&outputs, &read_files(plan))
+    crate::output::check_outputs_over_inputs(&outputs, &read_files(plan))?;
+    check_output_collisions(&outputs)
 }
 
 /// Every file the run reads: the inputs, the tag files, the sample sheet and the reference.
