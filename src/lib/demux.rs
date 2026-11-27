@@ -36,8 +36,8 @@ use crate::extract::{
     extract, span_range, Corrected, Extracted, GroupHit, GroupHits, MatchSpan, Segment,
 };
 use crate::fanout::{
-    compile_routing, expand_from_group, load_sample_sheet_columns, Disposition, RemoveTarget,
-    Route, Routing, SheetColumn, SheetColumns, Target,
+    compile_routing, expand_from_group, load_sample_sheet_columns, shadowed_warnings, Disposition,
+    RemoveTarget, Route, Routing, SheetColumn, SheetColumns, Target,
 };
 use crate::grammar::{
     column_tag_qualities, default_qual_tag, Anchor, DemuxPlan, Endpoint, GroupSource, MatchMode,
@@ -943,6 +943,10 @@ fn build_routing(
         demux,
         plan.require_samples_explain_all_tags,
     )?;
+    let sheet = matches!(plan.samples, SampleSpec::Sheet(..));
+    for warning in shadowed_warnings(&routing, tag_sets, group_index, sheet) {
+        log::warn!("{warning}");
+    }
     Ok((routing, sheet_columns))
 }
 

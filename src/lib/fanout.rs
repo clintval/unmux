@@ -18,6 +18,7 @@
 //! calls [`compile_routing`]; keeping the steps separate keeps each one
 //! testable on its own.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
@@ -124,7 +125,35 @@ impl Route {
     pub(crate) fn column(&self, slot: usize) -> Option<&str> {
         self.columns.get(slot)?.as_deref()
     }
+
+    /// The canonical indices of the groups this route reads, sorted.
+    fn groups(&self) -> Vec<usize> {
+        let mut groups: Vec<usize> = self.terms.iter().map(|term| term.group).collect();
+        groups.sort_unstable();
+        groups.dedup();
+        groups
+    }
+
+    /// The tags this route accepts in `group`, or `None` when it accepts any.
+    fn members(&self, group: usize) -> Option<&[usize]> {
+        let term = self.terms.iter().find(|term| term.group == group)?;
+        term.members.as_deref()
+    }
 }
+
+/// A route that loses a record it matches to an earlier route of another target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Shadowed {
+    /// The route that takes such a record.
+    taker: usize,
+    /// The route that loses it.
+    loser: usize,
+    /// The record's best tag as `(group, tag)` in each group either route reads.
+    tags: Vec<(usize, usize)>,
+}
+
+/// The most routes [`shadowed_warnings`] lists before counting the rest.
+const LISTED_SHADOWED: usize = 10;
 
 /// The sorted groups a set of routes fills, and those routes' indices.
 type Shape = (Vec<usize>, Vec<usize>);
@@ -301,6 +330,188 @@ impl Routing {
             quote(&b[slot])
         )
     }
+
+    /// Each route that loses a record it matches to an earlier route of another
+    /// target, with the route that takes the record. Routes over the same
+    /// groups never share a record, as compiling refuses a tag combination that
+    /// two targets claim, so each route is compared with earlier routes over
+    /// other groups, from the first, until one takes a record they share.
+    fn shadowed(&self) -> Vec<Shadowed> {
+        let mut shapes: Vec<Shape> = Vec::new();
+        for (index, route) in self.routes.iter().enumerate() {
+            let groups = route.groups();
+            match shapes.iter_mut().find(|(known, _)| *known == groups) {
+                Some((_, routes)) => routes.push(index),
+                None => shapes.push((groups, vec![index])),
+            }
+        }
+        if shapes.len() < 2 {
+            return Vec::new();
+        }
+        let mut found: Vec<Option<(usize, Shadowed)>> = vec![None; self.routes.len()];
+        for (earlier_groups, earlier) in &shapes {
+            for (later_groups, later) in &shapes {
+                if earlier_groups == later_groups {
+                    continue;
+                }
+                // Index the earlier routes by their tags in a group that both shapes read.
+                let pivot = earlier_groups
+                    .iter()
+                    .copied()
+                    .find(|g| later_groups.contains(g));
+                let mut by_tag: HashMap<usize, Vec<usize>> = HashMap::new();
+                let mut any_tag = Vec::new();
+                if let Some(pivot) = pivot {
+                    for &index in earlier {
+                        match self.routes[index].members(pivot) {
+                            Some(tags) => {
+                                for &tag in tags {
+                                    by_tag.entry(tag).or_default().push(index);
+                                }
+                            }
+                            None => any_tag.push(index),
+                        }
+                    }
+                }
+                for &loser in later {
+                    let tags = pivot.and_then(|pivot| self.routes[loser].members(pivot));
+                    let candidates: Cow<[usize]> = match tags {
+                        Some(tags) => {
+                            let mut listed: Vec<usize> = tags
+                                .iter()
+                                .filter_map(|tag| by_tag.get(tag))
+                                .flatten()
+                                .chain(&any_tag)
+                                .copied()
+                                .collect();
+                            listed.sort_unstable();
+                            listed.dedup();
+                            Cow::Owned(listed)
+                        }
+                        None => Cow::Borrowed(earlier),
+                    };
+                    let target = &self.routes[loser].target;
+                    let lost = candidates
+                        .iter()
+                        .copied()
+                        .take_while(|&candidate| candidate < loser)
+                        .filter(|&candidate| self.routes[candidate].target != *target)
+                        .find_map(|candidate| {
+                            let tags = shared_record(&self.routes[candidate], &self.routes[loser])?;
+                            let taker = self.first_route(&tags)?;
+                            (self.routes[taker].target != *target)
+                                .then_some((candidate, Shadowed { taker, loser, tags }))
+                        });
+                    if let Some((candidate, shadowed)) = lost {
+                        if found[loser]
+                            .as_ref()
+                            .is_none_or(|(known, _)| candidate < *known)
+                        {
+                            found[loser] = Some((candidate, shadowed));
+                        }
+                    }
+                }
+            }
+        }
+        found
+            .into_iter()
+            .flatten()
+            .map(|(_, shadowed)| shadowed)
+            .collect()
+    }
+
+    /// The first route that a record with the best tags `tags` satisfies.
+    fn first_route(&self, tags: &[(usize, usize)]) -> Option<usize> {
+        self.routes.iter().position(|route| {
+            route.terms.iter().all(|term| {
+                tags.iter().any(|&(group, tag)| {
+                    group == term.group && term.members.as_ref().is_none_or(|m| m.contains(&tag))
+                })
+            })
+        })
+    }
+}
+
+/// The best tags of a record that satisfies both routes, one per group either
+/// reads, or `None` when no record does. Where both accept any tag of a group,
+/// the record has its first.
+fn shared_record(a: &Route, b: &Route) -> Option<Vec<(usize, usize)>> {
+    let mut groups: Vec<usize> = a.terms.iter().chain(&b.terms).map(|t| t.group).collect();
+    groups.sort_unstable();
+    groups.dedup();
+    groups
+        .into_iter()
+        .map(|group| {
+            let mut lists = a
+                .terms
+                .iter()
+                .chain(&b.terms)
+                .filter(|term| term.group == group)
+                .filter_map(|term| term.members.as_deref());
+            let Some(first) = lists.next() else {
+                return Some((group, 0));
+            };
+            let rest: Vec<&[usize]> = lists.collect();
+            let tag = first
+                .iter()
+                .find(|tag| rest.iter().all(|list| list.contains(tag)))?;
+            Some((group, *tag))
+        })
+        .collect()
+}
+
+/// Warnings for the routes that lose a record they match to an earlier route of
+/// another target, for the rows of a sample sheet when `sheet` is set and for
+/// `--sample` targets otherwise. The first ten are listed and the rest counted.
+pub(crate) fn shadowed_warnings(
+    routing: &Routing,
+    tag_sets: &HashMap<String, TagSet>,
+    group_index: &HashMap<String, usize>,
+    sheet: bool,
+) -> Vec<String> {
+    let shadowed = routing.shadowed();
+    let names: HashMap<usize, &str> = group_index
+        .iter()
+        .map(|(name, &index)| (index, name.as_str()))
+        .collect();
+    let mut warnings: Vec<String> = shadowed
+        .iter()
+        .take(LISTED_SHADOWED)
+        .map(|shadowed| {
+            let mut unit: Vec<(String, usize)> = shadowed
+                .tags
+                .iter()
+                .map(|&(group, tag)| (names[&group].to_string(), tag))
+                .collect();
+            unit.sort();
+            let read = render_unit(&unit, tag_sets);
+            let taker = routing.routes[shadowed.taker].target.label();
+            let loser = routing.routes[shadowed.loser].target.label();
+            match sheet {
+                true => format!(
+                    "sample sheet rows {} (`{taker}`) and {} (`{loser}`) can both route one read, such as one with {read}; rows are tried in order, so such reads go to `{taker}`",
+                    shadowed.taker + 1,
+                    shadowed.loser + 1
+                ),
+                false => format!(
+                    "samples `{taker}` and `{loser}` can both route one read, such as one with {read}; --sample targets are tried in order, so such reads go to `{taker}`"
+                ),
+            }
+        })
+        .collect();
+    let more = shadowed.len().saturating_sub(LISTED_SHADOWED);
+    if more > 0 {
+        let plural = if more == 1 { "" } else { "s" };
+        warnings.push(match sheet {
+            true => format!(
+                "{more} more sample sheet row{plural} can lose reads to an earlier row of another sample"
+            ),
+            false => {
+                format!("{more} more sample{plural} can lose reads to an earlier --sample target")
+            }
+        });
+    }
+    warnings
 }
 
 /// Whether the record's best match in `group` (by canonical index) satisfies a
@@ -1893,5 +2104,109 @@ mod tests {
         assert_eq!(route(&[("a", 0)]), None);
         let targets: Vec<&str> = routing.route_targets().map(|t| t.sample.as_str()).collect();
         assert_eq!(targets, ["s1", "s1", "s2"]);
+    }
+
+    /// A route that loses a record, as `(taker, loser, tags)`.
+    type Lost = (usize, usize, Vec<(usize, usize)>);
+
+    /// Each route of `samples` that loses a record, over groups `a`, `b`, and
+    /// `c` (indices 0, 1, 2) of two tags each.
+    fn shadowed_of(samples: &[Sample]) -> Vec<Lost> {
+        let tag_sets = sets(&[
+            ("a", tagset(&[("a0", "AAAA"), ("a1", "CCCC")])),
+            ("b", tagset(&[("b0", "GGGG"), ("b1", "TTTT")])),
+            ("c", tagset(&[("c0", "ACAC"), ("c1", "GTGT")])),
+        ]);
+        let (routing, _) = compile(samples, &[], &tag_sets, "p", true, false).unwrap();
+        let shadowed = routing.shadowed().into_iter();
+        shadowed.map(|s| (s.taker, s.loser, s.tags)).collect()
+    }
+
+    #[test]
+    fn test_shadowed_finds_routes_over_other_groups_that_share_a_record() {
+        let crossed = [
+            sample("s1", None, &[("a", &["a0"])]),
+            sample("s2", None, &[("b", &["b0"])]),
+        ];
+        assert_eq!(shadowed_of(&crossed), [(0, 1, vec![(0, 0), (1, 0)])]);
+        let covered = [
+            sample("s1", None, &[("a", &["a0"])]),
+            sample("s2", None, &[("a", &["a0"]), ("b", &["b1"])]),
+        ];
+        assert_eq!(shadowed_of(&covered), [(0, 1, vec![(0, 0), (1, 1)])]);
+        let narrower_first = [
+            sample("s2", None, &[("a", &["a0"]), ("b", &["b1"])]),
+            sample("s1", None, &[("a", &["a0"])]),
+        ];
+        assert_eq!(shadowed_of(&narrower_first), [(0, 1, vec![(0, 0), (1, 1)])]);
+        let bare = [
+            sample("s1", None, &[("a", &[])]),
+            sample("s2", None, &[("a", &["a1"]), ("b", &["b1"])]),
+        ];
+        assert_eq!(shadowed_of(&bare), [(0, 1, vec![(0, 1), (1, 1)])]);
+        let pooled = [
+            sample("s1", None, &[("a", &["a0", "a1"])]),
+            sample("s2", None, &[("a", &["a1"]), ("b", &["b0"])]),
+        ];
+        assert_eq!(shadowed_of(&pooled), [(0, 1, vec![(0, 1), (1, 0)])]);
+        let sub_samples = [
+            sample("s1", Some("x"), &[("a", &["a0"])]),
+            sample("s1", Some("y"), &[("b", &["b0"])]),
+        ];
+        assert_eq!(shadowed_of(&sub_samples), [(0, 1, vec![(0, 0), (1, 0)])]);
+        let several = [
+            sample("s1", None, &[("a", &["a0"])]),
+            sample("s2", None, &[("b", &["b0"])]),
+            sample("s3", None, &[("c", &["c0"])]),
+        ];
+        assert_eq!(
+            shadowed_of(&several),
+            [(0, 1, vec![(0, 0), (1, 0)]), (0, 2, vec![(0, 0), (2, 0)])]
+        );
+    }
+
+    #[test]
+    fn test_shadowed_skips_routes_that_share_no_record_or_a_target() {
+        let same_groups = [
+            sample("s1", None, &[("a", &["a0"]), ("b", &["b0"])]),
+            sample("s2", None, &[("a", &["a1"]), ("b", &["b0"])]),
+        ];
+        assert!(shadowed_of(&same_groups).is_empty());
+        let disjoint = [
+            sample("s1", None, &[("a", &["a0"])]),
+            sample("s2", None, &[("a", &["a1"]), ("b", &["b0"])]),
+        ];
+        assert!(shadowed_of(&disjoint).is_empty());
+        let one_sample = [
+            sample("s1", None, &[("a", &["a0"])]),
+            sample("s1", None, &[("b", &["b0"])]),
+        ];
+        assert!(shadowed_of(&one_sample).is_empty());
+    }
+
+    #[test]
+    fn test_shadowed_routes_the_shared_record_to_find_its_taker() {
+        // Route 0 of the loser's own sample takes every record that route 2 shares with route 1.
+        let own_first = [
+            sample("s2", None, &[("b", &["b0"])]),
+            sample("s1", None, &[("a", &["a0"])]),
+            sample("s2", None, &[("a", &["a0"]), ("b", &["b0"])]),
+        ];
+        assert_eq!(shadowed_of(&own_first), [(0, 1, vec![(0, 0), (1, 0)])]);
+        // Route 3 loses to route 1 the record it shares with route 2, not the one route 0 takes.
+        let earlier_taker = [
+            sample("s2", None, &[("c", &["c0"])]),
+            sample("s1", None, &[("a", &[]), ("c", &[])]),
+            sample("s3", None, &[("c", &["c1"])]),
+            sample("s2", None, &[("a", &["a0"])]),
+        ];
+        assert_eq!(
+            shadowed_of(&earlier_taker),
+            [
+                (0, 1, vec![(0, 0), (2, 0)]),
+                (1, 2, vec![(0, 0), (2, 1)]),
+                (1, 3, vec![(0, 0), (2, 1)]),
+            ]
+        );
     }
 }
