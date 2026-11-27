@@ -343,9 +343,12 @@ struct DemuxCmd {
     /// the corrected ones are; the `obs` of `--qc-tag` stays in the read's.
     ///
     /// A record keeps the input tags of the read its first bases come from.
-    /// Per-base tags such as `MM`/`ML` and `OQ` stay only on a record
-    /// that copies that whole read in order, with no `~` or corrected
-    /// barcode; otherwise they are left out, with a warning.
+    /// Per-base tags such as `OQ` follow its bases: a trimmed, reordered, or
+    /// flipped record takes the matching slices, reversed where flipped
+    /// (bases, as in `E2`, reverse-complemented). Others, such as `MM`/`ML`,
+    /// stay only on a record that copies that whole read in order; otherwise
+    /// they are left out, with a warning, as are all per-base tags of a
+    /// record that joins reads or holds a corrected barcode.
     ///
     ///   --template cdna               one record = the whole cdna stream
     ///   --template cb+umi             concatenate two streams into one

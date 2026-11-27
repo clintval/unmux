@@ -24,6 +24,7 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use noodles::sam::alignment::record::data::field::Tag;
+use noodles::sam::alignment::record_buf::data::field::value::Array;
 use noodles::sam::alignment::record_buf::data::field::Value;
 use noodles::sam::alignment::record_buf::Data;
 use noodles::sam::alignment::RecordBuf;
@@ -2183,8 +2184,8 @@ fn run_engine(plan: &DemuxPlan, command_line: Option<&str>) -> Result<()> {
     }
     if !dropped.is_empty() {
         log::warn!(
-            "--template changed the bases of some records, so their per-base tags were left out: {}",
-            dropped.names()
+            "--template changed the bases of some records, so their per-base tags were left out: \
+             {dropped}"
         );
     }
     if let Some(pattern) = &plan.metrics_per_sample {
@@ -3516,56 +3517,215 @@ struct Body {
     alignment: Option<Alignment>,
 }
 
-/// SAM tags tied to a read's exact bases or pulses: modifications, qualities, kinetics, moves.
-const PER_BASE_TAGS: [[u8; 2]; 38] = [
-    *b"MM", *b"ML", *b"MN", *b"OQ", *b"BQ", *b"E2", *b"U2", *b"CQ", *b"CS", *b"FZ", *b"PT", *b"BI",
-    *b"BD", *b"ip", *b"pw", *b"fi", *b"fp", *b"ri", *b"rp", *b"dq", *b"dt", *b"iq", *b"mq", *b"sq",
-    *b"sa", *b"sx", *b"pc", *b"pq", *b"pg", *b"pa", *b"pm", *b"pd", *b"px", *b"pe", *b"sf", *b"bs",
-    *b"pb", *b"mv",
+/// How a per-base tag goes onto a template record whose bases are not its read's as they are.
+#[derive(Clone, Copy)]
+enum PerBase {
+    /// Left out.
+    Dropped,
+    /// A text value cut to the record's segments, reversed in a flipped one.
+    ReversedText,
+    /// An array value cut to the record's segments, reversed in a flipped one.
+    ReversedArray,
+    /// A text value of bases cut to the record's segments, reverse-complemented in a flipped one.
+    ComplementedText,
+}
+
+/// SAM tags tied to a read's exact bases or pulses, and how each goes onto a changed record.
+const PER_BASE_TAGS: [([u8; 2], PerBase); 54] = [
+    (*b"MM", PerBase::Dropped),
+    (*b"ML", PerBase::Dropped),
+    (*b"MN", PerBase::Dropped),
+    (*b"OQ", PerBase::ReversedText),
+    (*b"BQ", PerBase::Dropped),
+    (*b"E2", PerBase::ComplementedText),
+    (*b"U2", PerBase::ReversedText),
+    (*b"CQ", PerBase::Dropped),
+    (*b"CS", PerBase::Dropped),
+    (*b"FZ", PerBase::Dropped),
+    (*b"PT", PerBase::Dropped),
+    (*b"BI", PerBase::Dropped),
+    (*b"BD", PerBase::Dropped),
+    (*b"ip", PerBase::ReversedArray),
+    (*b"pw", PerBase::ReversedArray),
+    (*b"fi", PerBase::Dropped),
+    (*b"fp", PerBase::Dropped),
+    (*b"ri", PerBase::Dropped),
+    (*b"rp", PerBase::Dropped),
+    (*b"dq", PerBase::Dropped),
+    (*b"dt", PerBase::Dropped),
+    (*b"iq", PerBase::Dropped),
+    (*b"mq", PerBase::Dropped),
+    (*b"sq", PerBase::Dropped),
+    (*b"sa", PerBase::Dropped),
+    (*b"sx", PerBase::Dropped),
+    (*b"pc", PerBase::Dropped),
+    (*b"pq", PerBase::Dropped),
+    (*b"pg", PerBase::Dropped),
+    (*b"pa", PerBase::Dropped),
+    (*b"pm", PerBase::Dropped),
+    (*b"pd", PerBase::Dropped),
+    (*b"px", PerBase::Dropped),
+    (*b"pe", PerBase::Dropped),
+    (*b"sf", PerBase::Dropped),
+    (*b"bs", PerBase::Dropped),
+    (*b"pb", PerBase::Dropped),
+    (*b"mv", PerBase::Dropped),
+    (*b"cd", PerBase::ReversedArray),
+    (*b"ce", PerBase::ReversedArray),
+    (*b"ad", PerBase::ReversedArray),
+    (*b"ae", PerBase::ReversedArray),
+    (*b"bd", PerBase::ReversedArray),
+    (*b"be", PerBase::ReversedArray),
+    (*b"aq", PerBase::ReversedText),
+    (*b"bq", PerBase::ReversedText),
+    (*b"ac", PerBase::ComplementedText),
+    (*b"bc", PerBase::ComplementedText),
+    (*b"cu", PerBase::ReversedArray),
+    (*b"ct", PerBase::ReversedArray),
+    (*b"au", PerBase::ReversedArray),
+    (*b"at", PerBase::ReversedArray),
+    (*b"bu", PerBase::ReversedArray),
+    (*b"bt", PerBase::ReversedArray),
 ];
 
 const _: () = assert!(PER_BASE_TAGS.len() <= u64::BITS as usize);
 
-/// A set of [`PER_BASE_TAGS`], one bit per tag.
+/// The per-base tags left out of `--template` records, one bit per [`PER_BASE_TAGS`] entry.
 #[derive(Clone, Copy, Default)]
-struct PerBaseTags(u64);
+struct PerBaseTags {
+    /// Every tag left out.
+    left_out: u64,
+    /// The tags left out because their length was not the read's.
+    mismatched: u64,
+}
 
 impl PerBaseTags {
     fn is_empty(self) -> bool {
-        self.0 == 0
+        self.left_out == 0
     }
+}
 
-    /// The tags of the set, comma-separated in [`PER_BASE_TAGS`] order.
-    fn names(self) -> String {
-        PER_BASE_TAGS
-            .iter()
-            .enumerate()
-            .filter(|&(index, _)| self.0 & 1 << index != 0)
-            .map(|(_, tag)| String::from_utf8_lossy(tag))
-            .collect::<Vec<_>>()
-            .join(", ")
+impl std::fmt::Display for PerBaseTags {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let names = |bits: u64| {
+            PER_BASE_TAGS
+                .iter()
+                .enumerate()
+                .filter(|&(index, _)| bits & 1 << index != 0)
+                .map(|(_, (tag, _))| String::from_utf8_lossy(tag))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        f.write_str(&names(self.left_out))?;
+        if self.mismatched != 0 {
+            write!(
+                f,
+                "; {} did not match the read's length",
+                names(self.mismatched)
+            )?;
+        }
+        Ok(())
     }
 }
 
 impl std::ops::BitOrAssign for PerBaseTags {
     fn bitor_assign(&mut self, other: Self) {
-        self.0 |= other.0;
+        self.left_out |= other.left_out;
+        self.mismatched |= other.mismatched;
     }
 }
 
-/// The tags of `data` without its per-base ones, and which per-base tags it held.
-fn without_per_base_tags(data: &Data) -> (Data, PerBaseTags) {
+/// The [`PER_BASE_TAGS`] index and handling of a tag whose value has its per-base type.
+fn per_base(tag: Tag, value: &Value) -> Option<(usize, PerBase)> {
+    let index = PER_BASE_TAGS
+        .iter()
+        .position(|(name, _)| tag.as_ref() == name)?;
+    let per_base = PER_BASE_TAGS[index].1;
+    let typed = match per_base {
+        PerBase::Dropped => true,
+        PerBase::ReversedText | PerBase::ComplementedText => matches!(value, Value::String(_)),
+        PerBase::ReversedArray => matches!(value, Value::Array(_)),
+    };
+    typed.then_some((index, per_base))
+}
+
+/// A record segment: bases `[start, end)` of its read, reverse-complemented when `flipped`.
+#[derive(Clone, Copy)]
+struct Slice {
+    start: usize,
+    end: usize,
+    flipped: bool,
+}
+
+/// The values of a `len`-base read cut to `slices`, reversing each flipped one through `flip`.
+fn cut<T: Copy>(
+    values: &[T],
+    slices: &[Slice],
+    len: usize,
+    flip: impl Fn(T) -> T,
+) -> Option<Vec<T>> {
+    if values.len() != len {
+        return None;
+    }
+    let mut cut = Vec::with_capacity(slices.iter().map(|slice| slice.end - slice.start).sum());
+    for slice in slices {
+        let part = values.get(slice.start..slice.end)?;
+        match slice.flipped {
+            true => cut.extend(part.iter().rev().map(|&value| flip(value))),
+            false => cut.extend_from_slice(part),
+        }
+    }
+    Some(cut)
+}
+
+/// A per-base `value` of a `len`-base read cut to a record's `slices`, if it has `len` entries.
+fn follow(value: &Value, per_base: PerBase, slices: &[Slice], len: usize) -> Option<Value> {
+    use std::convert::identity;
+    Some(match value {
+        Value::String(text) => {
+            let flip: fn(u8) -> u8 = match per_base {
+                PerBase::ComplementedText => crate::iupac::complement,
+                _ => identity,
+            };
+            Value::String(cut(&text[..], slices, len, flip)?.into())
+        }
+        Value::Array(array) => Value::Array(match array {
+            Array::Int8(values) => Array::Int8(cut(values, slices, len, identity)?),
+            Array::UInt8(values) => Array::UInt8(cut(values, slices, len, identity)?),
+            Array::Int16(values) => Array::Int16(cut(values, slices, len, identity)?),
+            Array::UInt16(values) => Array::UInt16(cut(values, slices, len, identity)?),
+            Array::Int32(values) => Array::Int32(cut(values, slices, len, identity)?),
+            Array::UInt32(values) => Array::UInt32(cut(values, slices, len, identity)?),
+            Array::Float(values) => Array::Float(cut(values, slices, len, identity)?),
+        }),
+        _ => return None,
+    })
+}
+
+/// The tags of `data` for a changed record, with per-base ones cut to its `slices` or left out.
+fn followed_tags(data: &Data, slices: Option<&[Slice]>, len: usize) -> (Data, PerBaseTags) {
     let mut dropped = PerBaseTags::default();
     let kept = data
         .iter()
-        .filter(|(tag, _)| {
-            let per_base = PER_BASE_TAGS.iter().position(|bytes| tag.as_ref() == bytes);
-            if let Some(index) = per_base {
-                dropped.0 |= 1 << index;
+        .filter_map(|(tag, value)| {
+            let Some((index, per_base)) = per_base(tag, value) else {
+                return Some((tag, value.clone()));
+            };
+            let followed = match (per_base, slices) {
+                (PerBase::Dropped, _) | (_, None) => None,
+                (per_base, Some(slices)) => {
+                    let followed = follow(value, per_base, slices, len);
+                    if followed.is_none() {
+                        dropped.mismatched |= 1 << index;
+                    }
+                    followed
+                }
+            };
+            if followed.is_none() {
+                dropped.left_out |= 1 << index;
             }
-            per_base.is_none()
+            followed.map(|value| (tag, value))
         })
-        .map(|(tag, value)| (tag, value.clone()))
         .collect();
     (kept, dropped)
 }
@@ -3576,8 +3736,12 @@ struct BodyOrigin {
     file: Option<usize>,
     /// Whether a later non-empty stream is cut from another file.
     joined: bool,
+    /// Whether a non-empty stream's bases are not its read's own, such as a corrected barcode.
+    rewritten: bool,
     /// How far the streams copy that read from its start, forward and in order, if they all do.
     copied: Option<usize>,
+    /// The segment of each non-empty stream, in record order.
+    slices: SmallVec<[Slice; 4]>,
 }
 
 impl BodyOrigin {
@@ -3585,7 +3749,9 @@ impl BodyOrigin {
         let mut origin = Self {
             file: None,
             joined: false,
+            rewritten: false,
             copied: Some(0),
+            slices: SmallVec::new(),
         };
         let mut empty_file = None;
         for stream in &template.streams {
@@ -3597,6 +3763,7 @@ impl BodyOrigin {
                 continue;
             }
             let Some(source) = extracted.source else {
+                origin.rewritten = true;
                 origin.copied = None;
                 continue;
             };
@@ -3607,10 +3774,16 @@ impl BodyOrigin {
             }
             let forward = !stream.revcomp && !source.reversed;
             let observed = template.raw || extracted.corrected.is_none();
+            origin.rewritten |= !observed;
             origin.copied = origin
                 .copied
                 .filter(|&at| forward && observed && source.start == at)
                 .map(|_| source.end);
+            origin.slices.push(Slice {
+                start: source.start,
+                end: source.end,
+                flipped: stream.revcomp != source.reversed,
+            });
         }
         origin.file = origin.file.or(empty_file);
         origin
@@ -3620,14 +3793,20 @@ impl BodyOrigin {
     fn copies(&self, read: &InputRecord) -> bool {
         !self.joined && self.copied == Some(read.bases.len())
     }
+
+    /// The segments per-base tags can follow, or `None` when the bases are not all one read's own.
+    fn slices(&self) -> Option<&[Slice]> {
+        (!self.joined && !self.rewritten).then_some(self.slices.as_slice())
+    }
 }
 
 /// Assemble a record's output bodies: the raw input segments (each carrying its
 /// tags, and its source alignment when `keep_alignment` is set) when there is no
 /// `--template`, else one body per `--template`. A template body carries the
-/// tags of the read that supplies its first segment, without the per-base ones
-/// unless the body copies all of that read, forward and in order; the per-base
-/// tags left out are returned with the bodies. Returns
+/// tags of the read that supplies its first segment; unless the body copies all
+/// of that read, forward and in order, its per-base tags follow its segments or
+/// are left out (see [`followed_tags`]), and those left out are returned with
+/// the bodies. Returns
 /// `Err(missing_stream_name)` when a template references a stream that was not
 /// extracted (its anchoring group did not match), naming the absent stream for
 /// the `--qc-tag` slug.
@@ -3712,7 +3891,7 @@ fn assemble_bodies(
             if unchanged {
                 return Some(tags.clone());
             }
-            let (kept, left_out) = without_per_base_tags(tags);
+            let (kept, left_out) = followed_tags(tags, origin.slices(), record.bases.len());
             dropped |= left_out;
             Some(kept)
         });
