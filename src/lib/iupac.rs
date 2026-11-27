@@ -264,7 +264,7 @@ pub fn validate_group(name: &str, seqs: &[Vec<u8>], search: &Search) -> Result<V
         let noun = if count == 1 { "pair" } else { "pairs" };
         format!("{at_least}{count} {kind}{noun}")
     };
-    let verb = if compared > 0 { "can" } else { "may" };
+    let verb = if compared == colliding { "can" } else { "may" };
     if let Some(pair) = example {
         bail!(
             "group `{name}`: {} of tags {verb} both match one read within dist={budget} only through an indel, such as {pair}; {NEAREST}, or write mode=all to keep assigning each to one of the tags by tie-break",
@@ -372,14 +372,24 @@ fn indistinguishable(name: &str, a: &[u8], b: &[u8], found: &Overlap) -> String 
     if !found.flipped {
         return format!("group `{name}`: tags `{a_s}` and `{b_s}` are indistinguishable (the bases `{bases}` match both with zero errors); remove one or make them distinct");
     }
-    let relation = match a.len().cmp(&b.len()) {
-        Ordering::Equal => {
+    let plain = a.iter().chain(b).all(|&base| mask(base).count_ones() == 1);
+    let relation = match (a.len().cmp(&b.len()), plain) {
+        (Ordering::Equal, true) => {
             format!("tags `{a_s}` and `{b_s}` are reverse complements of each other")
         }
-        Ordering::Less => format!("tag `{a_s}` lies within the reverse complement of `{b_s}`"),
-        Ordering::Greater => format!("tag `{b_s}` lies within the reverse complement of `{a_s}`"),
+        (Ordering::Equal, false) => {
+            format!("tags `{a_s}` and `{b_s}` each match the other's reverse complement")
+        }
+        (order, _) => {
+            let (short, long) = match order {
+                Ordering::Less => (&a_s, &b_s),
+                _ => (&b_s, &a_s),
+            };
+            let within = if plain { "lies" } else { "matches" };
+            format!("tag `{short}` {within} within the reverse complement of `{long}`")
+        }
     };
-    format!("group `{name}`: {relation} (the bases `{bases}` match both with zero errors, one on each strand), so bothStrands=true cannot tell them apart; drop bothStrands to match each tag on the forward strand only")
+    format!("group `{name}`: {relation} (the bases `{bases}` match both with zero errors, one on each strand), so bothStrands=true cannot tell them apart; drop bothStrands to match each tag on the forward strand only, or remove one of them")
 }
 
 /// The `dist` attribute as written, leaving out the fields at their defaults.
