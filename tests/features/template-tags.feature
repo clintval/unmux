@@ -1,12 +1,13 @@
 Feature: Input tags on --template records
   A record built by --template keeps the input tags of the read it is cut from, as a record passed
   through whole does, so UMI and barcode tags, read groups, FASTX comment tags, and per-read vendor
-  tags survive trimming. Per-base tags describe the input bases one by one (MM/ML base
-  modifications, OQ original qualities, PacBio kinetics, the ONT move table), so a record keeps
-  them only when it is its read unchanged, with the same bases in the same orientation. Otherwise
-  they are left out, and one warning per run lists them. A record that joins two reads takes the
-  tags of the read that supplies its first segment, without the per-base ones. A --tag binding
-  still wins over a carried tag.
+  tags survive trimming. Simple per-base tags (OQ, U2, E2, PacBio ip and pw, fgbio consensus and
+  methylation counts) follow the record's bases: each segment takes its slice of the tag, reversed
+  where the segment is flipped, and E2 and consensus bases are also complemented. Other per-base
+  tags (MM/ML base modifications, the ONT move table, PacBio strand kinetics and pulse tracks) stay
+  only on a record that is its read unchanged; otherwise they are left out, and one warning per run
+  lists them. A record that joins two reads, or holds a corrected barcode, loses every per-base
+  tag. A --tag binding still wins over a carried tag.
 
   Scenario Outline: a template that copies the whole read keeps every input tag
     Given a file "in.sam" containing:
@@ -30,7 +31,7 @@ Feature: Input tags on --template records
       | bam  |
       | cram |
 
-  Scenario: a trimming template keeps read-level tags and leaves out per-base ones, with one warning
+  Scenario: a trimming template slices the per-base tags it can follow and leaves out the rest, with one warning
     Given a file "in.sam" containing:
       """
       @HD	VN:1.6
@@ -43,10 +44,10 @@ Feature: Input tags on --template records
     And the records of "out.sam" are:
       """
       r1	4	*	0	255	*	*	0	0	GTACGTCG	IIIIIIII	qs:f:20	ch:i:7	st:Z:2023-06-22T07:17:48.308+00:00	sm:f:96.5	pt:i:23	RG:Z:p
-      r2	4	*	0	255	*	*	0	0	GCATGCAA	IIIIIIII	np:i:12	rq:f:0.999	zm:i:42	RG:Z:p
-      r3	4	*	0	255	*	*	0	0	ATCCATGG	IIIIIIII	RX:Z:GGGG	QX:Z:FFFF	RG:Z:p
+      r2	4	*	0	255	*	*	0	0	GCATGCAA	IIIIIIII	np:i:12	rq:f:0.999	zm:i:42	ip:B:C,3,4,5,6,7,8,9,10	RG:Z:p
+      r3	4	*	0	255	*	*	0	0	ATCCATGG	IIIIIIII	OQ:Z:CDEFGHIJ	RX:Z:GGGG	QX:Z:FFFF	RG:Z:p
       """
-    And stderr contains "--template changed the bases of some records, so their per-base tags were left out: MM, ML, MN, OQ, ip, fi, mv"
+    And stderr contains "--template changed the bases of some records, so their per-base tags were left out: MM, ML, MN, fi, mv"
     And stderr contains "per-base tags were left out" exactly once
 
   Scenario: a trimming template leaves out PacBio pulse and pileup tags
@@ -63,7 +64,65 @@ Feature: Input tags on --template records
       """
     And stderr contains "per-base tags were left out: sa, sx, pc, pq, pg, pm, pd, px, pe, sf, bs, pb"
 
-  Scenario Outline: a record keeps per-base tags only when it is its read unchanged
+  Scenario: a trimmed record keeps the matching slices of OQ and ip
+    Given a file "in.sam" containing:
+      """
+      @HD	VN:1.6
+      r1	4	*	0	0	*	*	0	0	ACGTACGTCG	IIIIIIIIII	ch:i:7	OQ:Z:ABCDEFGHIJ	ip:B:C,10,20,30,40,50,60,70,80,90,100
+      """
+    When I run `unmux in.sam --pool p --extract r=0:2:-2 --template r --out out.sam`
+    Then the exit code is 0
+    And the records of "out.sam" are:
+      """
+      r1	4	*	0	255	*	*	0	0	GTACGT	IIIIII	ch:i:7	OQ:Z:CDEFGH	ip:B:C,30,40,50,60,70,80	RG:Z:p
+      """
+    And stderr does not contain "per-base tags"
+
+  Scenario: a flipped read reverses OQ, reverse-complements E2, and still leaves out MM and ML
+    Given a file "in.sam" containing:
+      """
+      @HD	VN:1.6
+      r1	4	*	0	0	*	*	0	0	AAACCCGT	ABCDEFGH	ch:i:7	OQ:Z:abcdefgh	E2:Z:CCGTTAAG	cd:B:s,1,2,3,4,5,6,7,8	MM:Z:C+m?,0;	ML:B:C,200
+      """
+    When I run `unmux in.sam --pool p --extract r=0:0:end --template ~r --out out.sam`
+    Then the exit code is 0
+    And the records of "out.sam" are:
+      """
+      r1	4	*	0	255	*	*	0	0	ACGGGTTT	HGFEDCBA	ch:i:7	OQ:Z:hgfedcba	E2:Z:CTTAACGG	cd:B:s,8,7,6,5,4,3,2,1	RG:Z:p
+      """
+    And stderr contains "--template changed the bases of some records, so their per-base tags were left out: MM, ML"
+
+  Scenario: a per-base tag whose length is not its read's is left out of a changed record
+    Given a file "in.sam" containing:
+      """
+      @HD	VN:1.6
+      r1	4	*	0	0	*	*	0	0	ACGTACGT	IIIIIIII	ch:i:7	OQ:Z:ABCD	ip:B:C,1,2,3
+      """
+    When I run `unmux in.sam --pool p --extract r=0:2:end --template r --out out.sam`
+    Then the exit code is 0
+    And the records of "out.sam" are:
+      """
+      r1	4	*	0	255	*	*	0	0	GTACGT	IIIIII	ch:i:7	RG:Z:p
+      """
+    And stderr contains "--template changed the bases of some records, so their per-base tags were left out: OQ, ip; OQ, ip did not match the read's length"
+
+  Scenario: fgbio consensus tags follow a trimmed, flipped read, while PacBio's same-named per-read tags stay
+    Given a file "in.sam" containing:
+      """
+      @HD	VN:1.6
+      r1	4	*	0	0	*	*	0	0	ACGTACGTCG	IIIIIIIIII	zm:i:42	ac:B:i,1,0,1,0	bc:B:S,3,3	bq:i:100	bt:Z:ACGTACGT
+      r2	4	*	0	0	*	*	0	0	AAACGG	IIIIII	ac:Z:AAACGG	bc:Z:AAACGA	aq:Z:ABCDEF	bq:Z:abcdef	ad:B:s,1,2,3,4,5,6	cu:B:s,0,1,0,2,0,3	bt:B:s,6,5,4,3,2,1
+      """
+    When I run `unmux in.sam --pool p --extract r=0:1:end --template ~r --out out.sam`
+    Then the exit code is 0
+    And the records of "out.sam" are:
+      """
+      r1	4	*	0	255	*	*	0	0	CGACGTACG	IIIIIIIII	zm:i:42	ac:B:i,1,0,1,0	bc:B:S,3,3	bq:i:100	bt:Z:ACGTACGT	RG:Z:p
+      r2	4	*	0	255	*	*	0	0	CCGTT	IIIII	ac:Z:CCGTT	bc:Z:TCGTT	aq:Z:FEDCB	bq:Z:fedcb	ad:B:s,6,5,4,3,2	cu:B:s,3,0,2,0,1	bt:B:s,1,2,3,4,5	RG:Z:p
+      """
+    And stderr does not contain "per-base tags"
+
+  Scenario Outline: a record keeps MM and ML only when it is its read unchanged
     Given a file "in.sam" containing:
       """
       @HD	VN:1.6
@@ -83,7 +142,7 @@ Feature: Input tags on --template records
       | --extract r=0:0:end --template ~r                    | ACGT  | ch:i:7                           |
       | --extract a=0:0:2 --extract b=0:2:end --template b+a | GTAC  | ch:i:7                           |
 
-  Scenario: a template that rearranges a read into the same bases still leaves out its per-base tags
+  Scenario: a rearranged record carries the rearranged slices of its per-base tags
     Given a file "in.sam" containing:
       """
       @HD	VN:1.6
@@ -93,9 +152,9 @@ Feature: Input tags on --template records
     Then the exit code is 0
     And the records of "out.sam" are:
       """
-      r1	4	*	0	255	*	*	0	0	ACGACGACGACG	IIIIIIIIIIII	ch:i:7	RG:Z:p
+      r1	4	*	0	255	*	*	0	0	ACGACGACGACG	IIIIIIIIIIII	ch:i:7	OQ:Z:DEFGHIJKLABC	RG:Z:p
       """
-    And stderr contains "per-base tags were left out: MM, ML, OQ"
+    And stderr contains "per-base tags were left out: MM, ML"
 
   Scenario Outline: per-base tags stay with the observed bases of a whole-read barcode, not its corrected form
     Given a file "in.sam" containing:
@@ -127,9 +186,9 @@ Feature: Input tags on --template records
     And the records of "out.sam" are:
       """
       q1	77	*	0	255	*	*	0	0	AAAACCCC	IIIIIIII	RX:Z:GG-TT	ZA:Z:one	OQ:Z:ABCDEFGH	RG:Z:p
-      q1	141	*	0	255	*	*	0	0	GGTTTT	JJJJJJ	RX:Z:GG-TT	ZA:Z:two	RG:Z:p
+      q1	141	*	0	255	*	*	0	0	GGTTTT	JJJJJJ	RX:Z:GG-TT	ZA:Z:two	OQ:Z:FEDCBA	RG:Z:p
       """
-    And stderr contains "per-base tags were left out: OQ"
+    And stderr does not contain "per-base tags"
 
   Scenario: a record that joins two reads takes the tags of the read that supplies its first segment
     Given a file "in.sam" containing:
