@@ -59,7 +59,7 @@ pub(crate) const PER_BASE_TAGS: [([u8; 2], Kind, PerBase); 58] = [
     (*b"mq", Kind::Any, PerBase::Dropped),
     (*b"sq", Kind::Any, PerBase::Dropped),
     (*b"sa", Kind::Any, PerBase::Dropped),
-    (*b"sx", Kind::Any, PerBase::Dropped),
+    (*b"sx", Kind::Array, PerBase::Native),
     (*b"pc", Kind::Any, PerBase::Dropped),
     (*b"pq", Kind::Any, PerBase::Dropped),
     (*b"pg", Kind::Any, PerBase::Dropped),
