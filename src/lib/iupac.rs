@@ -8,6 +8,8 @@
 //! primitives ([`complement`], [`reverse_complement`]) shared by extraction,
 //! input parsing, and tag correction.
 
+use std::cmp::Ordering;
+
 use anyhow::{bail, Result};
 use smallvec::SmallVec;
 
@@ -104,7 +106,8 @@ pub struct Search {
 /// match both, without an indel when that is enough; a pair whose table of
 /// alignments would hold more than `TABLE_CELLS` cells is taken to collide
 /// through an indel instead.
-/// A collision with zero errors always fails.
+/// A collision with zero errors always fails, and points at `bothStrands`
+/// when only opposite strands match.
 /// One that needs no indel fails under `mode=all`, written or not, which would
 /// assign such reads by tie-break; one that needs an indel fails only when no
 /// mode is written, asking for one. The rest are warnings: the first pairs are
@@ -209,8 +212,8 @@ pub fn validate_group(name: &str, seqs: &[Vec<u8>], search: &Search) -> Result<V
                 ""
             };
             if found.exact {
-                let bases = bases.unwrap_or_default();
-                bail!("group `{name}`: tags `{a_s}` and `{b_s}` are indistinguishable (the bases `{bases}` match both with zero errors{strand}); remove one or make them distinct");
+                let found = collision(a, b, None, &exact_only, shape).unwrap_or(found);
+                bail!("{}", indistinguishable(name, &seqs[i], &seqs[j], &found));
             }
             let (verb, witness) = match bases {
                 Some(bases) => ("can", format!("(the bases `{bases}` match both{strand})")),
@@ -265,6 +268,24 @@ pub fn validate_group(name: &str, seqs: &[Vec<u8>], search: &Search) -> Result<V
     }
 
     Ok(warnings)
+}
+
+/// The refusal for two tags that one read matches with zero errors, which
+/// points at `bothStrands` when only opposite strands match.
+fn indistinguishable(name: &str, a: &[u8], b: &[u8], found: &Overlap) -> String {
+    let (a_s, b_s) = (String::from_utf8_lossy(a), String::from_utf8_lossy(b));
+    let bases = String::from_utf8_lossy(found.bases.as_deref().unwrap_or_default());
+    if !found.flipped {
+        return format!("group `{name}`: tags `{a_s}` and `{b_s}` are indistinguishable (the bases `{bases}` match both with zero errors); remove one or make them distinct");
+    }
+    let relation = match a.len().cmp(&b.len()) {
+        Ordering::Equal => {
+            format!("tags `{a_s}` and `{b_s}` are reverse complements of each other")
+        }
+        Ordering::Less => format!("tag `{a_s}` lies within the reverse complement of `{b_s}`"),
+        Ordering::Greater => format!("tag `{b_s}` lies within the reverse complement of `{a_s}`"),
+    };
+    format!("group `{name}`: {relation} (the bases `{bases}` match both with zero errors, one on each strand), so bothStrands=true cannot tell them apart; drop bothStrands to match each tag on the forward strand only")
 }
 
 /// The `dist` attribute as written, leaving out the fields at their defaults.
