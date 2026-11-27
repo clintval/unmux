@@ -2621,6 +2621,28 @@ mod tests {
     }
 
     #[test]
+    fn test_read_fasta_keeps_a_name_after_a_space_unless_it_is_shaped_like_a_tag() {
+        for (definition, name, tags) in [
+            ("> read1 desc", "read1", ""),
+            (">\t read1 BC:Z:GGGG", "read1", "BC"),
+            ("> xa:A:Q\tML:B:C,1,2", "", "xa ML"),
+            ("> CO:Z:two words\tML:B:C,1", "", "CO ML"),
+            (">xa:A:Q\tML:B:C,1,2", "xa:A:Q", "ML"),
+        ] {
+            let file = temp_with(format!("{definition}\nACGT\n").as_bytes());
+            let record = read_all(&file).remove(0).records.remove(0);
+            assert_eq!(record.name, name.as_bytes(), "{definition}");
+            let lifted: Vec<String> = record
+                .tags
+                .iter()
+                .flat_map(Data::iter)
+                .map(|(tag, _)| String::from_utf8_lossy(&<[u8; 2]>::from(tag)).into_owned())
+                .collect();
+            assert_eq!(lifted.join(" "), tags, "{definition}");
+        }
+    }
+
+    #[test]
     fn test_read_fastx_refuses_a_tag_repeated_in_one_comment() {
         for comment in ["ns:i:5\tns:i:6", "RX:Z:A\tRX:Z:B", "ns:i:5\tBC:Z:A\tns:Z:x"] {
             let tag = &comment[..2];

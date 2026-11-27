@@ -139,6 +139,25 @@ Feature: Lifting SAM tags from FASTX read-name comments
       *	4	*	0	255	*	*	0	0	ACGT	*	xa:A:Q	ML:B:C,1,2	RG:Z:mid
       """
 
+  Scenario: a FASTA name after a space is kept unless it is shaped like a tag
+    Given a file "in.fa" containing:
+      """
+      > read1 desc
+      ACGT
+      >	read2	BC:Z:GGGG
+      ACGT
+      > xa:A:Q	ML:B:C,1,2
+      ACGT
+      """
+    When I run `unmux in.fa --out out.sam`
+    Then the exit code is 0
+    And the records of "out.sam" are:
+      """
+      read1	4	*	0	255	*	*	0	0	ACGT	*	RG:Z:in
+      read2	4	*	0	255	*	*	0	0	ACGT	*	BC:Z:GGGG	RG:Z:in
+      *	4	*	0	255	*	*	0	0	ACGT	*	xa:A:Q	ML:B:C,1,2	RG:Z:in
+      """
+
   Scenario Outline: a comment tag that a BAM record cannot hold stops the run: <field>
     Given a file "in.fq" containing:
       """
