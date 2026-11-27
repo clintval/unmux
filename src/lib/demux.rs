@@ -452,6 +452,7 @@ fn compile_groups(
         let mut compiled_group = CompiledGroup {
             name: group.name.clone(),
             tags: tag_sets[&group.name].seqs(),
+            patterns: Vec::new(),
             dist,
             loc: attrs.loc.clone(),
             revcomp: attrs.revcomp.unwrap_or(false),

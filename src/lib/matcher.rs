@@ -149,6 +149,8 @@ pub struct CompiledGroup {
     pub name: String,
     /// Tag sequences in definition order (bases / IUPAC, uppercase).
     pub tags: Vec<Vec<u8>>,
+    /// The tags as `sassy` searches them, with U read as T, since it complements no U.
+    pub patterns: Vec<Vec<u8>>,
     /// The error budget.
     pub dist: Dist,
     /// The optional search window; `None` searches every file's whole record.
@@ -246,6 +248,7 @@ impl CompiledGroup {
     pub fn new(name: impl Into<String>, tags: Vec<Vec<u8>>) -> Self {
         Self {
             name: name.into(),
+            patterns: search_patterns(&tags),
             tags,
             dist: Dist::default(),
             loc: None,
@@ -270,8 +273,8 @@ impl CompiledGroup {
     /// Precompute the `sassy` v2 batched search batches: group the tags by
     /// length and, for each length bucket of at least [`BATCHED_MIN_TAGS`] tags
     /// up to [`BATCHED_MAX_LEN`] bp, `encode_patterns` once for reuse across
-    /// every record. Idempotent: it rebuilds [`CompiledGroup::encoded`] from
-    /// the current tags.
+    /// every record. Idempotent: it rebuilds [`CompiledGroup::patterns`] and
+    /// [`CompiledGroup::encoded`] from the current tags.
     ///
     /// Forward-strand groups only. Two cases skip batching and stay on per-tag
     /// `search()`: partial (overhang) groups, because the batched path is
@@ -287,6 +290,7 @@ impl CompiledGroup {
     /// speedup is preserved for the common case; rc stays per-tag until the two
     /// `sassy` paths agree. A small or over-long bucket also stays per-tag.
     pub fn encode(&mut self) {
+        self.patterns = search_patterns(&self.tags);
         self.encoded.clear();
         self.batched_tags.clear();
         // TODO(upstream sassy): file an issue against `sassy` (0.2.3) that
@@ -316,8 +320,10 @@ impl CompiledGroup {
             if tag_indices.len() < BATCHED_MIN_TAGS {
                 continue;
             }
-            let patterns: Vec<Vec<u8>> =
-                tag_indices.iter().map(|&i| self.tags[i].clone()).collect();
+            let patterns: Vec<Vec<u8>> = tag_indices
+                .iter()
+                .map(|&i| self.patterns[i].clone())
+                .collect();
             let encoded = searcher.encode_patterns(&patterns);
             self.encoded.push(EncodedBatch {
                 tag_indices,
@@ -783,13 +789,13 @@ pub fn match_group_at(
 
         // Per-tag path for tags not in a batch (small or over-long buckets, and
         // partial groups).
-        for (tag_idx, tag) in group.tags.iter().enumerate() {
-            if tag.is_empty() || batched.contains(&tag_idx) {
+        for (tag_idx, pattern) in group.patterns.iter().enumerate() {
+            if pattern.is_empty() || batched.contains(&tag_idx) {
                 continue;
             }
-            for m in searcher.search(tag, text, search_budget(group, tag.len())) {
+            for m in searcher.search(pattern, text, search_budget(group, pattern.len())) {
                 let (subs, indels) = count_edits(&m);
-                if !accept_match(group, tag.len(), &m, subs, indels) {
+                if !accept_match(group, pattern.len(), &m, subs, indels) {
                     dropped.push((tag_idx, strand_of(m.strand)));
                     continue;
                 }
@@ -1270,6 +1276,17 @@ fn mask_no_call(base: u8) -> u8 {
         b'u' => b't',
         _ => b'X',
     }
+}
+
+fn search_patterns(tags: &[Vec<u8>]) -> Vec<Vec<u8>> {
+    let read_u_as_t = |&base: &u8| match base {
+        b'U' => b'T',
+        b'u' => b't',
+        base => base,
+    };
+    tags.iter()
+        .map(|tag| tag.iter().map(read_u_as_t).collect())
+        .collect()
 }
 
 /// The per-overhang-base cost for partial matching. At `1.0` a truncated tag
