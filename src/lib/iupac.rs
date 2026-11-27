@@ -9,6 +9,7 @@
 //! input parsing, and tag correction.
 
 use std::borrow::Cow;
+use std::cell::Cell;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
@@ -42,8 +43,17 @@ const NEAREST: &str = "set mode=nearest to leave such reads unassigned (recommen
 /// The most cells a table of one tag's alignments within another may hold; a
 /// pair that needs a larger one is taken to collide through an indel.
 const TABLE_CELLS: usize = 1 << 20;
+/// The most cells the tables of one group may hold in all; past them, a pair
+/// that needs a table is taken to collide through an indel.
+const GROUP_CELLS: usize = 1 << 27;
 /// Why a pair taken to collide gives no bases that match both tags.
-const TOO_COSTLY: &str = "(too long to compare exactly under this indel budget)";
+const TOO_COSTLY: &str = "(too costly to compare exactly under this indel budget)";
+
+thread_local! {
+    /// The cells left for the tables of the group checked on this thread, kept
+    /// here so that the comparison every pair goes through takes no budget.
+    static CELLS_LEFT: Cell<usize> = const { Cell::new(GROUP_CELLS) };
+}
 /// The most pairs compared one by one for two tags that one read matches with
 /// zero errors before a refusal; plain tags of one length are looked up instead.
 const EXACT_PAIRS: usize = 1 << 20;
@@ -109,8 +119,9 @@ pub struct Search {
 /// reverse-complemented when `bothStrands` is set. Each tag keeps its own
 /// substitution, indel, and total caps, and the message gives bases checked to
 /// match both, without an indel when that is enough; a pair whose table of
-/// alignments would hold more than `TABLE_CELLS` cells is taken to collide
-/// through an indel instead.
+/// alignments would hold more than `TABLE_CELLS` cells, or more than the
+/// group has left of `GROUP_CELLS`, is taken to collide through an indel
+/// instead.
 /// A collision with zero errors always fails, before any other refusal, and
 /// points at `bothStrands` when only opposite strands match.
 /// One that needs no indel fails under `mode=all`, written or not, which would
@@ -189,6 +200,7 @@ pub fn validate_group(name: &str, seqs: &[Vec<u8>], search: &Search) -> Result<V
         false => (&substitutions, TIE_BREAK),
     };
     let budget = dist_spec(&search.dist);
+    CELLS_LEFT.set(GROUP_CELLS);
     let (mut colliding, mut compared, mut example) = (0, 0, None);
     for (i, a) in tags.iter().enumerate() {
         for (j, b) in tags.iter().enumerate().skip(i + 1) {
@@ -706,7 +718,8 @@ fn disjoint(outer: &Tag, inner: &Tag, offset: usize) -> usize {
 enum Gapped {
     /// An alignment whose edits split within the budget.
     Found(Candidate),
-    /// No table was filled, as it would hold more than [`TABLE_CELLS`] cells.
+    /// No table was filled, as it would hold more than [`TABLE_CELLS`] cells or
+    /// more than the group has left of [`GROUP_CELLS`].
     TooLarge,
 }
 
@@ -728,9 +741,11 @@ fn gapped(outer: &Tag, inner: &Tag, dist: &Dist, shape: Shape, longest: usize) -
 /// out of line so that the path every pair takes stays small.
 #[inline(never)]
 fn tabled(outer: &Tag, inner: &Tag, dist: &Dist, shape: Shape, longest: usize) -> Option<Gapped> {
-    if Grid::size(outer, inner, dist, shape) > TABLE_CELLS {
+    let (size, left) = (Grid::size(outer, inner, dist, shape), CELLS_LEFT.get());
+    if size > TABLE_CELLS || size > left {
         return Some(Gapped::TooLarge);
     }
+    CELLS_LEFT.set(left - size);
     let grid = Grid::fill(outer, inner, dist, shape);
     let (gaps, skips, extras) = (grid.gaps, grid.skips, grid.extras);
     let ends = match shape.free_end {
@@ -1987,11 +2002,43 @@ mod tests {
             .collect();
         let huge = budget(0, 50);
         let (outer, inner) = (Tag::new(&tag), Tag::new(&other));
-        let cells = Grid::size(&outer, &inner, &huge, Shape::of(None));
-        assert!(cells > 500 * TABLE_CELLS, "{cells}");
+        let shape = Shape::of(None);
+        let size = Grid::size(&outer, &inner, &huge, shape);
+        assert!(size > 500 * TABLE_CELLS, "{size}");
+        let checked = search(huge, MatchMode::Nearest);
+        CELLS_LEFT.set(GROUP_CELLS);
+        let found = collision(&outer, &inner, None, &checked, shape).unwrap();
+        assert!(found.bases.is_none());
+        assert_eq!(CELLS_LEFT.get(), GROUP_CELLS, "no table was filled");
         let tags = vec![tag, other];
-        let w = validate_group("g", &tags, &search(huge, MatchMode::Nearest)).unwrap();
+        let w = validate_group("g", &tags, &checked).unwrap();
         assert!(w.len() == 1 && w[0].contains(TOO_COSTLY), "{w:?}");
+    }
+
+    #[test]
+    fn test_pairs_past_the_group_cell_budget_are_taken_to_collide() {
+        // Deleting the last base of either tag leaves ACGTA, one indel from both.
+        let (a, b) = (Tag::new(b"ACGTAC"), Tag::new(b"ACGTAG"));
+        let (checked, shape) = (search(budget(0, 1), MatchMode::Nearest), Shape::of(None));
+        let size = Grid::size(&a, &b, &checked.dist, shape);
+        CELLS_LEFT.set(size - 1);
+        let found = collision(&a, &b, None, &checked, shape).unwrap();
+        assert!(
+            found.bases.is_none(),
+            "taken to collide once the budget runs short"
+        );
+        assert_eq!(CELLS_LEFT.get(), size - 1, "no table was filled");
+        CELLS_LEFT.set(4 * size);
+        let found = collision(&a, &b, None, &checked, shape).unwrap();
+        assert_eq!(found.bases.as_deref(), Some(&b"ACGTA"[..]));
+        assert_eq!(CELLS_LEFT.get(), 2 * size, "both orders drew a table");
+        let tags = seqs(&["ACGTAC", "ACGTAG"]);
+        assert!(validate_group("g", &tags, &checked).unwrap()[0].contains("can both match"));
+        assert_eq!(
+            CELLS_LEFT.get(),
+            GROUP_CELLS - 2 * size,
+            "each group starts afresh"
+        );
     }
 
     /// Whether bases exist, no longer than the search window, that `outer`
