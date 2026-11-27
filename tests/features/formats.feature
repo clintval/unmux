@@ -314,6 +314,23 @@ Feature: Input and output format handling
       q1	141	*	0	255	*	*	0	0	AAAACCCC	ABCDEFGH	RG:Z:p
       """
 
+  Scenario: A reverse-strand record's per-base tags are turned back to sequencing order with its bases
+    Given a file "mapped.sam" containing:
+      """
+      @HD	VN:1.6	SO:coordinate
+      @SQ	SN:chr1	LN:1000
+      f	0	chr1	100	60	8M	*	0	0	ACGGGTTT	HGFEDCBA	OQ:Z:hgfedcba	E2:Z:CTTAACGG	U2:Z:87654321	cd:B:s,8,7,6,5,4,3,2,1	ac:Z:ACGGGTTT	ip:B:C,10,20,30,40,50,60,70,80	MM:Z:C+m?,0;	ML:B:C,200
+      r	16	chr1	200	60	8M	*	0	0	AAACCCGT	ABCDEFGH	OQ:Z:abcdefgh	E2:Z:CCGTTAAG	U2:Z:12345678	cd:B:s,1,2,3,4,5,6,7,8	ac:Z:AAACCCGT	ip:B:C,10,20,30,40,50,60,70,80	MM:Z:C+m?,0;	ML:B:C,200
+      """
+    # The same read aligned to each strand; aligners leave PacBio's ip and the MM/ML of a read as sequenced.
+    When I run `unmux mapped.sam --pool p --out out.sam`
+    Then the exit code is 0
+    And the records of "out.sam" are:
+      """
+      f	4	*	0	255	*	*	0	0	ACGGGTTT	HGFEDCBA	OQ:Z:hgfedcba	E2:Z:CTTAACGG	U2:Z:87654321	cd:B:s,8,7,6,5,4,3,2,1	ac:Z:ACGGGTTT	ip:B:C,10,20,30,40,50,60,70,80	MM:Z:C+m?,0;	ML:B:C,200	RG:Z:p
+      r	4	*	0	255	*	*	0	0	ACGGGTTT	HGFEDCBA	OQ:Z:hgfedcba	E2:Z:CTTAACGG	U2:Z:87654321	cd:B:s,8,7,6,5,4,3,2,1	ac:Z:ACGGGTTT	ip:B:C,10,20,30,40,50,60,70,80	MM:Z:C+m?,0;	ML:B:C,200	RG:Z:p
+      """
+
   Scenario: File index 1 is the second mate of a paired SAM input
     Given a file "paired.sam" containing:
       """

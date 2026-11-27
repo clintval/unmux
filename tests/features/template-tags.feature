@@ -120,6 +120,23 @@ Feature: Input tags on --template records
       """
     And stderr contains "--template left out per-base tags from 1 record that did not copy a read exactly: OQ, ip; OQ, ip did not match the read's length"
 
+  Scenario: a template cuts a reverse-strand alignment's per-base tags in sequencing order
+    Given a file "mapped.sam" containing:
+      """
+      @HD	VN:1.6	SO:coordinate
+      @SQ	SN:chr1	LN:1000
+      f	0	chr1	100	60	10M	*	0	0	ACGTACGTCG	ABCDEFGHIJ	OQ:Z:abcdefghij	MM:Z:C+m?,0;	ML:B:C,200
+      r	16	chr1	200	60	10M	*	0	0	CGACGTACGT	JIHGFEDCBA	OQ:Z:jihgfedcba	MM:Z:C+m?,0;	ML:B:C,200
+      """
+    When I run `unmux mapped.sam --pool p --extract r=0:2:end --template r --out out.sam`
+    Then the exit code is 0
+    And the records of "out.sam" are:
+      """
+      f	4	*	0	255	*	*	0	0	GTACGTCG	CDEFGHIJ	OQ:Z:cdefghij	RG:Z:p
+      r	4	*	0	255	*	*	0	0	GTACGTCG	CDEFGHIJ	OQ:Z:cdefghij	RG:Z:p
+      """
+    And stderr contains "--template left out per-base tags from 2 records that did not copy a read exactly: MM, ML"
+
   Scenario: fgbio consensus tags follow a trimmed, flipped read, while PacBio's same-named per-read tags stay
     Given a file "in.sam" containing:
       """
