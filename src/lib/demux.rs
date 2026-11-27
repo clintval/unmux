@@ -48,8 +48,8 @@ use crate::input::{
     PendingRecord, SniffedFormat,
 };
 use crate::matcher::{
-    match_verdict, match_verdict_after, CompiledGroup, GroupVerdict, MatchStrand, Prereq,
-    RelativeWindow, Scratch,
+    match_verdict, match_verdict_after, search_patterns, CompiledGroup, GroupVerdict, MatchStrand,
+    Prereq, RelativeWindow, Scratch,
 };
 use crate::metrics::Metrics;
 use crate::output::{
@@ -449,10 +449,11 @@ fn compile_groups(
                 log::warn!("{warning}");
             }
         }
+        let tags = tag_sets[&group.name].seqs();
         let mut compiled_group = CompiledGroup {
             name: group.name.clone(),
-            tags: tag_sets[&group.name].seqs(),
-            patterns: Vec::new(),
+            patterns: search_patterns(&tags),
+            tags,
             dist,
             loc: attrs.loc.clone(),
             revcomp: attrs.revcomp.unwrap_or(false),

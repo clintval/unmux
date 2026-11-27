@@ -150,7 +150,7 @@ pub struct CompiledGroup {
     /// Tag sequences in definition order (bases / IUPAC, uppercase).
     pub tags: Vec<Vec<u8>>,
     /// The tags as `sassy` searches them, with U read as T, since it complements no U.
-    pub patterns: Vec<Vec<u8>>,
+    pub(crate) patterns: Vec<Vec<u8>>,
     /// The error budget.
     pub dist: Dist,
     /// The optional search window; `None` searches every file's whole record.
@@ -273,7 +273,7 @@ impl CompiledGroup {
     /// Precompute the `sassy` v2 batched search batches: group the tags by
     /// length and, for each length bucket of at least [`BATCHED_MIN_TAGS`] tags
     /// up to [`BATCHED_MAX_LEN`] bp, `encode_patterns` once for reuse across
-    /// every record. Idempotent: it rebuilds [`CompiledGroup::patterns`] and
+    /// every record. Idempotent: it rebuilds the search patterns and
     /// [`CompiledGroup::encoded`] from the current tags.
     ///
     /// Forward-strand groups only. Two cases skip batching and stay on per-tag
@@ -1272,7 +1272,8 @@ fn mask_no_call(base: u8) -> u8 {
     }
 }
 
-fn search_patterns(tags: &[Vec<u8>]) -> Vec<Vec<u8>> {
+/// The [`CompiledGroup::patterns`] for `tags`.
+pub(crate) fn search_patterns(tags: &[Vec<u8>]) -> Vec<Vec<u8>> {
     let read_u_as_t = |&base: &u8| match base {
         b'U' => b'T',
         b'u' => b't',
