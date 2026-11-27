@@ -81,7 +81,7 @@ unmux "R1.fastq.gz" "R2.fastq.gz" \
 
 ## Features
 
-- **FASTX/SAM/BAM/CRAM in and out**, with per-segment qualities carried through extraction. Demultiplexed SAM/BAM/CRAM is written unmapped, keeping the pair and QC-fail flags, except an aligned read-group split.
+- **FASTX/SAM/BAM/CRAM in and out**, with per-segment qualities carried through extraction. Demultiplexed SAM/BAM/CRAM is written unmapped with MAPQ 0, keeping the pair and QC-fail flags, except an aligned read-group split.
 - **Alignment-preserving read-group splits**: `unmux "in.bam" --group sm=@RG::SM --sample-from-group sm --out "%sample.bam"` splits an aligned SAM/BAM into per-sample SAM/BAM files with every record (secondary and supplementary included), the `@SQ` dictionary, and the sort order kept intact. For unmapped records, run `samtools reset` on the outputs.
 - **splitcode-style matching**: tag groups, variable-length tags, location windows, mismatch/indel tolerance, sequential `next`/`prev` anchoring, `@extract` spans, and error-correction to canonical barcodes.
 - **SAM tags with quality tags**: a binding such as `--tag "RX=umi"` writes a stream to a SAM tag and its qualities to a paired tag (by default `CY` for `CB` and `CR`, `QX` for `RX`, `QT` for `BC`, and `BZ` for `OX`, or another with `::qual=TAG`). A command where two bindings, their quality tags, or `--qc-tag` would write the same tag is refused before any record is read, as is a binding of `RG`, which unmux reserves for the read group. The exception is `CB` and `CR`, which may both default to `CY`: a record's `CY` holds the `CR` qualities where `CR` writes them, as the SAM spec pairs them, and the `CB` qualities elsewhere.
