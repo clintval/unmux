@@ -206,10 +206,13 @@ struct DemuxCmd {
     /// matches both tags exactly. Pairs that one read can match only through
     /// an indel are refused only when no `mode` is set: add `mode=nearest`
     /// (recommended) or `mode=all`, which keeps assigning such reads by
-    /// tie-break, to run with warnings that list them. Matches cut short by
-    /// `partial5`/`partial3` are not checked. Tags that slide with no `loc`
-    /// can also both match one read at shifted places, as `ACGTAC` and
-    /// `CGTACG` both match `TACGTACGT`, which the check does not flag.
+    /// tie-break, to run with warnings that list them. Long tags too costly
+    /// to compare under a large indel budget count as such pairs, and so are
+    /// refused when no `mode` is set. Matches cut short by `partial5` or
+    /// `partial3` are not checked. Without `anchor`, tags slide along a whole
+    /// record or any window wider than they are, and two of them can then
+    /// both match one read at shifted positions, as `ACGTAC` and `CGTACG`
+    /// both match `TACGTACGT`, which the check does not flag.
     ///
     /// Sources (`NAME::SOURCE`):
     ///
