@@ -151,14 +151,8 @@ impl Routing {
     /// best-matched tag (an absent / `None` slot did not match). `--remove`
     /// rules are checked first and take precedence over sample assignment.
     pub fn route(&self, hits: &GroupHits) -> Disposition<'_> {
-        for remove in &self.removes {
-            if term_satisfied(
-                hits,
-                remove.group,
-                remove.tag.as_ref().map(std::slice::from_ref),
-            ) {
-                return Disposition::Removed(remove);
-            }
+        if let Some(remove) = self.removal(hits) {
+            return Disposition::Removed(remove);
         }
         if !self.demux {
             return Disposition::PassThrough;
@@ -184,6 +178,22 @@ impl Routing {
     /// The `--remove` rules, in the order they are checked.
     pub(crate) fn removes(&self) -> &[RemoveTarget] {
         &self.removes
+    }
+
+    /// The first `--remove` rule that `hits` satisfy, if any.
+    pub(crate) fn removal(&self, hits: &GroupHits) -> Option<&RemoveTarget> {
+        self.removes.iter().find(|remove| {
+            term_satisfied(
+                hits,
+                remove.group,
+                remove.tag.as_ref().map(std::slice::from_ref),
+            )
+        })
+    }
+
+    /// Whether `hits` satisfy a `--remove` rule, or one on group `next` or later still may.
+    pub(crate) fn may_remove(&self, hits: &GroupHits, next: usize) -> bool {
+        self.removes.iter().any(|remove| remove.group >= next) || self.removal(hits).is_some()
     }
 
     /// Each route's target, in route order.
