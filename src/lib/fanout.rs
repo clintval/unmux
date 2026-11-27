@@ -191,6 +191,13 @@ impl Routing {
         self.routes.iter().map(|route| &route.target)
     }
 
+    /// Whether a route reads the match of the group at canonical index `group`.
+    pub(crate) fn routes_on(&self, group: usize) -> bool {
+        self.routes
+            .iter()
+            .any(|route| route.terms.iter().any(|term| term.group == group))
+    }
+
     /// Store the `%sample::COLUMN` stream values on the routes, one list per
     /// stream in extract order, each holding one value per route.
     pub(crate) fn set_columns(&mut self, columns: Vec<Vec<Option<String>>>) -> Result<()> {

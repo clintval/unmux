@@ -504,6 +504,95 @@ fn compile_groups(
     Ok((ordered, group_index))
 }
 
+/// A warning when tags slide within an edit budget over a fixed window wider than the longest one.
+fn wide_window_warning(
+    index: usize,
+    groups: &[CompiledGroup],
+    plan: &DemuxPlan,
+    routing: &Routing,
+) -> Option<String> {
+    let group = &groups[index];
+    let edits = group.dist.total > 0 && group.dist.mismatch + group.dist.indel > 0;
+    let indels = group.dist.indel > 0;
+    // With indels allowed, narrowing cuts off barcodes with indels, so mode=nearest is the advice.
+    let advice_followed = indels && group.mode == MatchMode::Nearest;
+    if !edits
+        || advice_followed
+        || group.tags.len() < 2
+        || group.anchor.is_some()
+        || group.read_group.is_some()
+    {
+        return None;
+    }
+    let relative = group
+        .prereq
+        .as_ref()
+        .and_then(|prereq| prereq.window.as_ref());
+    let (width, window) = match (relative, &group.loc) {
+        (Some(relative), _) => (
+            relative.hi.saturating_sub(relative.lo),
+            format!("next={}:{}-{}", group.name, relative.lo, relative.hi),
+        ),
+        (None, Some(loc)) => {
+            let width = match (loc.start, loc.end.unwrap_or(Endpoint::ReadEnd)) {
+                (Endpoint::FromStart(start), Endpoint::FromStart(end)) => end.saturating_sub(start),
+                (Endpoint::FromEnd(start), Endpoint::FromEnd(end)) => start.saturating_sub(end),
+                (Endpoint::FromEnd(start), Endpoint::ReadEnd) => start,
+                // A window whose width varies with the record has no fixed slack to warn about.
+                _ => return None,
+            };
+            (width, "loc".to_string())
+        }
+        (None, None) => return None,
+    };
+    let longest = group.tags.iter().map(Vec::len).max()?;
+    let wider = width.checked_sub(longest).filter(|&wider| wider > 0)?;
+    if only_removed(index, groups, plan, routing) {
+        return None;
+    }
+    let narrow = format!("narrow {window} to {longest} bp");
+    let (outcome, advice) = match (group.mode, indels) {
+        (MatchMode::All, false) => (
+            "the leftmost match wins",
+            format!("{narrow} or use mode=nearest"),
+        ),
+        (MatchMode::All, true) => ("the leftmost match wins", "use mode=nearest".to_string()),
+        (MatchMode::Nearest, _) => ("be left unassigned", narrow),
+    };
+    Some(format!(
+        "group `{}`: the {window} window is {wider} bp wider than the longest tag, so a read can match another tag at a shifted position as closely as its true tag within dist and {outcome}; {advice}",
+        group.name
+    ))
+}
+
+/// Whether whole-group `--remove` rules alone read a group's match, which any of its tags satisfies.
+fn only_removed(
+    index: usize,
+    groups: &[CompiledGroup],
+    plan: &DemuxPlan,
+    routing: &Routing,
+) -> bool {
+    let name = groups[index].name.as_str();
+    let removes: Vec<_> = routing
+        .removes()
+        .iter()
+        .filter(|remove| remove.group == index)
+        .collect();
+    !removes.is_empty()
+        && removes.iter().all(|remove| remove.tag.is_none())
+        && !routing.routes_on(index)
+        && !groups.iter().any(|group| {
+            group
+                .prereq
+                .as_ref()
+                .is_some_and(|prereq| prereq.upstreams.contains(&index))
+        })
+        && !plan
+            .extracts
+            .iter()
+            .any(|extract| crate::grammar::anchor_groups(&extract.span.body).contains(&name))
+}
+
 /// Resolve a name-based [`NamePrereq`] into the index-based [`Prereq`] the
 /// matching path consumes, using the canonical `name -> index` map. Every
 /// referenced name is a declared group, so the lookups always succeed.
@@ -1763,6 +1852,11 @@ fn run_engine(plan: &DemuxPlan, command_line: Option<&str>) -> Result<()> {
     let pool = pool_id(plan);
     let (mut routing, sheet_columns) =
         build_routing(plan, &tag_sets, &group_index, &pool, &resolved)?;
+    for index in 0..groups.len() {
+        if let Some(warning) = wide_window_warning(index, &groups, plan, &routing) {
+            log::warn!("{warning}");
+        }
+    }
     attach_sample_columns(plan, &mut routing, &sheet_columns)?;
 
     // An `@RG`-split run (`--sample-from-group` over an `@RG` source) is faithful
