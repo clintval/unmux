@@ -244,6 +244,10 @@ struct DemuxCmd {
     ///   bc::anchor=3p            anchor tags' 3-prime base at `loc.end`
     ///   bc::match=i7+i5          match tags on joined `--extract` streams
     ///
+    /// A `next=G` target is searched after this group's match, past it when
+    /// the link has a window, but is not required: route on both groups, or
+    /// set `minFindsPerGroup=1` on `G`, to require it.
+    ///
     /// A reverse-strand match (`bothStrands=true`) is read in its tag's own
     /// orientation, as if the record were reverse-complemented: `@grp`
     /// streams from it are reverse-complemented with their qualities
