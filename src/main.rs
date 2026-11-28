@@ -231,7 +231,7 @@ struct DemuxCmd {
     ///   bc::dist=1:1:2           1 sub + 1 indel, total ≤ 2
     ///   bc::mode=nearest         keep best only if it beats runner-up...
     ///   bc::delta=2              ...by ≥ 2 (default: 1; needs mode=nearest)
-    ///   bc::next=bc3:0-4         bc3 follows, 0-4 bp past this match
+    ///   bc::next=bc3:0-8         bc3 lies within 0-8 bp past this match
     ///   bc::prev=bc1             require bc1 to have matched earlier
     ///   bc::minFindsPerGroup=1   group matches ≥ once (keeplist)
     ///   bc::maxFindsPerGroup=1   group matches ≤ once
@@ -243,6 +243,10 @@ struct DemuxCmd {
     ///   bc::anchor=5p            anchor tags' 5-prime base at `loc.start`
     ///   bc::anchor=3p            anchor tags' 3-prime base at `loc.end`
     ///   bc::match=i7+i5          match tags on joined `--extract` streams
+    ///
+    /// A `next=G` target is searched after this group's match, past it when
+    /// the link has a window, but is not required: route on both groups, or
+    /// set `minFindsPerGroup=1` on `G`, to require it.
     ///
     /// A reverse-strand match (`bothStrands=true`) is read in its tag's own
     /// orientation, as if the record were reverse-complemented: `@grp`
@@ -259,6 +263,11 @@ struct DemuxCmd {
     /// `--tag` without `raw=true` writes it, and any other stream, such as
     /// `1:0:8` or `@grp+0:8`, as the observed bases. A self-span whose tag
     /// has an ambiguity code, such as `N`, also joins as the observed bases.
+    ///
+    /// A `loc` or `next=G:lo-hi` window must hold a tag of its group: one too
+    /// narrow for every tag, after the indels `dist` allows or a `partial5` or
+    /// `partial3` minimum, is refused, as the group could never match. An
+    /// `anchor=5p` tag runs past its window end, so its window may be narrower.
     ///
     /// When `dist` allows an edit, a `loc`, `next` or `match=` window wider than a
     /// tag lets a read match another tag at a shifted position as closely
