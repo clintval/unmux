@@ -2472,22 +2472,28 @@ fn require_extract(extracts: &HashSet<&str>, name: &str, referrer: &str) -> Resu
 
 /// Non-fatal plan warnings, surfaced by [`parse_demux`] via `log::warn!`.
 /// Returned as strings so the detection logic is unit-testable without a
-/// logger. Two cases: a no-sample run that still defines groups (rule 2: it
+/// logger. Two cases: a no-sample run with a group nothing consumes (rule 2: it
 /// does no demultiplexing), and any single group nothing consumes (rule 1).
 fn plan_warnings(plan: &DemuxPlan) -> Vec<String> {
     let mut warnings = Vec::new();
+    let consumers = Consumers::of(plan);
+    let unused: Vec<&str> = plan
+        .groups
+        .iter()
+        .filter(|group| !consumers.consume(plan, group))
+        .map(|group| group.name.as_str())
+        .collect();
 
-    // Rule 2: groups defined but no sample target -> no demultiplexing happens
-    // (everything passes through to `--out`). Structurally indistinguishable
-    // from an intentional annotate-only run, so this can only be a warning,
-    // never an error.
-    if matches!(plan.samples, SampleSpec::None) && !plan.groups.is_empty() {
-        warnings.push(
+    // Rule 2: a run with no sample target warns only when some group feeds nothing.
+    if matches!(plan.samples, SampleSpec::None) && !unused.is_empty() {
+        let label = if unused.len() == 1 { "group" } else { "groups" };
+        let names: Vec<String> = unused.iter().map(|name| format!("`{name}`")).collect();
+        warnings.push(format!(
             "groups are defined but no `--sample`, `--sample-sheet`, or `--sample-from-group` was \
              given; reads will not be demultiplexed (they pass through to `--out` undemultiplexed). \
-             Add a sample target to name a single sample or split by sample."
-                .to_string(),
-        );
+             Add a sample target to name a single sample or split by sample. Unused {label}: {}.",
+            names.join(", ")
+        ));
     }
 
     // Rule 1: a group that nothing consumes has no effect on output. "Consumed"
@@ -2497,16 +2503,11 @@ fn plan_warnings(plan: &DemuxPlan) -> Vec<String> {
     // any group (resolved later, at load), so suppress the warning entirely
     // under a sheet.
     if !matches!(plan.samples, SampleSpec::Sheet(..)) {
-        let consumers = Consumers::of(plan);
-        for group in &plan.groups {
-            if consumers.consume(plan, group) {
-                continue;
-            }
+        for name in &unused {
             warnings.push(format!(
-                "group `{}` is defined but nothing consumes its matches (no sample selector, \
+                "group `{name}` is defined but nothing consumes its matches (no sample selector, \
                  `--remove`, find constraint, `next`/`prev` link, `match=`, or extract emitted by a \
-                 `--tag`/`--template`); it has no effect on output.",
-                group.name
+                 `--tag`/`--template`); it has no effect on output."
             ));
         }
     }
@@ -2885,9 +2886,65 @@ mod tests {
         let plan = parse_demux(&a).unwrap();
         let w = plan_warnings(&plan);
         assert!(
-            w.iter().any(|m| m.contains("will not be demultiplexed")),
+            w.iter()
+                .any(|m| m.contains("will not be demultiplexed")
+                    && m.ends_with("Unused group: `g`.")),
             "{w:?}"
         );
+    }
+
+    /// The warnings of a run on one input with `flags`, given as `--flag value` pairs.
+    fn warnings_of(flags: &str) -> Vec<String> {
+        let mut a = args();
+        let mut words = flags.split_whitespace();
+        while let (Some(flag), Some(value)) = (words.next(), words.next()) {
+            let list = match flag {
+                "--group" => &mut a.groups,
+                "--extract" => &mut a.extracts,
+                "--tag" => &mut a.tags,
+                "--template" => &mut a.templates,
+                "--remove" => &mut a.remove,
+                _ => panic!("unknown flag {flag}"),
+            };
+            list.push(value.to_string());
+        }
+        plan_warnings(&parse_demux(&a).unwrap())
+    }
+
+    #[test]
+    fn test_no_sample_warning_lists_only_the_unused_groups() {
+        let w = warnings_of(
+            "--group g={ACGT} --group g::loc=0:0:4 --group h={AAAA} --group i={CCCC} \
+             --extract bc=@g --tag CB=bc",
+        );
+        let undemuxed: Vec<_> = w
+            .iter()
+            .filter(|m| m.contains("will not be demultiplexed"))
+            .collect();
+        assert_eq!(undemuxed.len(), 1, "{w:?}");
+        assert!(undemuxed[0].ends_with("Unused groups: `h`, `i`."), "{w:?}");
+    }
+
+    #[test]
+    fn test_no_sample_warning_skips_groups_that_feed_something() {
+        for flags in [
+            "--group g={ACGT} --group g::loc=0:0:4 --extract bc=@g --tag CB=bc",
+            "--group g=tags.tsv --extract cell=@g::cell --tag xn=cell",
+            "--group g={ACGT} --group g::loc=0:0:4 --extract bc=@g --template bc",
+            "--group g={ACGT} --group g::loc=0:0:4 --group m={ACGT} --group m::match=bc \
+             --extract bc=@g",
+            "--group a={AAAA} --group a::loc=0:0:4,next=b:0-4 --group b={CCCC}",
+            "--group a={AAAA} --group a::loc=0:0:4 --group b={CCCC} --group b::prev=a",
+            "--group g={ACGT} --group g::loc=0:0:4 --remove g",
+            "--group g={x=ACGT} --group g::loc=0:0:4 --remove g::x",
+            "--group g={ACGT} --group g::maxFindsPerTag=1",
+        ] {
+            let w = warnings_of(flags);
+            assert!(
+                !w.iter().any(|m| m.contains("will not be demultiplexed")),
+                "{flags}: {w:?}"
+            );
+        }
     }
 
     #[test]
@@ -3009,27 +3066,24 @@ mod tests {
     }
 
     #[test]
-    fn test_minfinds_group_is_consumed_no_inert_warning() {
-        // A `minFindsPerGroup` keeplist gate is load-bearing -> not inert (no
-        // rule-1 warning).
+    fn test_minfinds_group_is_consumed_no_warning() {
+        // A `minFindsPerGroup` keeplist gate is load-bearing, so the run warns
+        // neither about an inert group nor about a missing sample target.
         let mut a = args();
         a.groups = vec!["g={ACGT}".to_string(), "g::minFindsPerGroup=1".to_string()];
         a.out = Some("out.fq".to_string());
         let plan = parse_demux(&a).unwrap();
         assert!(
-            !plan_warnings(&plan)
-                .iter()
-                .any(|m| m.contains("nothing consumes")),
+            plan_warnings(&plan).is_empty(),
             "{:?}",
             plan_warnings(&plan)
         );
     }
 
     #[test]
-    fn test_group_consumed_via_tag_extract_no_inert_warning() {
-        // Annotate-only: group -> @g extract -> CB tag. `g` is consumed even
-        // without a sample (this is the footgun's structural twin, so it warns
-        // about no-demux but NOT about an inert group).
+    fn test_group_consumed_via_tag_extract_no_warning() {
+        // Annotate-only: group -> @g extract -> CB tag. `g` feeds the tag, so
+        // the run warns neither about an inert group nor about demultiplexing.
         let mut a = args();
         a.groups = vec!["g={ACGT}".to_string(), "g::loc=0:0".to_string()];
         a.extracts = vec!["bc=@g".to_string()];
@@ -3037,11 +3091,7 @@ mod tests {
         a.out = Some("out.fq".to_string());
         let plan = parse_demux(&a).unwrap();
         let w = plan_warnings(&plan);
-        assert!(!w.iter().any(|m| m.contains("nothing consumes")), "{w:?}");
-        assert!(
-            w.iter().any(|m| m.contains("will not be demultiplexed")),
-            "{w:?}"
-        );
+        assert!(w.is_empty(), "{w:?}");
     }
 
     #[test]
