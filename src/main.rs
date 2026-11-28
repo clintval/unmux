@@ -536,12 +536,13 @@ struct DemuxCmd {
     /// Records to remove via `SEL[=PATH_PATTERN]` (repeatable).
     ///
     /// A record matching `SEL` (a `group` or `group::id`) is removed and tallied as
-    /// removed (distinct from `--unassigned`). With `=PATH_PATTERN` the removed
-    /// records are written to the output path otherwise they are simply
-    /// ignored. `SEL` is required. The only placeholders allowed in
-    /// `PATH_PATTERN` are `%pool` and `%source` (input file index). Given
-    /// the `--out` pattern itself, removed records share the `--out` file,
-    /// with the read group rules of `--unassigned`.
+    /// removed (distinct from `--unassigned`), even when another group fails a
+    /// find bound such as `minFindsPerGroup`, but not when the `SEL` group fails
+    /// its own. With `=PATH_PATTERN` the removed records are written to the
+    /// output path otherwise they are simply ignored. `SEL` is required. The
+    /// only placeholders allowed in `PATH_PATTERN` are `%pool` and `%source`
+    /// (input file index). Given the `--out` pattern itself, removed records
+    /// share the `--out` file, with the read group rules of `--unassigned`.
     ///
     ///   --remove phiX                      drop records matching phiX group
     ///   --remove bc::t99                   drop one specific tag's records

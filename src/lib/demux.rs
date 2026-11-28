@@ -48,8 +48,8 @@ use crate::input::{
     PendingRecord, SniffedFormat,
 };
 use crate::matcher::{
-    match_verdict, match_verdict_after, search_patterns, CompiledGroup, GroupVerdict, MatchStrand,
-    Prereq, RelativeWindow, Scratch,
+    match_verdict, match_verdict_after, search_patterns, CompiledGroup, FindFailure, GroupVerdict,
+    MatchStrand, Prereq, RelativeWindow, Scratch,
 };
 use crate::metrics::Metrics;
 use crate::output::{
@@ -2209,9 +2209,10 @@ fn run_engine(plan: &DemuxPlan, command_line: Option<&str>) -> Result<()> {
 /// `String` clones).
 enum FragmentMatch {
     /// A group's find constraint (e.g. an unmet `minFindsPerGroup`) was not
-    /// met; carries the reason for the optional `--qc-tag` slug, plus the
-    /// partial hits accumulated before the failure (the upstream groups that
-    /// matched), so the slug can report what did match.
+    /// met and no `--remove` rule matched; carries the reason for the optional
+    /// `--qc-tag` slug, plus the partial hits accumulated before the failure
+    /// (the upstream groups that matched), so the slug can report what did
+    /// match.
     Unassigned {
         /// The unassigned reason (the offending group's index + the specific
         /// find failure).
@@ -2220,7 +2221,8 @@ enum FragmentMatch {
         /// later slots are `None`.
         hits: Vec<Option<GroupHit>>,
     },
-    /// Every group matched or was skipped; the routing inputs are ready.
+    /// Every group matched or was skipped, or a `--remove` rule matched,
+    /// which routing checks first; the routing inputs are ready.
     Routed {
         /// One slot per group in canonical order; `None` means the group did
         /// not match.
@@ -2344,11 +2346,15 @@ fn match_fragment(
     // preserving today's `contains_key`/`get`->`None` semantics for routing,
     // anchoring, and prerequisite checks.
     let mut hits: Vec<Option<GroupHit>> = vec![None; engine.groups.len()];
+    let mut failed: Option<(usize, FindFailure)> = None;
     // `groups` is in dependency order, so an upstream group's hit (and its
     // span) is already recorded when its downstream group is matched (a
     // relative `next` link windows the downstream search; a bare `next`/`prev`
     // link skips the downstream group when the upstream did not match).
     for (idx, group) in engine.groups.iter().enumerate() {
+        if failed.is_some() && !engine.routing.may_remove(&hits, idx) {
+            break;
+        }
         if let Some(rg_to_idx) = &group.read_group {
             if let Some(tag_idx) = match_read_group(rg_to_idx, fragment) {
                 hits[idx] = Some(GroupHit {
@@ -2367,17 +2373,10 @@ fn match_fragment(
             Some(streams) => match_joined(engine, group, scratch, streams, &segments, &hits)?,
             None => match_group_for(group, scratch, &base_segments, &hits),
         };
-        // A failed find constraint (e.g. an unmet minFindsPerGroup) leaves the
-        // read unassigned; carry the specific failure and the partial hits so
-        // far for the optional QC slug.
+        // The group did not match; the read is unassigned unless a `--remove` rule matches.
         if let Some(failure) = verdict.failure {
-            return Ok(FragmentMatch::Unassigned {
-                reason: Unassigned::FindConstraint {
-                    group: idx,
-                    failure,
-                },
-                hits,
-            });
+            failed.get_or_insert((idx, failure));
+            continue;
         }
         if let Some(best) = &verdict.best {
             // A `match=` group matches a synthetic joined text, not a read
@@ -2399,6 +2398,16 @@ fn match_fragment(
         }
     }
 
+    if let Some((group, failure)) = failed {
+        if engine.routing.removal(&hits).is_none() {
+            // The QC slug lists the groups that matched before the failed one.
+            hits[group..].fill(None);
+            return Ok(FragmentMatch::Unassigned {
+                reason: Unassigned::FindConstraint { group, failure },
+                hits,
+            });
+        }
+    }
     Ok(FragmentMatch::Routed { hits })
 }
 
@@ -6047,6 +6056,46 @@ mod tests {
                 r#"{"v":1,"outcome":"removed","rule":"grp::C","group":"grp","tag":"CCCC","groups":[{"g":"grp","tag":"CCCC","loc":"0:0:4","obs":"CCCC","sub":0,"ind":0}]}"#
             )
         );
+    }
+
+    #[test]
+    fn test_remove_wins_over_a_find_failure_in_either_group_order() {
+        // `px` holds the phix tag and no i7 tag, which i7 requires.
+        let dir = tempfile::tempdir().unwrap();
+        let input = write_file(
+            dir.path(),
+            "in.fq",
+            b"@s1\nAAAAAAAACCCCCCCC\n+\nIIIIIIIIIIIIIIII\n@px\nTTTTTTTTGGGGGGGG\n+\nIIIIIIIIIIIIIIII\n@un\nTTTTTTTTCCCCCCCC\n+\nIIIIIIIIIIIIIIII\n",
+        );
+        let index = ["i7={s1=AAAAAAAA}", "i7::loc=0:0:8,minFindsPerGroup=1"];
+        let phix = ["phix={p=GGGGGGGG}", "phix::loc=0:8:16"];
+        for groups in [[index, phix].concat(), [phix, index].concat()] {
+            let removed = dir.path().join("removed.fq");
+            let unassigned = dir.path().join("un.fq");
+            let summary = dir.path().join("summary.tsv");
+            let mut args = base_args();
+            args.pool = Some("p".to_string());
+            args.inputs = vec![format!("0={}", input.display())];
+            args.groups = groups.iter().map(|group| group.to_string()).collect();
+            args.samples = vec!["S=i7::s1".to_string()];
+            args.out = Some(dir.path().join("%sample.fq").display().to_string());
+            args.remove = vec![format!("phix={}", removed.display())];
+            args.unassigned = Some(unassigned.display().to_string());
+            args.metrics_summary = Some(summary.clone());
+            run_demux(args).unwrap();
+
+            let names = |path: &Path| -> Vec<Vec<u8>> {
+                read_back(path)
+                    .into_iter()
+                    .map(|record| record.name)
+                    .collect()
+            };
+            assert_eq!(names(&removed), [b"px".to_vec()], "{groups:?}");
+            assert_eq!(names(&unassigned), [b"un".to_vec()], "{groups:?}");
+            let sum = std::fs::read_to_string(&summary).unwrap();
+            let row = sum.lines().nth(1).unwrap();
+            assert!(row.starts_with("p\t3\t1\t0\t1\t1\t"), "{groups:?}: {sum}");
+        }
     }
 
     #[test]
