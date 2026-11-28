@@ -339,7 +339,7 @@ Feature: BAM/CRAM provenance headers and demux statistics
       | reads.txt    | reads.txt  |
       | .fq          | .fq        |
 
-  Scenario: Two inputs share a default pool without an extension and lone separators
+  Scenario: Two inputs share a default pool without an extension, a read marker, and lone separators
     Given a file "lib1_R1.fq" containing:
       """
       @r
@@ -356,7 +356,72 @@ Feature: BAM/CRAM provenance headers and demux statistics
       """
     When I run `unmux lib1_R1.fq lib1_R2.fq --out out.sam`
     Then the exit code is 0
-    And the file "out.sam" contains "@RG	ID:lib1_R	SM:lib1_R	LB:lib1_R"
+    And the file "out.sam" contains "@RG	ID:lib1	SM:lib1	LB:lib1"
+
+  Scenario Outline: The default pool of <first> and <second> leaves out the read marker they share
+    Given a file "<first>" containing:
+      """
+      @r
+      ACGT
+      +
+      IIII
+      """
+    And a file "<second>" containing:
+      """
+      @r
+      TTTT
+      +
+      JJJJ
+      """
+    When I run `unmux <first> <second> --out out.sam`
+    Then the exit code is 0
+    And the file "out.sam" contains "@RG	ID:<pool>	SM:<pool>	LB:<pool>"
+    And the file "out.sam" contains "RG:Z:<pool>"
+    When I run `unmux <first> <second> --out out/%pool.R%ordinal.fq`
+    Then the exit code is 0
+    And a file "out/<pool>.R1.fq" exists
+
+    Examples:
+      | first              | second             | pool       |
+      | S10_L001_R1_001.fq | S10_L001_R2_001.fq | S10_L001   |
+      | lib.R1.fq          | lib.R2.fq          | lib        |
+      | lib-r1.fq          | lib-r2.fq          | lib        |
+      | R1.fq              | R2.fq              | pool       |
+      | SRR6109255_1.fq    | SRR6109255_2.fq    | SRR6109255 |
+      | SAMPLER1.fq        | SAMPLER2.fq        | SAMPLER    |
+
+  Scenario: Index reads beside R1 and R2 leave the default pool without its trailing separator
+    Given a file "S1_L001_R1_001.fq" containing:
+      """
+      @r
+      ACGT
+      +
+      IIII
+      """
+    And a file "S1_L001_R2_001.fq" containing:
+      """
+      @r
+      TTTT
+      +
+      JJJJ
+      """
+    And a file "S1_L001_I1_001.fq" containing:
+      """
+      @r
+      GG
+      +
+      II
+      """
+    And a file "S1_L001_I2_001.fq" containing:
+      """
+      @r
+      CC
+      +
+      II
+      """
+    When I run `unmux S1_L001_R1_001.fq S1_L001_R2_001.fq S1_L001_I1_001.fq S1_L001_I2_001.fq --out out/%pool.R%ordinal.fq`
+    Then the exit code is 0
+    And a file "out/S1_L001.R4.fq" exists
 
   Scenario: Input names that differ inside one character do not stop the run
     Given a file "é.fq" containing:

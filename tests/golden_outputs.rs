@@ -448,25 +448,25 @@ const CELLS: &str = "--group b1={in}/bc.tsv --group b1::loc=0:0:13 --group b1::d
 
 #[rstest]
 #[case::paired_fastq(
-    "642747c4dd6cdea82e97316eaae32e52",
+    "6e2d7a8606af3af998aea22a8be04d97",
     "{in}/r1.fq {in}/r2.fq {BC} {CUT} \
     --template a b --tag RX=umi --tag BC=s --sample-from-group bc --out %sample.R%ordinal.fq.gz \
     {BINS} {METRICS}"
 )]
 #[case::gzip_to_fastq(
-    "1637e6465a2c6a12f2d0406c3897b032",
+    "d78d615bf817217085361d8ebcf42a67",
     "{in}/r1.fq.gz {in}/r2.bgzf.fq.gz {BC} \
     {CUT} --template a b --tag RX=umi --sample-from-group bc --out %sample.R%ordinal.fq \
     --unassigned un.fq {METRICS}"
 )]
 #[case::gzip_members_to_bam(
-    "b6b146a76ce148d2d7022f12cbeccd8e",
+    "88a7fe6ab0d6bdd0e319e5c3cf5258e4",
     "{in}/r1.members.fq.gz {in}/r2.fq \
     {BC} {CUT} --template a b --tag BC=s --tag RX=umi --sample-from-group bc --out %sample.bam \
     {BINS} {METRICS}"
 )]
 #[case::mixed_gzip_to_one_bam(
-    "e960430695b5a134b10a7ee14a3d0a22",
+    "a4a8c7d879c73548ae18236d18c1e746",
     "{in}/r1.mixed.fq.gz \
     {in}/r2.bgzf.fq.gz {BC} {CUT} --template ~b a+s --tag BC=~s --tag OX=umi+s \
     --sample-from-group bc --out all.bam --unassigned un.bam"
@@ -582,7 +582,7 @@ const CELLS: &str = "--group b1={in}/bc.tsv --group b1::loc=0:0:13 --group b1::d
     --out %sample.fq.gz --unassigned un.fq.gz --qc-tag {METRICS}"
 )]
 #[case::missing_template_stream(
-    "6d89b0169265522f83b068e21cf43e0c",
+    "b750bd750071f95f9f73217706e24663",
     "{in}/r1.fq {in}/r2.fq \
     --group bc={in}/bc.tsv --group bc::loc=0:0:8 --extract s=@bc --extract b=1:0:end \
     --template s b --tag RX=s --out out.R%ordinal.fq.gz --unassigned un.%source.fq.gz --qc-tag \
@@ -641,12 +641,12 @@ const CELLS: &str = "--group b1={in}/bc.tsv --group b1::loc=0:0:13 --group b1::d
     {METRICS}"
 )]
 #[case::passed_through_to_bam(
-    "7f4ad0ce0f0d4b1410c059a907bf5c98",
+    "22ff70356631c3da24c66e929150de1b",
     "{in}/r1.fq {in}/r2.fq \
     --out out.bam --metrics-summary sum.tsv"
 )]
 #[case::passed_through_to_cram(
-    "cc6f2f9675eca41c4c28f8cb69c82587",
+    "08116100f0ee24d34c26c00ec7d8dc4e",
     "{in}/r1.fq {in}/r2.fq \
     --out out.cram"
 )]

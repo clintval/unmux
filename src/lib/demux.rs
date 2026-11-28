@@ -5648,6 +5648,46 @@ mod tests {
     }
 
     #[test]
+    fn test_pool_id_drops_a_trailing_read_marker() {
+        let pool = |inputs: &[&str], given: Option<&str>| {
+            let mut args = base_args();
+            args.pool = given.map(String::from);
+            args.inputs = inputs
+                .iter()
+                .enumerate()
+                .map(|(index, input)| format!("{index}=dir/{input}"))
+                .collect();
+            pool_id(&crate::grammar::parse_demux(&args).unwrap())
+        };
+        for (inputs, expected) in [
+            (
+                &["S10_L001_R1_001.fastq.gz", "S10_L001_R2_001.fastq.gz"][..],
+                "S10_L001",
+            ),
+            (&["lib.R1.fq", "lib.R2.fq"], "lib"),
+            (&["lib-r1.fq", "lib-r2.fq"], "lib"),
+            (&["lib_._R1.fq", "lib_._R2.fq"], "lib"),
+            (&["R1.fq", "R2.fq"], "pool"),
+            (&["r1.fq.gz", "r2.fq"], "pool"),
+            (&["_R1.fq", "_R2.fq"], "pool"),
+            (&["R1.fq", "R2.fq", "I1.fq", "I2.fq"], "pool"),
+            (
+                &["SRR6109255_1.fastq.gz", "SRR6109255_2.fastq.gz"],
+                "SRR6109255",
+            ),
+            (&["lib_R1.fq", "lib_R2.fq", "lib_I1.fq", "lib_I2.fq"], "lib"),
+            (&["SAMPLER1.fq", "SAMPLER2.fq"], "SAMPLER"),
+            (&["lib_Rx1.fq", "lib_Rx2.fq"], "lib_Rx"),
+            (&["reads_R.fq"], "reads_R"),
+            (&["R.fq"], "R"),
+            (&["a.fq", "b.fq"], "pool"),
+        ] {
+            assert_eq!(pool(inputs, None), expected, "{inputs:?}");
+        }
+        assert_eq!(pool(&["lib_R1.fq", "lib_R2.fq"], Some("lib_R")), "lib_R");
+    }
+
+    #[test]
     fn test_metrics_paths_expand_pool_placeholder() {
         // `%pool` in a `--metrics-*` path expands to the pool id (the same
         // value `--out` uses), so the files land at the resolved names rather
