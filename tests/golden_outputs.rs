@@ -537,7 +537,7 @@ const CELLS: &str = "--group b1={in}/bc.tsv --group b1::loc=0:0:13 --group b1::d
     --sample-from-group bc --out %sample.bam --unassigned un.bam --qc-tag {METRICS}"
 )]
 #[case::anywhere_on_both_strands_with_indels(
-    "bf5d926a160e61783f6dbda18436be63",
+    "dde8d56f319c14c10d25dc1b3cdbdbbd",
     "{in}/any.fq \
     --group bc={in}/bc.tsv --group bc::dist=1:1:1 --group bc::bothStrands=true \
     --group bc::mode=nearest \

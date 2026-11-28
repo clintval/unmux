@@ -562,6 +562,51 @@ mod tests {
     }
 
     #[test]
+    fn test_unassigned_tsv_counts_a_nearest_tie_under_its_own_reason() {
+        use crate::grammar::MatchMode;
+        use crate::matcher::{match_group, Scratch};
+
+        let mut tied = CompiledGroup::new("bc", vec![b"AAAACCCC".to_vec(), b"GGGGTTTT".to_vec()]);
+        tied.mode = MatchMode::Nearest;
+        tied.max_finds_per_group = Some(1);
+        let mut index = CompiledGroup::new("i7", vec![b"ACGTACGT".to_vec()]);
+        index.min_finds_per_group = Some(1);
+        let read: [&[u8]; 1] = [b"AAAACCCCGGGGTTTT"];
+        let failure = |group: &CompiledGroup| {
+            let outcome = match_group(group, &mut Scratch::new(), &read);
+            group
+                .find_failure(&outcome)
+                .expect("the read fails the group")
+        };
+        let mut metrics = Metrics::new("p", &[]);
+        for _ in 0..4 {
+            metrics.record_processed();
+        }
+        for _ in 0..2 {
+            metrics.record_unassigned(&Unassigned::FindConstraint {
+                group: 0,
+                failure: failure(&tied),
+            });
+        }
+        metrics.record_unassigned(&Unassigned::FindConstraint {
+            group: 1,
+            failure: failure(&index),
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("unassigned.tsv");
+        metrics.write_unassigned_tsv(&path, &[tied, index]).unwrap();
+        assert_eq!(
+            lines(&path),
+            vec![
+                "pool\treason\tgroup\tstream\treads\tfrac_of_pool",
+                "p\tmin_finds_per_group\ti7\t\t1\t0.250000",
+                "p\tnearest_tie\tbc\t\t2\t0.500000",
+            ]
+        );
+    }
+
+    #[test]
     fn test_unassigned_tsv_is_header_only_when_nothing_is_unassigned() {
         let dir = tempfile::tempdir().unwrap();
         let mut metrics = Metrics::new("p", &[]);

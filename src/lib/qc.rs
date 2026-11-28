@@ -351,6 +351,30 @@ mod tests {
     }
 
     #[test]
+    fn test_unassigned_slug_of_a_nearest_tie() {
+        use crate::grammar::MatchMode;
+        use crate::matcher::{match_group, Scratch};
+
+        let mut tied = group("bc", &["AAAACCCC", "GGGGTTTT"]);
+        tied.mode = MatchMode::Nearest;
+        tied.min_finds_per_group = Some(1);
+        let outcome = match_group(&tied, &mut Scratch::new(), &[b"AAAACCCCGGGGTTTT"]);
+        let failure = tied
+            .find_failure(&outcome)
+            .expect("a tie fails minFindsPerGroup=1");
+        let no_hits: [Option<GroupHit>; 0] = [];
+        assert_eq!(
+            unassigned_slug(
+                &[tied],
+                &no_hits,
+                &[],
+                &Unassigned::FindConstraint { group: 0, failure },
+            ),
+            r#"{"v":1,"outcome":"unassigned","reason":"nearest_tie","group":"bc","groups":[]}"#
+        );
+    }
+
+    #[test]
     fn test_removed_slug_group_tag_carries_rule_group_and_tag() {
         // A `group::id` remove rule: the slug echoes the selector in `rule`,
         // names the resolved `group`, and carries the triggering tag's

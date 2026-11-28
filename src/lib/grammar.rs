@@ -3855,6 +3855,26 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_plan_nearest_with_a_minimum_above_one_is_error() {
+        let parse = |attrs: &str| {
+            let mut a = args();
+            a.groups = vec!["g={ACGT,TTTT}".to_string(), format!("g::{attrs}")];
+            parse_demux(&a)
+        };
+        for bound in ["minFindsPerGroup=2", "minFindsPerTag=3"] {
+            let err = parse(&format!("mode=nearest,{bound}")).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                format!("group `g`: {bound} can never be met under mode=nearest, which settles on one match per group")
+            );
+            assert!(parse(&format!("mode=all,{bound}")).is_ok(), "{bound}");
+        }
+        for bound in ["minFindsPerGroup=1", "minFindsPerTag=1", "findOne"] {
+            assert!(parse(&format!("mode=nearest,{bound}")).is_ok(), "{bound}");
+        }
+    }
+
+    #[test]
     fn test_parse_group_anchored() {
         let mut a = args();
         a.groups = vec!["g={ACGT}".to_string(), "g::loc=0:0:4,anchor=5p".to_string()];

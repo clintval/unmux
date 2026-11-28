@@ -2659,6 +2659,84 @@ mod tests {
         );
     }
 
+    /// A find bound by its attribute, and how it sets a group.
+    type FindBound = (&'static str, fn(&mut CompiledGroup));
+
+    /// Each find bound a group can have.
+    fn find_bounds() -> [FindBound; 5] {
+        [
+            ("minFindsPerGroup=1", |g| g.min_finds_per_group = Some(1)),
+            ("maxFindsPerGroup=1", |g| g.max_finds_per_group = Some(1)),
+            ("minFindsPerTag=1", |g| g.min_finds_per_tag = Some(1)),
+            ("maxFindsPerTag=1", |g| g.max_finds_per_tag = Some(1)),
+            ("findOne", |g| {
+                g.max_finds_per_tag = Some(1);
+                g.min_finds_per_group = Some(1);
+                g.max_finds_per_group = Some(1);
+            }),
+        ]
+    }
+
+    /// `group` with the find bound `bound` set.
+    fn bounded(group: &CompiledGroup, bound: fn(&mut CompiledGroup)) -> CompiledGroup {
+        let mut bounded = group.clone();
+        bound(&mut bounded);
+        bounded
+    }
+
+    /// A `mode=nearest` group and a read that tags a and b both match exactly, a twice.
+    fn nearest_tie() -> (CompiledGroup, GroupOutcome) {
+        let mut g = group(&["AAAACCCC", "GGGGTTTT"]);
+        g.mode = MatchMode::Nearest;
+        let tie = outcome(&g, "AAAACCCCGGGGTTTTAAAACCCC");
+        assert_eq!((tie.accepted.len(), tie.best), (3, None), "{tie:?}");
+        (g, tie)
+    }
+
+    #[test]
+    fn test_find_failure_of_a_nearest_tie_is_the_same_under_each_bound() {
+        let (g, tie) = nearest_tie();
+        let failures = find_bounds().map(|(_, bound)| bounded(&g, bound).find_failure(&tie));
+        assert!(failures[0].is_some(), "a tie fails minFindsPerGroup=1");
+        for ((name, _), failure) in find_bounds().iter().zip(&failures) {
+            assert_eq!(failure, &failures[0], "{name}");
+        }
+    }
+
+    #[test]
+    fn test_find_failure_of_a_nearest_tie_without_find_bounds_is_none() {
+        let (g, tie) = nearest_tie();
+        assert_eq!(g.find_failure(&tie), None);
+        let unbounded = bounded(&g, |g| g.min_finds_per_group = Some(0));
+        assert_eq!(unbounded.find_failure(&tie), None);
+    }
+
+    #[test]
+    fn test_find_failure_counts_a_nearest_winner_as_one_find() {
+        // Tag a matches exactly at [1,7) and [12,18), tag b one substitution away at [0,6) and [11,17).
+        let mut g = group(&["AACCGG", "GAACCC"]);
+        g.dist = substitutions(1);
+        g.mode = MatchMode::Nearest;
+        let win = outcome(&g, "GAACCGGTTTTGAACCGGTTTT");
+        assert_eq!(win.best.map(|best| best.tag_idx), Some(0), "{win:?}");
+        assert_eq!(win.accepted.len(), 4, "{win:?}");
+        for (name, bound) in find_bounds() {
+            assert_eq!(bounded(&g, bound).find_failure(&win), None, "{name}");
+        }
+        assert!(!bounded(&g, |g| g.min_finds_per_group = Some(2)).satisfies_finds(&win));
+        assert!(!bounded(&g, |g| g.min_finds_per_tag = Some(2)).satisfies_finds(&win));
+    }
+
+    #[test]
+    fn test_find_failure_counts_every_match_under_mode_all() {
+        let g = group(&["AAAACCCC", "GGGGTTTT"]);
+        let tie = outcome(&g, "AAAACCCCGGGGTTTTAAAACCCC");
+        assert_eq!(tie.best.map(|best| best.tag_idx), Some(0), "{tie:?}");
+        let passes = find_bounds().map(|(_, bound)| bounded(&g, bound).satisfies_finds(&tie));
+        assert_eq!(passes, [true, false, true, false, false]);
+        assert!(bounded(&g, |g| g.min_finds_per_group = Some(3)).satisfies_finds(&tie));
+    }
+
     #[test]
     fn test_partial5_matches_tag_truncated_at_read_start() {
         // partial5=4:0.1: a tag whose 5' bases run off the read start still
