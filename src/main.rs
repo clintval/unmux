@@ -159,7 +159,9 @@ struct DemuxCmd {
 
     /// Identifier for the input pool; fills the placeholder `%pool`.
     ///
-    /// Optional, and defaults to the common stem of the input filenames.
+    /// Optional, and defaults to the common stem of the input filenames,
+    /// without a read marker they share, such as the `R` of `R1` and `R2`,
+    /// or to `pool` when nothing is left.
     /// SAM/BAM/CRAM output needs it to be printable ASCII.
     ///
     ///   --pool lib01   the `%pool` placeholder is now set to 'lib01'
