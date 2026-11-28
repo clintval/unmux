@@ -52,20 +52,20 @@ Feature: A --remove rule takes precedence over another group's find bounds
     Then the exit code is 0
     And the records of "S1.sam" are:
       """
-      s1	77	*	0	255	*	*	0	0	TTTTTTTTACGTACGT	IIIIIIIIIIIIIIII	ZS:Z:{"v":1,"outcome":"assigned","sample":"S1","sub_sample":null,"groups":[{"g":"i7","tag":"AAAAAAAA","loc":"1:0:8","obs":"AAAAAAAA","sub":0,"ind":0}]}	RG:Z:S1
-      s1	141	*	0	255	*	*	0	0	AAAAAAAACCCCGGGG	JJJJJJJJJJJJJJJJ	ZS:Z:{"v":1,"outcome":"assigned","sample":"S1","sub_sample":null,"groups":[{"g":"i7","tag":"AAAAAAAA","loc":"1:0:8","obs":"AAAAAAAA","sub":0,"ind":0}]}	RG:Z:S1
+      s1	77	*	0	0	*	*	0	0	TTTTTTTTACGTACGT	IIIIIIIIIIIIIIII	ZS:Z:{"v":1,"outcome":"assigned","sample":"S1","sub_sample":null,"groups":[{"g":"i7","tag":"AAAAAAAA","loc":"1:0:8","obs":"AAAAAAAA","sub":0,"ind":0}]}	RG:Z:S1
+      s1	141	*	0	0	*	*	0	0	AAAAAAAACCCCGGGG	JJJJJJJJJJJJJJJJ	ZS:Z:{"v":1,"outcome":"assigned","sample":"S1","sub_sample":null,"groups":[{"g":"i7","tag":"AAAAAAAA","loc":"1:0:8","obs":"AAAAAAAA","sub":0,"ind":0}]}	RG:Z:S1
       """
     And the records of "removed.sam" are:
       """
-      px	77	*	0	255	*	*	0	0	GATCGATCACGTACGT	IIIIIIIIIIIIIIII	ZS:Z:{"v":1,"outcome":"removed","rule":"phix","group":"phix","groups":[{"g":"phix","tag":"GATCGATC","loc":"0:0:8","obs":"GATCGATC","sub":0,"ind":0}]}	RG:Z:p
-      px	141	*	0	255	*	*	0	0	TTTTTTTTCCCCGGGG	JJJJJJJJJJJJJJJJ	ZS:Z:{"v":1,"outcome":"removed","rule":"phix","group":"phix","groups":[{"g":"phix","tag":"GATCGATC","loc":"0:0:8","obs":"GATCGATC","sub":0,"ind":0}]}	RG:Z:p
-      both	77	*	0	255	*	*	0	0	GATCGATCACGTACGT	IIIIIIIIIIIIIIII	ZS:Z:{"v":1,"outcome":"removed","rule":"phix","group":"phix","groups":[{"g":"i7","tag":"AAAAAAAA","loc":"1:0:8","obs":"AAAAAAAA","sub":0,"ind":0},{"g":"phix","tag":"GATCGATC","loc":"0:0:8","obs":"GATCGATC","sub":0,"ind":0}]}	RG:Z:p
-      both	141	*	0	255	*	*	0	0	AAAAAAAACCCCGGGG	JJJJJJJJJJJJJJJJ	ZS:Z:{"v":1,"outcome":"removed","rule":"phix","group":"phix","groups":[{"g":"i7","tag":"AAAAAAAA","loc":"1:0:8","obs":"AAAAAAAA","sub":0,"ind":0},{"g":"phix","tag":"GATCGATC","loc":"0:0:8","obs":"GATCGATC","sub":0,"ind":0}]}	RG:Z:p
+      px	77	*	0	0	*	*	0	0	GATCGATCACGTACGT	IIIIIIIIIIIIIIII	ZS:Z:{"v":1,"outcome":"removed","rule":"phix","group":"phix","groups":[{"g":"phix","tag":"GATCGATC","loc":"0:0:8","obs":"GATCGATC","sub":0,"ind":0}]}	RG:Z:p
+      px	141	*	0	0	*	*	0	0	TTTTTTTTCCCCGGGG	JJJJJJJJJJJJJJJJ	ZS:Z:{"v":1,"outcome":"removed","rule":"phix","group":"phix","groups":[{"g":"phix","tag":"GATCGATC","loc":"0:0:8","obs":"GATCGATC","sub":0,"ind":0}]}	RG:Z:p
+      both	77	*	0	0	*	*	0	0	GATCGATCACGTACGT	IIIIIIIIIIIIIIII	ZS:Z:{"v":1,"outcome":"removed","rule":"phix","group":"phix","groups":[{"g":"i7","tag":"AAAAAAAA","loc":"1:0:8","obs":"AAAAAAAA","sub":0,"ind":0},{"g":"phix","tag":"GATCGATC","loc":"0:0:8","obs":"GATCGATC","sub":0,"ind":0}]}	RG:Z:p
+      both	141	*	0	0	*	*	0	0	AAAAAAAACCCCGGGG	JJJJJJJJJJJJJJJJ	ZS:Z:{"v":1,"outcome":"removed","rule":"phix","group":"phix","groups":[{"g":"i7","tag":"AAAAAAAA","loc":"1:0:8","obs":"AAAAAAAA","sub":0,"ind":0},{"g":"phix","tag":"GATCGATC","loc":"0:0:8","obs":"GATCGATC","sub":0,"ind":0}]}	RG:Z:p
       """
     And the records of "un.sam" are:
       """
-      none	77	*	0	255	*	*	0	0	TTTTTTTTACGTACGT	IIIIIIIIIIIIIIII	ZS:Z:{"v":1,"outcome":"unassigned","reason":"find_constraint","group":"i7","constraint":"min_finds_per_group","found":0,"limit":1,"groups":[]}	RG:Z:p
-      none	141	*	0	255	*	*	0	0	TTTTTTTTCCCCGGGG	JJJJJJJJJJJJJJJJ	ZS:Z:{"v":1,"outcome":"unassigned","reason":"find_constraint","group":"i7","constraint":"min_finds_per_group","found":0,"limit":1,"groups":[]}	RG:Z:p
+      none	77	*	0	0	*	*	0	0	TTTTTTTTACGTACGT	IIIIIIIIIIIIIIII	ZS:Z:{"v":1,"outcome":"unassigned","reason":"find_constraint","group":"i7","constraint":"min_finds_per_group","found":0,"limit":1,"groups":[]}	RG:Z:p
+      none	141	*	0	0	*	*	0	0	TTTTTTTTCCCCGGGG	JJJJJJJJJJJJJJJJ	ZS:Z:{"v":1,"outcome":"unassigned","reason":"find_constraint","group":"i7","constraint":"min_finds_per_group","found":0,"limit":1,"groups":[]}	RG:Z:p
       """
     And the file "ps.tsv" contains "p	S1		1	0.250000	0.000000"
     And the file "sum.tsv" contains "p	4	1	0	1	2	0.250000	0.000000	16,16"
@@ -87,20 +87,20 @@ Feature: A --remove rule takes precedence over another group's find bounds
     Then the exit code is 0
     And the records of "S1.sam" are:
       """
-      s1	77	*	0	255	*	*	0	0	TTTTTTTTACGTACGT	IIIIIIIIIIIIIIII	RG:Z:S1	ZS:Z:{"v":1,"outcome":"assigned","sample":"S1","sub_sample":null,"groups":[{"g":"i7","tag":"AAAAAAAA","loc":"1:0:8","obs":"AAAAAAAA","sub":0,"ind":0}]}
-      s1	141	*	0	255	*	*	0	0	AAAAAAAACCCCGGGG	JJJJJJJJJJJJJJJJ	RG:Z:S1	ZS:Z:{"v":1,"outcome":"assigned","sample":"S1","sub_sample":null,"groups":[{"g":"i7","tag":"AAAAAAAA","loc":"1:0:8","obs":"AAAAAAAA","sub":0,"ind":0}]}
+      s1	77	*	0	0	*	*	0	0	TTTTTTTTACGTACGT	IIIIIIIIIIIIIIII	RG:Z:S1	ZS:Z:{"v":1,"outcome":"assigned","sample":"S1","sub_sample":null,"groups":[{"g":"i7","tag":"AAAAAAAA","loc":"1:0:8","obs":"AAAAAAAA","sub":0,"ind":0}]}
+      s1	141	*	0	0	*	*	0	0	AAAAAAAACCCCGGGG	JJJJJJJJJJJJJJJJ	RG:Z:S1	ZS:Z:{"v":1,"outcome":"assigned","sample":"S1","sub_sample":null,"groups":[{"g":"i7","tag":"AAAAAAAA","loc":"1:0:8","obs":"AAAAAAAA","sub":0,"ind":0}]}
       """
     And the records of "removed.sam" are:
       """
-      px	77	*	0	255	*	*	0	0	GATCGATCACGTACGT	IIIIIIIIIIIIIIII	RG:Z:p	ZS:Z:{"v":1,"outcome":"removed","rule":"phix","group":"phix","groups":[{"g":"phix","tag":"GATCGATC","loc":"0:0:8","obs":"GATCGATC","sub":0,"ind":0}]}
-      px	141	*	0	255	*	*	0	0	TTTTTTTTCCCCGGGG	JJJJJJJJJJJJJJJJ	RG:Z:p	ZS:Z:{"v":1,"outcome":"removed","rule":"phix","group":"phix","groups":[{"g":"phix","tag":"GATCGATC","loc":"0:0:8","obs":"GATCGATC","sub":0,"ind":0}]}
-      both	77	*	0	255	*	*	0	0	GATCGATCACGTACGT	IIIIIIIIIIIIIIII	RG:Z:p	ZS:Z:{"v":1,"outcome":"removed","rule":"phix","group":"phix","groups":[{"g":"i7","tag":"AAAAAAAA","loc":"1:0:8","obs":"AAAAAAAA","sub":0,"ind":0},{"g":"phix","tag":"GATCGATC","loc":"0:0:8","obs":"GATCGATC","sub":0,"ind":0}]}
-      both	141	*	0	255	*	*	0	0	AAAAAAAACCCCGGGG	JJJJJJJJJJJJJJJJ	RG:Z:p	ZS:Z:{"v":1,"outcome":"removed","rule":"phix","group":"phix","groups":[{"g":"i7","tag":"AAAAAAAA","loc":"1:0:8","obs":"AAAAAAAA","sub":0,"ind":0},{"g":"phix","tag":"GATCGATC","loc":"0:0:8","obs":"GATCGATC","sub":0,"ind":0}]}
+      px	77	*	0	0	*	*	0	0	GATCGATCACGTACGT	IIIIIIIIIIIIIIII	RG:Z:p	ZS:Z:{"v":1,"outcome":"removed","rule":"phix","group":"phix","groups":[{"g":"phix","tag":"GATCGATC","loc":"0:0:8","obs":"GATCGATC","sub":0,"ind":0}]}
+      px	141	*	0	0	*	*	0	0	TTTTTTTTCCCCGGGG	JJJJJJJJJJJJJJJJ	RG:Z:p	ZS:Z:{"v":1,"outcome":"removed","rule":"phix","group":"phix","groups":[{"g":"phix","tag":"GATCGATC","loc":"0:0:8","obs":"GATCGATC","sub":0,"ind":0}]}
+      both	77	*	0	0	*	*	0	0	GATCGATCACGTACGT	IIIIIIIIIIIIIIII	RG:Z:p	ZS:Z:{"v":1,"outcome":"removed","rule":"phix","group":"phix","groups":[{"g":"i7","tag":"AAAAAAAA","loc":"1:0:8","obs":"AAAAAAAA","sub":0,"ind":0},{"g":"phix","tag":"GATCGATC","loc":"0:0:8","obs":"GATCGATC","sub":0,"ind":0}]}
+      both	141	*	0	0	*	*	0	0	AAAAAAAACCCCGGGG	JJJJJJJJJJJJJJJJ	RG:Z:p	ZS:Z:{"v":1,"outcome":"removed","rule":"phix","group":"phix","groups":[{"g":"i7","tag":"AAAAAAAA","loc":"1:0:8","obs":"AAAAAAAA","sub":0,"ind":0},{"g":"phix","tag":"GATCGATC","loc":"0:0:8","obs":"GATCGATC","sub":0,"ind":0}]}
       """
     And the records of "un.sam" are:
       """
-      none	77	*	0	255	*	*	0	0	TTTTTTTTACGTACGT	IIIIIIIIIIIIIIII	RG:Z:p	ZS:Z:{"v":1,"outcome":"unassigned","reason":"find_constraint","group":"i7","constraint":"min_finds_per_group","found":0,"limit":1,"groups":[]}
-      none	141	*	0	255	*	*	0	0	TTTTTTTTCCCCGGGG	JJJJJJJJJJJJJJJJ	RG:Z:p	ZS:Z:{"v":1,"outcome":"unassigned","reason":"find_constraint","group":"i7","constraint":"min_finds_per_group","found":0,"limit":1,"groups":[]}
+      none	77	*	0	0	*	*	0	0	TTTTTTTTACGTACGT	IIIIIIIIIIIIIIII	RG:Z:p	ZS:Z:{"v":1,"outcome":"unassigned","reason":"find_constraint","group":"i7","constraint":"min_finds_per_group","found":0,"limit":1,"groups":[]}
+      none	141	*	0	0	*	*	0	0	TTTTTTTTCCCCGGGG	JJJJJJJJJJJJJJJJ	RG:Z:p	ZS:Z:{"v":1,"outcome":"unassigned","reason":"find_constraint","group":"i7","constraint":"min_finds_per_group","found":0,"limit":1,"groups":[]}
       """
     And the file "ps.tsv" contains "p	S1		1	0.250000	0.000000"
     And the file "sum.tsv" contains "p	4	1	0	1	2	0.250000	0.000000	16,16"
@@ -132,8 +132,8 @@ Feature: A --remove rule takes precedence over another group's find bounds
     Then the exit code is 0
     And the records of "all.sam" are:
       """
-      px	4	*	0	255	*	*	0	0	GATCGATCTTTTTTTTCCCCGGGG	IIIIIIIIIIIIIIIIIIIIIIII	ZS:Z:{"v":1,"outcome":"removed","rule":"phix","group":"phix","groups":[{"g":"lib","tag":"CCCCGGGG","loc":"0:16:24","obs":"CCCCGGGG","sub":0,"ind":0},{"g":"phix","tag":"GATCGATC","loc":"0:0:8","obs":"GATCGATC","sub":0,"ind":0}]}	RG:Z:p
-      none	4	*	0	255	*	*	0	0	TTTTTTTTTTTTTTTTCCCCGGGG	IIIIIIIIIIIIIIIIIIIIIIII	ZS:Z:{"v":1,"outcome":"unassigned","reason":"find_constraint","group":"i7","constraint":"min_finds_per_group","found":0,"limit":1,"groups":[{"g":"lib","tag":"CCCCGGGG","loc":"0:16:24","obs":"CCCCGGGG","sub":0,"ind":0}]}	RG:Z:p
+      px	4	*	0	0	*	*	0	0	GATCGATCTTTTTTTTCCCCGGGG	IIIIIIIIIIIIIIIIIIIIIIII	ZS:Z:{"v":1,"outcome":"removed","rule":"phix","group":"phix","groups":[{"g":"lib","tag":"CCCCGGGG","loc":"0:16:24","obs":"CCCCGGGG","sub":0,"ind":0},{"g":"phix","tag":"GATCGATC","loc":"0:0:8","obs":"GATCGATC","sub":0,"ind":0}]}	RG:Z:p
+      none	4	*	0	0	*	*	0	0	TTTTTTTTTTTTTTTTCCCCGGGG	IIIIIIIIIIIIIIIIIIIIIIII	ZS:Z:{"v":1,"outcome":"unassigned","reason":"find_constraint","group":"i7","constraint":"min_finds_per_group","found":0,"limit":1,"groups":[{"g":"lib","tag":"CCCCGGGG","loc":"0:16:24","obs":"CCCCGGGG","sub":0,"ind":0}]}	RG:Z:p
       """
 
     Examples:
@@ -158,8 +158,8 @@ Feature: A --remove rule takes precedence over another group's find bounds
     Then the exit code is 0
     And the records of "out.sam" are:
       """
-      px	4	*	0	255	*	*	0	0	GATCGATCAAAACCCCAAAACCCC	IIIIIIIIIIIIIIIIIIIIIIII	ZS:Z:{"v":1,"outcome":"removed","rule":"phix","group":"phix","groups":[{"g":"phix","tag":"GATCGATC","loc":"0:0:8","obs":"GATCGATC","sub":0,"ind":0}]}	RG:Z:p
-      idx	4	*	0	255	*	*	0	0	TTTTTTTTAAAACCCCAAAACCCC	IIIIIIIIIIIIIIIIIIIIIIII	ZS:Z:{"v":1,"outcome":"unassigned","reason":"find_constraint","group":"i7","constraint":"<constraint>","found":2,"limit":<limit>,"groups":[]}	RG:Z:p
+      px	4	*	0	0	*	*	0	0	GATCGATCAAAACCCCAAAACCCC	IIIIIIIIIIIIIIIIIIIIIIII	ZS:Z:{"v":1,"outcome":"removed","rule":"phix","group":"phix","groups":[{"g":"phix","tag":"GATCGATC","loc":"0:0:8","obs":"GATCGATC","sub":0,"ind":0}]}	RG:Z:p
+      idx	4	*	0	0	*	*	0	0	TTTTTTTTAAAACCCCAAAACCCC	IIIIIIIIIIIIIIIIIIIIIIII	ZS:Z:{"v":1,"outcome":"unassigned","reason":"find_constraint","group":"i7","constraint":"<constraint>","found":2,"limit":<limit>,"groups":[]}	RG:Z:p
       """
 
     Examples:
@@ -182,7 +182,7 @@ Feature: A --remove rule takes precedence over another group's find bounds
     Then the exit code is 0
     And the records of "all.sam" are:
       """
-      own	4	*	0	255	*	*	0	0	GATCGATCGATCGATCAAAAAAAA	IIIIIIIIIIIIIIIIIIIIIIII	ZS:Z:{"v":1,"outcome":"unassigned","reason":"find_constraint","group":"phix","constraint":"max_finds_per_group","found":3,"limit":1,"groups":[{"g":"i7","tag":"AAAAAAAA","loc":"0:16:24","obs":"AAAAAAAA","sub":0,"ind":0}]}	RG:Z:p
+      own	4	*	0	0	*	*	0	0	GATCGATCGATCGATCAAAAAAAA	IIIIIIIIIIIIIIIIIIIIIIII	ZS:Z:{"v":1,"outcome":"unassigned","reason":"find_constraint","group":"phix","constraint":"max_finds_per_group","found":3,"limit":1,"groups":[{"g":"i7","tag":"AAAAAAAA","loc":"0:16:24","obs":"AAAAAAAA","sub":0,"ind":0}]}	RG:Z:p
       """
 
   Scenario: a remove rule whose group follows a group that fails its find bound does not remove the read
@@ -198,5 +198,5 @@ Feature: A --remove rule takes precedence over another group's find bounds
     Then the exit code is 0
     And the records of "all.sam" are:
       """
-      after	4	*	0	255	*	*	0	0	GATCGATCTTTTTTTT	IIIIIIIIIIIIIIII	ZS:Z:{"v":1,"outcome":"unassigned","reason":"find_constraint","group":"i7","constraint":"min_finds_per_group","found":0,"limit":1,"groups":[]}	RG:Z:p
+      after	4	*	0	0	*	*	0	0	GATCGATCTTTTTTTT	IIIIIIIIIIIIIIII	ZS:Z:{"v":1,"outcome":"unassigned","reason":"find_constraint","group":"i7","constraint":"min_finds_per_group","found":0,"limit":1,"groups":[]}	RG:Z:p
       """
