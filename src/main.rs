@@ -131,7 +131,8 @@ struct DemuxCmd {
     /// Mutually exclusive with `--in`. Inputs must agree on yes/no qualities
     /// FASTA cannot blend with a quality-containing FASTQ/SAM/BAM/CRAM.
     /// SAM tags in a FASTX record-name comment are lifted onto the record,
-    /// and a malformed one stops the run.
+    /// and a malformed one stops the run. Alignment tags such as `NM` and
+    /// `MD` are dropped there, as from SAM/BAM/CRAM input.
     ///
     ///   unmux r1.fq r2.fq i1.fq   files 0, 1, 2
     ///   unmux < reads.fq          file 0 from stdin (no args = stdin)
