@@ -1345,6 +1345,13 @@ fn parse_template(spec: &str) -> Result<Template> {
              use `--template r1 r2` or repeat `--template`. Got: {spec:?}"
         );
     }
+    if stream_part.contains('|') {
+        bail!(
+            "a `--template` stream cannot fall back with `|`, which works in `--tag` only; a record \
+             whose template stream is absent is unassigned, and `--unassigned` writes it as its \
+             input reads. Got: {spec:?}"
+        );
+    }
     let streams: Vec<StreamRef> = stream_part
         .split('+')
         .map(str::trim)
