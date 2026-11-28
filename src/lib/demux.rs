@@ -2219,7 +2219,7 @@ fn run_engine(plan: &DemuxPlan, command_line: Option<&str>) -> Result<()> {
     // go to stderr and the `--metrics-*` TSVs below (they are not embedded back
     // into the output headers, which would force a full post-pass rewrite of
     // each file).
-    metrics.log();
+    metrics.log(&groups);
     if is_read_group_split && plan.unassigned.is_none() && metrics.unassigned() > 0 {
         log::warn!(
             "{} records carried no RG:Z, or one the header does not declare, and were dropped; \

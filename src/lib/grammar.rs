@@ -2008,6 +2008,20 @@ fn validate_plan(plan: &DemuxPlan) -> Result<()> {
                 group.name
             );
         }
+        if attrs.mode == Some(MatchMode::Nearest) {
+            let minimums = [
+                ("minFindsPerGroup", attrs.min_finds_per_group),
+                ("minFindsPerTag", attrs.min_finds_per_tag),
+            ];
+            for (bound, min) in minimums {
+                if let Some(min) = min.filter(|&min| min > 1) {
+                    bail!(
+                        "group `{}`: {bound}={min} can never be met under mode=nearest, which settles on one match per group",
+                        group.name
+                    );
+                }
+            }
+        }
         if let Some(anchor) = attrs.anchor {
             // An anchored placement fixes each tag's anchored edge at a loc
             // boundary and matches over the tag's own length via a direct
