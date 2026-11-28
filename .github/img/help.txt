@@ -71,7 +71,8 @@ Arguments:
           Mutually exclusive with --in. Inputs must agree on yes/no qualities
           FASTA cannot blend with a quality-containing FASTQ/SAM/BAM/CRAM.
           SAM tags in a FASTX record-name comment are lifted onto the record,
-          and a malformed one stops the run.
+          and a malformed one stops the run. Alignment tags such as NM and
+          MD are dropped there, as from SAM/BAM/CRAM input.
           
             unmux r1.fq r2.fq i1.fq   files 0, 1, 2
             unmux < reads.fq          file 0 from stdin (no args = stdin)
@@ -92,7 +93,9 @@ Options:
       --pool <ID>
           Identifier for the input pool; fills the placeholder %pool.
           
-          Optional, and defaults to the common stem of the input filenames.
+          Optional, and defaults to the common stem of the input filenames,
+          without a read marker they share, such as the R of R1 and R2,
+          or to pool when nothing is left.
           SAM/BAM/CRAM output needs it to be printable ASCII.
           
             --pool lib01   the %pool placeholder is now set to 'lib01'
@@ -163,7 +166,7 @@ Options:
             bc::dist=1:1:2           1 sub + 1 indel, total ≤ 2
             bc::mode=nearest         keep best only if it beats runner-up...
             bc::delta=2              ...by ≥ 2 (default: 1; needs mode=nearest)
-            bc::next=bc3:0-4         bc3 follows, 0-4 bp past this match
+            bc::next=bc3:0-8         bc3 lies within 0-8 bp past this match
             bc::prev=bc1             require bc1 to have matched earlier
             bc::minFindsPerGroup=1   group matches ≥ once (keeplist)
             bc::maxFindsPerGroup=1   group matches ≤ once
@@ -175,6 +178,17 @@ Options:
             bc::anchor=5p            anchor tags' 5-prime base at loc.start
             bc::anchor=3p            anchor tags' 3-prime base at loc.end
             bc::match=i7+i5          match tags on joined --extract streams
+          
+          A next=G target is searched after this group's match, past it when
+          the link has a window, but is not required: route on both groups, or
+          set minFindsPerGroup=1 on G, to require it.
+          
+          Under mode=nearest the find bounds count only the match it keeps, as
+          one find for the group and its tag, so a runner-up within dist is no
+          find, and a minFindsPerGroup or minFindsPerTag above 1 is refused.
+          A read whose best match does not beat the runner-up by delta fails
+          every find bound the group has and is unassigned as nearest_tie; with
+          no find bound, the group is left unmatched.
           
           A reverse-strand match (bothStrands=true) is read in its tag's own
           orientation, as if the record were reverse-complemented: @grp
@@ -191,6 +205,11 @@ Options:
           --tag without raw=true writes it, and any other stream, such as
           1:0:8 or @grp+0:8, as the observed bases. A self-span whose tag
           has an ambiguity code, such as N, also joins as the observed bases.
+          
+          A loc or next=G:lo-hi window must hold a tag of its group: one too
+          narrow for every tag, after the indels dist allows or a partial5 or
+          partial3 minimum, is refused, as the group could never match. An
+          anchor=5p tag runs past its window end, so its window may be narrower.
           
           When dist allows an edit, a loc, next or match= window wider than a
           tag lets a read match another tag at a shifted position as closely
@@ -446,12 +465,13 @@ Options:
           Records to remove via SEL[=PATH_PATTERN] (repeatable).
           
           A record matching SEL (a group or group::id) is removed and tallied as
-          removed (distinct from --unassigned). With =PATH_PATTERN the removed
-          records are written to the output path otherwise they are simply
-          ignored. SEL is required. The only placeholders allowed in
-          PATH_PATTERN are %pool and %source (input file index). Given
-          the --out pattern itself, removed records share the --out file,
-          with the read group rules of --unassigned.
+          removed (distinct from --unassigned), even when another group fails a
+          find bound such as minFindsPerGroup, but not when the SEL group fails
+          its own. With =PATH_PATTERN the removed records are written to the
+          output path otherwise they are simply ignored. SEL is required. The
+          only placeholders allowed in PATH_PATTERN are %pool and %source
+          (input file index). Given the --out pattern itself, removed records
+          share the --out file, with the read group rules of --unassigned.
           
             --remove phiX                      drop records matching phiX group
             --remove bc::t99                   drop one specific tag's records
