@@ -233,9 +233,9 @@ Feature: Read routing, removal, and fan-out primitives
     Then the exit code is 0
     And the records of "out.sam" are:
       """
-      r1	4	*	0	255	*	*	0	0	AAAACCCCTTTT	IIIIIIIIIIII	<r1>	RG:Z:p
-      r2	4	*	0	255	*	*	0	0	AAAAACGTTTTT	IIIIIIIIIIII	RG:Z:p
-      r3	4	*	0	255	*	*	0	0	AAAATTTTACGT	IIIIIIIIIIII	RG:Z:p
+      r1	4	*	0	0	*	*	0	0	AAAACCCCTTTT	IIIIIIIIIIII	<r1>	RG:Z:p
+      r2	4	*	0	0	*	*	0	0	AAAAACGTTTTT	IIIIIIIIIIII	RG:Z:p
+      r3	4	*	0	0	*	*	0	0	AAAATTTTACGT	IIIIIIIIIIII	RG:Z:p
       """
 
     Examples:
@@ -267,8 +267,8 @@ Feature: Read routing, removal, and fan-out primitives
     Then the exit code is 0
     And the records of "out.sam" are:
       """
-      r1	4	*	0	255	*	*	0	0	AAAACCCCTTTT	IIIIIIIIIIII	CB:Z:AAAA-CCCC-TTTT	CY:Z:IIII IIII IIII	RX:Z:GGGG	QX:Z:FFFF	RG:Z:p
-      r2	4	*	0	255	*	*	0	0	AAAAACGTTTTT	IIIIIIIIIIII	RX:Z:GGGG	QX:Z:FFFF	RG:Z:p
+      r1	4	*	0	0	*	*	0	0	AAAACCCCTTTT	IIIIIIIIIIII	CB:Z:AAAA-CCCC-TTTT	CY:Z:IIII IIII IIII	RX:Z:GGGG	QX:Z:FFFF	RG:Z:p
+      r2	4	*	0	0	*	*	0	0	AAAAACGTTTTT	IIIIIIIIIIII	RX:Z:GGGG	QX:Z:FFFF	RG:Z:p
       """
 
     Examples:
@@ -295,8 +295,8 @@ Feature: Read routing, removal, and fan-out primitives
     Then the exit code is 0
     And the records of "out.sam" are:
       """
-      r1	4	*	0	255	*	*	0	0	AAAACCCCTTTT	IIIIIIIIIIII	CB:Z:AAAA-CCCC	CY:Z:IIII IIII	RX:Z:AAAA-TTTT	QX:Z:IIII IIII	RG:Z:p
-      r2	4	*	0	255	*	*	0	0	AAAACCCCGGGG	IIIIIIIIIIII	CB:Z:AAAA-	CY:Z:IIII 	RG:Z:p
+      r1	4	*	0	0	*	*	0	0	AAAACCCCTTTT	IIIIIIIIIIII	CB:Z:AAAA-CCCC	CY:Z:IIII IIII	RX:Z:AAAA-TTTT	QX:Z:IIII IIII	RG:Z:p
+      r2	4	*	0	0	*	*	0	0	AAAACCCCGGGG	IIIIIIIIIIII	CB:Z:AAAA-	CY:Z:IIII 	RG:Z:p
       """
 
   Scenario: a literal sub_sample and the %pool placeholder set different read-group LB values

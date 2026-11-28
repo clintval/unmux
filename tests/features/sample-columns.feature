@@ -46,10 +46,10 @@ Feature: Sample-sheet column streams
     Then the exit code is 0
     And the records of "out.<ext>" are:
       """
-      r1	4	*	0	255	*	*	0	0	ACGTACGT	IJKLMNOP	xn:Z:N1	nu:Z:N1-AAAA-GGGG	CB:Z:AAAA-GGGG	CY:Z:ABCD EFGH	RG:Z:s1
-      r2	4	*	0	255	*	*	0	0	ACGTACGT	IJKLMNOP	xn:Z:N2+N3	nu:Z:N2+N3-AAAA-TTTT	CB:Z:AAAA-TTTT	CY:Z:ABCD EFGH	RG:Z:s1
-      r3	4	*	0	255	*	*	0	0	ACGTACGT	IJKLMNOP	CB:Z:CCCC-GGGG	CY:Z:ABCD EFGH	RG:Z:s2
-      r4	4	*	0	255	*	*	0	0	ACGTACGT	IJKLMNOP	xn:Z:N4	nu:Z:N4-CCCC-TTTT	CB:Z:CCCC-TTTT	CY:Z:ABCD EFGH	RG:Z:s2
+      r1	4	*	0	0	*	*	0	0	ACGTACGT	IJKLMNOP	xn:Z:N1	nu:Z:N1-AAAA-GGGG	CB:Z:AAAA-GGGG	CY:Z:ABCD EFGH	RG:Z:s1
+      r2	4	*	0	0	*	*	0	0	ACGTACGT	IJKLMNOP	xn:Z:N2+N3	nu:Z:N2+N3-AAAA-TTTT	CB:Z:AAAA-TTTT	CY:Z:ABCD EFGH	RG:Z:s1
+      r3	4	*	0	0	*	*	0	0	ACGTACGT	IJKLMNOP	CB:Z:CCCC-GGGG	CY:Z:ABCD EFGH	RG:Z:s2
+      r4	4	*	0	0	*	*	0	0	ACGTACGT	IJKLMNOP	xn:Z:N4	nu:Z:N4-CCCC-TTTT	CB:Z:CCCC-TTTT	CY:Z:ABCD EFGH	RG:Z:s2
       """
     And stderr contains "column "nucleus" is blank in 1 of 4 sheet rows; records they route get no xn or nu tag"
 
@@ -184,8 +184,8 @@ Feature: Sample-sheet column streams
   Scenario: the sample and sub_sample columns of inline samples
     When I run `unmux reads.fq --pool p --group a={a1=AAAA,a2=CCCC} --group a::loc=0:0:4 --extract sm=%sample::sample --extract ss=%sample::sub_sample --tag xs=sm --tag xb=ss --sample s1::%pool=a::a1 --sample s2=a::a2 --out out.sam`
     Then the exit code is 0
-    And the file "out.sam" contains "r1	4	*	0	255	*	*	0	0	AAAAGGGGACGTACGT	ABCDEFGHIJKLMNOP	xs:Z:s1	xb:Z:p	RG:Z:s1.p"
-    And the file "out.sam" contains "r3	4	*	0	255	*	*	0	0	CCCCGGGGACGTACGT	ABCDEFGHIJKLMNOP	xs:Z:s2	RG:Z:s2"
+    And the file "out.sam" contains "r1	4	*	0	0	*	*	0	0	AAAAGGGGACGTACGT	ABCDEFGHIJKLMNOP	xs:Z:s1	xb:Z:p	RG:Z:s1.p"
+    And the file "out.sam" contains "r3	4	*	0	0	*	*	0	0	CCCCGGGGACGTACGT	ABCDEFGHIJKLMNOP	xs:Z:s2	RG:Z:s2"
     And stderr contains "column "sub_sample" is blank in 1 of 2 samples; records they route get no xb tag"
 
   Scenario: the sample and sub_sample columns with --sample-from-group
@@ -366,7 +366,7 @@ Feature: Sample-sheet column streams
     And the file "out.sam" contains "xv:Z:007 Ab	RG:Z:s1"
     And the file "out.sam" contains "xv:Z:x,y;z+w:1	RG:Z:s1"
     And the file "out.sam" contains "xv:Z:~!@#$%^&*()	RG:Z:s2"
-    And the file "out.sam" contains "r3	4	*	0	255	*	*	0	0	CCCCGGGGACGTACGT	ABCDEFGHIJKLMNOP	RG:Z:s2"
+    And the file "out.sam" contains "r3	4	*	0	0	*	*	0	0	CCCCGGGGACGTACGT	ABCDEFGHIJKLMNOP	RG:Z:s2"
 
   Scenario: a value that is not printable ASCII is an error that gives its row
     Given a file "values.tsv" containing:

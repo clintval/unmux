@@ -75,10 +75,10 @@ Feature: Lifting SAM tags from FASTX read-name comments
     Then the exit code is 0
     And the records of "out.sam" are:
       """
-      r1	4	*	0	255	*	*	0	0	AAAACCCC	IIIIIIII	RG:Z:in
-      r2	4	*	0	255	*	*	0	0	AAAACCCC	IIIIIIII	RG:Z:in
-      r3	4	*	0	255	*	*	0	0	AAAACCCC	IIIIIIII	RG:Z:in
-      r4	4	*	0	255	*	*	0	0	AAAACCCC	IIIIIIII	BC:Z:ACGT	RG:Z:in
+      r1	4	*	0	0	*	*	0	0	AAAACCCC	IIIIIIII	RG:Z:in
+      r2	4	*	0	0	*	*	0	0	AAAACCCC	IIIIIIII	RG:Z:in
+      r3	4	*	0	0	*	*	0	0	AAAACCCC	IIIIIIII	RG:Z:in
+      r4	4	*	0	0	*	*	0	0	AAAACCCC	IIIIIIII	BC:Z:ACGT	RG:Z:in
       """
 
   Scenario: a base-modification FASTQ keeps its MM, ML, and ns tags
@@ -93,7 +93,7 @@ Feature: Lifting SAM tags from FASTX read-name comments
     Then the exit code is 0
     And the records of "out.sam" are:
       """
-      read1	4	*	0	255	*	*	0	0	ACGTACGTCC	IIIIIIIIII	MM:Z:C+m,0,1;	ML:B:C,200,100	ns:i:4000000000	RG:Z:mod
+      read1	4	*	0	0	*	*	0	0	ACGTACGTCC	IIIIIIIIII	MM:Z:C+m,0,1;	ML:B:C,200,100	ns:i:4000000000	RG:Z:mod
       """
 
   Scenario: every SAM tag type survives a SAM to FASTQ to SAM round trip
@@ -108,7 +108,7 @@ Feature: Lifting SAM tags from FASTX read-name comments
     Then the exit code is 0
     And the records of "out.sam" are:
       """
-      read1	4	*	0	255	*	*	0	0	ACGT	IIII	xa:A:Q	xn:i:-2147483648	xu:i:4294967295	xf:f:1.5	xz:Z:hello world	xh:H:CAFE	xc:B:c,-128,127	ML:B:C,200,100	xs:B:s,-32768,32767	xS:B:S,0,65535	xi:B:i,-2147483648,2147483647	xI:B:I,0,4294967295	xF:B:f,1.5,-2.25	xe:B:C	RG:Z:mid
+      read1	4	*	0	0	*	*	0	0	ACGT	IIII	xa:A:Q	xn:i:-2147483648	xu:i:4294967295	xf:f:1.5	xz:Z:hello world	xh:H:CAFE	xc:B:c,-128,127	ML:B:C,200,100	xs:B:s,-32768,32767	xS:B:S,0,65535	xi:B:i,-2147483648,2147483647	xI:B:I,0,4294967295	xF:B:f,1.5,-2.25	xe:B:C	RG:Z:mid
       """
 
   Scenario: a FASTA description lifts array and hex tags
@@ -121,7 +121,7 @@ Feature: Lifting SAM tags from FASTX read-name comments
     Then the exit code is 0
     And the records of "out.sam" are:
       """
-      read1	4	*	0	255	*	*	0	0	ACGTACGT	*	ML:B:C,200,100	xh:H:CAFE	RG:Z:in
+      read1	4	*	0	0	*	*	0	0	ACGTACGT	*	ML:B:C,200,100	xh:H:CAFE	RG:Z:in
       """
 
   Scenario: a nameless record keeps its empty name and its tags through a FASTA round trip
@@ -136,7 +136,7 @@ Feature: Lifting SAM tags from FASTX read-name comments
     Then the exit code is 0
     And the records of "out.sam" are:
       """
-      *	4	*	0	255	*	*	0	0	ACGT	*	xa:A:Q	ML:B:C,1,2	RG:Z:mid
+      *	4	*	0	0	*	*	0	0	ACGT	*	xa:A:Q	ML:B:C,1,2	RG:Z:mid
       """
 
   Scenario: two nameless records read back from FASTA as single-end records, not a pair
@@ -152,8 +152,8 @@ Feature: Lifting SAM tags from FASTX read-name comments
     Then the exit code is 0
     And the records of "back.sam" are:
       """
-      *	4	*	0	255	*	*	0	0	ACGT	*	xa:A:Q	RG:Z:two
-      *	4	*	0	255	*	*	0	0	CCGG	*	xa:A:R	RG:Z:two
+      *	4	*	0	0	*	*	0	0	ACGT	*	xa:A:Q	RG:Z:two
+      *	4	*	0	0	*	*	0	0	CCGG	*	xa:A:R	RG:Z:two
       """
 
   Scenario: three nameless records read back from FASTA as single-end records
@@ -170,9 +170,9 @@ Feature: Lifting SAM tags from FASTX read-name comments
     Then the exit code is 0
     And the records of "back.sam" are:
       """
-      *	4	*	0	255	*	*	0	0	ACGT	*	xa:A:Q	RG:Z:three
-      *	4	*	0	255	*	*	0	0	CCGG	*	xa:A:R	RG:Z:three
-      *	4	*	0	255	*	*	0	0	TTAA	*	xa:A:S	RG:Z:three
+      *	4	*	0	0	*	*	0	0	ACGT	*	xa:A:Q	RG:Z:three
+      *	4	*	0	0	*	*	0	0	CCGG	*	xa:A:R	RG:Z:three
+      *	4	*	0	0	*	*	0	0	TTAA	*	xa:A:S	RG:Z:three
       """
 
   Scenario: a FASTA name after a space is kept unless it is shaped like a tag
@@ -189,9 +189,9 @@ Feature: Lifting SAM tags from FASTX read-name comments
     Then the exit code is 0
     And the records of "out.sam" are:
       """
-      read1	4	*	0	255	*	*	0	0	ACGT	*	RG:Z:in
-      read2	4	*	0	255	*	*	0	0	ACGT	*	BC:Z:GGGG	RG:Z:in
-      *	4	*	0	255	*	*	0	0	ACGT	*	xa:A:Q	ML:B:C,1,2	RG:Z:in
+      read1	4	*	0	0	*	*	0	0	ACGT	*	RG:Z:in
+      read2	4	*	0	0	*	*	0	0	ACGT	*	BC:Z:GGGG	RG:Z:in
+      *	4	*	0	0	*	*	0	0	ACGT	*	xa:A:Q	ML:B:C,1,2	RG:Z:in
       """
 
   Scenario Outline: a comment tag that a BAM record cannot hold stops the run: <field>

@@ -104,13 +104,13 @@ Feature: Split an existing multi-read-group input by its @RG header
     Then the exit code is 0
     And the records of "out/sampleA.sam" are:
       """
-      r1	77	*	0	255	*	*	0	0	AAAAAAAA	IIIIIIII	RG:Z:rg1
-      r1	141	*	0	255	*	*	0	0	CCCCCCCC	JJJJJJJJ	RG:Z:rg1
+      r1	77	*	0	0	*	*	0	0	AAAAAAAA	IIIIIIII	RG:Z:rg1
+      r1	141	*	0	0	*	*	0	0	CCCCCCCC	JJJJJJJJ	RG:Z:rg1
       """
     And the records of "out/sampleB.sam" are:
       """
-      r2	77	*	0	255	*	*	0	0	GGGGGGGG	IIIIIIII	RG:Z:rg2
-      r2	141	*	0	255	*	*	0	0	TTTTTTTT	JJJJJJJJ	RG:Z:rg2
+      r2	77	*	0	0	*	*	0	0	GGGGGGGG	IIIIIIII	RG:Z:rg2
+      r2	141	*	0	0	*	*	0	0	TTTTTTTT	JJJJJJJJ	RG:Z:rg2
       """
 
   Scenario: a record with no RG:Z lands in the unassigned bin
@@ -219,9 +219,9 @@ Feature: Split an existing multi-read-group input by its @RG header
     Then the exit code is 0
     And the records of "out/rg1.sam" are:
       """
-      r1	4	*	0	255	*	*	0	0	AACCCC	IIIIII	RG:Z:rg1	RX:Z:GGGG
+      r1	4	*	0	0	*	*	0	0	AACCCC	IIIIII	RG:Z:rg1	RX:Z:GGGG
       """
     And the records of "out/rg2.sam" are:
       """
-      r2	4	*	0	255	*	*	0	0	CCAAAA	IIIIII	RG:Z:rg2	RX:Z:TTTT
+      r2	4	*	0	0	*	*	0	0	CCAAAA	IIIIII	RG:Z:rg2	RX:Z:TTTT
       """
