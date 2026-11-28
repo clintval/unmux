@@ -285,3 +285,12 @@ Feature: Tags that one read can match together are refused or warned about
       | attrs     |
       | dist=0    |
       | loc=0:0:8 |
+
+  Scenario: a whitelist-sized group of 100,000 tags is checked within a minute
+    # Of the five billion pairs of these random 16 bp tags, at least a thousand differ at two bases or fewer.
+    Given a tag file "cells.tsv" of 100000 distinct random 16 bp tags
+    When I run `unmux reads.fq --group cb=cells.tsv --group cb::loc=0:0:16,dist=1,mode=nearest --extract cell=@cb --tag CB=cell --out out.sam` allowing 60 seconds
+    Then the run finished in the time allowed
+    And the exit code is 0
+    And stderr contains "tags `TTCTGAGTTGCAGTGA` and `TTCGGAGTTCCAGTGA` can both match one read within dist=1 (the bases `TTCGGAGTTGCAGTGA` match both)"
+    And stderr contains "at least 990 more pairs (counting stopped at 1000) of tags can both match one read within dist=1"

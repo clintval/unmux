@@ -14,9 +14,11 @@
 //! binary with that directory as the cwd, and the file-oriented `Then` steps
 //! inspect what it wrote.
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Output;
+use std::time::{Duration, Instant};
 
 use assert_cmd::Command;
 use cucumber::gherkin::Step;
@@ -60,6 +62,8 @@ struct SassWorld {
     stderr: String,
     /// Named pipes held open for the scenario, so a run writing to one never blocks.
     pipes: Vec<fs::File>,
+    /// How long the most recent timed invocation ran, and how long it was allowed.
+    timed: Option<(Duration, Duration)>,
 }
 
 impl SassWorld {
@@ -139,6 +143,28 @@ async fn given_repeated_records(world: &mut SassWorld, name: String, copies: usi
         }
     }
     fs::write(world.work_dir().join(&name), content).expect("write fixture file");
+}
+
+#[given(regex = r#"^a tag file "([^"]+)" of (\d+) distinct random (\d+) bp tags$"#)]
+async fn given_random_tags(world: &mut SassWorld, name: String, count: usize, len: usize) {
+    assert!(len <= 32, "one draw holds at most 32 bases");
+    let mut state: u64 = 0x5eed_ce11;
+    let mut seen = HashSet::with_capacity(count);
+    let mut content = String::from("id\tseq\n");
+    while seen.len() < count {
+        state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^= z >> 31;
+        let tag: String = (0..len)
+            .map(|at| char::from(b"ACGT"[(z >> (2 * at) & 3) as usize]))
+            .collect();
+        if seen.insert(tag.clone()) {
+            content.push_str(&format!("c{}\t{tag}\n", seen.len() - 1));
+        }
+    }
+    fs::write(world.work_dir().join(&name), content).expect("write tag file");
 }
 
 #[given(regex = r#"^the test file "([^"]+)"$"#)]
@@ -221,6 +247,36 @@ async fn i_run(world: &mut SassWorld, arg_line: String) {
     world.stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     world.stderr = String::from_utf8_lossy(&out.stderr).into_owned();
     world.args = args;
+}
+
+#[when(regex = r"^I run `unmux ?(.*)` allowing (\d+) seconds$")]
+async fn i_run_allowing(world: &mut SassWorld, arg_line: String, seconds: u64) {
+    let dir = world.work_dir();
+    let args: Vec<String> = arg_line.split_whitespace().map(str::to_owned).collect();
+    let allowed = Duration::from_secs(seconds);
+    let started = Instant::now();
+    let out = Command::cargo_bin("unmux")
+        .expect("binary `unmux` builds")
+        .current_dir(&dir)
+        .args(&args)
+        .timeout(allowed)
+        .output()
+        .expect("unmux runs");
+    world.timed = Some((started.elapsed(), allowed));
+    world.code = out.status.code();
+    world.stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    world.stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    world.args = args;
+}
+
+#[then(regex = r"^the run finished in the time allowed$")]
+async fn finished_in_time(world: &mut SassWorld) {
+    let (ran, allowed) = world.timed.expect("a timed run");
+    assert!(
+        ran < allowed && world.code.is_some(),
+        "unmux was stopped after {ran:.1?}, past the {allowed:?} allowed\nargs={:?}",
+        world.args
+    );
 }
 
 #[when(regex = r#"^I run `unmux ?(.*)` with "([^"]+)" on stdin$"#)]
