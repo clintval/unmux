@@ -36,6 +36,7 @@ PAGE = ROOT / "docs" / "recipes.md"
 USER_AGENT = "unmux-recipes/1.0"
 
 GITHUB = "https://raw.githubusercontent.com"
+SPLITCODE_TUTORIAL = f"{GITHUB}/pachterlab/splitcode-tutorial/68387770995199a9ac4ccadc25ee2f8e96cd24be"
 SAMTOOLS_SHA = "7162950d0988480faeddeb49f03520737e13a9c4"
 NFCORE_SHA = "d934d6e8367fe2626184496b1889671cf2b02dab"
 FASTQUORUM_SHA = "2ca9f8176f1f40ec1124c5182c58524766c95411"
@@ -74,6 +75,10 @@ def sra_slice(key, accession, first, last, outputs, label, extra=""):
 UNPINNED_OK = False
 
 PINS = {
+    "splitcode/tutorials_splitseq.rst": "6e934dd97d01e06da432f4013b84a5b77cb6cb649ecdf634724e4d69384c363b",
+    "splitcode/r1_R.txt": "c354ab4973dc8784bee811a4e689f7d56be1fbcf1f264b6ffff12497347adb90",
+    "splitcode/r1_T.txt": "32afa5f996f4c206f11671f049e5ab6050c48725084fe3d68e9f8555e02de431",
+    "splitcode/r2_r3.txt": "346ecc6bf50e72c91e0ec115ca22918abbfa8d3dae7be0dab9e602a1564de199",
     "sra-SRR390728/SRR390728_1.fastq": "93f6ea4eae9361fa6109c62caed201f8d462d11a2af3fdb2307eb3a597e1aabd",
     "sra-SRR390728/SRR390728_2.fastq": "479caf671e0766784f78ff7aedc7578ca6a1cee66f983a7c6fdcc1d8df99e134",
     "uditas/Undetermined_S0_L001_R1_001.fastq": "cc4c86e51b466a7c8f6885f3a0c6b7c832f9a5d80cdf5840d6ebe689f3abbfa1",
@@ -242,6 +247,14 @@ SOURCES = [
     Source("pacbio-cyp2d6", "Sequel_96_barcodes_v1.fasta",
            f"{GITHUB}/PacificBiosciences/hifi-amplicon-workflow/2964cd1fbddae04243d56914935881cca01f6d13/data/Sequel_96_barcodes_v1.fasta",
            "", "PacBio Sequel 96 barcodes v1"),
+    Source("splitcode", "tutorials_splitseq.rst", f"{SPLITCODE_TUTORIAL}/docs/source/tutorials_splitseq.rst", "",
+           "splitcode tutorial: SPLiT-seq processing"),
+    Source("splitcode", "r1_R.txt", f"{SPLITCODE_TUTORIAL}/uploads/splitseq/r1_R.txt", "",
+           "splitcode tutorial round-1 random-hexamer barcodes"),
+    Source("splitcode", "r1_T.txt", f"{SPLITCODE_TUTORIAL}/uploads/splitseq/r1_T.txt", "",
+           "splitcode tutorial round-1 oligo-dT barcodes"),
+    Source("splitcode", "r2_r3.txt", f"{SPLITCODE_TUTORIAL}/uploads/splitseq/r2_r3.txt", "",
+           "splitcode tutorial round-2 and round-3 barcodes"),
     *[
         Source("sra-carabus", f"{run}.fastq", "https://www.ncbi.nlm.nih.gov/bioproject/PRJDB2148", "",
                "SRA runs DRR021959 to DRR021990 of study DRP001067, spots 1 to 250 of each", sra=CARABUS_FETCH)
@@ -614,6 +627,57 @@ def tally(parts, total=None):
     return words[0] if len(words) == 1 else ", ".join(words[:-1]) + " and " + words[-1]
 
 
+CONCORDANCE = ("same", "different", "unmux", "other", "neither")
+
+
+def concord(compared_with, mine, theirs, note):
+    """Count, over the reads of both sides, where unmux's call and another's agree; a call of None is no call."""
+    reads = set(mine) | set(theirs)
+    counts = collections.Counter()
+    for read in reads:
+        a, b = mine.get(read), theirs.get(read)
+        counts["same" if a is not None and a == b else "different" if a is not None and b is not None
+               else "unmux" if a is not None else "other" if b is not None else "neither"] += 1
+    row = {"with": compared_with, "reads": len(reads), "note": note, **{kind: counts[kind] for kind in CONCORDANCE}}
+    check(sum(row[kind] for kind in CONCORDANCE) == row["reads"], f"{compared_with}: the counts add up to the reads compared")
+    return row
+
+
+def agreement(row):
+    called = row["reads"] - row["neither"]
+    if not called:
+        return "n/a"
+    return "100%" if row["same"] == called else f"{10000 * row['same'] // called / 100:.2f}%"
+
+
+def agreement_table(other, columns):
+    """Per-read calls of unmux beside another tool's, one column per run of that tool."""
+    labels = [("same", "Same call from both"), ("different", "Different calls"), ("unmux", "A call from unmux only"),
+              ("other", f"A call from {other} only"), ("neither", "No call from either")]
+    lines = ["| Reads | " + " | ".join(name for name, _ in columns) + " |",
+             "| --- | " + " | ".join("---:" for _ in columns) + " |"]
+    lines += [f"| {label} | " + " | ".join(fmt(row[kind]) for _, row in columns) + " |" for kind, label in labels]
+    return "\n".join(lines)
+
+
+def tool_version(ctx, w, tool):
+    text = ctx.sh(w, f"{tool} --version").out
+    found = re.search(r"\d+\.\d+\.\d+", text)
+    check(found is not None, f"{tool} reports its version ({text.strip()!r})")
+    return f"{tool} {found.group(0)}"
+
+
+NO_MAPQ = (0, 1, 2, 3, 5, 6, 7, 8, 9, 10)
+
+
+def templates(ctx, cwd, path, columns=None):
+    """The records of a SAM or BAM file by read name, each as the tuple of the given columns (all by default)."""
+    grouped = collections.defaultdict(list)
+    for fields, _ in sam_records(ctx, cwd, path):
+        grouped[fields[0]].append(tuple(fields[i] for i in columns) if columns else tuple(fields))
+    return {name: tuple(rows) for name, rows in grouped.items()}
+
+
 def native_barcodes(ctx):
     text = ctx.fetch("dorado", "barcode_kits.cpp").read_text()
     front = re.search(r'NB_1st_FRONT = "([ACGT]+)"', text).group(1)
@@ -632,10 +696,11 @@ def splitseq_layout(ctx):
 
 
 class Recipe:
-    def __init__(self, section, title, blocks):
+    def __init__(self, section, title, blocks, concordance=()):
         self.section = section
         self.title = title
         self.blocks = blocks
+        self.concordance = list(concordance)
 
 
 def source_links(ctx, *keys):
@@ -669,6 +734,8 @@ def recipe_fastq_to_ubam(ctx):
         check((fields[0], fields[9], fields[10]) == (name, seq, qual), f"record {k} equals its FASTQ read")
         check(int(fields[1]) == (77 if k % 2 == 0 else 141) and tags == {"RG": "SRR390728"}, f"record {k} flags and tags")
     check(same.out.strip() == "identical" and mapq == ["0"], f"samtools import comparison: {same.out!r} {mapq}")
+    row = concord("samtools import", templates(ctx, w, "SRR390728.unmapped.bam", NO_MAPQ),
+                  templates(ctx, w, "samtools.unmapped.bam", NO_MAPQ), "MAPQ (255 against 0) and the tags left out")
     return Recipe("Conversions", "Paired FASTQ to an unmapped BAM", [
         "Use this to store raw read pairs as one unmapped BAM (uBAM), the input many alignment "
         "workflows such as GATK's expect, with a read group on every record.",
@@ -690,7 +757,7 @@ def recipe_fastq_to_ubam(ctx):
         callout("NOTE", f"MAPQ is left out of the comparison: unmux writes 255 (unavailable) on unmapped "
                         f"records, where `samtools import` writes 0. All {fmt(len(records))} records match "
                         "otherwise."),
-    ])
+    ], [row])
 
 
 def recipe_ubam_to_fastq(ctx):
@@ -708,11 +775,21 @@ def recipe_ubam_to_fastq(ctx):
         "done"
     )
     same = ctx.sh(w, compare)
-    assert same.out.split("\n")[:2] == ["R1 identical", "R2 identical"], same.out
+    check(same.out.split("\n")[:2] == ["R1 identical", "R2 identical"],
+          f"R1 and R2 equal what samtools fastq writes ({same.out.strip()!r})")
     original = ctx.cache / "work" / "01-fastq-to-ubam"
     back = [(s, q) for _, s, q in read_fastq(w / "SRR390728.R1.fastq.gz")]
     orig = [(s, q) for _, s, q in read_fastq(original / "SRR390728_1.fastq.gz")]
-    assert back == orig
+    check(back == orig, "the FASTQ written back holds the bases and qualities of the input R1")
+
+    def pairs(prefix):
+        reads = collections.defaultdict(list)
+        for r in (1, 2):
+            for name, seq, qual in read_fastq(w / f"{prefix}.R{r}.fastq.gz"):
+                reads[name.split()[0]].append((name.replace("\t", " "), seq, qual))
+        return {name: tuple(mates) for name, mates in reads.items()}
+
+    row = concord("samtools fastq -T RG", pairs("SRR390728"), pairs("samtools"), "samtools' tab before the tags read as a space")
     return Recipe("Conversions", "Unmapped BAM back to paired FASTQ", [
         "Use this to hand reads stored in an unmapped BAM to a tool that wants FASTQ. The "
         "`%ordinal` placeholder writes one file per read of the pair.",
@@ -726,7 +803,7 @@ def recipe_ubam_to_fastq(ctx):
         fence(compare, "bash"),
         fence(same.out, "text"),
         f"Bases and qualities equal the original FASTQ for all {fmt(len(back))} pairs.",
-    ])
+    ], [row])
 
 
 def recipe_passthrough(ctx):
@@ -748,11 +825,15 @@ def recipe_passthrough(ctx):
         "diff <(samtools view reset.bam | cut -f 1-4,6-11) <(samtools view modbam.unmapped.bam | cut -f 1-4,6-11) && echo identical"
     )
     same = ctx.sh(w, compare)
-    assert same.out.strip() == "identical", same.out
+    check(same.out.strip() == "identical", f"the records equal what samtools reset writes ({same.out.strip()!r})")
     aligned = sam_records(ctx, w, "modbam.aligned.bam")
     unmapped = sam_records(ctx, w, "modbam.unmapped.bam")
-    assert all(a[1]["MM"] == u[1]["MM"] and a[1]["ML"] == u[1]["ML"] for a, u in zip(aligned, unmapped))
-    assert all(u[0][9] == (revcomp(a[0][9]) if int(a[0][1]) & 16 else a[0][9]) for a, u in zip(aligned, unmapped))
+    check(all(a[1]["MM"] == u[1]["MM"] and a[1]["ML"] == u[1]["ML"] for a, u in zip(aligned, unmapped)),
+          "MM and ML are unchanged on both records")
+    check(all(u[0][9] == (revcomp(a[0][9]) if int(a[0][1]) & 16 else a[0][9]) for a, u in zip(aligned, unmapped)),
+          "the reverse-strand read is the reverse complement of its aligned SEQ")
+    row = concord("samtools reset", templates(ctx, w, "modbam.unmapped.bam", NO_MAPQ), templates(ctx, w, "reset.bam", NO_MAPQ),
+                  "MAPQ and the tags left out")
     dropped = sorted(set(aligned[0][1]) - set(unmapped[0][1]))
     return Recipe("Conversions", "What plain SAM or BAM pass-through keeps and changes", [
         "Use this to get an unmapped copy of aligned reads, to realign them or share them without "
@@ -781,7 +862,7 @@ def recipe_passthrough(ctx):
         "reverse-strand read is the reverse complement of its aligned SEQ.",
         callout("TIP", "To keep the alignments and split them into files instead, use a read-group "
                        f"split, as in {ref('split_rg')}."),
-    ])
+    ], [row])
 
 
 CHANGESEQ_COMMAND = """unmux TEST.r1.fastq.gz TEST.r2.fastq.gz \\
@@ -805,7 +886,7 @@ def recipe_changeseq(ctx):
     ctx.sh(w, CHANGESEQ_COMMAND)
     view_cmd = "gzip -dc TEST_merged.fastq.gz | head -n 2 | cut -c 1-70"
     view = ctx.sh(w, view_cmd)
-    counts = {}
+    counts, mine, theirs = {}, {}, {}
     for sample, merged in (("TEST", "TEST_merged"), ("TEST_control", "control_TEST_merged")):
         r1 = list(read_fastq(w / f"{sample}.r1.fastq.gz"))
         r2 = list(read_fastq(w / f"{sample}.r2.fastq.gz"))
@@ -814,6 +895,8 @@ def recipe_changeseq(ctx):
         for (n1, s1, q1), (_, s2, q2), (name, seq, qual) in zip(r1, r2, out):
             check(name == n1.split()[0], f"{merged}: the name of {n1}")
             check(seq == revcomp(s1) + s2 and qual == q1[::-1] + q2, f"{merged}: {name} equals mergeReads()")
+            mine[(sample, name)] = (seq, qual)
+            theirs[(sample, name)] = (revcomp(s1) + s2, q1[::-1] + q2)
         counts[sample] = len(out)
     return Recipe("Conversions", "Join read pairs end to end for CHANGE-seq", [
         "Use this to turn read pairs into the single reads that CIRCLE-seq and CHANGE-seq align: the "
@@ -831,7 +914,7 @@ def recipe_changeseq(ctx):
         "streams into one read. Every merged read of both libraries equals what "
         f"{link('mergeReads.py', ctx.sources[('changeseq', 'mergeReads.py')].url)} writes for its "
         "pair, bases and qualities, and keeps the pair's name without its comment.",
-    ])
+    ], [concord("mergeReads() of CHANGE-seq", mine, theirs, "")])
 
 
 def recipe_split_rg(ctx):
@@ -850,10 +933,23 @@ def recipe_split_rg(ctx):
         "done"
     )
     same = ctx.sh(w, compare)
-    assert same.out.split() == ["grp1", "identical", "grp2", "identical", "unknown", "identical"], same.out
+    check(same.out.split() == ["grp1", "identical", "grp2", "identical", "unknown", "identical"],
+          f"each read group holds the records samtools split writes ({same.out.split()})")
     hdiff_cmd = "diff <(samtools view --no-PG -H by_rg/grp1.bam) <(samtools view --no-PG -H grp1.samtools.bam)"
     hdiff = ctx.sh(w, hdiff_cmd, ok=(0, 1))
     total = int(ctx.sh(w, "grep -vc '^@' split.sam").out)
+
+    def placed(files):
+        calls = collections.defaultdict(list)
+        for rg, path in files:
+            for name, rows in templates(ctx, w, path).items():
+                calls[name] += [(rg, r) for r in rows]
+        return {name: tuple(sorted(rows)) for name, rows in calls.items()}
+
+    groups = ("grp1", "grp2", "unknown")
+    row = concord("samtools split", placed((g, f"by_rg/{g}.bam") for g in groups),
+                  placed((g, f"{g}.samtools.bam") for g in groups), "headers aside")
+    check(sum(len(v) for v in placed((g, f"by_rg/{g}.bam") for g in groups).values()) == total, "every record is in one output")
     return Recipe("Conversions", "Split an aligned BAM by read group", [
         "Use this to separate an aligned SAM or BAM that holds several read groups, such as lanes "
         "or samples, into one file per read group with the alignments kept whole.",
@@ -873,7 +969,7 @@ def recipe_split_rg(ctx):
         callout("TIP", "With `--group \"rg=@RG::SM\"` the files are per sample, merging the read "
                        "groups of one sample, and `@RG::SM::LB` adds a library level for "
                        "`--out \"%sample.%sub_sample.bam\"`."),
-    ])
+    ], [row])
 
 
 UDITAS_SHEET = """awk -F , 'NR == 1 { for (i = 1; i <= NF; i++) c[$i] = i; print "sample\\ti7\\ti5"; next }
@@ -927,6 +1023,93 @@ def uditas_calls(i1, i2, rows, masked=True):
     return calls
 
 
+FQTK_UDITAS_SHEET = """awk 'BEGIN { print "sample_id\\tbarcode" } FNR == 1 { next }
+  FILENAME == "i7.tsv" { i7[$1] = $2; next } FILENAME == "i5.tsv" { i5[$1] = $2; next }
+  { print $1 "\\t" i7[$2] i5[$3] }' i7.tsv i5.tsv samples.tsv > fqtk.samples.tsv"""
+
+FQTK_UDITAS = """fqtk demux \\
+  --inputs Undetermined_S0_L001_R1_001.fastq.gz Undetermined_S0_L001_R2_001.fastq.gz \\
+    Undetermined_S0_L001_I1_001.fastq.gz Undetermined_S0_L001_I2_001.fastq.gz \\
+  --read-structures +T +T 8B 8B+M \\
+  --sample-metadata fqtk.samples.tsv \\
+  --max-mismatches 2 --min-mismatch-delta 1 \\
+  --umi-in-name false \\
+  --output fqtk"""
+
+
+def fqtk_calls(directory):
+    """Each read's sample from fqtk's per-sample FASTQs, or None for its unmatched reads."""
+    calls = {}
+    for path in sorted(directory.glob("*.R1.fq.gz")):
+        sample = path.name[: -len(".R1.fq.gz")]
+        for name, _, _ in read_fastq(path):
+            calls[name.split()[0]] = None if sample == "unmatched" else sample
+    return calls
+
+
+def fqtk_uditas(ctx, w, mine):
+    version = tool_version(ctx, w, "fqtk")
+    ctx.sh(w, FQTK_UDITAS_SHEET)
+    sheet = ctx.sh(w, "head -n 3 fqtk.samples.tsv")
+    ctx.sh(w, FQTK_UDITAS)
+    defaults_cmd = FQTK_UDITAS.replace("  --max-mismatches 2 --min-mismatch-delta 1 \\\n", "").replace("--output fqtk", "--output fqtk-defaults")
+    ctx.sh(w, defaults_cmd)
+    close = concord(version, mine, fqtk_calls(w / "fqtk"), "with `--max-mismatches 2 --min-mismatch-delta 1`")
+    loose = fqtk_calls(w / "fqtk-defaults")
+    defaults = concord(version, mine, loose, "")
+    i7 = {r["id"]: r["seq"] for r in read_tsv(w / "i7.tsv")}
+    i5 = {r["id"]: r["seq"] for r in read_tsv(w / "i5.tsv")}
+    sheet_rows = {r["sample"]: (i7[r["i7"]], i5[r["i5"]]) for r in read_tsv(w / "samples.tsv")}
+    seen = {n.split()[0]: s for n, s, _ in read_fastq(w / "Undetermined_S0_L001_I1_001.fastq.gz")}
+    seen5 = {n.split()[0]: s[:8] for n, s, _ in read_fastq(w / "Undetermined_S0_L001_I2_001.fastq.gz")}
+
+    def mismatches(read, sample):
+        return hamming(seen[read], sheet_rows[sample][0]), hamming(seen5[read], sheet_rows[sample][1])
+
+    lost = [n for n in mine if mine[n] and not loose.get(n)]
+    check(close["different"] == close["unmux"] == close["other"] == 0, "with two mismatches and a lead of one, fqtk makes unmux's calls")
+    check(defaults["different"] == defaults["other"] == 0 and len(lost) == defaults["unmux"], "fqtk's defaults only lose reads")
+    check(all(mismatches(n, mine[n]) == (1, 1) for n in lost), "every read fqtk's defaults lose has one mismatch in each index")
+    twice = sum(1 for n in mine if mine[n] and 2 in mismatches(n, mine[n]))
+    settings = "\n".join([
+        "| fqtk | unmux |",
+        "| --- | --- |",
+        "| `--read-structures`, with `B` for the barcode bases of each read | a group's `loc`, such as `i7::loc=2:0:8` |",
+        "| `--sample-metadata`, each sample's barcodes joined | `--sample-sheet`, a column per group, and a tag file per group |",
+        "| `--max-mismatches`, over all the barcode bases | `dist`, for each group |",
+        "| `--min-mismatch-delta` | `mode=nearest`, with `delta` |",
+        "| `M` segments, the UMI | `--extract` and `--tag \"RX=umi\"` |",
+        "| `T` segments, written to one FASTQ per sample and read | `--template` and `--out` |",
+        "| `--unmatched-prefix` | `--unassigned` |",
+        "| `demux-metrics.txt` | `--metrics-per-sample` and `--metrics-summary` |",
+        "| IUPAC codes in expected barcodes | IUPAC codes in tags |",
+        "| `--header-format illumina` and `--umi-in-name` | no equivalent |",
+    ])
+    blocks = [
+        f"**Compared with {version}.** fqtk reads each read's barcodes from fixed positions given as read "
+        "structures, and each sample's i7 and i5 joined in one `barcode` column:",
+        fence(FQTK_UDITAS_SHEET + "\nhead -n 3 fqtk.samples.tsv", "bash"),
+        fence(sheet.out, "tsv"),
+        fence(FQTK_UDITAS, "bash"),
+        "fqtk counts mismatches over the joined barcode, where unmux gives each index a budget of its "
+        "own, so `--max-mismatches 2` admits one mismatch in each index, and `--min-mismatch-delta 1` "
+        "takes the best sample when it beats the next by one; with `--umi-in-name false` the read "
+        "names stay as they are, so each read can be matched with unmux's. Per read, against unmux:",
+        agreement_table("fqtk", [("these settings", close), ("fqtk's defaults", defaults)]),
+        f"With these settings fqtk makes unmux's call on all {fmt(close['reads'])} reads. They would "
+        "also admit two mismatches in one index, which unmux does not"
+        + (f"; {fmt(twice)} reads here have that." if twice else "; no read here has that.")
+        + f" With fqtk's defaults, one mismatch and a lead of two, the {fmt(len(lost))} reads with a "
+        "mismatch in each index are left unmatched.",
+        "How unmux expresses fqtk's settings:",
+        settings,
+        "What fqtk does that unmux does not: it can write FASTQ headers in the bcl2fastq style, with "
+        "the sample barcode in the comment and the UMI in the read name. unmux writes tags such as BC "
+        "and RX as SAM tags instead, in the record or in the FASTQ comment.",
+    ]
+    return blocks, close
+
+
 def recipe_uditas(ctx):
     w = ctx.workdir("05-uditas")
     for r in ("R1", "R2", "I1", "I2"):
@@ -975,6 +1158,11 @@ def recipe_uditas(ctx):
     quals = {n: (q1, q2[:8]) for (n, _, q1), (_, _, q2) in zip(i1, i2)}
     low = [sum(1 for n in differ if any(ord(c) - 33 < 12 for c in quals[n][k])) for k in (0, 1)]
     assigned = sum(1 for c in calls.values() if c != "unassigned")
+    mine = {n: None if c == "unassigned" else c for n, c in calls.items()}
+    rules = concord("UDiTaS's demultiplex() rules", mine,
+                    {n: None if c in ("mismatched_adapters", "not_in_exp_list") else c for n, c in masked.items()},
+                    f"quality masking ({fmt(len(differ))} reads)" if differ else "")
+    fqtk_blocks, fqtk_row = fqtk_uditas(ctx, w, mine)
     return Recipe("Illumina demultiplexing", "Dual-index demultiplexing with a sample sheet", [
         "Use this to split a pooled Illumina run into per-sample unmapped BAMs when the index reads "
         "are in their own files, here with a UMI after the i5 index in I2, as in UDiTaS "
@@ -1014,7 +1202,8 @@ def recipe_uditas(ctx):
         + " RX and QX equal I2's bases and qualities from base 8 on, on every record.",
         callout("NOTE", "UDiTaS writes the UMI with low-quality bases masked to N. unmux writes the bases as "
                         "read and their qualities to QX, so a later step can weigh them."),
-    ])
+        *fqtk_blocks,
+    ], [rules, fqtk_row])
 
 
 BINS_COMMAND = """unmux R1.fastq.gz R2.fastq.gz I1.fastq.gz I2.fastq.gz \\
@@ -1120,6 +1309,10 @@ def recipe_bins(ctx):
     run_pairs = {n for n, o in origin.items() if o == "phix-run"}
     check(run_pairs <= undetermined_strict and not run_pairs & removed_strict,
           "with minFindsPerGroup on the index groups, the PhiX run's pairs go to Undetermined, not the PhiX bin")
+    truth = {n: expected[n] if o == "uditas" and expected[n] not in ("mismatched_adapters", "not_in_exp_list") else None
+             for n, o in origin.items()}
+    truth_row = concord("the run of each pair, and the UDiTaS rules within fig2b", {n: assigned.get(n) for n in origin}, truth,
+                        f"fig2b pairs that match the PhiX k-mers ({fmt(len(kept_out))})")
     return Recipe("Illumina demultiplexing", "Undetermined reads and a PhiX bin", [
         "Use this to keep the reads that match no sample, the way `bcl-convert` writes "
         "Undetermined files, and to move spike-in reads such as PhiX into a bin of their own.",
@@ -1161,8 +1354,17 @@ def recipe_bins(ctx):
                            "Undetermined and none to the PhiX bin."),
         callout("TIP", "Pass the `--out` pattern itself to `--unassigned` to keep unassigned reads in "
                        "the `--out` file instead of a file of their own."),
-    ])
+    ], [truth_row])
 
+
+FQTK_RAD_SHEET = """awk 'BEGIN { print "sample_id\\tbarcode" } NR > 1 { print $1 "\\t" $2 }' barcodes.tsv > fqtk.samples.tsv"""
+
+FQTK_RAD = """fqtk demux \\
+  --inputs pool.fastq.gz \\
+  --read-structures 5B+T \\
+  --sample-metadata fqtk.samples.tsv \\
+  --max-mismatches 1 --min-mismatch-delta 1 \\
+  --output fqtk"""
 
 INLINE_COMMAND = """unmux pool.fastq.gz \\
   --pool D0BTPACXX.8 \\
@@ -1191,6 +1393,7 @@ def recipe_inline(ctx):
     ctx.sh(w, INLINE_COMMAND)
     reads = {name: (seq, qual) for name, seq, qual in records}
     correct = wrong = 0
+    calls = {}
     mismatched = None
     for path in sorted((w / "bam").glob("*.unmapped.bam")):
         sample = path.name.split(".")[0]
@@ -1198,6 +1401,7 @@ def recipe_inline(ctx):
             seq, qual = reads[fields[0]]
             correct += origin[fields[0]] == sample
             wrong += origin[fields[0]] != sample
+            calls[fields[0]] = sample
             check((tags["BC"], tags["QT"]) == (seq[:5], qual[:5]), f"{fields[0]}: BC and QT are the read's first 5 bases")
             check((fields[9], fields[10]) == (seq[5:], qual[5:]), f"{fields[0]}: the record is the read from base 5 on")
             if mismatched is None and tags["BC"] != dict((s, b) for _, s, b in CARABUS)[sample]:
@@ -1209,6 +1413,12 @@ def recipe_inline(ctx):
     ctx.sh(w, exact)
     exact_n = sum(len(sam_records(ctx, w, f"exact/{p.name}")) for p in (w / "exact").glob("*.bam"))
     site = sum(1 for s, _ in reads.values() if s[5:10] == "TGCAG")
+    mine = {n: calls.get(n) for n in origin}
+    truth_row = concord("the run each read came from", mine, origin, "")
+    version = tool_version(ctx, w, "fqtk")
+    ctx.sh(w, FQTK_RAD_SHEET + "\n" + FQTK_RAD)
+    fqtk_row = concord(version, mine, fqtk_calls(w / "fqtk"), "with `--max-mismatches 1 --min-mismatch-delta 1`")
+    check(site == len(records), "every read has the remnant, so the site group changes no call")
     return Recipe("Illumina demultiplexing", "Inline barcodes into unmapped BAMs", [
         "Use this when the sample barcode is the first bases of the read rather than an index read, "
         "as in RAD-seq: unmux checks the restriction site after it, demultiplexes on the barcode, "
@@ -1235,7 +1445,16 @@ def recipe_inline(ctx):
                         "substitution, so no read here has more errors than `dist=1` corrects."),
         callout("TIP", f"With `dist=0`, {fmt(exact_n)} reads are assigned and the "
                        f"{fmt(len(records) - exact_n)} with a substitution in the barcode are not."),
-    ])
+        f"**Compared with {version}.** The same pool through fqtk, with one mismatch, as `dist=1` "
+        f"allows, and a lead of one over the next barcode; {ref('uditas')} gives how its settings map "
+        "to unmux's:",
+        fence(FQTK_RAD_SHEET + "\n" + FQTK_RAD, "bash"),
+        agreement_table("fqtk", [("fqtk", fqtk_row)]),
+        ("fqtk makes unmux's call on all " if fqtk_row["same"] == fqtk_row["reads"] else
+         f"fqtk makes unmux's call on {fmt(fqtk_row['same'])} of ") + f"{fmt(fqtk_row['reads'])} reads. It reads "
+        "the barcode from a fixed read structure and has no check like the `site` group's; every read "
+        "here has the remnant, so that check changes no call.",
+    ], [truth_row, fqtk_row])
 
 
 def read_structure(sheet, fastq_name):
@@ -1269,7 +1488,7 @@ def recipe_duplex(ctx):
     for name in ("SRR6109255_1.fastq.gz", "SRR6109255_2.fastq.gz"):
         shutil.copyfile(ctx.fetch("fastquorum", name), w / name)
     structure = read_structure(ctx.fetch("fastquorum", "samplesheet.tiny.csv"), "SRR6109255_1.fastq.gz")
-    assert structure == "10M1S+T 10M1S+T", structure
+    check(structure == "10M1S+T 10M1S+T", f"the test sheet gives the read structure 10M1S+T 10M1S+T ({structure})")
     input_cmd = "gzip -dc SRR6109255_1.fastq.gz | head -n 4 | cut -c 1-60\ngzip -dc SRR6109255_2.fastq.gz | head -n 4 | cut -c 1-60"
     inputs = ctx.sh(w, input_cmd)
     ctx.sh(w, DUPLEX_COMMAND)
@@ -1278,18 +1497,21 @@ def recipe_duplex(ctx):
     r1 = list(read_fastq(w / "SRR6109255_1.fastq.gz"))
     r2 = list(read_fastq(w / "SRR6109255_2.fastq.gz"))
     records = sam_records(ctx, w, "SRR6109255.unmapped.bam")
-    assert len(records) == 2 * len(r1) == 2 * len(r2)
+    check(len(records) == 2 * len(r1) == 2 * len(r2), "one record for each read of each pair")
     pairs = collections.Counter()
     for k, (a, b) in enumerate(zip(r1, r2)):
         (f1, t1), (f2, t2) = records[2 * k], records[2 * k + 1]
         rx, qx = f"{a[1][:10]}-{b[1][:10]}", f"{a[2][:10]} {b[2][:10]}"
-        assert f1[0] == f2[0] == a[0].split()[0] and int(f1[1]) & 64 and int(f2[1]) & 128
-        assert t1["RX"] == t2["RX"] == rx and t1["QX"] == t2["QX"] == qx, (rx, qx, t1, t2)
-        assert (f1[9], f1[10], f2[9], f2[10]) == (a[1][11:], a[2][11:], b[1][11:], b[2][11:])
+        check(f1[0] == f2[0] == a[0].split()[0] and int(f1[1]) & 64 and int(f2[1]) & 128,
+              f"{a[0].split()[0]}: the records are the pair, first then second")
+        check(t1["RX"] == t2["RX"] == rx and t1["QX"] == t2["QX"] == qx,
+              f"{f1[0]}: RX and QX hold the UMI of R1, then of R2 ({rx}, {qx})")
+        check((f1[9], f1[10], f2[9], f2[10]) == (a[1][11:], a[2][11:], b[1][11:], b[2][11:]),
+              f"{f1[0]}: each record holds its read after the UMI and skipped base")
         pairs[rx] += 1
     both = {p for p in pairs if swapped(p) in pairs and swapped(p) != p}
     count = ctx.sh(w, SWAP_COMMAND)
-    assert int(count.out) == len(both), (count.out, len(both))
+    check(int(count.out) == len(both), f"the shell pipeline counts the swapped UMI pairs ({count.out.strip()} and {len(both)})")
     spacers = collections.Counter(s[10] for _, s, _ in r1 + r2)
     return Recipe("UMIs and duplex sequencing", "Random duplex UMIs into RX", [
         "Use this for duplex sequencing libraries with a random UMI at the start of each read: one "
@@ -1344,7 +1566,7 @@ def recipe_duplex_fixed(ctx):
     for name in ("synthetic_nonrandom_umi_1.fastq.gz", "synthetic_nonrandom_umi_2.fastq.gz", "idt-xgen-cfdna-umis.txt"):
         shutil.copyfile(ctx.fetch("fastquorum", name), w / name)
     structure = read_structure(ctx.fetch("fastquorum", "samplesheet.nonrandom.csv"), "synthetic_nonrandom_umi_1.fastq.gz")
-    assert structure == "8M+T 8M+T", structure
+    check(structure == "8M+T 8M+T", f"the test sheet gives the read structure 8M+T 8M+T ({structure})")
     prep_cmd = UMI_PREP + "\nhead -n 3 umis.tsv"
     prep = ctx.sh(w, prep_cmd)
     umis = [row["seq"] for row in read_tsv(w / "umis.tsv")]
@@ -1359,11 +1581,12 @@ def recipe_duplex_fixed(ctx):
         check(all(m[1][8:] == r[1][11:] and m[2][8:] == r[2][11:] and m[2][:8] == "I" * 8 for m, r in zip(made, real)),
               f"each R{end} read is 8 bases of quality I and the SRR6109255 read after its first 11 bases")
     records = sam_records(ctx, w, "umis.unmapped.bam")
-    assert len(records) == 2 * len(r1)
+    check(len(records) == 2 * len(r1), "one record for each read of each pair")
 
     def nearest(seen):
         best = sorted((hamming(seen, u), u) for u in umis)
-        assert best[0][0] <= 1 and best[1][0] > best[0][0], (seen, best[:2])
+        check(best[0][0] <= 1 and best[1][0] > best[0][0],
+              f"the UMI {seen} is within one substitution of one list UMI only ({best[:2]})")
         return best[0][1]
 
     fixed = [0, 0]
@@ -1374,9 +1597,10 @@ def recipe_duplex_fixed(ctx):
         fixed[0] += n1 != a[1][:8]
         fixed[1] += n2 != b[1][:8]
         for t in (t1, t2):
-            assert t["RX"] == f"{n1}-{n2}" and t["OX"] == f"{a[1][:8]}-{b[1][:8]}" and "QX" not in t
-            assert t["BZ"] == f"{a[2][:8]} {b[2][:8]}"
-        assert (f1[9], f2[9]) == (a[1][8:], b[1][8:])
+            check(t["RX"] == f"{n1}-{n2}" and t["OX"] == f"{a[1][:8]}-{b[1][:8]}" and "QX" not in t,
+                  f"{f1[0]}: RX holds the corrected UMIs, OX the UMIs as read, and no QX is written")
+            check(t["BZ"] == f"{a[2][:8]} {b[2][:8]}", f"{f1[0]}: BZ holds the qualities of the UMIs as read")
+        check((f1[9], f2[9]) == (a[1][8:], b[1][8:]), f"{f1[0]}: each record holds its read after the UMI")
         if pick is None and n1 != a[1][:8]:
             pick = f1[0]
     view_cmd = f"samtools view umis.unmapped.bam | awk '$1 == \"{pick}\"' | cut -f 1,2,12-"
@@ -1387,8 +1611,9 @@ def recipe_duplex_fixed(ctx):
     counted = ctx.sh(w, exact_cmd)
     either = sum(1 for a, b in zip(r1, r2) if a[1][:8] not in umis or b[1][:8] not in umis)
     exact_records = sam_records(ctx, w, "umis.exact.bam")
-    assert all("OX" in t and "BZ" in t for _, t in exact_records)
-    assert counted.out.split() == [str(len(r1)), str(len(r1) - either)], (counted.out, either)
+    check(all("OX" in t and "BZ" in t for _, t in exact_records), "with dist=0 every record still has OX and BZ")
+    check(counted.out.split() == [str(len(r1)), str(len(r1) - either)],
+          f"with dist=0 every pair is written and only those with both UMIs on the list have RX ({counted.out.split()})")
     wide = ctx.sh(w, FIXED_COMMAND.replace("dist=1", "dist=2"), ok=(1,))
     check("can both match" in wide.err, "dist=2 is refused as a collision")
     aside = exact.replace("dist=0", "dist=0,minFindsPerGroup=1").replace(
@@ -1495,6 +1720,7 @@ def recipe_tenx(ctx):
 
     agree = exact = corrected = 0
     kinds = collections.Counter()
+    mine, theirs = {}, {}
     pick_fixed = pick_none = None
     for fields, tags in records:
         seq, qual = r1[fields[0]]
@@ -1502,6 +1728,7 @@ def recipe_tenx(ctx):
         kinds[kind] += 1
         got = tags.get("CB")
         agree += got == want
+        mine[fields[0]], theirs[fields[0]] = got, want
         check(tags["CR"] == seq[:16] and tags["CY"] == qual[:16], f"{fields[0]}: CR and CY are R1 bases 0 to 16")
         check(tags["UR"] == tags["UB"] == seq[16:26] and tags["UY"] == qual[16:26], f"{fields[0]}: UR, UB and UY are R1 bases 16 to 26")
         check((fields[9], fields[10]) == r2[fields[0]], f"{fields[0]}: the record is R2")
@@ -1549,7 +1776,7 @@ def recipe_tenx(ctx):
                         "velocyto read UB."),
         callout("WARNING", "Without `--pool S10` the pool, and with it the read group, would be "
                            "`S10_L001_R`: the common stem of the two file names."),
-    ])
+    ], [concord("the whole 10x keeplist", mine, theirs, "")])
 
 
 SPLITSEQ_COMMAND = """unmux R1.fastq.gz R2.fastq.gz \\
@@ -1645,6 +1872,144 @@ def splitseq_scores(ctx, w, path, cells, reference=None):
     return written, with_cb, in_cells, changed
 
 
+SPLITCODE_COMMAND = """splitcode -c config.txt --nFastqs=2 --select=0 \\
+--gzip -o output_R1.fastq.gz,unused_R2.fastq.gz R1.fastq.gz R2.fastq.gz"""
+
+SPLITCODE_LISTS = """awk -F , '$1 < 48 { print $2 }' bc_8nt_v2.csv > r1_T.txt
+awk -F , '$1 >= 48 { print $2 }' bc_8nt_v2.csv > r1_R.txt"""
+
+
+def splitcode_config(rst):
+    """The config.txt of the tutorial's barcode reformatting example, from its reStructuredText source."""
+    lines = rst.split("\n")
+    start = lines.index("  :caption: config.txt")
+    body = []
+    for line in lines[start + 1:]:
+        if not line.strip():
+            if body:
+                break
+            continue
+        body.append(line[3:])
+    check(body[0].startswith("@extract") and len(body) == 6, "the tutorial's config.txt has its @extract line, a header and four tags")
+    return "\n".join(body) + "\n"
+
+
+def splitcode_calls(d, names):
+    """Each read's CB from splitcode's stitched barcodes (rounds 3, 2 and 1), or None for a read it drops."""
+    windows = {n.split()[0]: s for n, s, _ in read_fastq(d / "R2.fastq.gz")}
+    calls = dict.fromkeys(names)
+    for name, seq, _ in read_fastq(d / "output_R2.fastq.gz"):
+        n = name.split()[0].split("::")[0]
+        r3, r2, r1 = seq[:8], seq[8:16], seq[16:24]
+        check(len(seq) == 24 and all(hamming(a, b) <= 1 for a, b in ((r3, windows[n][10:18]), (r2, windows[n][48:56]), (r1, windows[n][78:86]))),
+              f"{n}: splitcode's barcode is rounds 3, 2 and 1, each within one substitution of its window")
+        calls[n] = f"{r1}-{r2}-{r3}"
+    return calls
+
+
+def splitcode_comparison(ctx, w, mine):
+    version = tool_version(ctx, w, "splitcode")
+    rst_source = ctx.fetch("splitcode", "tutorials_splitseq.rst")
+    config = splitcode_config(rst_source.read_text())
+    runs = {}
+    for label in ("tutorial", "library"):
+        d = ctx.workdir(f"09-splitcode-{label}")
+        for name in ("R1.fastq.gz", "R2.fastq.gz", "bc_8nt_v2.csv"):
+            shutil.copyfile(w / name, d / name)
+        for name in ("r1_R.txt", "r1_T.txt", "r2_r3.txt"):
+            shutil.copyfile(ctx.fetch("splitcode", name), d / name)
+        write_text(d / "config.txt", config)
+        if label == "library":
+            ctx.sh(d, SPLITCODE_LISTS)
+        else:
+            as_written = ctx.sh(d, SPLITCODE_COMMAND.replace(",unused_R2.fastq.gz", ""), ok=(1,))
+            check("Incorrect number of output files" in as_written.err + as_written.out,
+                  "splitcode refuses the tutorial's command as written")
+        ctx.sh(d, SPLITCODE_COMMAND)
+        check(not list(read_fastq(d / "unused_R2.fastq.gz")), "the second -o file stays empty")
+        runs[label] = splitcode_calls(d, mine)
+    tutorial1 = [s for n in ("r1_R.txt", "r1_T.txt") for s in ctx.fetch("splitcode", n).read_text().split()]
+    library1 = {r["seq"] for r in read_tsv(w / "round1.tags.txt")}
+    check(set(ctx.fetch("splitcode", "r2_r3.txt").read_text().split()) == {r["seq"] for r in read_tsv(w / "round2_3.tags.txt")},
+          "the tutorial's round-2 and round-3 list is this library's")
+    shared = len(set(tutorial1) & library1)
+    theirs = runs["tutorial"]
+    window = {n.split()[0]: s[78:86] for n, s, _ in read_fastq(w / "R2.fastq.gz")}
+    unmux_only = [n for n in mine if mine[n] and not theirs[n]]
+    outside = sum(1 for n in unmux_only if mine[n].split("-")[0] not in tutorial1)
+    two = sum(1 for n in unmux_only if mine[n].split("-")[0] in tutorial1 and sum(hamming(window[n], b) <= 1 for b in tutorial1) > 1)
+    check(outside + two == len(unmux_only),
+          f"each read only unmux calls has a round-1 barcode outside the tutorial's lists or two within reach ({outside}, {two}, {len(unmux_only)})")
+    other_only = [n for n in mine if theirs[n] and not mine[n]]
+    check(all(theirs[n].split("-")[0] not in library1 and min(hamming(window[n], b) for b in library1) > 1 for n in other_only),
+          "each read only splitcode calls holds a tutorial round-1 barcode more than one substitution from this library's")
+    exact = sum(1 for n in other_only if window[n] == theirs[n].split("-")[0])
+    differ = [n for n in mine if mine[n] and theirs[n] and mine[n] != theirs[n]]
+    check(all(mine[n].split("-")[1:] == theirs[n].split("-")[1:] and theirs[n].split("-")[0] not in library1 for n in differ),
+          "the calls that differ differ in round 1, where splitcode takes a tutorial barcode")
+    differ_exact = sum(1 for n in differ if window[n] == theirs[n].split("-")[0])
+    tutorial = concord(f"{version}, tutorial files", mine, theirs,
+                       f"{shared} of the tutorial's {len(tutorial1)} round-1 barcodes are this library's")
+    library = concord(f"{version}, this library's lists", mine, runs["library"], "")
+    check(library["different"] == library["unmux"] == library["other"] == 0, "with this library's lists, splitcode makes unmux's calls")
+    settings = "\n".join([
+        "| splitcode | unmux |",
+        "| --- | --- |",
+        "| tag files such as `r1_R.txt$`, one tag per line, in group `round1` | `--group \"round1=round1.tags.txt\"`, one tag file for both primers |",
+        "| `distances` 1 | `dist=1` |",
+        "| `locations` 1,78,86 | `loc=1:78:86` |",
+        "| `minFindsG` 1 for round 1, and 2 for rounds 2 and 3 together | `minFindsPerGroup=1` on each round |",
+        "| `@extract 1:0<umi[10]>` | `--extract \"umi=1:0:10\"` and `--tag \"RX=umi\"` |",
+        "| `@extract <output_R2{*}>`, the corrected tags stitched together | `--tag \"CB=bc1+bc2+bc3\"` |",
+        "| `--select=0`, writing R1 only | `--template \"cdna\"` |",
+        "| `--min-delta` | `mode=nearest`, with `delta` |",
+        "| `--keep-grp`, files of tag-group arrangements to keep | `--sample-sheet` |",
+        f"| `--subs`, such as to turn R barcodes into T barcodes | a `match=` group with a column, as in {ref('match')} |",
+        "| `--revcomp` | `bothStrands=true` |",
+        "| `next` and `previous`, with the bases between | `next=` |",
+        "| `--partial5` and `--partial3` | `partial5` and `partial3` |",
+        "| `--qtrim` and `--filter-len` | no equivalent |",
+        "| `--assign` and `--mapping`, an ID for each combination of tags | no equivalent |",
+    ])
+    blocks = [
+        f"**Compared with {version}.** splitcode's SPLiT-seq tutorial "
+        f"({link('tutorials_splitseq.rst', ctx.sources[('splitcode', 'tutorials_splitseq.rst')].url)}) uses "
+        "the same layout as this command: rounds 1, 2 and 3 at R2 bases 78 to 86, 48 to 56 and 10 to 18, "
+        "one substitution, and the UMI in R2's first 10 bases. Its config.txt for barcode reformatting, "
+        f"with its barcode files ({source_links(ctx, ('splitcode', 'r1_R.txt'), ('splitcode', 'r1_T.txt'), ('splitcode', 'r2_r3.txt'))}):",
+        fence(config, "text"),
+        fence(SPLITCODE_COMMAND, "bash"),
+        "As the tutorial gives the command, with one `-o` file, splitcode 0.31.6 stops with "
+        "`Error: Incorrect number of output files`, since it counts the `-o` files against `--nFastqs` "
+        "even with `--select=0`. A second name, whose file stays empty, is the only change. The file "
+        "output_R2.fastq.gz then holds each kept read's corrected rounds 3, 2 and 1.",
+        f"The tutorial's round-1 files hold {fmt(len(tutorial1))} barcodes, of which {shared} are among "
+        f"the {len(library1)} of this library's list, while its round-2 and round-3 file is this "
+        "library's list. A second run keeps the configuration and puts this library's oligo-dT and "
+        "random-hexamer barcodes in r1_T.txt and r1_R.txt:",
+        fence(SPLITCODE_LISTS, "bash"),
+        "Per read, against unmux:",
+        agreement_table("splitcode", [("tutorial files", tutorial), ("this library's lists", library)]),
+        f"With this library's lists, splitcode makes unmux's call on every read: {fmt(library['same'])} "
+        f"with a CB and {fmt(library['neither'])} with none. With the tutorial's files, of the "
+        f"{fmt(len(unmux_only))} reads only unmux calls, {fmt(outside)} have a round-1 barcode outside "
+        "the tutorial's lists" + (f" and {fmt(two)} have round-1 bases within one substitution of two of "
+                                  "its barcodes" if two else "")
+        + f"; the {fmt(len(other_only))} only splitcode calls hold one of the tutorial's round-1 "
+        f"barcodes, {fmt(exact)} of them exactly, more than one substitution from any of this "
+        f"library's; and the {fmt(len(differ))} calls that differ agree on rounds 2 and 3, while round 1 "
+        "is one substitution from this library's barcode and "
+        + (f"is a tutorial barcode exactly in {fmt(differ_exact)}" if differ_exact else "within one of a tutorial barcode")
+        + ", which splitcode takes.",
+        "How unmux expresses splitcode's settings:",
+        settings,
+        "What splitcode does that unmux does not: it trims bases by quality and filters reads by length, "
+        "and it can give each combination of tags a short ID with a mapping file. It also nests "
+        "configurations and remultiplexes reads.",
+    ]
+    return blocks, [tutorial, library]
+
+
 def recipe_splitseq(ctx):
     w = ctx.workdir("09-splitseq")
     splitseq_inputs(ctx, w)
@@ -1673,6 +2038,10 @@ def recipe_splitseq(ctx):
     both = sum(1 for seqs in by_primer.values() if len(seqs) == 2)
     r2 = next(read_fastq(w / "R2.fastq.gz"))
     reads = len(oracle)
+    mine = dict.fromkeys(oracle)
+    for fields, tags in records:
+        mine[fields[0]] = tags["CB"]
+    splitcode_blocks, splitcode_rows = splitcode_comparison(ctx, w, mine)
     return Recipe("Single cell", "SPLiT-seq barcodes in three rounds", [
         "Use this for split-pool data such as SPLiT-seq, where the cell barcode is three 8 bp "
         "barcodes, one per round of barcoding, separated by fixed linkers in R2. This is the "
@@ -1708,7 +2077,8 @@ def recipe_splitseq(ctx):
                         "them through a cell list."),
         callout("NOTE", "Without `--pool`, the pool is the common stem of the input names, here `R` "
                         "from R1 and R2, so every record gets `RG:Z:R`; add `--pool` to set it."),
-    ])
+        *splitcode_blocks,
+    ], splitcode_rows)
 
 
 MATCH_COMMAND = """unmux R1.fastq.gz R2.fastq.gz \\
@@ -1906,12 +2276,14 @@ def recipe_nanopore(ctx):
     counts = ctx.sh(w, counts_cmd)
     reads = {name: seq for name, seq, _ in records}
     correct = wrong = 0
+    calls = {}
     cut = []
     for path in sorted((w / "demux").glob("NB*.fastq.gz")):
         sample = path.name.split(".")[0]
         for name, seq, _ in read_fastq(path):
             correct += origin[name] == sample
             wrong += origin[name] != sample
+            calls[name] = sample
             start = reads[name].find(seq)
             check(start >= 0, f"{name}: the trimmed read is part of the read")
             cut.append((start, len(reads[name]) - start - len(seq)))
@@ -1940,6 +2312,8 @@ def recipe_nanopore(ctx):
     check(bool(left_out) and all(tag in left_out for tag in per_base), "unmux warns which per-base tags it left out")
     warn, listed = pair_warnings(run.err)
     check(listed > 0 and "window" not in warn, "unmux warns about tag pairs and not about the windows")
+    row = concord("the run each read came from", {n: calls.get(n) for n in origin}, origin,
+                  f"reads left unclassified ({fmt(unclassified)})")
     return Recipe("Long reads", "Nanopore native barcodes at both ends", [
         "Use this to demultiplex Nanopore reads from a native barcoding kit, where each read starts "
         "with the barcode and ends with its reverse complement, trimming the barcodes off.",
@@ -1987,7 +2361,7 @@ def recipe_nanopore(ctx):
                            "leaves them out of a record that does not copy its read exactly, with one "
                            "warning for the run. Demultiplex without a template to keep the "
                            "modification calls; the barcodes then stay in the reads."),
-    ])
+    ], [row])
 
 
 PACBIO_PREP = """samtools view -h prefix.bam 2> /dev/null | samtools view -b -o hifi_reads.bam -
@@ -2125,6 +2499,8 @@ def recipe_pacbio(ctx):
     missing_text = ("" if not missing else
                     f"One read, of {len(reads[missing[0]])} bases, is missing from lima's report." if len(missing) == 1 else
                     f"{fmt(len(missing))} reads are missing from lima's report.")
+    row = concord(lima_version, {z: unmux_calls.get(z) for z in reads}, {z: lima.get(z) for z in reads},
+                  f"lima's score filter ({fmt(len(unmux_only))}); one end beyond unmux's budget ({fmt(len(lima_only))})")
     return Recipe("Long reads", "PacBio barcode pairs, compared with lima", [
         "Use this to demultiplex PacBio HiFi reads that still carry their barcodes, one at each end, "
         "as lima does, here with a different barcode at each end of a sample's amplicons.",
@@ -2166,7 +2542,7 @@ def recipe_pacbio(ctx):
         modes,
         callout("NOTE", f"Both tools keep the tags PacBio wrote ({', '.join(pacbio_tags)}) on the reads "
                         "they clip, and lima adds its own. unmux sets RG to the sample's read group."),
-    ])
+    ], [row])
 
 
 def recipe_direct_rna(ctx):
@@ -2187,7 +2563,7 @@ def recipe_direct_rna(ctx):
     text = ctx.sh(w, text_cmd)
     seq_in = next(read_fastq(w / "direct_rna.fastq"))[1]
     rec = sam_records(ctx, w, "direct_rna.bam")[0]
-    assert rec[0][9] == seq_in.replace("U", "T")
+    check(rec[0][9] == seq_in.replace("U", "T"), "the BAM record holds the read with T for U")
     ctx.sh(w, "samtools import -0 direct_rna.fastq -o samtools.bam")
     check(sam_records(ctx, w, "samtools.bam")[0][0][9] == rec[0][9], "BAM bases equal samtools import's")
     probe = revcomp(seq_in[100:124].replace("U", "T"))
@@ -2231,13 +2607,15 @@ def recipe_comment_tags(ctx):
     view = ctx.sh(w, view_cmd)
     original = sam_records(ctx, w, "modbam.unmapped.bam")
     back = sam_records(ctx, w, "modbam.roundtrip.bam")
-    assert len(original) == len(back)
+    check(len(original) == len(back), "the round trip keeps every record")
     for (fa, ta), (fb, tb) in zip(original, back):
-        assert fa[0] == fb[0] and fa[9] == fb[9] and fa[10] == fb[10]
-        assert {k: v for k, v in ta.items() if k != "RG"} == {k: v for k, v in tb.items() if k != "RG"}
-        assert tb["RG"] == "modbam" != ta["RG"]
+        check(fa[0] == fb[0] and fa[9] == fb[9] and fa[10] == fb[10], f"{fa[0]}: the name, bases and qualities survive the round trip")
+        check({k: v for k, v in ta.items() if k != "RG"} == {k: v for k, v in tb.items() if k != "RG"},
+              f"{fa[0]}: every tag but RG survives the round trip")
+        check(tb["RG"] == "modbam" != ta["RG"], f"{fa[0]}: RG is the new pool's read group")
     ctx.sh(w, "unmux modbam.unmapped.bam --out direct.bam")
-    assert all("NM" not in t and "MD" not in t for _, t in sam_records(ctx, w, "direct.bam"))
+    check(all("NM" not in t and "MD" not in t for _, t in sam_records(ctx, w, "direct.bam")),
+          "read from BAM directly, the records drop NM and MD")
     return Recipe("Long reads", "Lift SAM tags from FASTQ comments back onto records", [
         "Use this when reads went through FASTQ with their SAM tags in the name comment, as "
         "`samtools fastq -T` and basecallers write them, and the tags, MM and ML among them, should "
@@ -2471,32 +2849,6 @@ def recipe_wide(ctx):
     ])
 
 
-def recipe_refuse_input(ctx):
-    w = ctx.workdir("19-refuse-input")
-    place(ctx.fetch("sra-SRR390728", "SRR390728_1.fastq"), w / "SRR390728_1.fastq.gz")
-    command = 'unmux SRR390728_1.fastq.gz \\\n  --extract "trimmed=0:10:end" --template trimmed \\\n  --out "%pool.fastq.gz"'
-    error = refused(ctx, w, command, 'output "SRR390728_1.fastq.gz" (--out) is input 0', snapshot(w))
-    return Recipe("Refusals that protect data", "An output over an input", [
-        f"The pool placeholder expands to the input's stem, so this command on the reads of "
-        f"{ref('fastq_to_ubam')}, meant to write a trimmed copy, would write over its own input:",
-        fence(command, "bash"),
-        fence(error, "text"),
-        "unmux compares every output, bins and metrics files included, with every file it reads "
-        "under any name (inputs, tag files, the sample sheet, the reference), before it writes "
-        "anything. The generator checks the exit status, the message, and that the input is "
-        "unchanged.",
-    ])
-
-
-def refusal_inputs(ctx, w):
-    source = ctx.cache / "work" / "05-uditas"
-    for name in ("Undetermined_S0_L001_R1_001.fastq.gz", "Undetermined_S0_L001_R2_001.fastq.gz",
-                 "Undetermined_S0_L001_I1_001.fastq.gz", "Undetermined_S0_L001_I2_001.fastq.gz",
-                 "samples.tsv", "i7.tsv", "i5.tsv"):
-        shutil.copyfile(source / name, w / name)
-    return snapshot(w)
-
-
 def snapshot(w):
     return {p.relative_to(w).as_posix(): sha256(p) if p.is_file() else "directory" for p in sorted(w.rglob("*"))}
 
@@ -2509,56 +2861,6 @@ def refused(ctx, w, command, expected, before):
     return error
 
 
-def recipe_refuse_tag(ctx):
-    w = ctx.workdir("20-refuse-tag")
-    before = refusal_inputs(ctx, w)
-    command = UDITAS_COMMAND.replace(
-        '--extract "umi=3:8:end" \\\n', '--extract "umi=3:8:end" \\\n  --extract "b7=2:0:8" --extract "b5=3:0:8" \\\n').replace(
-        '  --tag "RX=umi" \\\n', '  --tag "BC=b7+b5" \\\n  --tag "RX=umi" --tag "RX::qual=QT" \\\n')
-    error = refused(ctx, w, command, "tag `QT` would be written twice", before)
-    return Recipe("Refusals that protect data", "Two writers for one SAM tag", [
-        f"The UDiTaS command of {ref('uditas')}, with the index bases added as BC and the UMI "
-        "qualities sent to QT by mistake:",
-        fence(command, "bash"),
-        fence(error, "text"),
-        "QT is already the default quality tag of BC, so one would overwrite the other. Each "
-        "binding, its quality tag and `--qc-tag` must write a different tag, and RG is reserved "
-        "for the read group. The one exception is CB and CR, which share their default CY as the "
-        "SAM spec pairs them. The generator checks the exit status, the message, and that no file "
-        "changed.",
-    ])
-
-
-REFUSE_BIN_COMMAND = """unmux Undetermined_S0_L001_R1_001.fastq.gz Undetermined_S0_L001_R2_001.fastq.gz \\
-  Undetermined_S0_L001_I1_001.fastq.gz Undetermined_S0_L001_I2_001.fastq.gz \\
-  --group "i7=i7.tsv" --group "i7::loc=2:0:8,dist=1" \\
-  --group "i5=i5.tsv" --group "i5::loc=3:0:8,dist=1" \\
-  --extract "r1=0:0:end" --extract "r2=1:0:end" \\
-  --template r1 r2 \\
-  --sample "N701_N504=i7::N701+i5::N504" \\
-  --out "N701_N504.R%ordinal.fastq.gz" \\
-  --unassigned "N701_N504.R%source.fastq.gz\""""
-
-
-def recipe_refuse_bin(ctx):
-    w = ctx.workdir("21-refuse-bin")
-    before = refusal_inputs(ctx, w)
-    error = refused(ctx, w, REFUSE_BIN_COMMAND, 'outputs "N701_N504.R1.fastq.gz" (sample N701_N504) and '
-                                                '"N701_N504.R1.fastq.gz" (--unassigned) are the same file', before)
-    return Recipe("Refusals that protect data", "A bin that shares a sample's file", [
-        f"Pulling one sample out of the UDiTaS run of {ref('uditas')} and setting the rest beside it, "
-        "with names that look alike:",
-        fence(REFUSE_BIN_COMMAND, "bash"),
-        fence(error, "text"),
-        "The `%ordinal` placeholder counts reads of a template from 1, while `%source` counts input "
-        "files from 0, so the unassigned reads of input 1 (R2) would be written into the sample's R1 "
-        "file. unmux expands every pattern for every sample and refuses the run before writing; the "
-        "generator checks the exit status, the message, and that no file changed.",
-        callout("TIP", "To keep unassigned reads in the sample's own files on purpose, pass the "
-                       "`--out` pattern itself: `--unassigned \"N701_N504.R%ordinal.fastq.gz\"`."),
-    ])
-
-
 SECTIONS = {
     "Conversions": "Format conversions with nothing to demultiplex: unmux as a converter between FASTQ, SAM and BAM, compared with samtools.",
     "Illumina demultiplexing": "Short-read runs split by index reads or inline barcodes, with reads of known origin so each result can be scored.",
@@ -2566,7 +2868,6 @@ SECTIONS = {
     "Single cell": "Cell barcodes and UMIs into SAM tags, from 10x Chromium, split-pool and antibody-tag libraries.",
     "Long reads": "Nanopore and PacBio reads: barcodes at both ends, U bases, and tags carried in FASTQ comments.",
     "Diagnostics": "Ways to see what a run did and why.",
-    "Refusals that protect data": "",
 }
 
 
@@ -2599,6 +2900,7 @@ def render(ctx, recipes):
         number += 1
         sections[-1][1].append((number, recipe))
         anchors[recipe.key] = f"[recipe {number}](#{slug(f'{number}. {recipe.title}')})"
+    lines.append("- [Concordance at a glance](#concordance-at-a-glance)")
     for section, items in sections:
         lines.append(f"- [{section}](#{slug(section)})")
         for n, recipe in items:
@@ -2606,14 +2908,27 @@ def render(ctx, recipes):
             lines.append(f"  - [{title}](#{slug(title)})")
     lines.append("- [Data sources](#data-sources)")
     lines.append("- [Regenerating this page](#regenerating-this-page)")
+    lines += ["", "## Concordance at a glance", "",
+              "Each row counts, read by read, how unmux's calls compare with another tool's or with the "
+              "truth, from the same results its recipe checks. A call is the sample, cell barcode or record "
+              "each side gives a read, and a read pair counts once.", "",
+              "| Recipe | Compared with | Reads compared | Same call | Different call | unmux only | Other only "
+              "| Neither | Agreement | Main reason for differences |",
+              "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |"]
+    for section, items in sections:
+        for n, recipe in items:
+            for row in recipe.concordance:
+                clean = row["different"] == row["unmux"] == row["other"] == 0
+                note = ("none" + (f"; {row['note']}" if row["note"] else "")) if clean else row["note"]
+                cells = [f"[{n}](#{slug(f'{n}. {recipe.title}')})", row["with"], fmt(row["reads"]),
+                         *(fmt(row[kind]) for kind in CONCORDANCE), agreement(row), note]
+                lines.append("| " + " | ".join(cells) + " |")
+    lines += ["", "Agreement is the share of same calls among the reads that at least one side calls; reads "
+              "that neither calls are left out of it.", ""]
     for section, items in sections:
         lines += ["", f"## {section}", ""]
         if SECTIONS.get(section):
             lines += [SECTIONS[section], ""]
-        if section == "Refusals that protect data":
-            lines += [callout("CAUTION", "Each command in this section is a mistake. unmux refuses it before "
-                                         "reading a record or writing a file, exits with status 1, and "
-                                         "leaves every file as it was."), ""]
         for n, recipe in items:
             lines += [f"### {n}. {recipe.title}", ""]
             for block in recipe.blocks:
@@ -2632,12 +2947,12 @@ def render(ctx, recipes):
     lines += ["", "## Regenerating this page", "",
               "One command fetches the inputs into `docs/recipes/cache/`, builds unmux, runs every "
               "recipe with its checks, and rewrites this page. It needs Python 3, samtools 1.16 or "
-              "newer, fg-sra and, for the lima comparison, Docker.", "",
+              "newer, fg-sra, fqtk, splitcode and, for the lima comparison, Docker.", "",
               fence("make -C docs/recipes            # fetch, build, run, and write docs/recipes.md\n"
                     "make -C docs/recipes check      # fail if the page would change\n"
                     "make -C docs/recipes run UNMUX=/path/to/unmux", "bash"),
               "", "The targets are `fetch`, `run`, `page`, `check` and `clean`, and the variables "
-              "`SAMTOOLS`, `FG_SRA` and `LIMA` give other ways to run those tools, for example "
+              "`SAMTOOLS`, `FG_SRA`, `FQTK`, `SPLITCODE` and `LIMA` give other ways to run those tools, for example "
               "`SAMTOOLS=\"pixi exec -c conda-forge -c bioconda -s samtools samtools\"`.", ""]
     page = re.sub(r"\n{3,}", "\n\n", "\n".join(lines))
     return re.sub("\x00([a-z_]+)\x00", lambda m: anchors.get(m.group(1), f"recipe {m.group(1)}"), page)
@@ -2666,11 +2981,7 @@ RECIPES = [
     recipe_metrics,
     recipe_collision,
     recipe_wide,
-    recipe_refuse_input,
-    recipe_refuse_tag,
-    recipe_refuse_bin,
 ]
-
 
 
 def run_recipes(ctx, only=None):
@@ -2682,7 +2993,7 @@ def run_recipes(ctx, only=None):
         print(f"running {key}", file=sys.stderr)
         try:
             result = recipe(ctx)
-        except (CheckFailed, AssertionError) as error:
+        except CheckFailed as error:
             frame = traceback.extract_tb(error.__traceback__)[-1]
             detail = str(error) or frame.line
             raise SystemExit(f"recipe {key} failed a check at generate.py:{frame.lineno}: {detail}")
@@ -2700,6 +3011,8 @@ def main():
     parser.add_argument("--samtools", default=os.environ.get("SAMTOOLS", "samtools"))
     parser.add_argument("--fg-sra", default=os.environ.get("FG_SRA", "fg-sra"))
     parser.add_argument("--lima", default=os.environ.get("LIMA", "lima"))
+    parser.add_argument("--fqtk", default=os.environ.get("FQTK", "fqtk"))
+    parser.add_argument("--splitcode", default=os.environ.get("SPLITCODE", "splitcode"))
     parser.add_argument("--cache", type=Path, default=ROOT / "docs" / "recipes" / "cache")
     parser.add_argument("--only", default="", help="with run: a comma-separated list of recipes to run")
     parser.add_argument("--print-pins", action="store_true",
@@ -2711,15 +3024,13 @@ def main():
     only = [k for k in args.only.split(",") if k]
     if only and args.action != "run":
         raise SystemExit("--only works with run, since a page needs every recipe")
-    if not __debug__:
-        raise SystemExit("run without -O: the recipe checks are assert statements")
     args.cache.mkdir(parents=True, exist_ok=True)
     unmux = None
     if args.action != "fetch":
         unmux = args.unmux.resolve()
         if not unmux.exists():
             raise SystemExit(f"{unmux} does not exist; build it with `cargo build --release`")
-    tools = {"samtools": args.samtools, "fg-sra": args.fg_sra, "lima": args.lima}
+    tools = {"samtools": args.samtools, "fg-sra": args.fg_sra, "lima": args.lima, "fqtk": args.fqtk, "splitcode": args.splitcode}
     ctx = Context(args.cache.resolve(), unmux, tools)
     for source in SOURCES:
         ctx.fetch(source.key, source.name)

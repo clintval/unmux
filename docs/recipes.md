@@ -9,6 +9,7 @@ Commands are bash and run in a directory that holds their inputs. Log lines appe
 
 ## Contents
 
+- [Concordance at a glance](#concordance-at-a-glance)
 - [Conversions](#conversions)
   - [1. Paired FASTQ to an unmapped BAM](#1-paired-fastq-to-an-unmapped-bam)
   - [2. Unmapped BAM back to paired FASTQ](#2-unmapped-bam-back-to-paired-fastq)
@@ -37,12 +38,32 @@ Commands are bash and run in a directory that holds their inputs. Log lines appe
   - [20. Read the metrics files](#20-read-the-metrics-files)
   - [21. The tag-collision check](#21-the-tag-collision-check)
   - [22. Search windows wider than their tags](#22-search-windows-wider-than-their-tags)
-- [Refusals that protect data](#refusals-that-protect-data)
-  - [23. An output over an input](#23-an-output-over-an-input)
-  - [24. Two writers for one SAM tag](#24-two-writers-for-one-sam-tag)
-  - [25. A bin that shares a sample's file](#25-a-bin-that-shares-a-samples-file)
 - [Data sources](#data-sources)
 - [Regenerating this page](#regenerating-this-page)
+
+## Concordance at a glance
+
+Each row counts, read by read, how unmux's calls compare with another tool's or with the truth, from the same results its recipe checks. A call is the sample, cell barcode or record each side gives a read, and a read pair counts once.
+
+| Recipe | Compared with | Reads compared | Same call | Different call | unmux only | Other only | Neither | Agreement | Main reason for differences |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| [1](#1-paired-fastq-to-an-unmapped-bam) | samtools import | 2,000 | 2,000 | 0 | 0 | 0 | 0 | 100% | none; MAPQ (255 against 0) and the tags left out |
+| [2](#2-unmapped-bam-back-to-paired-fastq) | samtools fastq -T RG | 2,000 | 2,000 | 0 | 0 | 0 | 0 | 100% | none; samtools' tab before the tags read as a space |
+| [3](#3-what-plain-sam-or-bam-pass-through-keeps-and-changes) | samtools reset | 2 | 2 | 0 | 0 | 0 | 0 | 100% | none; MAPQ and the tags left out |
+| [4](#4-split-an-aligned-bam-by-read-group) | samtools split | 17 | 17 | 0 | 0 | 0 | 0 | 100% | none; headers aside |
+| [5](#5-join-read-pairs-end-to-end-for-change-seq) | mergeReads() of CHANGE-seq | 3,406 | 3,406 | 0 | 0 | 0 | 0 | 100% | none |
+| [6](#6-dual-index-demultiplexing-with-a-sample-sheet) | UDiTaS's demultiplex() rules | 20,000 | 20,000 | 0 | 0 | 0 | 0 | 100% | none |
+| [6](#6-dual-index-demultiplexing-with-a-sample-sheet) | fqtk 0.5.0 | 20,000 | 20,000 | 0 | 0 | 0 | 0 | 100% | none; with `--max-mismatches 2 --min-mismatch-delta 1` |
+| [7](#7-undetermined-reads-and-a-phix-bin) | the run of each pair, and the UDiTaS rules within fig2b | 27,000 | 19,997 | 0 | 0 | 3 | 7,000 | 99.98% | fig2b pairs that match the PhiX k-mers (3) |
+| [8](#8-inline-barcodes-into-unmapped-bams) | the run each read came from | 8,000 | 8,000 | 0 | 0 | 0 | 0 | 100% | none |
+| [8](#8-inline-barcodes-into-unmapped-bams) | fqtk 0.5.0 | 8,000 | 8,000 | 0 | 0 | 0 | 0 | 100% | none; with `--max-mismatches 1 --min-mismatch-delta 1` |
+| [11](#11-10x-chromium-cell-barcodes-and-umis) | the whole 10x keeplist | 100,000 | 97,291 | 0 | 0 | 0 | 2,709 | 100% | none |
+| [12](#12-split-seq-barcodes-in-three-rounds) | splitcode 0.31.6, tutorial files | 10,000 | 3,473 | 6 | 3,637 | 211 | 2,673 | 47.40% | 43 of the tutorial's 192 round-1 barcodes are this library's |
+| [12](#12-split-seq-barcodes-in-three-rounds) | splitcode 0.31.6, this library's lists | 10,000 | 7,116 | 0 | 0 | 0 | 2,884 | 100% | none |
+| [15](#15-nanopore-native-barcodes-at-both-ends) | the run each read came from | 4,800 | 4,748 | 0 | 0 | 52 | 0 | 98.91% | reads left unclassified (52) |
+| [16](#16-pacbio-barcode-pairs-compared-with-lima) | lima 26.2.1 | 1,922 | 1,253 | 0 | 11 | 8 | 650 | 98.50% | lima's score filter (11); one end beyond unmux's budget (8) |
+
+Agreement is the share of same calls among the reads that at least one side calls; reads that neither calls are left out of it.
 
 ## Conversions
 
@@ -435,6 +456,61 @@ M03958:36:000000000-B85D5:1:1101:9738:1064	141	RX:Z:GCTTCGGTTA	QX:Z:GGGGGGGGGG	R
 > [!NOTE]
 > UDiTaS writes the UMI with low-quality bases masked to N. unmux writes the bases as read and their qualities to QX, so a later step can weigh them.
 
+**Compared with fqtk 0.5.0.** fqtk reads each read's barcodes from fixed positions given as read structures, and each sample's i7 and i5 joined in one `barcode` column:
+
+```bash
+awk 'BEGIN { print "sample_id\tbarcode" } FNR == 1 { next }
+  FILENAME == "i7.tsv" { i7[$1] = $2; next } FILENAME == "i5.tsv" { i5[$1] = $2; next }
+  { print $1 "\t" i7[$2] i5[$3] }' i7.tsv i5.tsv samples.tsv > fqtk.samples.tsv
+head -n 3 fqtk.samples.tsv
+```
+
+```tsv
+sample_id	barcode
+N701_N504	ATTCCGCTAGAGTAGA
+N702_N504	GCATGATCAGAGTAGA
+```
+
+```bash
+fqtk demux \
+  --inputs Undetermined_S0_L001_R1_001.fastq.gz Undetermined_S0_L001_R2_001.fastq.gz \
+    Undetermined_S0_L001_I1_001.fastq.gz Undetermined_S0_L001_I2_001.fastq.gz \
+  --read-structures +T +T 8B 8B+M \
+  --sample-metadata fqtk.samples.tsv \
+  --max-mismatches 2 --min-mismatch-delta 1 \
+  --umi-in-name false \
+  --output fqtk
+```
+
+fqtk counts mismatches over the joined barcode, where unmux gives each index a budget of its own, so `--max-mismatches 2` admits one mismatch in each index, and `--min-mismatch-delta 1` takes the best sample when it beats the next by one; with `--umi-in-name false` the read names stay as they are, so each read can be matched with unmux's. Per read, against unmux:
+
+| Reads | these settings | fqtk's defaults |
+| --- | ---: | ---: |
+| Same call from both | 20,000 | 19,828 |
+| Different calls | 0 | 0 |
+| A call from unmux only | 0 | 172 |
+| A call from fqtk only | 0 | 0 |
+| No call from either | 0 | 0 |
+
+With these settings fqtk makes unmux's call on all 20,000 reads. They would also admit two mismatches in one index, which unmux does not; no read here has that. With fqtk's defaults, one mismatch and a lead of two, the 172 reads with a mismatch in each index are left unmatched.
+
+How unmux expresses fqtk's settings:
+
+| fqtk | unmux |
+| --- | --- |
+| `--read-structures`, with `B` for the barcode bases of each read | a group's `loc`, such as `i7::loc=2:0:8` |
+| `--sample-metadata`, each sample's barcodes joined | `--sample-sheet`, a column per group, and a tag file per group |
+| `--max-mismatches`, over all the barcode bases | `dist`, for each group |
+| `--min-mismatch-delta` | `mode=nearest`, with `delta` |
+| `M` segments, the UMI | `--extract` and `--tag "RX=umi"` |
+| `T` segments, written to one FASTQ per sample and read | `--template` and `--out` |
+| `--unmatched-prefix` | `--unassigned` |
+| `demux-metrics.txt` | `--metrics-per-sample` and `--metrics-summary` |
+| IUPAC codes in expected barcodes | IUPAC codes in tags |
+| `--header-format illumina` and `--umi-in-name` | no equivalent |
+
+What fqtk does that unmux does not: it can write FASTQ headers in the bcl2fastq style, with the sample barcode in the comment and the UMI in the read name. unmux writes tags such as BC and RX as SAM tags instead, in the record or in the FASTQ comment.
+
 ### 7. Undetermined reads and a PhiX bin
 
 Use this to keep the reads that match no sample, the way `bcl-convert` writes Undetermined files, and to move spike-in reads such as PhiX into a bin of their own.
@@ -568,6 +644,28 @@ All 8,000 reads went to their run's sample and none to a wrong one; 8,000 carry 
 
 > [!TIP]
 > With `dist=0`, 7,829 reads are assigned and the 171 with a substitution in the barcode are not.
+
+**Compared with fqtk 0.5.0.** The same pool through fqtk, with one mismatch, as `dist=1` allows, and a lead of one over the next barcode; [recipe 6](#6-dual-index-demultiplexing-with-a-sample-sheet) gives how its settings map to unmux's:
+
+```bash
+awk 'BEGIN { print "sample_id\tbarcode" } NR > 1 { print $1 "\t" $2 }' barcodes.tsv > fqtk.samples.tsv
+fqtk demux \
+  --inputs pool.fastq.gz \
+  --read-structures 5B+T \
+  --sample-metadata fqtk.samples.tsv \
+  --max-mismatches 1 --min-mismatch-delta 1 \
+  --output fqtk
+```
+
+| Reads | fqtk |
+| --- | ---: |
+| Same call from both | 8,000 |
+| Different calls | 0 |
+| A call from unmux only | 0 |
+| A call from fqtk only | 0 |
+| No call from either | 0 |
+
+fqtk makes unmux's call on all 8,000 reads. It reads the barcode from a fixed read structure and has no check like the `site` group's; every read here has the remnant, so that check changes no call.
 
 ## UMIs and duplex sequencing
 
@@ -884,6 +982,65 @@ The warning is expected: this command tags reads and does not split them by samp
 
 > [!NOTE]
 > Without `--pool`, the pool is the common stem of the input names, here `R` from R1 and R2, so every record gets `RG:Z:R`; add `--pool` to set it.
+
+**Compared with splitcode 0.31.6.** splitcode's SPLiT-seq tutorial ([tutorials_splitseq.rst](https://raw.githubusercontent.com/pachterlab/splitcode-tutorial/68387770995199a9ac4ccadc25ee2f8e96cd24be/docs/source/tutorials_splitseq.rst)) uses the same layout as this command: rounds 1, 2 and 3 at R2 bases 78 to 86, 48 to 56 and 10 to 18, one substitution, and the UMI in R2's first 10 bases. Its config.txt for barcode reformatting, with its barcode files ([r1_R.txt](https://raw.githubusercontent.com/pachterlab/splitcode-tutorial/68387770995199a9ac4ccadc25ee2f8e96cd24be/uploads/splitseq/r1_R.txt), [r1_T.txt](https://raw.githubusercontent.com/pachterlab/splitcode-tutorial/68387770995199a9ac4ccadc25ee2f8e96cd24be/uploads/splitseq/r1_T.txt), [r2_r3.txt](https://raw.githubusercontent.com/pachterlab/splitcode-tutorial/68387770995199a9ac4ccadc25ee2f8e96cd24be/uploads/splitseq/r2_r3.txt)):
+
+```text
+@extract <output_R2{*}>,1:0<umi[10]>
+tags         distances  ids     groups    minFindsG	locations
+r1_R.txt$    1          r1_R    round1    1          1,78,86
+r1_T.txt$    1          r1_T    round1    1          1,78,86
+r2_r3.txt$   1          r2      round2_3  2          1,48,56
+r2_r3.txt$   1          r3      round2_3  2          1,10,18
+```
+
+```bash
+splitcode -c config.txt --nFastqs=2 --select=0 \
+--gzip -o output_R1.fastq.gz,unused_R2.fastq.gz R1.fastq.gz R2.fastq.gz
+```
+
+As the tutorial gives the command, with one `-o` file, splitcode 0.31.6 stops with `Error: Incorrect number of output files`, since it counts the `-o` files against `--nFastqs` even with `--select=0`. A second name, whose file stays empty, is the only change. The file output_R2.fastq.gz then holds each kept read's corrected rounds 3, 2 and 1.
+
+The tutorial's round-1 files hold 192 barcodes, of which 43 are among the 96 of this library's list, while its round-2 and round-3 file is this library's list. A second run keeps the configuration and puts this library's oligo-dT and random-hexamer barcodes in r1_T.txt and r1_R.txt:
+
+```bash
+awk -F , '$1 < 48 { print $2 }' bc_8nt_v2.csv > r1_T.txt
+awk -F , '$1 >= 48 { print $2 }' bc_8nt_v2.csv > r1_R.txt
+```
+
+Per read, against unmux:
+
+| Reads | tutorial files | this library's lists |
+| --- | ---: | ---: |
+| Same call from both | 3,473 | 7,116 |
+| Different calls | 6 | 0 |
+| A call from unmux only | 3,637 | 0 |
+| A call from splitcode only | 211 | 0 |
+| No call from either | 2,673 | 2,884 |
+
+With this library's lists, splitcode makes unmux's call on every read: 7,116 with a CB and 2,884 with none. With the tutorial's files, of the 3,637 reads only unmux calls, 3,628 have a round-1 barcode outside the tutorial's lists and 9 have round-1 bases within one substitution of two of its barcodes; the 211 only splitcode calls hold one of the tutorial's round-1 barcodes, 174 of them exactly, more than one substitution from any of this library's; and the 6 calls that differ agree on rounds 2 and 3, while round 1 is one substitution from this library's barcode and within one of a tutorial barcode, which splitcode takes.
+
+How unmux expresses splitcode's settings:
+
+| splitcode | unmux |
+| --- | --- |
+| tag files such as `r1_R.txt$`, one tag per line, in group `round1` | `--group "round1=round1.tags.txt"`, one tag file for both primers |
+| `distances` 1 | `dist=1` |
+| `locations` 1,78,86 | `loc=1:78:86` |
+| `minFindsG` 1 for round 1, and 2 for rounds 2 and 3 together | `minFindsPerGroup=1` on each round |
+| `@extract 1:0<umi[10]>` | `--extract "umi=1:0:10"` and `--tag "RX=umi"` |
+| `@extract <output_R2{*}>`, the corrected tags stitched together | `--tag "CB=bc1+bc2+bc3"` |
+| `--select=0`, writing R1 only | `--template "cdna"` |
+| `--min-delta` | `mode=nearest`, with `delta` |
+| `--keep-grp`, files of tag-group arrangements to keep | `--sample-sheet` |
+| `--subs`, such as to turn R barcodes into T barcodes | a `match=` group with a column, as in [recipe 13](#13-keep-the-reads-of-called-cells-with-a-joined-match) |
+| `--revcomp` | `bothStrands=true` |
+| `next` and `previous`, with the bases between | `next=` |
+| `--partial5` and `--partial3` | `partial5` and `partial3` |
+| `--qtrim` and `--filter-len` | no equivalent |
+| `--assign` and `--mapping`, an ID for each combination of tags | no equivalent |
+
+What splitcode does that unmux does not: it trims bases by quality and filters reads by length, and it can give each combination of tags a short ID with a mapping file. It also nests configurations and remultiplexes reads.
 
 ### 13. Keep the reads of called cells with a joined match
 
@@ -1614,79 +1771,6 @@ samtools view -c -d CB splitseq.unmapped.bam
 > [!WARNING]
 > Under `mode=nearest`, a read that ties between two tags of a round is still written, without the CB built from that round, though every round sets `minFindsPerGroup=1`; its `--qc-tag` lists only the rounds that matched. Keep only reads with a CB, for example with `samtools view -d CB`.
 
-## Refusals that protect data
-
-> [!CAUTION]
-> Each command in this section is a mistake. unmux refuses it before reading a record or writing a file, exits with status 1, and leaves every file as it was.
-
-### 23. An output over an input
-
-The pool placeholder expands to the input's stem, so this command on the reads of [recipe 1](#1-paired-fastq-to-an-unmapped-bam), meant to write a trimmed copy, would write over its own input:
-
-```bash
-unmux SRR390728_1.fastq.gz \
-  --extract "trimmed=0:10:end" --template trimmed \
-  --out "%pool.fastq.gz"
-```
-
-```text
-[ERROR unmux] output "SRR390728_1.fastq.gz" (--out) is input 0 (SRR390728_1.fastq.gz); give it a distinct path
-```
-
-unmux compares every output, bins and metrics files included, with every file it reads under any name (inputs, tag files, the sample sheet, the reference), before it writes anything. The generator checks the exit status, the message, and that the input is unchanged.
-
-### 24. Two writers for one SAM tag
-
-The UDiTaS command of [recipe 6](#6-dual-index-demultiplexing-with-a-sample-sheet), with the index bases added as BC and the UMI qualities sent to QT by mistake:
-
-```bash
-unmux Undetermined_S0_L001_R1_001.fastq.gz Undetermined_S0_L001_R2_001.fastq.gz \
-  Undetermined_S0_L001_I1_001.fastq.gz Undetermined_S0_L001_I2_001.fastq.gz \
-  --pool fig2b \
-  --group "i7=i7.tsv" --group "i7::loc=2:0:8,dist=1" \
-  --group "i5=i5.tsv" --group "i5::loc=3:0:8,dist=1" \
-  --extract "r1=0:0:end" --extract "r2=1:0:end" --extract "umi=3:8:end" \
-  --extract "b7=2:0:8" --extract "b5=3:0:8" \
-  --template r1 r2 \
-  --tag "BC=b7+b5" \
-  --tag "RX=umi" --tag "RX::qual=QT" \
-  --sample-sheet samples.tsv \
-  --rg-tag PL=ILLUMINA \
-  --out "bam/%sample.unmapped.bam" \
-  --metrics-per-sample metrics.per_sample.tsv
-```
-
-```text
-[ERROR unmux] tag `QT` would be written twice, as the default quality tag of `--tag BC=b7+b5` and by `--tag RX::qual=QT`; set `BC::qual=none` or `BC::qual=<TAG>`
-```
-
-QT is already the default quality tag of BC, so one would overwrite the other. Each binding, its quality tag and `--qc-tag` must write a different tag, and RG is reserved for the read group. The one exception is CB and CR, which share their default CY as the SAM spec pairs them. The generator checks the exit status, the message, and that no file changed.
-
-### 25. A bin that shares a sample's file
-
-Pulling one sample out of the UDiTaS run of [recipe 6](#6-dual-index-demultiplexing-with-a-sample-sheet) and setting the rest beside it, with names that look alike:
-
-```bash
-unmux Undetermined_S0_L001_R1_001.fastq.gz Undetermined_S0_L001_R2_001.fastq.gz \
-  Undetermined_S0_L001_I1_001.fastq.gz Undetermined_S0_L001_I2_001.fastq.gz \
-  --group "i7=i7.tsv" --group "i7::loc=2:0:8,dist=1" \
-  --group "i5=i5.tsv" --group "i5::loc=3:0:8,dist=1" \
-  --extract "r1=0:0:end" --extract "r2=1:0:end" \
-  --template r1 r2 \
-  --sample "N701_N504=i7::N701+i5::N504" \
-  --out "N701_N504.R%ordinal.fastq.gz" \
-  --unassigned "N701_N504.R%source.fastq.gz"
-```
-
-```text
-[ERROR unmux] outputs "N701_N504.R1.fastq.gz" (sample N701_N504) and "N701_N504.R1.fastq.gz" (--unassigned) are the same file; give them distinct paths
-```
-
-The `%ordinal` placeholder counts reads of a template from 1, while `%source` counts input files from 0, so the unassigned reads of input 1 (R2) would be written into the sample's R1 file. unmux expands every pattern for every sample and refuses the run before writing; the generator checks the exit status, the message, and that no file changed.
-
-> [!TIP]
-> To keep unassigned reads in the sample's own files on purpose, pass the `--out` pattern itself: `--unassigned "N701_N504.R%ordinal.fastq.gz"`.
-
 ## Data sources
 
 Every download is pinned: GitHub files by commit, SRA runs by accession and spot range, NCBI sequences by accession and version.
@@ -1712,6 +1796,10 @@ Every download is pinned: GitHub files by commit, SRA runs by accession and spot
 | PacBio pbAmpliconAnalysis_CYP2D6 HiFi reads before lima, first 10 MB | <https://downloads.pacbcloud.com/public/dataset/pbAmpliconAnalysis_CYP2D6/workflow_inputs/m64013e_210223_231140.hifi_reads.bam> |
 | PacBio CYP2D6 barcode pairs and samples | <https://downloads.pacbcloud.com/public/dataset/pbAmpliconAnalysis_CYP2D6/workflow_inputs/biosamples.csv> |
 | PacBio Sequel 96 barcodes v1 | <https://raw.githubusercontent.com/PacificBiosciences/hifi-amplicon-workflow/2964cd1fbddae04243d56914935881cca01f6d13/data/Sequel_96_barcodes_v1.fasta> |
+| splitcode tutorial: SPLiT-seq processing | <https://raw.githubusercontent.com/pachterlab/splitcode-tutorial/68387770995199a9ac4ccadc25ee2f8e96cd24be/docs/source/tutorials_splitseq.rst> |
+| splitcode tutorial round-1 random-hexamer barcodes | <https://raw.githubusercontent.com/pachterlab/splitcode-tutorial/68387770995199a9ac4ccadc25ee2f8e96cd24be/uploads/splitseq/r1_R.txt> |
+| splitcode tutorial round-1 oligo-dT barcodes | <https://raw.githubusercontent.com/pachterlab/splitcode-tutorial/68387770995199a9ac4ccadc25ee2f8e96cd24be/uploads/splitseq/r1_T.txt> |
+| splitcode tutorial round-2 and round-3 barcodes | <https://raw.githubusercontent.com/pachterlab/splitcode-tutorial/68387770995199a9ac4ccadc25ee2f8e96cd24be/uploads/splitseq/r2_r3.txt> |
 | SRA runs DRR021959 to DRR021990 of study DRP001067, spots 1 to 250 of each | <https://www.ncbi.nlm.nih.gov/bioproject/PRJDB2148> |
 | SRA run SRR13948565, spots 1,000,001 to 1,010,000 | <https://www.ncbi.nlm.nih.gov/sra/SRR13948565> |
 | GEO GSM5169184, the cells split-pipe called in SRR13948565 | <https://ftp.ncbi.nlm.nih.gov/geo/samples/GSM5169nnn/GSM5169184/suppl/GSM5169184_C2C12_short_1k_cell_metadata.csv.gz> |
@@ -1742,7 +1830,7 @@ Every download is pinned: GitHub files by commit, SRA runs by accession and spot
 
 ## Regenerating this page
 
-One command fetches the inputs into `docs/recipes/cache/`, builds unmux, runs every recipe with its checks, and rewrites this page. It needs Python 3, samtools 1.16 or newer, fg-sra and, for the lima comparison, Docker.
+One command fetches the inputs into `docs/recipes/cache/`, builds unmux, runs every recipe with its checks, and rewrites this page. It needs Python 3, samtools 1.16 or newer, fg-sra, fqtk, splitcode and, for the lima comparison, Docker.
 
 ```bash
 make -C docs/recipes            # fetch, build, run, and write docs/recipes.md
@@ -1750,4 +1838,4 @@ make -C docs/recipes check      # fail if the page would change
 make -C docs/recipes run UNMUX=/path/to/unmux
 ```
 
-The targets are `fetch`, `run`, `page`, `check` and `clean`, and the variables `SAMTOOLS`, `FG_SRA` and `LIMA` give other ways to run those tools, for example `SAMTOOLS="pixi exec -c conda-forge -c bioconda -s samtools samtools"`.
+The targets are `fetch`, `run`, `page`, `check` and `clean`, and the variables `SAMTOOLS`, `FG_SRA`, `FQTK`, `SPLITCODE` and `LIMA` give other ways to run those tools, for example `SAMTOOLS="pixi exec -c conda-forge -c bioconda -s samtools samtools"`.

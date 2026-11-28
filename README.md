@@ -93,7 +93,7 @@ unmux "R1.fastq.gz" "R2.fastq.gz" \
 
 ## Cookbook
 
-The [cookbook](docs/recipes.md) has recipes for common jobs, each run on public data with the exact command and the output it gave: format conversions, Illumina demultiplexing, duplex UMIs, single-cell barcodes, long reads, diagnostics, and the refusals that protect your files.
+The [cookbook](docs/recipes.md) has recipes for common jobs, each run on public data with the exact command and the output it gave: format conversions, Illumina demultiplexing, duplex UMIs, single-cell barcodes, long reads and diagnostics.
 
 ## Development and Testing
 

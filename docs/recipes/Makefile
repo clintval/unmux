@@ -16,6 +16,8 @@ PYTHON ?= python3
 UNMUX ?=
 SAMTOOLS ?= samtools
 FG_SRA ?= fg-sra
+FQTK ?= fqtk
+SPLITCODE ?= splitcode
 LIMA ?= docker run --rm --platform linux/amd64 -v "$$PWD":/w -w /w quay.io/biocontainers/lima:26.2.1--h9ee0642_0 lima
 CARGO_BUILD ?= cargo build --release --manifest-path $(REPO)/Cargo.toml
 
@@ -27,7 +29,7 @@ BINARY := $(UNMUX)
 BUILD := true
 endif
 
-GENERATE = $(PYTHON) -I generate.py --unmux "$(BINARY)" --samtools '$(SAMTOOLS)' --fg-sra '$(FG_SRA)' --lima '$(LIMA)'
+GENERATE = $(PYTHON) -I generate.py --unmux "$(BINARY)" --samtools '$(SAMTOOLS)' --fg-sra '$(FG_SRA)' --fqtk '$(FQTK)' --splitcode '$(SPLITCODE)' --lima '$(LIMA)'
 
 .PHONY: page fetch run check clean build
 
