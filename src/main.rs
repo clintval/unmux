@@ -431,6 +431,11 @@ struct DemuxCmd {
     /// (any of its tags), or several joined with '`+`' (AND across groups).
     /// `SAMPLE` → `@RG SM` and `SUB_SAMPLE` → `@RG LB`.
     ///
+    /// A read goes to the first sample whose selector it satisfies. Two
+    /// samples claiming one tag combination are an error, and selectors over
+    /// different groups that one read can both satisfy, as `s1=i7::a` and
+    /// `s2=i5::b` can, are warned about.
+    ///
     /// Exclusive with `--sample-sheet` and `--sample-from-group`.
     ///
     ///   --sample s1=bc::t01          route tag t01 to sample s1
@@ -449,6 +454,10 @@ struct DemuxCmd {
     /// sharing a `sample` are OR'd into one pool; group columns filled in the
     /// same row are AND'd (a match is needed in each). Below, s1 needs i7 `a`
     /// AND i5 `b`; s2 pools (i7 `c` AND i5 `d`) OR (i7 `e` AND i5 `f`).
+    ///
+    /// A read goes to the first row it satisfies. Rows of two samples that
+    /// one read can both satisfy, as rows filling different group columns
+    /// can, are warned about.
     ///
     /// Every other column must be a group or be read by a `%sample::COLUMN`
     /// extract; skip extra metadata columns with `--sample-sheet-ignore`.
