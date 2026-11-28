@@ -10,8 +10,9 @@
 
 use std::borrow::Cow;
 use std::cell::Cell;
-use std::cmp::Ordering;
+use std::cmp::{Ordering, Reverse};
 use std::collections::HashMap;
+use std::iter::once;
 
 use anyhow::{bail, Result};
 use smallvec::SmallVec;
@@ -130,6 +131,8 @@ pub struct Search {
 /// listed and the rest counted up to a limit, past which only collisions that
 /// would fail are looked for, and under `mode=all` a last warning recommends
 /// `mode=nearest`. Truncated matches (`partial5`/`partial3`) are not considered.
+/// Pairs of plain ACGT tags of one length are compared only when they share a
+/// block of bases, as every pair that one read can match does.
 pub fn validate_group(name: &str, seqs: &[Vec<u8>], search: &Search) -> Result<Vec<String>> {
     let mut warnings = Vec::new();
 
@@ -168,127 +171,613 @@ pub fn validate_group(name: &str, seqs: &[Vec<u8>], search: &Search) -> Result<V
         ));
     }
 
-    let shape = Shape::of(search.anchor);
-    let tags: Vec<Tag> = seqs.iter().map(|seq| Tag::new(seq)).collect();
-    let flipped: Vec<Tag> = match search.both_strands {
-        true => seqs
-            .iter()
-            .map(|seq| {
-                let mut seq = seq.clone();
-                reverse_complement(&mut seq);
-                Tag::new(&seq)
-            })
-            .collect(),
-        false => Vec::new(),
+    compare(
+        name,
+        seqs,
+        search,
+        warnings,
+        GROUP_CELLS,
+        Likely::new(seqs, search),
+    )
+    .0
+}
+
+/// Compare the pairs of a group's tags in order, every pair or else the pairs
+/// that `likely` finds could collide, with `cells` left for the group's tables.
+/// Gives the warnings or refusal and the pairs found to collide.
+fn compare(
+    name: &str,
+    seqs: &[Vec<u8>],
+    search: &Search,
+    warnings: Vec<String>,
+    cells: usize,
+    likely: Option<Likely>,
+) -> (Result<Vec<String>>, Vec<(usize, usize)>) {
+    let mut tally = Tally::new(name, seqs, search, warnings);
+    CELLS_LEFT.set(cells);
+    let visited = match likely {
+        Some(likely) => tally.likely(likely),
+        None => tally.every(),
     };
-    let subs = search.dist.mismatch.min(search.dist.total);
-    let substitutions = Search {
-        dist: Dist {
-            mismatch: subs,
-            indel: 0,
-            total: subs,
-        },
-        ..*search
-    };
-    let exact_only = Search {
-        dist: Dist::default(),
-        ..*search
-    };
-    let nearest = search.mode == Some(MatchMode::Nearest);
-    let (still_refused, consequence) = match nearest {
-        true => (&exact_only, UNASSIGNED),
-        false => (&substitutions, TIE_BREAK),
-    };
-    let budget = dist_spec(&search.dist);
-    CELLS_LEFT.set(GROUP_CELLS);
-    let (mut colliding, mut compared, mut example) = (0, 0, None);
-    for (i, a) in tags.iter().enumerate() {
-        for (j, b) in tags.iter().enumerate().skip(i + 1) {
-            let strands = search.both_strands.then(|| (&flipped[i], &flipped[j]));
-            let checked = match colliding < COUNTED_PAIRS {
-                true => search,
-                false => still_refused,
-            };
-            let Some(found) = collision(a, b, strands, checked, shape) else {
+    let found = std::mem::take(&mut tally.found);
+    (visited.and_then(|()| tally.finish()), found)
+}
+
+/// The pairs of one group's tags found to collide so far, and what they give.
+struct Tally<'a> {
+    name: &'a str,
+    seqs: &'a [Vec<u8>],
+    search: &'a Search,
+    shape: Shape,
+    substitutions: Search,
+    exact_only: Search,
+    budget: String,
+    colliding: usize,
+    compared: usize,
+    example: Option<String>,
+    warnings: Vec<String>,
+    found: Vec<(usize, usize)>,
+}
+
+impl<'a> Tally<'a> {
+    fn new(name: &'a str, seqs: &'a [Vec<u8>], search: &'a Search, warnings: Vec<String>) -> Self {
+        let subs = search.dist.mismatch.min(search.dist.total);
+        let substitutions = Search {
+            dist: Dist {
+                mismatch: subs,
+                indel: 0,
+                total: subs,
+            },
+            ..*search
+        };
+        let exact_only = Search {
+            dist: Dist::default(),
+            ..*search
+        };
+        Tally {
+            name,
+            seqs,
+            search,
+            shape: Shape::of(search.anchor),
+            substitutions,
+            exact_only,
+            budget: dist_spec(&search.dist),
+            colliding: 0,
+            compared: 0,
+            example: None,
+            warnings,
+            found: Vec::new(),
+        }
+    }
+
+    fn nearest(&self) -> bool {
+        self.search.mode == Some(MatchMode::Nearest)
+    }
+
+    /// The search a pair is compared under: the group's own until
+    /// [`COUNTED_PAIRS`] pairs collide, then the one whose collisions would
+    /// still be refused.
+    fn checked(&self) -> &Search {
+        match (self.colliding < COUNTED_PAIRS, self.nearest()) {
+            (true, _) => self.search,
+            (false, true) => &self.exact_only,
+            (false, false) => &self.substitutions,
+        }
+    }
+
+    /// Compare every pair.
+    fn every(&mut self) -> Result<()> {
+        let tags = Tags::new(self.seqs, self.search.both_strands, true);
+        for i in 0..self.seqs.len() {
+            let row = tags.get(i);
+            for j in i + 1..self.seqs.len() {
+                self.pair((i, j), &row, &tags.get(j), &tags)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Compare the pairs that `likely` finds could collide.
+    fn likely(&mut self, mut likely: Likely) -> Result<()> {
+        let up_front = likely.scans(Reach::of(self.search));
+        let tags = Tags::new(self.seqs, self.search.both_strands, up_front);
+        for i in 0..self.seqs.len() {
+            let partners = likely.partners(i, Reach::of(self.checked()));
+            if partners.is_empty() {
                 continue;
-            };
-            let plain = match search.dist.indel {
-                0 => None,
-                _ => collision(a, b, strands, &substitutions, shape),
-            };
-            let needs_indel = search.dist.indel > 0 && plain.is_none();
-            let found = plain.unwrap_or(found);
-            let (a_s, b_s) = (
-                String::from_utf8_lossy(&seqs[i]),
-                String::from_utf8_lossy(&seqs[j]),
-            );
-            let bases = found.bases.as_deref().map(String::from_utf8_lossy);
-            let strand = if found.flipped {
-                ", one on each strand"
-            } else {
-                ""
-            };
-            if found.exact {
-                let found = collision(a, b, None, &exact_only, shape).unwrap_or(found);
+            }
+            let row = tags.get(i);
+            for j in partners {
+                self.pair((i, j), &row, &tags.get(j), &tags)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Compare one pair, counting it when one read can match both tags and
+    /// failing when that is refused.
+    fn pair(
+        &mut self,
+        (i, j): (usize, usize),
+        a: &Strands,
+        b: &Strands,
+        tags: &Tags,
+    ) -> Result<()> {
+        let (name, seqs, shape) = (self.name, self.seqs, self.shape);
+        let strands = a.1.as_deref().zip(b.1.as_deref());
+        let (a, b) = (&*a.0, &*b.0);
+        let Some(found) = collision(a, b, strands, self.checked(), shape) else {
+            return Ok(());
+        };
+        self.found.push((i, j));
+        let plain = match self.search.dist.indel {
+            0 => None,
+            _ => collision(a, b, strands, &self.substitutions, shape),
+        };
+        let needs_indel = self.search.dist.indel > 0 && plain.is_none();
+        let found = plain.unwrap_or(found);
+        let (a_s, b_s) = (
+            String::from_utf8_lossy(&seqs[i]),
+            String::from_utf8_lossy(&seqs[j]),
+        );
+        let bases = found.bases.as_deref().map(String::from_utf8_lossy);
+        let strand = if found.flipped {
+            ", one on each strand"
+        } else {
+            ""
+        };
+        if found.exact {
+            let found = collision(a, b, None, &self.exact_only, shape).unwrap_or(found);
+            bail!("{}", indistinguishable(name, &seqs[i], &seqs[j], &found));
+        }
+        let (verb, witness) = match bases {
+            Some(bases) => ("can", format!("(the bases `{bases}` match both{strand})")),
+            None => ("may", TOO_COSTLY.to_string()),
+        };
+        let budget = &self.budget;
+        let overlap = format!(
+            "group `{name}`: tags `{a_s}` and `{b_s}` {verb} both match one read within dist={budget} {witness}"
+        );
+        if !self.nearest() && !needs_indel {
+            let exact = exact_pair(seqs, tags, &self.exact_only, shape, EXACT_PAIRS);
+            if let Some((i, j, found)) = exact {
                 bail!("{}", indistinguishable(name, &seqs[i], &seqs[j], &found));
             }
-            let (verb, witness) = match bases {
-                Some(bases) => ("can", format!("(the bases `{bases}` match both{strand})")),
-                None => ("may", TOO_COSTLY.to_string()),
-            };
-            let overlap = format!(
-                "group `{name}`: tags `{a_s}` and `{b_s}` {verb} both match one read within dist={budget} {witness}"
-            );
-            if !nearest && !needs_indel {
-                let exact = exact_pair(seqs, &tags, &flipped, &exact_only, shape, EXACT_PAIRS);
-                if let Some((i, j, found)) = exact {
-                    bail!("{}", indistinguishable(name, &seqs[i], &seqs[j], &found));
-                }
-                bail!("{overlap}; with mode=all this silently mis-assigns reads: separate the tags, lower dist, or use mode=nearest, which only warns and lists the colliding pairs");
+            bail!("{overlap}; with mode=all this silently mis-assigns reads: separate the tags, lower dist, or use mode=nearest, which only warns and lists the colliding pairs");
+        }
+        self.colliding += 1;
+        self.compared += usize::from(found.bases.is_some());
+        if self.search.mode.is_none() {
+            let first_compared = found.bases.is_some() && self.compared == 1;
+            if self.example.is_none() || first_compared {
+                self.example = Some(format!("`{a_s}` and `{b_s}` {witness}"));
             }
-            colliding += 1;
-            compared += usize::from(found.bases.is_some());
-            if search.mode.is_none() {
-                let first_compared = found.bases.is_some() && compared == 1;
-                if example.is_none() || first_compared {
-                    example = Some(format!("`{a_s}` and `{b_s}` {witness}"));
-                }
-            } else if colliding <= LISTED_PAIRS {
-                warnings.push(format!("{overlap}; {consequence}"));
+        } else if self.colliding <= LISTED_PAIRS {
+            let consequence = self.consequence();
+            self.warnings.push(format!("{overlap}; {consequence}"));
+        }
+        Ok(())
+    }
+
+    /// What the group's mode does with a read that two tags match.
+    fn consequence(&self) -> &'static str {
+        match self.nearest() {
+            true => UNASSIGNED,
+            false => TIE_BREAK,
+        }
+    }
+
+    /// The warnings once every pair is compared, or the refusal of pairs that
+    /// need an indel when the group sets no mode.
+    fn finish(self) -> Result<Vec<String>> {
+        let (nearest, consequence) = (self.nearest(), self.consequence());
+        let Tally {
+            name,
+            budget,
+            colliding,
+            compared,
+            example,
+            mut warnings,
+            ..
+        } = self;
+        let complete = colliding < COUNTED_PAIRS;
+        let pairs = |count: usize, kind: &str| {
+            let at_least = if complete { "" } else { "at least " };
+            let noun = if count == 1 { "pair" } else { "pairs" };
+            format!("{at_least}{count} {kind}{noun}")
+        };
+        let verb = if compared == colliding { "can" } else { "may" };
+        if let Some(pair) = example {
+            bail!(
+                "group `{name}`: {} of tags {verb} both match one read within dist={budget} only through an indel, such as {pair}; {NEAREST}, or write mode=all to keep assigning each to one of the tags by tie-break",
+                pairs(colliding, "")
+            );
+        }
+        if colliding > LISTED_PAIRS {
+            let stopped = match complete {
+                true => String::new(),
+                false => format!(" (counting stopped at {COUNTED_PAIRS})"),
+            };
+            warnings.push(format!(
+                "group `{name}`: {}{stopped} of tags {verb} both match one read within dist={budget}; {consequence}",
+                pairs(colliding - LISTED_PAIRS, "more ")
+            ));
+        }
+        if !nearest && colliding > 0 {
+            warnings.push(format!(
+                "group `{name}`: {} of tags {verb} match one read only through an indel; {NEAREST}",
+                pairs(colliding, "")
+            ));
+        }
+        Ok(warnings)
+    }
+}
+
+/// One tag and, under `bothStrands`, its reverse complement.
+type Strands<'a> = (Cow<'a, Tag>, Option<Cow<'a, Tag>>);
+
+/// A group's tags as compared, with their reverse complements under
+/// `bothStrands`, built up front or else for each pair as it is compared.
+struct Tags<'a> {
+    seqs: &'a [Vec<u8>],
+    both_strands: bool,
+    forward: Vec<Tag>,
+    flipped: Vec<Tag>,
+}
+
+impl<'a> Tags<'a> {
+    fn new(seqs: &'a [Vec<u8>], both_strands: bool, up_front: bool) -> Self {
+        let built = |build: fn(&[u8]) -> Tag, wanted: bool| match up_front && wanted {
+            true => seqs.iter().map(|seq| build(seq)).collect(),
+            false => Vec::new(),
+        };
+        Tags {
+            seqs,
+            both_strands,
+            forward: built(Tag::new, true),
+            flipped: built(Tag::flipped, both_strands),
+        }
+    }
+
+    fn get(&self, i: usize) -> Strands<'_> {
+        let seq = &self.seqs[i];
+        let flipped = self
+            .both_strands
+            .then(|| held(&self.flipped, i, || Tag::flipped(seq)));
+        (held(&self.forward, i, || Tag::new(seq)), flipped)
+    }
+}
+
+/// The tag built up front at `i`, or else one built now.
+fn held(built: &[Tag], i: usize, build: impl FnOnce() -> Tag) -> Cow<'_, Tag> {
+    built
+        .get(i)
+        .map_or_else(|| Cow::Owned(build()), Cow::Borrowed)
+}
+
+/// What two plain tags of one length share whenever [`collision`] finds a read
+/// that matches both or fills a table for them: at most this many differing
+/// bases, or an alignment of one within the other with at most this many edits.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Reach {
+    Substitutions(usize),
+    Edits(usize),
+}
+
+impl Reach {
+    /// The reach of a search, as [`ungapped`] allows twice its substitutions
+    /// and [`gapped`] fills no table past twice its total edits.
+    fn of(search: &Search) -> Self {
+        match search.dist.indel {
+            0 => Reach::Substitutions(search.dist.mismatch.saturating_mul(2)),
+            _ => Reach::Edits(search.dist.total.saturating_mul(2)),
+        }
+    }
+
+    fn most(self) -> usize {
+        match self {
+            Reach::Substitutions(most) | Reach::Edits(most) => most,
+        }
+    }
+
+    /// The length of the blocks, one more than the reach, that a tag of `len`
+    /// bases splits into, when they take fewer lookups than there are kinds of
+    /// block of that length.
+    fn block(self, len: usize) -> Option<usize> {
+        let blocks = self.most().saturating_add(1);
+        let q = Some(len / blocks).filter(|&q| q > 0)?;
+        let lookups = match self {
+            Reach::Substitutions(_) => blocks,
+            Reach::Edits(most) => 2 * blocks * (2 * most + 1),
+        };
+        let kinds = 4usize.checked_pow(q as u32);
+        kinds.is_none_or(|kinds| lookups < kinds).then_some(q)
+    }
+
+    /// Whether plain tags `a` and `b` of `len` bases are within reach, given
+    /// packed with the reverse complement of `a` under `bothStrands`.
+    fn admits(self, (a, flipped): (u64, Option<u64>), b: u64, len: usize, shape: Shape) -> bool {
+        match self {
+            Reach::Substitutions(most) => {
+                differ(a, b) <= most || flipped.is_some_and(|flipped| differ(flipped, b) <= most)
+            }
+            Reach::Edits(most) => {
+                let within = |outer, inner| {
+                    unmatched_bases(outer, inner, len) <= most
+                        && plain_within(outer, inner, len, shape, most)
+                };
+                let other_strand = |flipped| within(a, flipped_code(b, len)) || within(b, flipped);
+                within(a, b) || within(b, a) || flipped.is_some_and(other_strand)
             }
         }
     }
-    let complete = colliding < COUNTED_PAIRS;
-    let pairs = |count: usize, kind: &str| {
-        let at_least = if complete { "" } else { "at least " };
-        let noun = if count == 1 { "pair" } else { "pairs" };
-        format!("{at_least}{count} {kind}{noun}")
+}
+
+/// A plain ACGT tag of 1 to 32 bases as two bits per base, the first base lowest.
+fn packed(seq: &[u8]) -> Option<u64> {
+    if seq.is_empty() || seq.len() > 32 {
+        return None;
+    }
+    seq.iter().rev().try_fold(0, |code, &base| {
+        let set = mask(base);
+        (set.count_ones() == 1).then(|| code << 2 | u64::from(set.trailing_zeros()))
+    })
+}
+
+/// The `count` bases from `from` of a packed tag.
+fn bases(code: u64, from: usize, count: usize) -> u64 {
+    let kept = u64::MAX.checked_shr(64 - 2 * count as u32).unwrap_or(0);
+    code >> (2 * from) & kept
+}
+
+/// The reverse complement of a packed tag of `len` bases.
+fn flipped_code(code: u64, len: usize) -> u64 {
+    (0..len).fold(0, |flipped, at| flipped << 2 | (3 - bases(code, at, 1)))
+}
+
+/// How many bases two packed tags of one length differ at.
+fn differ(a: u64, b: u64) -> usize {
+    let apart = a ^ b;
+    ((apart | apart >> 1) & 0x5555_5555_5555_5555).count_ones() as usize
+}
+
+/// How many bases of packed tag `inner` no base of packed tag `outer` can pair
+/// with, both `len` bases long, as [`unmatched`] counts.
+fn unmatched_bases(outer: u64, inner: u64, len: usize) -> usize {
+    let held = |code: u64, kind: u64| {
+        let apart = code ^ (kind * 0x5555_5555_5555_5555);
+        (!(apart | apart >> 1) & bases(0x5555_5555_5555_5555, 0, len)).count_ones()
     };
-    let verb = if compared == colliding { "can" } else { "may" };
-    if let Some(pair) = example {
-        bail!(
-            "group `{name}`: {} of tags {verb} both match one read within dist={budget} only through an indel, such as {pair}; {NEAREST}, or write mode=all to keep assigning each to one of the tags by tie-break",
-            pairs(colliding, "")
-        );
+    let short = (0..4).map(|kind| held(inner, kind).saturating_sub(held(outer, kind)));
+    short.sum::<u32>() as usize
+}
+
+/// Whether packed tag `inner` aligns within packed tag `outer`, both `len`
+/// bases long, with at most `budget` edits, as [`edits_within`] finds.
+fn plain_within(outer: u64, inner: u64, len: usize, shape: Shape, budget: usize) -> bool {
+    let mut sites = [0u64; 4];
+    for at in 0..len {
+        sites[bases(inner, at, 1) as usize] |= 1 << at;
     }
-    if colliding > LISTED_PAIRS {
-        let stopped = match complete {
-            true => String::new(),
-            false => format!(" (counting stopped at {COUNTED_PAIRS})"),
-        };
-        warnings.push(format!(
-            "group `{name}`: {}{stopped} of tags {verb} both match one read within dist={budget}; {consequence}",
-            pairs(colliding - LISTED_PAIRS, "more ")
-        ));
-    }
-    if !nearest && colliding > 0 {
-        warnings.push(format!(
-            "group `{name}`: {} of tags {verb} match one read only through an indel; {NEAREST}",
-            pairs(colliding, "")
-        ));
+    let met = (0..len).map(|at| sites[bases(outer, at, 1) as usize]);
+    myers_within(met, len, shape, budget)
+}
+
+/// The pairs worth comparing in a group with plain ACGT tags of one length:
+/// every pair with another tag, and the pairs within reach, found by a block of
+/// bases that one tag holds and the other holds shifted by at most the reach.
+struct Likely {
+    len: usize,
+    both_strands: bool,
+    shape: Shape,
+    codes: Vec<u64>,
+    members: Vec<u32>,
+    loose: Vec<usize>,
+    seen: Vec<u32>,
+    grams: Vec<Grams>,
+}
+
+impl Likely {
+    /// The pairs of `seqs` worth comparing, or `None` when fewer than two of
+    /// them are plain ACGT of one length up to 32 bases.
+    fn new(seqs: &[Vec<u8>], search: &Search) -> Option<Self> {
+        if u32::try_from(seqs.len()).is_err() {
+            return None;
+        }
+        let codes: Vec<Option<u64>> = seqs.iter().map(|seq| packed(seq)).collect();
+        let mut lengths = [0usize; 33];
+        for (seq, code) in seqs.iter().zip(&codes) {
+            lengths[seq.len().min(32)] += usize::from(code.is_some());
+        }
+        let len = (1..=32).max_by_key(|&len| (lengths[len], Reverse(len)))?;
+        if lengths[len] < 2 {
+            return None;
+        }
+        let (members, loose): (Vec<usize>, Vec<usize>) =
+            (0..seqs.len()).partition(|&i| codes[i].is_some() && seqs[i].len() == len);
+        Some(Likely {
+            len,
+            both_strands: search.both_strands,
+            shape: Shape::of(search.anchor),
+            codes: codes.into_iter().map(Option::unwrap_or_default).collect(),
+            members: members.into_iter().map(|i| i as u32).collect(),
+            loose,
+            seen: vec![u32::MAX; seqs.len()],
+            grams: Vec::new(),
+        })
     }
 
-    Ok(warnings)
+    /// Whether some pair is compared without blocks under `reach`, which
+    /// needs every tag.
+    fn scans(&self, reach: Reach) -> bool {
+        !self.loose.is_empty() || reach.block(self.len).is_none()
+    }
+
+    /// The tags after `i` that might collide with it under `reach`, in order.
+    fn partners(&mut self, i: usize, reach: Reach) -> Vec<usize> {
+        let rows = self.codes.len();
+        let Some(q) = reach.block(self.len) else {
+            return (i + 1..rows).collect();
+        };
+        if self.loose.binary_search(&i).is_ok() {
+            return (i + 1..rows).collect();
+        }
+        let mut partners = self.near(i, reach, q);
+        let after = self.loose.partition_point(|&j| j <= i);
+        partners.extend_from_slice(&self.loose[after..]);
+        partners.sort();
+        partners
+    }
+
+    /// The plain tags after `i` within `reach` of it, found by the blocks of
+    /// `q` bases they share with it.
+    fn near(&mut self, i: usize, reach: Reach, q: usize) -> Vec<usize> {
+        let at = match self.grams.iter().position(|grams| grams.reach == reach) {
+            Some(at) => at,
+            None => {
+                let grams = Grams::new(reach, q, self.len, &self.codes, &self.members);
+                self.grams.push(grams);
+                self.grams.len() - 1
+            }
+        };
+        let Likely {
+            len,
+            both_strands,
+            shape,
+            codes,
+            seen,
+            grams,
+            ..
+        } = self;
+        let (grams, code, row) = (&grams[at], codes[i], i as u32);
+        let strands = (code, both_strands.then(|| flipped_code(code, *len)));
+        let mut near = Vec::new();
+        for side in once(code).chain(strands.1) {
+            for (from, key) in grams.lookups(side) {
+                let tags = grams.get(from, key, codes);
+                for &j in &tags[tags.partition_point(|&j| j <= row)..] {
+                    let seen = &mut seen[j as usize];
+                    if *seen != row {
+                        *seen = row;
+                        if reach.admits(strands, codes[j as usize], *len, *shape) {
+                            near.push(j as usize);
+                        }
+                    }
+                }
+            }
+        }
+        near.sort_unstable();
+        near
+    }
+}
+
+/// Plain tags of one length by their bases at each position that the blocks
+/// of a reach are looked up at.
+struct Grams {
+    reach: Reach,
+    len: usize,
+    q: usize,
+    columns: Vec<Option<Column>>,
+}
+
+impl Grams {
+    fn new(reach: Reach, q: usize, len: usize, codes: &[u64], members: &[u32]) -> Self {
+        let mut grams = Grams {
+            reach,
+            len,
+            q,
+            columns: (0..=len - q).map(|_| None).collect(),
+        };
+        for (from, _) in grams.lookups(0) {
+            if grams.columns[from].is_none() {
+                grams.columns[from] = Some(Column::new(members, codes, from, q));
+            }
+        }
+        grams
+    }
+
+    /// The positions and bases to look up for the tags within reach of the
+    /// tag of bases `code`: each of its blocks where it lies, and under edits
+    /// each block shifted by up to the reach, either tag holding the block.
+    fn lookups(&self, code: u64) -> Vec<(usize, u64)> {
+        let (q, last) = (self.q, self.len - self.q);
+        let blocks = (0..=self.reach.most()).map(move |k| k * q);
+        match self.reach {
+            Reach::Substitutions(_) => blocks.map(|at| (at, bases(code, at, q))).collect(),
+            Reach::Edits(most) => blocks
+                .flat_map(|at| {
+                    (at.saturating_sub(most)..=last.min(at + most)).flat_map(move |shifted| {
+                        [(at, bases(code, shifted, q)), (shifted, bases(code, at, q))]
+                    })
+                })
+                .collect(),
+        }
+    }
+
+    /// The tags whose `q` bases from `from` are `key`, in order.
+    fn get(&self, from: usize, key: u64, codes: &[u64]) -> &[u32] {
+        self.columns[from]
+            .as_ref()
+            .map_or(&[], |column| column.get(key, codes))
+    }
+}
+
+/// Plain tags by the `q` bases they hold from one position, sorted by those
+/// bases, with where each value of their leading bits starts.
+struct Column {
+    from: usize,
+    q: usize,
+    shift: u32,
+    starts: Vec<u32>,
+    tags: Vec<u32>,
+}
+
+impl Column {
+    fn new(members: &[u32], codes: &[u64], from: usize, q: usize) -> Self {
+        let bits = 2 * q as u32;
+        let shift = bits - bits.min(members.len().max(2).ilog2());
+        let key = |tag: u32| bases(codes[tag as usize], from, q);
+        let lead = |tag: u32| (key(tag) >> shift) as usize;
+        let mut starts = vec![0u32; (1 << (bits - shift)) + 1];
+        for &tag in members {
+            starts[lead(tag) + 1] += 1;
+        }
+        for at in 1..starts.len() {
+            starts[at] += starts[at - 1];
+        }
+        let mut next = starts.clone();
+        let mut tags = vec![0u32; members.len()];
+        for &tag in members {
+            let slot = &mut next[lead(tag)];
+            tags[*slot as usize] = tag;
+            *slot += 1;
+        }
+        if shift > 0 {
+            for run in starts.windows(2) {
+                tags[run[0] as usize..run[1] as usize].sort_unstable_by_key(|&tag| (key(tag), tag));
+            }
+        }
+        Column {
+            from,
+            q,
+            shift,
+            starts,
+            tags,
+        }
+    }
+
+    /// The tags whose bases here are `key`, in order.
+    fn get(&self, key: u64, codes: &[u64]) -> &[u32] {
+        let lead = (key >> self.shift) as usize;
+        let run = &self.tags[self.starts[lead] as usize..self.starts[lead + 1] as usize];
+        if self.shift == 0 {
+            return run;
+        }
+        let bases_of = |tag: &u32| bases(codes[*tag as usize], self.from, self.q);
+        let from = run.partition_point(|tag| bases_of(tag) < key);
+        let to = run.partition_point(|tag| bases_of(tag) <= key);
+        &run[from..to]
+    }
 }
 
 /// Two tags, by index, that one read matches with zero errors, with their
@@ -298,23 +787,23 @@ pub fn validate_group(name: &str, seqs: &[Vec<u8>], search: &Search) -> Result<V
 /// compared pair by pair, up to `limit` pairs.
 fn exact_pair(
     seqs: &[Vec<u8>],
-    tags: &[Tag],
-    flipped: &[Tag],
+    tags: &Tags,
     exact_only: &Search,
     shape: Shape,
     limit: usize,
 ) -> Option<(usize, usize, Overlap)> {
     let compare = |(i, j): (usize, usize)| {
-        let strands = exact_only.both_strands.then(|| (&flipped[i], &flipped[j]));
-        let found = collision(&tags[i], &tags[j], None, exact_only, shape)
-            .or_else(|| collision(&tags[i], &tags[j], strands, exact_only, shape))?;
+        let ((a, flipped_a), (b, flipped_b)) = (tags.get(i), tags.get(j));
+        let strands = flipped_a.as_deref().zip(flipped_b.as_deref());
+        let found = collision(&a, &b, None, exact_only, shape)
+            .or_else(|| collision(&a, &b, strands, exact_only, shape))?;
         Some((i, j, found))
     };
     if looked_up(seqs, exact_only.window) {
         return equal_pair(seqs, exact_only.both_strands).and_then(compare);
     }
-    (0..tags.len())
-        .flat_map(|i| (i + 1..tags.len()).map(move |j| (i, j)))
+    (0..seqs.len())
+        .flat_map(|i| (i + 1..seqs.len()).map(move |j| (i, j)))
         .take(limit)
         .find_map(compare)
 }
@@ -409,6 +898,7 @@ fn dist_spec(dist: &Dist) -> String {
 /// A tag's IUPAC base sets, with the positions meeting each set as bits in
 /// words of 64 positions, and its 3-grams: the concrete ones as bits, the
 /// windows that may match more than those, and the 3-grams it can hold.
+#[derive(Clone)]
 struct Tag {
     masks: Vec<u8>,
     sites: Vec<[u64; 16]>,
@@ -463,6 +953,13 @@ impl Tag {
             concrete,
             admitting,
         }
+    }
+
+    /// The reverse complement of `seq` as a tag.
+    fn flipped(seq: &[u8]) -> Self {
+        let mut seq = seq.to_vec();
+        reverse_complement(&mut seq);
+        Tag::new(&seq)
     }
 
     fn len(&self) -> usize {
@@ -841,11 +1338,18 @@ fn edits_within(outer: &Tag, inner: &Tag, shape: Shape, budget: usize) -> bool {
     let Some(sites) = inner.word() else {
         return banded_within(outer, inner, shape, budget);
     };
-    let last = 1u64 << (inner.len() - 1);
-    let (mut pv, mut mv, mut score) = (u64::MAX, 0u64, inner.len());
+    let met = outer.masks.iter().map(|&set| sites[usize::from(set & 15)]);
+    myers_within(met, inner.len(), shape, budget)
+}
+
+/// Whether an alignment of an inner tag of `len` bases, at most 64, within an
+/// outer one has at most `budget` disjoint pairs and unpaired bases, given the
+/// inner positions each outer base meets as bits, by Myers' algorithm.
+fn myers_within(met: impl Iterator<Item = u64>, len: usize, shape: Shape, budget: usize) -> bool {
+    let last = 1u64 << (len - 1);
+    let (mut pv, mut mv, mut score) = (u64::MAX, 0u64, len);
     let mut fewest = score;
-    for &set in &outer.masks {
-        let eq = sites[usize::from(set & 15)];
+    for eq in met {
         let xv = eq | mv;
         let xh = ((eq & pv).wrapping_add(pv) ^ pv) | eq;
         let ph = mv | !(xh | pv);
@@ -1250,7 +1754,11 @@ mod tests {
 
     /// Random barcodes, each at least `apart` substitutions from every other.
     fn spread_barcodes(count: usize, len: usize, apart: usize) -> Vec<Vec<u8>> {
-        let mut rng = Rng(0x2545_f491);
+        spread_from(&mut Rng(0x2545_f491), count, len, apart)
+    }
+
+    /// Barcodes drawn from `rng`, each at least `apart` substitutions from every other.
+    fn spread_from(rng: &mut Rng, count: usize, len: usize, apart: usize) -> Vec<Vec<u8>> {
         let mut tags: Vec<Vec<u8>> = Vec::new();
         while tags.len() < count {
             let tag = rng.sample(len, b"ACGT");
@@ -1643,13 +2151,12 @@ mod tests {
     fn test_plain_tags_of_one_length_are_looked_up_without_comparing_pairs() {
         let mut seqs = after_a_close_pair(3_000);
         seqs.push(seqs[1_500].to_ascii_lowercase());
-        let tags: Vec<Tag> = seqs.iter().map(|seq| Tag::new(seq)).collect();
-        let shape = Shape::of(None);
-        let pair = |seqs: &[Vec<u8>], limit| {
-            exact_pair(seqs, &tags, &[], &unset(dist(0)), shape, limit).map(|(i, j, _)| (i, j))
+        let pair = |seqs: &[Vec<u8>], search: &Search| {
+            let tags = Tags::new(seqs, search.both_strands, true);
+            exact_pair(seqs, &tags, search, Shape::of(None), 0).map(|(i, j, _)| (i, j))
         };
         assert_eq!(
-            pair(&seqs, 0),
+            pair(&seqs, &unset(dist(0))),
             Some((1_500, 3_002)),
             "found with no pair compared"
         );
@@ -1661,19 +2168,16 @@ mod tests {
         };
         let mut seqs = seqs[..3_002].to_vec();
         seqs.push(flipped);
-        let flipped_tags: Vec<Tag> = seqs.iter().map(|seq| Tag::new(&flip(seq))).collect();
-        let tags: Vec<Tag> = seqs.iter().map(|seq| Tag::new(seq)).collect();
-        let found = exact_pair(&seqs, &tags, &flipped_tags, &both, shape, 0);
-        assert_eq!(found.map(|(i, j, _)| (i, j)), Some((1_500, 3_002)));
+        assert_eq!(pair(&seqs, &both), Some((1_500, 3_002)));
     }
 
     #[test]
     fn test_other_sets_are_compared_pair_by_pair_up_to_the_limit() {
         // ACGN and ACGT, the first and last tags, form the second pair compared.
         let seqs = seqs(&["ACGN", "TTTT", "ACGT"]);
-        let tags: Vec<Tag> = seqs.iter().map(|seq| Tag::new(seq)).collect();
+        let tags = Tags::new(&seqs, false, true);
         let pair = |limit| {
-            exact_pair(&seqs, &tags, &[], &unset(dist(0)), Shape::of(None), limit)
+            exact_pair(&seqs, &tags, &unset(dist(0)), Shape::of(None), limit)
                 .map(|(i, j, _)| (i, j))
         };
         assert_eq!(pair(1), None);
@@ -2092,6 +2596,260 @@ mod tests {
             );
         }
         assert!(collided > 100, "the trials exercise collisions: {collided}");
+    }
+
+    /// A random search over every attribute the check reads, with or without a
+    /// mode, including attributes the grammar refuses together.
+    fn any_search(rng: &mut Rng, len: usize) -> Search {
+        let (mismatch, indel, total) = [
+            (0, 0, 0),
+            (1, 0, 1),
+            (2, 0, 2),
+            (0, 1, 1),
+            (1, 1, 1),
+            (1, 1, 2),
+            (0, 2, 2),
+            (2, 1, 3),
+        ][rng.below(8)];
+        Search {
+            dist: Dist {
+                mismatch,
+                indel,
+                total,
+            },
+            mode: [None, Some(MatchMode::All), Some(MatchMode::Nearest)][rng.below(3)],
+            anchor: [None, Some(Anchor::FivePrime), Some(Anchor::ThreePrime)][rng.below(3)],
+            both_strands: rng.below(2) == 0,
+            window: [
+                None,
+                None,
+                Some(len),
+                Some(len - 1),
+                Some(1 + rng.below(2 * len)),
+            ][rng.below(5)],
+        }
+    }
+
+    /// Random plain tags of one length near one another: a few seeds with some
+    /// bases substituted, shifted by a base, or reverse-complemented.
+    fn near_tags(rng: &mut Rng, len: usize, count: usize) -> Vec<Vec<u8>> {
+        let seeds: Vec<Vec<u8>> = (0..1 + rng.below(3))
+            .map(|_| rng.sample(len, b"ACGT"))
+            .collect();
+        (0..count)
+            .map(|_| {
+                let mut tag = seeds[rng.below(seeds.len())].clone();
+                match rng.below(6) {
+                    0 => tag = rng.sample(len, b"ACGT"),
+                    1 => {
+                        tag.remove(0);
+                        tag.push(b"ACGT"[rng.below(4)]);
+                    }
+                    2 => tag = flip(&tag),
+                    _ => {}
+                }
+                for _ in 0..rng.below(4) {
+                    let at = rng.below(len);
+                    tag[at] = b"ACGT"[rng.below(4)];
+                }
+                tag
+            })
+            .collect()
+    }
+
+    /// `tags` with a few other tags put among them: shorter or longer tags
+    /// nested in them, tags with an ambiguity code, and repeats in lowercase or
+    /// with U.
+    fn with_others(rng: &mut Rng, mut tags: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
+        for _ in 0..1 + rng.below(4) {
+            let tag = tags[rng.below(tags.len())].clone();
+            let other = match rng.below(5) {
+                0 => tag[..1 + rng.below(tag.len())].to_vec(),
+                1 => {
+                    let flank = 1 + rng.below(2);
+                    [rng.sample(flank, b"ACGT"), tag].concat()
+                }
+                2 => {
+                    let mut coded = tag;
+                    let at = rng.below(coded.len());
+                    coded[at] = b"NRYKMSWBDHV"[rng.below(11)];
+                    coded
+                }
+                3 => tag.to_ascii_lowercase(),
+                _ => tag
+                    .iter()
+                    .map(|&base| if base == b'T' { b'U' } else { base })
+                    .collect(),
+            };
+            let at = rng.below(tags.len() + 1);
+            tags.insert(at, other);
+        }
+        tags
+    }
+
+    /// A group's warnings or refusal, the pairs found to collide, and the cells left.
+    type Verdict = (Result<Vec<String>, String>, Vec<(usize, usize)>, usize);
+
+    /// The verdict on the pairs of `seqs`, every one compared or only those
+    /// the index picks.
+    fn verdict(seqs: &[Vec<u8>], search: &Search, cells: usize, indexed: bool) -> Verdict {
+        let likely = indexed.then(|| Likely::new(seqs, search)).flatten();
+        let (result, found) = compare("g", seqs, search, Vec::new(), cells, likely);
+        (
+            result.map_err(|err| err.to_string()),
+            found,
+            CELLS_LEFT.get(),
+        )
+    }
+
+    #[test]
+    fn test_comparing_only_likely_pairs_gives_the_verdict_of_every_pair() {
+        let mut rng = Rng(0x11ce);
+        let (mut indexed, mut mixed, mut refused, mut warned, mut past, mut costly) =
+            (0, 0, 0, 0, 0, 0);
+        for trial in 0..500 {
+            // Every tenth set is large and every twentieth spread, so some count past the limit.
+            let (spread, large) = (trial % 20 == 5, trial % 10 == 0);
+            let (len, count) = match large {
+                true => (4 + rng.below(4), 50 + rng.below(50)),
+                false => (3 + rng.below(14), 2 + rng.below(40)),
+            };
+            let mut search = any_search(&mut rng, len);
+            let mut seqs = match spread {
+                true => spread_from(&mut rng, 90 + count % 20, 8, 3),
+                false => near_tags(&mut rng, len, count),
+            };
+            if spread {
+                search.dist = budget(1, 1);
+                search.window = None;
+            }
+            if rng.below(3) == 0 {
+                seqs = with_others(&mut rng, seqs);
+                mixed += 1;
+            }
+            let costly_tables = large && search.dist.indel > 1;
+            let cells = match (spread || large, rng.below(4)) {
+                _ if costly_tables => rng.below(4_000),
+                (true, 0 | 1) | (false, 1..) => GROUP_CELLS,
+                _ => rng.below(4_000),
+            };
+            let every = verdict(&seqs, &search, cells, false);
+            let likely = verdict(&seqs, &search, cells, true);
+            let shown: Vec<String> = seqs
+                .iter()
+                .map(|seq| String::from_utf8_lossy(seq).into_owned())
+                .collect();
+            assert_eq!(
+                every, likely,
+                "{shown:?} under {search:?} with {cells} cells"
+            );
+            let len = Likely::new(&seqs, &search).map(|likely| likely.len);
+            indexed += usize::from(len.is_some_and(|len| Reach::of(&search).block(len).is_some()));
+            refused += usize::from(every.0.is_err());
+            warned += usize::from(every.0.as_ref().is_ok_and(|w| !w.is_empty()));
+            past += usize::from(every.1.len() >= COUNTED_PAIRS);
+            let message = |w: &[String]| w.iter().any(|w| w.contains(TOO_COSTLY));
+            costly += usize::from(
+                every
+                    .0
+                    .as_ref()
+                    .map_or_else(|e| e.contains(" may "), |w| message(w)),
+            );
+        }
+        let tallies = [indexed, mixed, refused, warned, past, costly];
+        assert!(tallies.iter().all(|&n| n > 10), "{tallies:?}");
+    }
+
+    #[test]
+    fn test_likely_partners_are_the_plain_tags_within_reach() {
+        let mut rng = Rng(0xb10c);
+        let mut blocked = 0;
+        for _ in 0..300 {
+            let (len, count) = (4 + rng.below(29), 2 + rng.below(120));
+            let seqs = near_tags(&mut rng, len, count);
+            let search = any_search(&mut rng, len);
+            let reach = [Reach::Substitutions, Reach::Edits][rng.below(2)](rng.below(6));
+            let (codes, shape) = (
+                seqs.iter()
+                    .map(|seq| packed(seq).unwrap())
+                    .collect::<Vec<_>>(),
+                Shape::of(search.anchor),
+            );
+            let mut likely = Likely::new(&seqs, &search).unwrap();
+            blocked += usize::from(reach.block(len).is_some());
+            for i in 0..seqs.len() {
+                let flipped = search.both_strands.then(|| flipped_code(codes[i], len));
+                let within = |&j: &usize| match reach.block(len) {
+                    Some(_) => reach.admits((codes[i], flipped), codes[j], len, shape),
+                    None => true,
+                };
+                let expected: Vec<usize> = (i + 1..seqs.len()).filter(within).collect();
+                let shown = seqs_shown(&[&seqs[i]]);
+                assert_eq!(
+                    likely.partners(i, reach),
+                    expected,
+                    "{shown:?} under {reach:?}"
+                );
+            }
+        }
+        assert!(blocked > 100, "the trials look up blocks: {blocked}");
+    }
+
+    #[test]
+    fn test_pairs_that_collide_or_fill_a_table_are_within_reach() {
+        let mut rng = Rng(0x7ab1e);
+        let mut admitted = 0;
+        for _ in 0..4000 {
+            let len = 1 + rng.below(12);
+            let a = rng.sample(len, b"ACGT");
+            let b = match rng.below(3) {
+                0 => rng.sample(len, b"ACGT"),
+                _ => {
+                    let mut b = mutate(&mut rng, &a, 3, b"ACGT");
+                    b.resize(len, b'A');
+                    b
+                }
+            };
+            let search = any_search(&mut rng, len);
+            let (code_a, code_b) = (packed(&a).unwrap(), packed(&b).unwrap());
+            let counted = unmatched(&Tag::new(&a), &Tag::new(&b));
+            assert_eq!(unmatched_bases(code_a, code_b, len), counted);
+            let flipped = search.both_strands.then(|| flipped_code(code_a, len));
+            let within =
+                Reach::of(&search).admits((code_a, flipped), code_b, len, Shape::of(search.anchor));
+            let tally = Tally::new("g", &[], &search, Vec::new());
+            for checked in [&search, &tally.substitutions, &tally.exact_only] {
+                CELLS_LEFT.set(GROUP_CELLS);
+                let collides = found(&a, &b, checked).is_some();
+                let filled = CELLS_LEFT.get() < GROUP_CELLS;
+                let shown = seqs_shown(&[&a, &b]);
+                assert!(
+                    within || !(collides || filled),
+                    "{shown:?} under {checked:?}"
+                );
+            }
+            admitted += usize::from(within);
+        }
+        assert!(
+            admitted > 1000,
+            "the trials hold pairs within reach: {admitted}"
+        );
+    }
+
+    #[test]
+    fn test_packed_tags_hold_their_bases_in_order() {
+        let code = packed(b"ACGTu").unwrap();
+        assert_eq!(
+            (0..5).map(|at| bases(code, at, 1)).collect::<Vec<_>>(),
+            [0, 1, 2, 3, 3]
+        );
+        assert_eq!(bases(code, 1, 3), 0b11_10_01);
+        assert_eq!(flipped_code(code, 5), packed(b"AACGT").unwrap());
+        assert_eq!(differ(code, packed(b"ACCTA").unwrap()), 2);
+        assert_eq!(packed(b"ACGN"), None);
+        assert_eq!(packed(&[b'A'; 33]), None);
+        let full = packed(&[b'T'; 32]).unwrap();
+        assert_eq!((full, bases(full, 0, 32)), (u64::MAX, u64::MAX));
     }
 
     #[test]
