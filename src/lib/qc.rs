@@ -18,7 +18,8 @@
 //! `str` is present only for a reverse-complement match.
 //! Unassigned also carries a `reason`: `find_constraint` adds the offending
 //! `group`, the failed `constraint`, and the observed `found` vs the `limit`;
-//! `missing_stream` adds the `stream`. Removed carries `rule` (the `--remove`
+//! `nearest_tie` adds the `group` whose `mode=nearest` tie failed its find
+//! bounds; `missing_stream` adds the `stream`. Removed carries `rule` (the `--remove`
 //! selector verbatim, e.g. `grp::C` or a bare `grp`), the resolved `group`, and
 //! the triggering `tag` (canonical bases; omitted for a bare-group rule). JSON
 //! is built directly (no serde dependency); all string values are escaped.
@@ -29,9 +30,9 @@ use crate::matcher::{CompiledGroup, FindFailure};
 /// Why a record was not assigned to a sample, for the unassigned slug.
 pub enum Unassigned {
     /// A group's find constraint (`min`/`maxFindsPerGroup`/`PerTag`) was not
-    /// met; carries the group's canonical index (resolved to its name at write
-    /// time, so this stays `Send` across the matcher boundary) and the specific
-    /// [`FindFailure`] (which bound, the observed count, the limit).
+    /// met, or a `mode=nearest` tie failed it; carries the group's canonical
+    /// index (resolved to its name at write time, so this stays `Send` across
+    /// the matcher boundary) and the specific [`FindFailure`].
     FindConstraint {
         /// Canonical index of the offending group (resolved to its name at
         /// write time).
@@ -169,7 +170,15 @@ pub fn unassigned_slug(
     push_member_str(&mut out, "outcome", "unassigned");
     out.push(',');
     match reason {
-        Unassigned::FindConstraint { group, failure } => {
+        Unassigned::FindConstraint {
+            group,
+            failure:
+                FindFailure::Bound {
+                    kind,
+                    observed,
+                    bound,
+                },
+        } => {
             push_member_str(&mut out, "reason", "find_constraint");
             if let Some(group) = groups.get(*group) {
                 out.push(',');
@@ -179,11 +188,21 @@ pub fn unassigned_slug(
             // limit, so an over-match (found 2, max 1) is distinguishable from
             // a no-match (found 0, min 1).
             out.push(',');
-            push_member_str(&mut out, "constraint", failure.kind.as_str());
+            push_member_str(&mut out, "constraint", kind.as_str());
             out.push_str(",\"found\":");
-            out.push_str(&failure.observed.to_string());
+            out.push_str(&observed.to_string());
             out.push_str(",\"limit\":");
-            out.push_str(&failure.bound.to_string());
+            out.push_str(&bound.to_string());
+        }
+        Unassigned::FindConstraint {
+            group,
+            failure: FindFailure::NearestTie,
+        } => {
+            push_member_str(&mut out, "reason", "nearest_tie");
+            if let Some(group) = groups.get(*group) {
+                out.push(',');
+                push_member_str(&mut out, "group", &group.name);
+            }
         }
         Unassigned::NoSample => push_member_str(&mut out, "reason", "no_sample"),
         Unassigned::MissingStream(stream) => {
@@ -326,7 +345,7 @@ mod tests {
                 &[],
                 &Unassigned::FindConstraint {
                     group: 0,
-                    failure: FindFailure {
+                    failure: FindFailure::Bound {
                         kind: FindKind::MinPerGroup,
                         observed: 0,
                         bound: 1
@@ -347,6 +366,30 @@ mod tests {
                 &Unassigned::MissingStream("bc".to_string())
             ),
             r#"{"v":1,"outcome":"unassigned","reason":"missing_stream","stream":"bc","groups":[]}"#
+        );
+    }
+
+    #[test]
+    fn test_unassigned_slug_of_a_nearest_tie() {
+        use crate::grammar::MatchMode;
+        use crate::matcher::{match_group, Scratch};
+
+        let mut tied = group("bc", &["AAAACCCC", "GGGGTTTT"]);
+        tied.mode = MatchMode::Nearest;
+        tied.min_finds_per_group = Some(1);
+        let outcome = match_group(&tied, &mut Scratch::new(), &[b"AAAACCCCGGGGTTTT"]);
+        let failure = tied
+            .find_failure(&outcome)
+            .expect("a tie fails minFindsPerGroup=1");
+        let no_hits: [Option<GroupHit>; 0] = [];
+        assert_eq!(
+            unassigned_slug(
+                &[tied],
+                &no_hits,
+                &[],
+                &Unassigned::FindConstraint { group: 0, failure },
+            ),
+            r#"{"v":1,"outcome":"unassigned","reason":"nearest_tie","group":"bc","groups":[]}"#
         );
     }
 

@@ -251,6 +251,13 @@ struct DemuxCmd {
     /// the link has a window, but is not required: route on both groups, or
     /// set `minFindsPerGroup=1` on `G`, to require it.
     ///
+    /// Under `mode=nearest` the find bounds count only the match it keeps, as
+    /// one find for the group and its tag, so a runner-up within `dist` is no
+    /// find, and a `minFindsPerGroup` or `minFindsPerTag` above 1 is refused.
+    /// A read whose best match does not beat the runner-up by `delta` fails
+    /// every find bound the group has and is unassigned as `nearest_tie`; with
+    /// no find bound, the group is left unmatched.
+    ///
     /// A reverse-strand match (`bothStrands=true`) is read in its tag's own
     /// orientation, as if the record were reverse-complemented: `@grp`
     /// streams from it are reverse-complemented with their qualities

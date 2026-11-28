@@ -201,17 +201,23 @@ pub struct CompiledGroup {
     pub read_group: Option<std::collections::HashMap<Vec<u8>, usize>>,
 }
 
-/// Which find-count constraint a group outcome violated, with the observed
-/// count and the crossed bound, for the optional `--qc-tag` unassigned slug.
+/// How a group outcome fails its find bounds, for the optional `--qc-tag`
+/// unassigned slug and the unassigned metrics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FindFailure {
-    /// The constraint that was violated.
-    pub kind: FindKind,
-    /// The observed count: group matches for a per-group bound, or occurrences
-    /// of the offending tag for a per-tag bound.
-    pub observed: usize,
-    /// The configured bound that was crossed.
-    pub bound: usize,
+pub enum FindFailure {
+    /// A find-count constraint was violated.
+    Bound {
+        /// The constraint that was violated.
+        kind: FindKind,
+        /// The observed count: group matches for a per-group bound, or
+        /// occurrences of the offending tag for a per-tag bound.
+        observed: usize,
+        /// The configured bound that was crossed.
+        bound: usize,
+    },
+    /// Under `mode=nearest` no match beat the runner-up by `delta`, which fails
+    /// every find bound of the group.
+    NearestTie,
 }
 
 /// The kind of find-count constraint, for [`FindFailure`]; [`FindKind::as_str`]
@@ -340,7 +346,7 @@ impl CompiledGroup {
     /// Whether a group outcome satisfies the per-tag and per-group find-count
     /// bounds. An unset bound is unconstrained. Per-group bounds gate the total
     /// accepted-match count; per-tag bounds apply to each tag that occurs, by
-    /// its occurrence count.
+    /// its occurrence count. Under `mode=nearest` only the kept match counts.
     pub fn satisfies_finds(&self, outcome: &GroupOutcome) -> bool {
         self.find_failure(outcome).is_none()
     }
@@ -348,14 +354,23 @@ impl CompiledGroup {
     /// The find-count constraint this outcome violates (with the observed count
     /// and the bound), or `None` when every bound is satisfied. Per-group
     /// bounds gate the total accepted-match count; per-tag bounds apply to each
-    /// tag that occurs, by its occurrence count. The per-tag check runs in
-    /// ascending tag-index order so the reported failure is deterministic when
-    /// several tags are out of bounds (HashMap iteration order is not).
+    /// tag that occurs, by its occurrence count. Under `mode=nearest` the only
+    /// find is the match it keeps, and a tie fails every bound the group has.
+    /// The per-tag check runs in ascending tag-index order so the reported
+    /// failure is deterministic when several tags are out of bounds (HashMap
+    /// iteration order is not).
     pub fn find_failure(&self, outcome: &GroupOutcome) -> Option<FindFailure> {
-        let group_count = outcome.accepted.len();
+        let finds = match (&outcome.best, self.mode) {
+            (Some(best), MatchMode::Nearest) => std::slice::from_ref(best),
+            (None, MatchMode::Nearest) if !outcome.accepted.is_empty() => {
+                return self.has_find_bounds().then_some(FindFailure::NearestTie);
+            }
+            _ => outcome.accepted.as_slice(),
+        };
+        let group_count = finds.len();
         if let Some(min) = self.min_finds_per_group {
             if group_count < min {
-                return Some(FindFailure {
+                return Some(FindFailure::Bound {
                     kind: FindKind::MinPerGroup,
                     observed: group_count,
                     bound: min,
@@ -364,7 +379,7 @@ impl CompiledGroup {
         }
         if let Some(max) = self.max_finds_per_group {
             if group_count > max {
-                return Some(FindFailure {
+                return Some(FindFailure::Bound {
                     kind: FindKind::MaxPerGroup,
                     observed: group_count,
                     bound: max,
@@ -373,7 +388,7 @@ impl CompiledGroup {
         }
         if self.min_finds_per_tag.is_some() || self.max_finds_per_tag.is_some() {
             let mut counts: AHashMap<usize, usize> = AHashMap::new();
-            for m in &outcome.accepted {
+            for m in finds {
                 *counts.entry(m.tag_idx).or_default() += 1;
             }
             let mut counts: Vec<(usize, usize)> = counts.into_iter().collect();
@@ -381,7 +396,7 @@ impl CompiledGroup {
             for (_tag_idx, count) in counts {
                 if let Some(max) = self.max_finds_per_tag {
                     if count > max {
-                        return Some(FindFailure {
+                        return Some(FindFailure::Bound {
                             kind: FindKind::MaxPerTag,
                             observed: count,
                             bound: max,
@@ -390,7 +405,7 @@ impl CompiledGroup {
                 }
                 if let Some(min) = self.min_finds_per_tag {
                     if count < min {
-                        return Some(FindFailure {
+                        return Some(FindFailure::Bound {
                             kind: FindKind::MinPerTag,
                             observed: count,
                             bound: min,
@@ -400,6 +415,14 @@ impl CompiledGroup {
             }
         }
         None
+    }
+
+    /// Whether a find bound can fail the group: a minimum of at least one, or any maximum.
+    fn has_find_bounds(&self) -> bool {
+        self.min_finds_per_group.is_some_and(|min| min >= 1)
+            || self.max_finds_per_group.is_some()
+            || self.min_finds_per_tag.is_some_and(|min| min >= 1)
+            || self.max_finds_per_tag.is_some()
     }
 }
 
@@ -2657,6 +2680,84 @@ mod tests {
             !g.satisfies_finds(&result),
             "a tag found twice exceeds maxFindsPerTag=1"
         );
+    }
+
+    /// A find bound by its attribute, and how it sets a group.
+    type FindBound = (&'static str, fn(&mut CompiledGroup));
+
+    /// Each find bound a group can have.
+    fn find_bounds() -> [FindBound; 5] {
+        [
+            ("minFindsPerGroup=1", |g| g.min_finds_per_group = Some(1)),
+            ("maxFindsPerGroup=1", |g| g.max_finds_per_group = Some(1)),
+            ("minFindsPerTag=1", |g| g.min_finds_per_tag = Some(1)),
+            ("maxFindsPerTag=1", |g| g.max_finds_per_tag = Some(1)),
+            ("findOne", |g| {
+                g.max_finds_per_tag = Some(1);
+                g.min_finds_per_group = Some(1);
+                g.max_finds_per_group = Some(1);
+            }),
+        ]
+    }
+
+    /// `group` with the find bound `bound` set.
+    fn bounded(group: &CompiledGroup, bound: fn(&mut CompiledGroup)) -> CompiledGroup {
+        let mut bounded = group.clone();
+        bound(&mut bounded);
+        bounded
+    }
+
+    /// A `mode=nearest` group and a read that tags a and b both match exactly, a twice.
+    fn nearest_tie() -> (CompiledGroup, GroupOutcome) {
+        let mut g = group(&["AAAACCCC", "GGGGTTTT"]);
+        g.mode = MatchMode::Nearest;
+        let tie = outcome(&g, "AAAACCCCGGGGTTTTAAAACCCC");
+        assert_eq!((tie.accepted.len(), tie.best), (3, None), "{tie:?}");
+        (g, tie)
+    }
+
+    #[test]
+    fn test_find_failure_of_a_nearest_tie_is_the_same_under_each_bound() {
+        let (g, tie) = nearest_tie();
+        let failures = find_bounds().map(|(_, bound)| bounded(&g, bound).find_failure(&tie));
+        assert!(failures[0].is_some(), "a tie fails minFindsPerGroup=1");
+        for ((name, _), failure) in find_bounds().iter().zip(&failures) {
+            assert_eq!(failure, &failures[0], "{name}");
+        }
+    }
+
+    #[test]
+    fn test_find_failure_of_a_nearest_tie_without_find_bounds_is_none() {
+        let (g, tie) = nearest_tie();
+        assert_eq!(g.find_failure(&tie), None);
+        let unbounded = bounded(&g, |g| g.min_finds_per_group = Some(0));
+        assert_eq!(unbounded.find_failure(&tie), None);
+    }
+
+    #[test]
+    fn test_find_failure_counts_a_nearest_winner_as_one_find() {
+        // Tag a matches exactly at [1,7) and [12,18), tag b one substitution away at [0,6) and [11,17).
+        let mut g = group(&["AACCGG", "GAACCC"]);
+        g.dist = substitutions(1);
+        g.mode = MatchMode::Nearest;
+        let win = outcome(&g, "GAACCGGTTTTGAACCGGTTTT");
+        assert_eq!(win.best.map(|best| best.tag_idx), Some(0), "{win:?}");
+        assert_eq!(win.accepted.len(), 4, "{win:?}");
+        for (name, bound) in find_bounds() {
+            assert_eq!(bounded(&g, bound).find_failure(&win), None, "{name}");
+        }
+        assert!(!bounded(&g, |g| g.min_finds_per_group = Some(2)).satisfies_finds(&win));
+        assert!(!bounded(&g, |g| g.min_finds_per_tag = Some(2)).satisfies_finds(&win));
+    }
+
+    #[test]
+    fn test_find_failure_counts_every_match_under_mode_all() {
+        let g = group(&["AAAACCCC", "GGGGTTTT"]);
+        let tie = outcome(&g, "AAAACCCCGGGGTTTTAAAACCCC");
+        assert_eq!(tie.best.map(|best| best.tag_idx), Some(0), "{tie:?}");
+        let passes = find_bounds().map(|(_, bound)| bounded(&g, bound).satisfies_finds(&tie));
+        assert_eq!(passes, [true, false, true, false, false]);
+        assert!(bounded(&g, |g| g.min_finds_per_group = Some(3)).satisfies_finds(&tie));
     }
 
     #[test]

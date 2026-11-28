@@ -19,13 +19,14 @@ use serde::Serialize;
 use thousands::Separable;
 
 use crate::fanout::Target;
-use crate::matcher::{CompiledGroup, FindKind};
+use crate::matcher::{CompiledGroup, FindFailure, FindKind};
 use crate::qc::Unassigned;
 
 /// One `--metrics-unassigned` row's reason; the derived order is the row order.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum UnassignedReason {
     FindConstraint { group: usize, kind: FindKind },
+    NearestTie { group: usize },
     MissingStream(String),
     NoSample,
 }
@@ -33,12 +34,32 @@ enum UnassignedReason {
 impl From<&Unassigned> for UnassignedReason {
     fn from(reason: &Unassigned) -> Self {
         match reason {
-            Unassigned::FindConstraint { group, failure } => Self::FindConstraint {
+            Unassigned::FindConstraint {
+                group,
+                failure: FindFailure::Bound { kind, .. },
+            } => Self::FindConstraint {
                 group: *group,
-                kind: failure.kind,
+                kind: *kind,
             },
+            Unassigned::FindConstraint {
+                group,
+                failure: FindFailure::NearestTie,
+            } => Self::NearestTie { group: *group },
             Unassigned::MissingStream(stream) => Self::MissingStream(stream.clone()),
             Unassigned::NoSample => Self::NoSample,
+        }
+    }
+}
+
+impl UnassignedReason {
+    /// The reason, group and stream columns of this reason's row.
+    fn columns<'a>(&'a self, groups: &'a [CompiledGroup]) -> (&'a str, &'a str, &'a str) {
+        let name = |group: &usize| groups.get(*group).map_or("", |g| g.name.as_str());
+        match self {
+            Self::FindConstraint { group, kind } => (kind.as_str(), name(group), ""),
+            Self::NearestTie { group } => ("nearest_tie", name(group), ""),
+            Self::MissingStream(stream) => ("missing_stream", "", stream.as_str()),
+            Self::NoSample => ("no_sample", "", ""),
         }
     }
 }
@@ -274,15 +295,7 @@ impl Metrics {
                 .context("failed to write the unassigned metrics header")?;
         }
         for (reason, &reads) in &self.unassigned_by_reason {
-            let (reason, group, stream) = match reason {
-                UnassignedReason::FindConstraint { group, kind } => (
-                    kind.as_str(),
-                    groups.get(*group).map_or("", |g| g.name.as_str()),
-                    "",
-                ),
-                UnassignedReason::MissingStream(stream) => ("missing_stream", "", stream.as_str()),
-                UnassignedReason::NoSample => ("no_sample", "", ""),
-            };
+            let (reason, group, stream) = reason.columns(groups);
             writer
                 .serialize(UnassignedRow {
                     pool: &self.pool,
@@ -298,8 +311,9 @@ impl Metrics {
     }
 
     /// Log the metrics to stderr as a long-form table (always emitted, with or
-    /// without the TSV flags).
-    pub fn log(&self) {
+    /// without the TSV flags), with one line for the reads unassigned as
+    /// `nearest_tie`, by their group in `groups`.
+    pub fn log(&self, groups: &[CompiledGroup]) {
         let assigned = self.assigned();
         log::info!(
             "metrics pool={}: {} reads ({} assigned, {} pass-through, {} unassigned, {} removed) frac_assigned={:.4} frac_bases_unextracted={:.4} mean_read_len_by_input={}",
@@ -329,6 +343,25 @@ impl Metrics {
                 tally.reads.separate_with_commas(),
                 frac(tally.reads, self.total),
                 frac(tally.unextracted_bases, tally.denominator_bases),
+            );
+        }
+        let ties: Vec<(&str, u64)> = self
+            .unassigned_by_reason
+            .iter()
+            .filter(|(reason, _)| matches!(reason, UnassignedReason::NearestTie { .. }))
+            .map(|(reason, &reads)| (reason.columns(groups).1, reads))
+            .collect();
+        if !ties.is_empty() {
+            let total: u64 = ties.iter().map(|&(_, reads)| reads).sum();
+            let by_group: Vec<String> = ties
+                .iter()
+                .map(|(group, reads)| format!("{group}={}", reads.separate_with_commas()))
+                .collect();
+            log::info!(
+                "metrics pool={}: {} reads unassigned as nearest_tie ({})",
+                self.pool,
+                total.separate_with_commas(),
+                by_group.join(", "),
             );
         }
         let unassigned_rate = self.unassigned_rate();
@@ -528,7 +561,7 @@ mod tests {
         ];
         let constraint = |group, kind, observed, bound| Unassigned::FindConstraint {
             group,
-            failure: FindFailure {
+            failure: FindFailure::Bound {
                 kind,
                 observed,
                 bound,
@@ -557,6 +590,51 @@ mod tests {
                 "p\tmin_finds_per_group\tbc2\t\t1\t0.100000",
                 "p\tmissing_stream\t\tumi\t1\t0.100000",
                 "p\tno_sample\t\t\t1\t0.100000",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_unassigned_tsv_counts_a_nearest_tie_under_its_own_reason() {
+        use crate::grammar::MatchMode;
+        use crate::matcher::{match_group, Scratch};
+
+        let mut tied = CompiledGroup::new("bc", vec![b"AAAACCCC".to_vec(), b"GGGGTTTT".to_vec()]);
+        tied.mode = MatchMode::Nearest;
+        tied.max_finds_per_group = Some(1);
+        let mut index = CompiledGroup::new("i7", vec![b"ACGTACGT".to_vec()]);
+        index.min_finds_per_group = Some(1);
+        let read: [&[u8]; 1] = [b"AAAACCCCGGGGTTTT"];
+        let failure = |group: &CompiledGroup| {
+            let outcome = match_group(group, &mut Scratch::new(), &read);
+            group
+                .find_failure(&outcome)
+                .expect("the read fails the group")
+        };
+        let mut metrics = Metrics::new("p", &[]);
+        for _ in 0..4 {
+            metrics.record_processed();
+        }
+        for _ in 0..2 {
+            metrics.record_unassigned(&Unassigned::FindConstraint {
+                group: 0,
+                failure: failure(&tied),
+            });
+        }
+        metrics.record_unassigned(&Unassigned::FindConstraint {
+            group: 1,
+            failure: failure(&index),
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("unassigned.tsv");
+        metrics.write_unassigned_tsv(&path, &[tied, index]).unwrap();
+        assert_eq!(
+            lines(&path),
+            vec![
+                "pool\treason\tgroup\tstream\treads\tfrac_of_pool",
+                "p\tmin_finds_per_group\ti7\t\t1\t0.250000",
+                "p\tnearest_tie\tbc\t\t2\t0.500000",
             ]
         );
     }
