@@ -853,7 +853,8 @@ fn order_by_prereq(
 
 /// The pool id filling `%pool`, including in `%pool` sub_samples: `--pool` when
 /// given, else the longest common prefix of the input file names without their
-/// format extensions (trimmed of trailing separators), else `pool`.
+/// format extensions, trimmed of trailing separators and, for several inputs, of
+/// a read marker, or `pool` when that leaves nothing.
 fn pool_id(plan: &DemuxPlan) -> String {
     if let Some(pool) = &plan.pool {
         return pool.clone();
@@ -865,11 +866,31 @@ fn pool_id(plan: &DemuxPlan) -> String {
         .map(|name| without_format_extension(&name.to_string_lossy()).to_string())
         .collect();
     let prefix = longest_common_prefix(&names);
-    let trimmed = prefix.trim_end_matches(['.', '_', '-', ' ']);
-    if trimmed.is_empty() {
+    let trimmed = prefix.trim_end_matches(SEPARATORS);
+    let pool = match names.len() {
+        1 => trimmed,
+        _ => without_read_marker(trimmed),
+    };
+    if pool.is_empty() {
         "pool".to_string()
     } else {
-        trimmed.to_string()
+        pool.to_string()
+    }
+}
+
+/// The characters trimmed from the end of a pool taken from input names.
+const SEPARATORS: [char; 4] = ['.', '_', '-', ' '];
+
+/// The prefix minus a trailing read marker: an `R` or `r` alone or after separators, with them.
+fn without_read_marker(prefix: &str) -> &str {
+    let Some(rest) = prefix.strip_suffix(['R', 'r']) else {
+        return prefix;
+    };
+    let kept = rest.trim_end_matches(['_', '.', '-']);
+    if rest.is_empty() || kept.len() < rest.len() {
+        kept
+    } else {
+        prefix
     }
 }
 
