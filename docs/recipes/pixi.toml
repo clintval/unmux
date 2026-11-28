@@ -1,0 +1,21 @@
+[workspace]
+name = "unmux-cookbook"
+channels = ["conda-forge", "bioconda"]
+platforms = ["osx-arm64", "linux-64"]
+
+[dependencies]
+python = "==3.12.16"
+snakemake-minimal = "==9.27.2"
+pyyaml = "==6.0.3"
+samtools = "==1.25"
+fg-sra = "==0.2.1"
+fqtk = "==0.5.0"
+splitcode = "==0.31.6"
+ruff = "==0.17.6"
+
+[tasks]
+build = "cargo build --release --manifest-path ../../Cargo.toml"
+run = { cmd = "snakemake --cores 8", depends-on = ["build"] }
+page = { cmd = "snakemake --cores 8 page", depends-on = ["build"] }
+check = { cmd = "snakemake --cores 8 check", depends-on = ["build"] }
+clean = "rm -rf cache results .snakemake"

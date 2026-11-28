@@ -1,0 +1,782 @@
+# Every input of the cookbook: where it comes from, how it is fetched, and its sha256.
+- key: sra-SRR390728
+  name: "SRR390728_1.fastq"
+  label: "SRA run SRR390728, spots 1 to 2,000"
+  url: "https://www.ncbi.nlm.nih.gov/sra/SRR390728"
+  accession: SRR390728
+  spots: [1, 2000]
+  fetch: "fg-sra fastq --min-spot-id 1 --max-spot-id 2000 --r1 SRR390728_1.fastq --r2 SRR390728_2.fastq SRR390728"
+  sha256: 93f6ea4eae9361fa6109c62caed201f8d462d11a2af3fdb2307eb3a597e1aabd
+- key: sra-SRR390728
+  name: "SRR390728_2.fastq"
+  label: "SRA run SRR390728, spots 1 to 2,000"
+  url: "https://www.ncbi.nlm.nih.gov/sra/SRR390728"
+  accession: SRR390728
+  spots: [1, 2000]
+  fetch: "fg-sra fastq --min-spot-id 1 --max-spot-id 2000 --r1 SRR390728_1.fastq --r2 SRR390728_2.fastq SRR390728"
+  sha256: 479caf671e0766784f78ff7aedc7578ca6a1cee66f983a7c6fdcc1d8df99e134
+- key: uditas
+  name: "Undetermined_S0_L001_R1_001.fastq"
+  label: "UDiTaS fig2b run, R1 (first 20,000 records)"
+  url: "https://raw.githubusercontent.com/editasmedicine/uditas/658ad062acf2b073dd42523704fae9c71e14bd8a/data/fig2b/Undetermined_S0_L001_R1_001.fastq.gz"
+  commit: 658ad062acf2b073dd42523704fae9c71e14bd8a
+  records: 20000
+  sha256: cc4c86e51b466a7c8f6885f3a0c6b7c832f9a5d80cdf5840d6ebe689f3abbfa1
+- key: uditas
+  name: "Undetermined_S0_L001_R2_001.fastq"
+  label: "UDiTaS fig2b run, R2 (first 20,000 records)"
+  url: "https://raw.githubusercontent.com/editasmedicine/uditas/658ad062acf2b073dd42523704fae9c71e14bd8a/data/fig2b/Undetermined_S0_L001_R2_001.fastq.gz"
+  commit: 658ad062acf2b073dd42523704fae9c71e14bd8a
+  records: 20000
+  sha256: 91bfe77bcf39b4e248a6e67814d01e3c9eb52af4e89bfe8fc08694b2d1b9d283
+- key: uditas
+  name: "Undetermined_S0_L001_I1_001.fastq"
+  label: "UDiTaS fig2b run, I1 (first 20,000 records)"
+  url: "https://raw.githubusercontent.com/editasmedicine/uditas/658ad062acf2b073dd42523704fae9c71e14bd8a/data/fig2b/Undetermined_S0_L001_I1_001.fastq.gz"
+  commit: 658ad062acf2b073dd42523704fae9c71e14bd8a
+  records: 20000
+  sha256: d45f9944f59c394b5804d0706d17d3d84ee04b5ff58c60c1795a223d03d53317
+- key: uditas
+  name: "Undetermined_S0_L001_I2_001.fastq"
+  label: "UDiTaS fig2b run, I2 (first 20,000 records)"
+  url: "https://raw.githubusercontent.com/editasmedicine/uditas/658ad062acf2b073dd42523704fae9c71e14bd8a/data/fig2b/Undetermined_S0_L001_I2_001.fastq.gz"
+  commit: 658ad062acf2b073dd42523704fae9c71e14bd8a
+  records: 20000
+  sha256: cba62a532e8a8eb3cbfa7d6faeaf032ab4edcc627443fe5eeda7143f541f1e0e
+- key: uditas
+  name: "sample_info.csv"
+  label: "UDiTaS fig2b sample sheet"
+  url: "https://raw.githubusercontent.com/editasmedicine/uditas/658ad062acf2b073dd42523704fae9c71e14bd8a/data/fig2b/sample_info.csv"
+  commit: 658ad062acf2b073dd42523704fae9c71e14bd8a
+  sha256: 11807fb316b2e86a2b59bff67b765eaf4778ce67c38501f910856b25a9c892cc
+- key: uditas-fig2c
+  name: "Undetermined_S0_L001_R1_001.fastq"
+  label: "UDiTaS fig2c run, R1 (first 5,000 records)"
+  url: "https://raw.githubusercontent.com/editasmedicine/uditas/658ad062acf2b073dd42523704fae9c71e14bd8a/data/fig2c/Undetermined_S0_L001_R1_001.fastq.gz"
+  commit: 658ad062acf2b073dd42523704fae9c71e14bd8a
+  records: 5000
+  sha256: 8183bf5ab0a273466b4c17a700a34f48ba50418d7911c93abce6c10cbf392019
+- key: uditas-fig2c
+  name: "Undetermined_S0_L001_R2_001.fastq"
+  label: "UDiTaS fig2c run, R2 (first 5,000 records)"
+  url: "https://raw.githubusercontent.com/editasmedicine/uditas/658ad062acf2b073dd42523704fae9c71e14bd8a/data/fig2c/Undetermined_S0_L001_R2_001.fastq.gz"
+  commit: 658ad062acf2b073dd42523704fae9c71e14bd8a
+  records: 5000
+  sha256: 99ab74d3e3afc5c8d7851747981fdf52b3c600eced7fce8cc2c7cce5ca609d57
+- key: uditas-fig2c
+  name: "Undetermined_S0_L001_I1_001.fastq"
+  label: "UDiTaS fig2c run, I1 (first 5,000 records)"
+  url: "https://raw.githubusercontent.com/editasmedicine/uditas/658ad062acf2b073dd42523704fae9c71e14bd8a/data/fig2c/Undetermined_S0_L001_I1_001.fastq.gz"
+  commit: 658ad062acf2b073dd42523704fae9c71e14bd8a
+  records: 5000
+  sha256: 9b10600a26d8dd53abb77265b1e310e0a3987a0ff500051d8d496a106e18f20c
+- key: uditas-fig2c
+  name: "Undetermined_S0_L001_I2_001.fastq"
+  label: "UDiTaS fig2c run, I2 (first 5,000 records)"
+  url: "https://raw.githubusercontent.com/editasmedicine/uditas/658ad062acf2b073dd42523704fae9c71e14bd8a/data/fig2c/Undetermined_S0_L001_I2_001.fastq.gz"
+  commit: 658ad062acf2b073dd42523704fae9c71e14bd8a
+  records: 5000
+  sha256: 403d5b9c34908ca2544c46cf9ef9a307ff36f5555f3cf10e16a3b40209cb0c15
+- key: changeseq
+  name: "TEST.r1.fastq.gz"
+  label: "CHANGE-seq test reads TEST, r1"
+  url: "https://raw.githubusercontent.com/tsailabSJ/changeseq/742427fb1ee9e016d247fa263039f1cd349a42cf/test/data/input/TEST.r1.fastq.gz"
+  commit: 742427fb1ee9e016d247fa263039f1cd349a42cf
+  sha256: a4843b9ff978958de6863718193c8380218e551717e659f3856b891539465e72
+- key: changeseq
+  name: "TEST.r2.fastq.gz"
+  label: "CHANGE-seq test reads TEST, r2"
+  url: "https://raw.githubusercontent.com/tsailabSJ/changeseq/742427fb1ee9e016d247fa263039f1cd349a42cf/test/data/input/TEST.r2.fastq.gz"
+  commit: 742427fb1ee9e016d247fa263039f1cd349a42cf
+  sha256: ee0117a9f829f86aa942efc521a2e97d507fc84e51e6b95ffa483ccafa55ca1a
+- key: changeseq
+  name: "TEST_control.r1.fastq.gz"
+  label: "CHANGE-seq test reads TEST_control, r1"
+  url: "https://raw.githubusercontent.com/tsailabSJ/changeseq/742427fb1ee9e016d247fa263039f1cd349a42cf/test/data/input/TEST_control.r1.fastq.gz"
+  commit: 742427fb1ee9e016d247fa263039f1cd349a42cf
+  sha256: c66c3a4f6791da9cadc6fe81e36337db5b6a8f9bbbfcfdb6a49d4b48f8eaccef
+- key: changeseq
+  name: "TEST_control.r2.fastq.gz"
+  label: "CHANGE-seq test reads TEST_control, r2"
+  url: "https://raw.githubusercontent.com/tsailabSJ/changeseq/742427fb1ee9e016d247fa263039f1cd349a42cf/test/data/input/TEST_control.r2.fastq.gz"
+  commit: 742427fb1ee9e016d247fa263039f1cd349a42cf
+  sha256: d9b90ec361f8a31b34cfa4b9fbc8e40e139e4784ac57fb9369522731d6f70a10
+- key: changeseq
+  name: "mergeReads.py"
+  label: "CHANGE-seq read merging, mergeReads()"
+  url: "https://raw.githubusercontent.com/tsailabSJ/changeseq/742427fb1ee9e016d247fa263039f1cd349a42cf/changeseq/mergeReads.py"
+  commit: 742427fb1ee9e016d247fa263039f1cd349a42cf
+  sha256: 61854937da7e2a0be34f323298802a37ca99b0f82de4b0d409e2d5244a6c9467
+- key: sra-verd6
+  name: "SRR14560737.fastq"
+  label: "SRA runs of BioProject PRJNA730334 batch VERD6, one per native barcode, spots 1 to 200 of each"
+  url: "https://www.ncbi.nlm.nih.gov/bioproject/PRJNA730334"
+  accession: SRR14560737
+  spots: [1, 200]
+  fetch: &sra_verd6 |-
+    for run in SRR14560737 SRR14560738 SRR14560739 SRR14560652 SRR14560583 SRR14560584 \
+      SRR14560585 SRR14560586 SRR14560587 SRR14560588 SRR14560763 SRR14560764 \
+      SRR14560765 SRR14560523 SRR14560525 SRR14560631 SRR14560632 SRR14560633 \
+      SRR14560634 SRR14560635 SRR14560769 SRR14560772 SRR14560526 SRR14560531; do
+      fg-sra fastq --min-spot-id 1 --max-spot-id 200 --unpaired "$run.fastq" "$run"
+    done
+  sha256: 3a692351b5d50e7387d468df2869eb19a701906c1013a94179ec64a80cacf6f1
+- key: sra-verd6
+  name: "SRR14560738.fastq"
+  label: "SRA runs of BioProject PRJNA730334 batch VERD6, one per native barcode, spots 1 to 200 of each"
+  url: "https://www.ncbi.nlm.nih.gov/bioproject/PRJNA730334"
+  accession: SRR14560738
+  spots: [1, 200]
+  fetch: *sra_verd6
+  sha256: 54729bb12872bef5f8f2e5a96669e45752fd7d71a5e8586b640b54936a11d870
+- key: sra-verd6
+  name: "SRR14560739.fastq"
+  label: "SRA runs of BioProject PRJNA730334 batch VERD6, one per native barcode, spots 1 to 200 of each"
+  url: "https://www.ncbi.nlm.nih.gov/bioproject/PRJNA730334"
+  accession: SRR14560739
+  spots: [1, 200]
+  fetch: *sra_verd6
+  sha256: 54cf8134c59224cc98746faa52febf2ef9e045a51faf7eb653f23dd4ebae7ae8
+- key: sra-verd6
+  name: "SRR14560652.fastq"
+  label: "SRA runs of BioProject PRJNA730334 batch VERD6, one per native barcode, spots 1 to 200 of each"
+  url: "https://www.ncbi.nlm.nih.gov/bioproject/PRJNA730334"
+  accession: SRR14560652
+  spots: [1, 200]
+  fetch: *sra_verd6
+  sha256: dcc6dae37460689c7f051705bbc747ccd7e8e1cca92cc4a3ac3527ff9cac8856
+- key: sra-verd6
+  name: "SRR14560583.fastq"
+  label: "SRA runs of BioProject PRJNA730334 batch VERD6, one per native barcode, spots 1 to 200 of each"
+  url: "https://www.ncbi.nlm.nih.gov/bioproject/PRJNA730334"
+  accession: SRR14560583
+  spots: [1, 200]
+  fetch: *sra_verd6
+  sha256: bfa90841686f0a6945f7552e7db7458cbcffb7d5a75ad41ef269a198ea57c105
+- key: sra-verd6
+  name: "SRR14560584.fastq"
+  label: "SRA runs of BioProject PRJNA730334 batch VERD6, one per native barcode, spots 1 to 200 of each"
+  url: "https://www.ncbi.nlm.nih.gov/bioproject/PRJNA730334"
+  accession: SRR14560584
+  spots: [1, 200]
+  fetch: *sra_verd6
+  sha256: ecbdb88f15476b226059aea8d8ee81a0b3ba94afe9e610a2e1883e01c41d1994
+- key: sra-verd6
+  name: "SRR14560585.fastq"
+  label: "SRA runs of BioProject PRJNA730334 batch VERD6, one per native barcode, spots 1 to 200 of each"
+  url: "https://www.ncbi.nlm.nih.gov/bioproject/PRJNA730334"
+  accession: SRR14560585
+  spots: [1, 200]
+  fetch: *sra_verd6
+  sha256: 4fa1317adf546e55c818bb11a71af9e324f48e7128f88d2a1244fd3f1d36fc80
+- key: sra-verd6
+  name: "SRR14560586.fastq"
+  label: "SRA runs of BioProject PRJNA730334 batch VERD6, one per native barcode, spots 1 to 200 of each"
+  url: "https://www.ncbi.nlm.nih.gov/bioproject/PRJNA730334"
+  accession: SRR14560586
+  spots: [1, 200]
+  fetch: *sra_verd6
+  sha256: cc42fa60cda9831ef4c3c1b4e60b53a1348a500e6919340e64c8f2282198e268
+- key: sra-verd6
+  name: "SRR14560587.fastq"
+  label: "SRA runs of BioProject PRJNA730334 batch VERD6, one per native barcode, spots 1 to 200 of each"
+  url: "https://www.ncbi.nlm.nih.gov/bioproject/PRJNA730334"
+  accession: SRR14560587
+  spots: [1, 200]
+  fetch: *sra_verd6
+  sha256: d2ce4814a9cdeacbb2828962e4f57060a3cd6f7ecb70d5c409b99346502b18bd
+- key: sra-verd6
+  name: "SRR14560588.fastq"
+  label: "SRA runs of BioProject PRJNA730334 batch VERD6, one per native barcode, spots 1 to 200 of each"
+  url: "https://www.ncbi.nlm.nih.gov/bioproject/PRJNA730334"
+  accession: SRR14560588
+  spots: [1, 200]
+  fetch: *sra_verd6
+  sha256: 01fc16f31974a478f0fa75b9002ab4f8d6edd95492c6d6ed8271bef58f05bda1
+- key: sra-verd6
+  name: "SRR14560763.fastq"
+  label: "SRA runs of BioProject PRJNA730334 batch VERD6, one per native barcode, spots 1 to 200 of each"
+  url: "https://www.ncbi.nlm.nih.gov/bioproject/PRJNA730334"
+  accession: SRR14560763
+  spots: [1, 200]
+  fetch: *sra_verd6
+  sha256: 3150aa81144c401c18b850808f0d3ab43a1648a18c6e6257b7679cef315f03d6
+- key: sra-verd6
+  name: "SRR14560764.fastq"
+  label: "SRA runs of BioProject PRJNA730334 batch VERD6, one per native barcode, spots 1 to 200 of each"
+  url: "https://www.ncbi.nlm.nih.gov/bioproject/PRJNA730334"
+  accession: SRR14560764
+  spots: [1, 200]
+  fetch: *sra_verd6
+  sha256: f03ecee43a0ae83583034af37abf189df639f30682b99808a2f7540d32192826
+- key: sra-verd6
+  name: "SRR14560765.fastq"
+  label: "SRA runs of BioProject PRJNA730334 batch VERD6, one per native barcode, spots 1 to 200 of each"
+  url: "https://www.ncbi.nlm.nih.gov/bioproject/PRJNA730334"
+  accession: SRR14560765
+  spots: [1, 200]
+  fetch: *sra_verd6
+  sha256: 503f7cca77c1934756fddb88e9df66ed60621b5c2da59af59c4adf7e0df24fa0
+- key: sra-verd6
+  name: "SRR14560523.fastq"
+  label: "SRA runs of BioProject PRJNA730334 batch VERD6, one per native barcode, spots 1 to 200 of each"
+  url: "https://www.ncbi.nlm.nih.gov/bioproject/PRJNA730334"
+  accession: SRR14560523
+  spots: [1, 200]
+  fetch: *sra_verd6
+  sha256: d2d13bfa942b7833add772dfe81719bd3ad90ba32e2af9b30a3c24a25dbeb542
+- key: sra-verd6
+  name: "SRR14560525.fastq"
+  label: "SRA runs of BioProject PRJNA730334 batch VERD6, one per native barcode, spots 1 to 200 of each"
+  url: "https://www.ncbi.nlm.nih.gov/bioproject/PRJNA730334"
+  accession: SRR14560525
+  spots: [1, 200]
+  fetch: *sra_verd6
+  sha256: 66a9d6ff51b98a9143a2d7948e086cead3f4d24861c4b553a00e1573b0fe50c9
+- key: sra-verd6
+  name: "SRR14560631.fastq"
+  label: "SRA runs of BioProject PRJNA730334 batch VERD6, one per native barcode, spots 1 to 200 of each"
+  url: "https://www.ncbi.nlm.nih.gov/bioproject/PRJNA730334"
+  accession: SRR14560631
+  spots: [1, 200]
+  fetch: *sra_verd6
+  sha256: 1463b94bc77bedb1c8e6c14c7f699abefef865f1a0ade5dcb10811001832ff07
+- key: sra-verd6
+  name: "SRR14560632.fastq"
+  label: "SRA runs of BioProject PRJNA730334 batch VERD6, one per native barcode, spots 1 to 200 of each"
+  url: "https://www.ncbi.nlm.nih.gov/bioproject/PRJNA730334"
+  accession: SRR14560632
+  spots: [1, 200]
+  fetch: *sra_verd6
+  sha256: 87802c2392aceea734eebc1a7d589aa927508843f98336c436b1c178f6aae6d7
+- key: sra-verd6
+  name: "SRR14560633.fastq"
+  label: "SRA runs of BioProject PRJNA730334 batch VERD6, one per native barcode, spots 1 to 200 of each"
+  url: "https://www.ncbi.nlm.nih.gov/bioproject/PRJNA730334"
+  accession: SRR14560633
+  spots: [1, 200]
+  fetch: *sra_verd6
+  sha256: 237105db8f009af9264abb482e2a50ea716881ffcd159315666bca6df094b49b
+- key: sra-verd6
+  name: "SRR14560634.fastq"
+  label: "SRA runs of BioProject PRJNA730334 batch VERD6, one per native barcode, spots 1 to 200 of each"
+  url: "https://www.ncbi.nlm.nih.gov/bioproject/PRJNA730334"
+  accession: SRR14560634
+  spots: [1, 200]
+  fetch: *sra_verd6
+  sha256: 6c421ff0111e2dbc51ee08f175c8bf04499db5d4a879af9e47bc53e48cabd82c
+- key: sra-verd6
+  name: "SRR14560635.fastq"
+  label: "SRA runs of BioProject PRJNA730334 batch VERD6, one per native barcode, spots 1 to 200 of each"
+  url: "https://www.ncbi.nlm.nih.gov/bioproject/PRJNA730334"
+  accession: SRR14560635
+  spots: [1, 200]
+  fetch: *sra_verd6
+  sha256: 0f9752c8f7574cc0145f9ef82d5cbfcfa4b2977ff3d3b00e9f83a0ec147c4798
+- key: sra-verd6
+  name: "SRR14560769.fastq"
+  label: "SRA runs of BioProject PRJNA730334 batch VERD6, one per native barcode, spots 1 to 200 of each"
+  url: "https://www.ncbi.nlm.nih.gov/bioproject/PRJNA730334"
+  accession: SRR14560769
+  spots: [1, 200]
+  fetch: *sra_verd6
+  sha256: f5afceed5aacc5a7330bc205486985910cfc721268dbd58641c9843ec98a2015
+- key: sra-verd6
+  name: "SRR14560772.fastq"
+  label: "SRA runs of BioProject PRJNA730334 batch VERD6, one per native barcode, spots 1 to 200 of each"
+  url: "https://www.ncbi.nlm.nih.gov/bioproject/PRJNA730334"
+  accession: SRR14560772
+  spots: [1, 200]
+  fetch: *sra_verd6
+  sha256: ab17c2abe95ca9935858003f337fdae2e03a1528f35fc5cd786a810919b43a0b
+- key: sra-verd6
+  name: "SRR14560526.fastq"
+  label: "SRA runs of BioProject PRJNA730334 batch VERD6, one per native barcode, spots 1 to 200 of each"
+  url: "https://www.ncbi.nlm.nih.gov/bioproject/PRJNA730334"
+  accession: SRR14560526
+  spots: [1, 200]
+  fetch: *sra_verd6
+  sha256: 3b9459789f9a6b3c380ff7bc31bdc257b03296d125798b2cb4bb818089fc3010
+- key: sra-verd6
+  name: "SRR14560531.fastq"
+  label: "SRA runs of BioProject PRJNA730334 batch VERD6, one per native barcode, spots 1 to 200 of each"
+  url: "https://www.ncbi.nlm.nih.gov/bioproject/PRJNA730334"
+  accession: SRR14560531
+  spots: [1, 200]
+  fetch: *sra_verd6
+  sha256: 5a79a546ca2b9297e49125437552b95ddc97276af2d3c36a7179f9ff1d9efa36
+- key: pacbio-cyp2d6
+  name: "prefix.bam"
+  label: "PacBio pbAmpliconAnalysis_CYP2D6 HiFi reads before lima, first 10 MB"
+  url: "https://downloads.pacbcloud.com/public/dataset/pbAmpliconAnalysis_CYP2D6/workflow_inputs/m64013e_210223_231140.hifi_reads.bam"
+  bytes: [0, 9999999]
+  fetch: "curl -sS -A unmux-recipes/1.0 -r 0-9999999 -o prefix.bam https://downloads.pacbcloud.com/public/dataset/pbAmpliconAnalysis_CYP2D6/workflow_inputs/m64013e_210223_231140.hifi_reads.bam"
+  sha256: 055d6bba9b3296e09fb731203e5a5c66b5c888b618076eab4fa9fee027efd187
+- key: pacbio-cyp2d6
+  name: "biosamples.csv"
+  label: "PacBio CYP2D6 barcode pairs and samples"
+  url: "https://downloads.pacbcloud.com/public/dataset/pbAmpliconAnalysis_CYP2D6/workflow_inputs/biosamples.csv"
+  sha256: 62a94113d99bd7394297b15587e320cfbd9913003cb2302121ead540673ed01e
+- key: pacbio-cyp2d6
+  name: "Sequel_96_barcodes_v1.fasta"
+  label: "PacBio Sequel 96 barcodes v1"
+  url: "https://raw.githubusercontent.com/PacificBiosciences/hifi-amplicon-workflow/2964cd1fbddae04243d56914935881cca01f6d13/data/Sequel_96_barcodes_v1.fasta"
+  commit: 2964cd1fbddae04243d56914935881cca01f6d13
+  sha256: 98d81e93dff2c7e08ef26833ecbb066fb0e4bc3de3a60f48a7ca3705d029d57d
+- key: splitcode
+  name: "tutorials_splitseq.rst"
+  label: "splitcode tutorial: SPLiT-seq processing"
+  url: "https://raw.githubusercontent.com/pachterlab/splitcode-tutorial/68387770995199a9ac4ccadc25ee2f8e96cd24be/docs/source/tutorials_splitseq.rst"
+  commit: 68387770995199a9ac4ccadc25ee2f8e96cd24be
+  sha256: 6e934dd97d01e06da432f4013b84a5b77cb6cb649ecdf634724e4d69384c363b
+- key: splitcode
+  name: "r1_R.txt"
+  label: "splitcode tutorial round-1 random-hexamer barcodes"
+  url: "https://raw.githubusercontent.com/pachterlab/splitcode-tutorial/68387770995199a9ac4ccadc25ee2f8e96cd24be/uploads/splitseq/r1_R.txt"
+  commit: 68387770995199a9ac4ccadc25ee2f8e96cd24be
+  sha256: c354ab4973dc8784bee811a4e689f7d56be1fbcf1f264b6ffff12497347adb90
+- key: splitcode
+  name: "r1_T.txt"
+  label: "splitcode tutorial round-1 oligo-dT barcodes"
+  url: "https://raw.githubusercontent.com/pachterlab/splitcode-tutorial/68387770995199a9ac4ccadc25ee2f8e96cd24be/uploads/splitseq/r1_T.txt"
+  commit: 68387770995199a9ac4ccadc25ee2f8e96cd24be
+  sha256: 32afa5f996f4c206f11671f049e5ab6050c48725084fe3d68e9f8555e02de431
+- key: splitcode
+  name: "r2_r3.txt"
+  label: "splitcode tutorial round-2 and round-3 barcodes"
+  url: "https://raw.githubusercontent.com/pachterlab/splitcode-tutorial/68387770995199a9ac4ccadc25ee2f8e96cd24be/uploads/splitseq/r2_r3.txt"
+  commit: 68387770995199a9ac4ccadc25ee2f8e96cd24be
+  sha256: 346ecc6bf50e72c91e0ec115ca22918abbfa8d3dae7be0dab9e602a1564de199
+- key: sra-carabus
+  name: "DRR021959.fastq"
+  label: "SRA runs DRR021959 to DRR021990 of study DRP001067, spots 1 to 250 of each"
+  url: "https://www.ncbi.nlm.nih.gov/bioproject/PRJDB2148"
+  accession: DRR021959
+  spots: [1, 250]
+  fetch: &sra_carabus |-
+    for run in DRR0219{59..90}; do
+      fg-sra fastq --min-spot-id 1 --max-spot-id 250 --unpaired "$run.fastq" "$run"
+    done
+  sha256: 0c238893ff23c25c2931e3ae0d5fa81de27d85b4090a7a6b40b69f12cbaa7e58
+- key: sra-carabus
+  name: "DRR021960.fastq"
+  label: "SRA runs DRR021959 to DRR021990 of study DRP001067, spots 1 to 250 of each"
+  url: "https://www.ncbi.nlm.nih.gov/bioproject/PRJDB2148"
+  accession: DRR021960
+  spots: [1, 250]
+  fetch: *sra_carabus
+  sha256: 5b27a3556070beab59e9ef456c8f0903d912c97d22911ca764fcf2e8222494f0
+- key: sra-carabus
+  name: "DRR021961.fastq"
+  label: "SRA runs DRR021959 to DRR021990 of study DRP001067, spots 1 to 250 of each"
+  url: "https://www.ncbi.nlm.nih.gov/bioproject/PRJDB2148"
+  accession: DRR021961
+  spots: [1, 250]
+  fetch: *sra_carabus
+  sha256: d18849fb726000845295874fc3dfc2542387999a9e5dbf1b810a2703df288ebd
+- key: sra-carabus
+  name: "DRR021962.fastq"
+  label: "SRA runs DRR021959 to DRR021990 of study DRP001067, spots 1 to 250 of each"
+  url: "https://www.ncbi.nlm.nih.gov/bioproject/PRJDB2148"
+  accession: DRR021962
+  spots: [1, 250]
+  fetch: *sra_carabus
+  sha256: d046c33aee0788148486d4bdf4a15e3d74d5d0742d45587efa750893988df82c
+- key: sra-carabus
+  name: "DRR021963.fastq"
+  label: "SRA runs DRR021959 to DRR021990 of study DRP001067, spots 1 to 250 of each"
+  url: "https://www.ncbi.nlm.nih.gov/bioproject/PRJDB2148"
+  accession: DRR021963
+  spots: [1, 250]
+  fetch: *sra_carabus
+  sha256: 0e6b8e96145f52c6851a411ffadba91aa85beda083e845a4c4ebef293fb35a67
+- key: sra-carabus
+  name: "DRR021964.fastq"
+  label: "SRA runs DRR021959 to DRR021990 of study DRP001067, spots 1 to 250 of each"
+  url: "https://www.ncbi.nlm.nih.gov/bioproject/PRJDB2148"
+  accession: DRR021964
+  spots: [1, 250]
+  fetch: *sra_carabus
+  sha256: 71ae671058495a2a697a117d3fa91a320eae68d6c800d0f215a5bf7efc1631ea
+- key: sra-carabus
+  name: "DRR021965.fastq"
+  label: "SRA runs DRR021959 to DRR021990 of study DRP001067, spots 1 to 250 of each"
+  url: "https://www.ncbi.nlm.nih.gov/bioproject/PRJDB2148"
+  accession: DRR021965
+  spots: [1, 250]
+  fetch: *sra_carabus
+  sha256: 4382ab3114205f3fcb262952a5e80274b8b4a2228dfecde5ab476941136e5970
+- key: sra-carabus
+  name: "DRR021966.fastq"
+  label: "SRA runs DRR021959 to DRR021990 of study DRP001067, spots 1 to 250 of each"
+  url: "https://www.ncbi.nlm.nih.gov/bioproject/PRJDB2148"
+  accession: DRR021966
+  spots: [1, 250]
+  fetch: *sra_carabus
+  sha256: b0272673caecfe1d62db048ad3a869d155890f7f5a661b889571bc676e934811
+- key: sra-carabus
+  name: "DRR021967.fastq"
+  label: "SRA runs DRR021959 to DRR021990 of study DRP001067, spots 1 to 250 of each"
+  url: "https://www.ncbi.nlm.nih.gov/bioproject/PRJDB2148"
+  accession: DRR021967
+  spots: [1, 250]
+  fetch: *sra_carabus
+  sha256: ddd4c041514d5f6d6f822707703fa1035a57b0177f81c69df0d1a43feeefd51f
+- key: sra-carabus
+  name: "DRR021968.fastq"
+  label: "SRA runs DRR021959 to DRR021990 of study DRP001067, spots 1 to 250 of each"
+  url: "https://www.ncbi.nlm.nih.gov/bioproject/PRJDB2148"
+  accession: DRR021968
+  spots: [1, 250]
+  fetch: *sra_carabus
+  sha256: 8cd1479c4679da842eea250a77b482c94e8028a3a336563d9e953cdd41f2e3ef
+- key: sra-carabus
+  name: "DRR021969.fastq"
+  label: "SRA runs DRR021959 to DRR021990 of study DRP001067, spots 1 to 250 of each"
+  url: "https://www.ncbi.nlm.nih.gov/bioproject/PRJDB2148"
+  accession: DRR021969
+  spots: [1, 250]
+  fetch: *sra_carabus
+  sha256: 2693e8bd774c8d5b145e37260088656f5b8ec7ca3c27b7ae9d8a46ea8fdc1c8f
+- key: sra-carabus
+  name: "DRR021970.fastq"
+  label: "SRA runs DRR021959 to DRR021990 of study DRP001067, spots 1 to 250 of each"
+  url: "https://www.ncbi.nlm.nih.gov/bioproject/PRJDB2148"
+  accession: DRR021970
+  spots: [1, 250]
+  fetch: *sra_carabus
+  sha256: 49238791a24bbe435b3b172ab1957bf3ec2ae24e9cd5ec7269bae925a30f18aa
+- key: sra-carabus
+  name: "DRR021971.fastq"
+  label: "SRA runs DRR021959 to DRR021990 of study DRP001067, spots 1 to 250 of each"
+  url: "https://www.ncbi.nlm.nih.gov/bioproject/PRJDB2148"
+  accession: DRR021971
+  spots: [1, 250]
+  fetch: *sra_carabus
+  sha256: 9dc6623d30215a82e4b2d9fe87c40f3cc5bec010bdbda4182dd014457b615b1e
+- key: sra-carabus
+  name: "DRR021972.fastq"
+  label: "SRA runs DRR021959 to DRR021990 of study DRP001067, spots 1 to 250 of each"
+  url: "https://www.ncbi.nlm.nih.gov/bioproject/PRJDB2148"
+  accession: DRR021972
+  spots: [1, 250]
+  fetch: *sra_carabus
+  sha256: 1e82b6637e399e4a558b29e1c92d17583604606bddfede5f7e2dda1c8c985cf0
+- key: sra-carabus
+  name: "DRR021973.fastq"
+  label: "SRA runs DRR021959 to DRR021990 of study DRP001067, spots 1 to 250 of each"
+  url: "https://www.ncbi.nlm.nih.gov/bioproject/PRJDB2148"
+  accession: DRR021973
+  spots: [1, 250]
+  fetch: *sra_carabus
+  sha256: b4f0583690c8f3a0c6075aa323673f2766bb139271fd2cff2ae634579d1dd33c
+- key: sra-carabus
+  name: "DRR021974.fastq"
+  label: "SRA runs DRR021959 to DRR021990 of study DRP001067, spots 1 to 250 of each"
+  url: "https://www.ncbi.nlm.nih.gov/bioproject/PRJDB2148"
+  accession: DRR021974
+  spots: [1, 250]
+  fetch: *sra_carabus
+  sha256: 34d12541515b0a02a210677b9a86e97d58cd33326167951724b0a88b83896909
+- key: sra-carabus
+  name: "DRR021975.fastq"
+  label: "SRA runs DRR021959 to DRR021990 of study DRP001067, spots 1 to 250 of each"
+  url: "https://www.ncbi.nlm.nih.gov/bioproject/PRJDB2148"
+  accession: DRR021975
+  spots: [1, 250]
+  fetch: *sra_carabus
+  sha256: 9bc1833659db71bd8b4f1e9fe1604ea3131fe8570bb7f6aecbfa1c39db34b24e
+- key: sra-carabus
+  name: "DRR021976.fastq"
+  label: "SRA runs DRR021959 to DRR021990 of study DRP001067, spots 1 to 250 of each"
+  url: "https://www.ncbi.nlm.nih.gov/bioproject/PRJDB2148"
+  accession: DRR021976
+  spots: [1, 250]
+  fetch: *sra_carabus
+  sha256: 804616e2328f35e7929251e9c710551a95d2862326c5308cfce3c69f7bd8e9e9
+- key: sra-carabus
+  name: "DRR021977.fastq"
+  label: "SRA runs DRR021959 to DRR021990 of study DRP001067, spots 1 to 250 of each"
+  url: "https://www.ncbi.nlm.nih.gov/bioproject/PRJDB2148"
+  accession: DRR021977
+  spots: [1, 250]
+  fetch: *sra_carabus
+  sha256: c9f6e640faed7c00dfa70291069819742bf3cc902dee2e14fded35c6abe16aaa
+- key: sra-carabus
+  name: "DRR021978.fastq"
+  label: "SRA runs DRR021959 to DRR021990 of study DRP001067, spots 1 to 250 of each"
+  url: "https://www.ncbi.nlm.nih.gov/bioproject/PRJDB2148"
+  accession: DRR021978
+  spots: [1, 250]
+  fetch: *sra_carabus
+  sha256: c7fa6248da59579b711c6bb06a9ae711015f08f0c68fb67c9811936bd66117d1
+- key: sra-carabus
+  name: "DRR021979.fastq"
+  label: "SRA runs DRR021959 to DRR021990 of study DRP001067, spots 1 to 250 of each"
+  url: "https://www.ncbi.nlm.nih.gov/bioproject/PRJDB2148"
+  accession: DRR021979
+  spots: [1, 250]
+  fetch: *sra_carabus
+  sha256: f8332f39eea56c76bcc5c5ab077956b537d0094d1023bdfb0e4fc129a1817f52
+- key: sra-carabus
+  name: "DRR021980.fastq"
+  label: "SRA runs DRR021959 to DRR021990 of study DRP001067, spots 1 to 250 of each"
+  url: "https://www.ncbi.nlm.nih.gov/bioproject/PRJDB2148"
+  accession: DRR021980
+  spots: [1, 250]
+  fetch: *sra_carabus
+  sha256: 63b6f04302bf01addb15430dcaf5601292d93b4e2891d672c361b274d2229061
+- key: sra-carabus
+  name: "DRR021981.fastq"
+  label: "SRA runs DRR021959 to DRR021990 of study DRP001067, spots 1 to 250 of each"
+  url: "https://www.ncbi.nlm.nih.gov/bioproject/PRJDB2148"
+  accession: DRR021981
+  spots: [1, 250]
+  fetch: *sra_carabus
+  sha256: fec38c24f73f8cf0dad59d72a96f7788d5da86294247c6b5fbeddf15821234cf
+- key: sra-carabus
+  name: "DRR021982.fastq"
+  label: "SRA runs DRR021959 to DRR021990 of study DRP001067, spots 1 to 250 of each"
+  url: "https://www.ncbi.nlm.nih.gov/bioproject/PRJDB2148"
+  accession: DRR021982
+  spots: [1, 250]
+  fetch: *sra_carabus
+  sha256: 79ddea5945e7cf09e233fe1a5c7f69bd49156414bcec8ebee86ae6326180ae0b
+- key: sra-carabus
+  name: "DRR021983.fastq"
+  label: "SRA runs DRR021959 to DRR021990 of study DRP001067, spots 1 to 250 of each"
+  url: "https://www.ncbi.nlm.nih.gov/bioproject/PRJDB2148"
+  accession: DRR021983
+  spots: [1, 250]
+  fetch: *sra_carabus
+  sha256: 98945a94011a38079280c2b45e9e57a33dccf37dd06985e33c01837283314cf2
+- key: sra-carabus
+  name: "DRR021984.fastq"
+  label: "SRA runs DRR021959 to DRR021990 of study DRP001067, spots 1 to 250 of each"
+  url: "https://www.ncbi.nlm.nih.gov/bioproject/PRJDB2148"
+  accession: DRR021984
+  spots: [1, 250]
+  fetch: *sra_carabus
+  sha256: 83823d52123cf0c957a14f93fc9bca8140315c1e8605cf565dc7f4d172550945
+- key: sra-carabus
+  name: "DRR021985.fastq"
+  label: "SRA runs DRR021959 to DRR021990 of study DRP001067, spots 1 to 250 of each"
+  url: "https://www.ncbi.nlm.nih.gov/bioproject/PRJDB2148"
+  accession: DRR021985
+  spots: [1, 250]
+  fetch: *sra_carabus
+  sha256: 0077438bad31dca17989ce979c60b11dda4c9200ce00746ec0f4f3203bf5dcc0
+- key: sra-carabus
+  name: "DRR021986.fastq"
+  label: "SRA runs DRR021959 to DRR021990 of study DRP001067, spots 1 to 250 of each"
+  url: "https://www.ncbi.nlm.nih.gov/bioproject/PRJDB2148"
+  accession: DRR021986
+  spots: [1, 250]
+  fetch: *sra_carabus
+  sha256: f5b542fdf1e0b80649322f38d57b217f43b707bda988cf0397a590d63120761a
+- key: sra-carabus
+  name: "DRR021987.fastq"
+  label: "SRA runs DRR021959 to DRR021990 of study DRP001067, spots 1 to 250 of each"
+  url: "https://www.ncbi.nlm.nih.gov/bioproject/PRJDB2148"
+  accession: DRR021987
+  spots: [1, 250]
+  fetch: *sra_carabus
+  sha256: ea8aea3cd4683cceb6b5bad273862e4d9e20b6e85580399ad3780a32627de0d2
+- key: sra-carabus
+  name: "DRR021988.fastq"
+  label: "SRA runs DRR021959 to DRR021990 of study DRP001067, spots 1 to 250 of each"
+  url: "https://www.ncbi.nlm.nih.gov/bioproject/PRJDB2148"
+  accession: DRR021988
+  spots: [1, 250]
+  fetch: *sra_carabus
+  sha256: e0985fef474c6061a3dca3d691300847e5c20ddb60213366b7ef66aec0b31a3f
+- key: sra-carabus
+  name: "DRR021989.fastq"
+  label: "SRA runs DRR021959 to DRR021990 of study DRP001067, spots 1 to 250 of each"
+  url: "https://www.ncbi.nlm.nih.gov/bioproject/PRJDB2148"
+  accession: DRR021989
+  spots: [1, 250]
+  fetch: *sra_carabus
+  sha256: fbde07c93e7fe23bd24efedaa93dac1226637a464e5d8158b9cad6294256996f
+- key: sra-carabus
+  name: "DRR021990.fastq"
+  label: "SRA runs DRR021959 to DRR021990 of study DRP001067, spots 1 to 250 of each"
+  url: "https://www.ncbi.nlm.nih.gov/bioproject/PRJDB2148"
+  accession: DRR021990
+  spots: [1, 250]
+  fetch: *sra_carabus
+  sha256: 27b6d3d91794876f75fb7eeada811ea9d970c63eb2df94229a7ed60c5699e910
+- key: sra-SRR13948565
+  name: "SRR13948565_1.fastq"
+  label: "SRA run SRR13948565, spots 1,000,001 to 1,010,000"
+  url: "https://www.ncbi.nlm.nih.gov/sra/SRR13948565"
+  accession: SRR13948565
+  spots: [1000001, 1010000]
+  fetch: "fg-sra fastq --min-spot-id 1000001 --max-spot-id 1010000 --r1 SRR13948565_1.fastq --r2 SRR13948565_2.fastq SRR13948565"
+  sha256: fcad4d5e5173a21e9db9accdecee6454cf123abe8128a08019a2719a9479c6d5
+- key: sra-SRR13948565
+  name: "SRR13948565_2.fastq"
+  label: "SRA run SRR13948565, spots 1,000,001 to 1,010,000"
+  url: "https://www.ncbi.nlm.nih.gov/sra/SRR13948565"
+  accession: SRR13948565
+  spots: [1000001, 1010000]
+  fetch: "fg-sra fastq --min-spot-id 1000001 --max-spot-id 1010000 --r1 SRR13948565_1.fastq --r2 SRR13948565_2.fastq SRR13948565"
+  sha256: 5abd93388975a6fe2ef9b18785485935c215ec35f0a53ddb0f56ce7af7529238
+- key: geo
+  name: "GSM5169184_C2C12_short_1k_cell_metadata.csv.gz"
+  label: "GEO GSM5169184, the cells split-pipe called in SRR13948565"
+  url: "https://ftp.ncbi.nlm.nih.gov/geo/samples/GSM5169nnn/GSM5169184/suppl/GSM5169184_C2C12_short_1k_cell_metadata.csv.gz"
+  sha256: 5c50c7cc1fe85f51fe9f4724ceb211d8e0091c9cfd2acec4b22c9ab957d511cc
+- key: nfcore-modules
+  name: "subsampled_5k_human_antiCMV_T_TBNK_connect_AB_S2_L004_R1_001.fastq.gz"
+  label: "nf-core/test-datasets (modules) 10x antibody reads, read 1"
+  url: "https://raw.githubusercontent.com/nf-core/test-datasets/e8d2f4f2af42cc757ed2448c2398e282e9990235/data/genomics/homo_sapiens/10xgenomics/cellranger/5k_cmvpos_tcells/fastqs/ab/subsampled_5k_human_antiCMV_T_TBNK_connect_AB_S2_L004_R1_001.fastq.gz"
+  commit: e8d2f4f2af42cc757ed2448c2398e282e9990235
+  sha256: 12de3133f682ea61d5e9158021d59c20d17372bdbe97ccb40a23ca6320a377b4
+- key: nfcore-modules
+  name: "subsampled_5k_human_antiCMV_T_TBNK_connect_AB_S2_L004_R2_001.fastq.gz"
+  label: "nf-core/test-datasets (modules) 10x antibody reads, read 2"
+  url: "https://raw.githubusercontent.com/nf-core/test-datasets/e8d2f4f2af42cc757ed2448c2398e282e9990235/data/genomics/homo_sapiens/10xgenomics/cellranger/5k_cmvpos_tcells/fastqs/ab/subsampled_5k_human_antiCMV_T_TBNK_connect_AB_S2_L004_R2_001.fastq.gz"
+  commit: e8d2f4f2af42cc757ed2448c2398e282e9990235
+  sha256: e531f406e8f8273d949ff62015d73edbb90982e1064326f6208e46d1a8431daa
+- key: nfcore-modules
+  name: "5k_human_antiCMV_T_TBNK_connect_Multiplex_count_feature_reference.csv"
+  label: "nf-core/test-datasets (modules) antibody feature reference"
+  url: "https://raw.githubusercontent.com/nf-core/test-datasets/e8d2f4f2af42cc757ed2448c2398e282e9990235/data/genomics/homo_sapiens/10xgenomics/cellranger/5k_cmvpos_tcells/5k_human_antiCMV_T_TBNK_connect_Multiplex_count_feature_reference.csv"
+  commit: e8d2f4f2af42cc757ed2448c2398e282e9990235
+  sha256: 167c46e917b3879b7b5416eba04a33388d624a1dce481e211a8bdfff0022aaf7
+- key: sra-SRR27862880
+  name: "SRR27862880_1.fastq"
+  label: "SRA run SRR27862880, spots 1 to 2,000"
+  url: "https://www.ncbi.nlm.nih.gov/sra/SRR27862880"
+  accession: SRR27862880
+  spots: [1, 2000]
+  fetch: "fg-sra fastq --min-spot-id 1 --max-spot-id 2000 --r1 SRR27862880_1.fastq --r2 SRR27862880_2.fastq --defline '$sn $ri:N:0:$sg' SRR27862880"
+  sha256: 9bcb902a6ba0d5fc3030658dbffef3573129c51e4c4b3d361d399b040c55222d
+- key: sra-SRR27862880
+  name: "SRR27862880_2.fastq"
+  label: "SRA run SRR27862880, spots 1 to 2,000"
+  url: "https://www.ncbi.nlm.nih.gov/sra/SRR27862880"
+  accession: SRR27862880
+  spots: [1, 2000]
+  fetch: "fg-sra fastq --min-spot-id 1 --max-spot-id 2000 --r1 SRR27862880_1.fastq --r2 SRR27862880_2.fastq --defline '$sn $ri:N:0:$sg' SRR27862880"
+  sha256: 344783d6ff278b44559abb61d1487adacb426fde41a5e2592f4019a73a267d35
+- key: ncbi
+  name: "NC_001422.1.fasta"
+  label: "NCBI RefSeq NC_001422.1, the PhiX174 genome"
+  url: "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?db=nuccore&id=NC_001422.1&rettype=fasta&retmode=text"
+  sha256: caa155c83967cc080f4f188f14f1f28c18d77448e87c3d00d3579ed348f4de2a
+- key: uditas
+  name: "uditas_helpers.py"
+  label: "UDiTaS demultiplexing rules, demultiplex()"
+  url: "https://raw.githubusercontent.com/editasmedicine/uditas/658ad062acf2b073dd42523704fae9c71e14bd8a/uditas/uditas_helpers.py"
+  commit: 658ad062acf2b073dd42523704fae9c71e14bd8a
+  sha256: 9aafa10ce759e93ed59a15686e8039b2d9ef8af95ec0e39b102315dbee0a2ec8
+- key: samtools
+  name: "split.sam"
+  label: "samtools 1.25 test file test/split/split.sam"
+  url: "https://raw.githubusercontent.com/samtools/samtools/7162950d0988480faeddeb49f03520737e13a9c4/test/split/split.sam"
+  commit: 7162950d0988480faeddeb49f03520737e13a9c4
+  sha256: f937e3eebd2056046ece910f934725c17946fb3be16c2339ab03c8f5ddcf6794
+- key: modkit
+  name: "fwd_rev_modbase_records.bam"
+  label: "modkit test file tests/resources/fwd_rev_modbase_records.bam"
+  url: "https://raw.githubusercontent.com/nanoporetech/modkit/5cecc3fb3a9336068d9e3c68d5c08d678153dd2c/tests/resources/fwd_rev_modbase_records.bam"
+  commit: 5cecc3fb3a9336068d9e3c68d5c08d678153dd2c
+  sha256: 246f175ecd169f4a39b30a5130a7fe64234490c920f5110fb33a49d7849f7d9b
+- key: modkit
+  name: "bc_anchored_10_reads.unmapped.bam"
+  label: "modkit test file tests/resources/bc_anchored_10_reads.unmapped.bam"
+  url: "https://raw.githubusercontent.com/nanoporetech/modkit/5cecc3fb3a9336068d9e3c68d5c08d678153dd2c/tests/resources/bc_anchored_10_reads.unmapped.bam"
+  commit: 5cecc3fb3a9336068d9e3c68d5c08d678153dd2c
+  sha256: e1a802203410fccc9f6b4258cef3d9ca2cf93bb3dfc487f63e2acfa57678e144
+- key: nfcore
+  name: "S10_L001_R1_001.fastq.gz"
+  label: "nf-core/test-datasets (scrnaseq) 10x v2 read 1"
+  url: "https://raw.githubusercontent.com/nf-core/test-datasets/d934d6e8367fe2626184496b1889671cf2b02dab/testdata/S10_L001_R1_001.fastq.gz"
+  commit: d934d6e8367fe2626184496b1889671cf2b02dab
+  sha256: a318e85709d690b25c763fb3f156fc98d0ce46360115f3de3d9b1b2ecc55a1f7
+- key: nfcore
+  name: "S10_L001_R2_001.fastq.gz"
+  label: "nf-core/test-datasets (scrnaseq) 10x v2 read 2"
+  url: "https://raw.githubusercontent.com/nf-core/test-datasets/d934d6e8367fe2626184496b1889671cf2b02dab/testdata/S10_L001_R2_001.fastq.gz"
+  commit: d934d6e8367fe2626184496b1889671cf2b02dab
+  sha256: 1514b26ce8e972ac7ba1860d591fa72e8c1fb6f716825651c2eb24b59c1a38d2
+- key: nfcore
+  name: "10xv2_whitelist.txt"
+  label: "nf-core/test-datasets (scrnaseq) 10x v2 barcode keeplist"
+  url: "https://raw.githubusercontent.com/nf-core/test-datasets/d934d6e8367fe2626184496b1889671cf2b02dab/reference/kallisto/10xv2_whitelist.txt"
+  commit: d934d6e8367fe2626184496b1889671cf2b02dab
+  sha256: b0dda4b114d8fc7ea8def94fb472e6205c1831a72e3ac245ed13cc332d9f20d1
+- key: fastquorum
+  name: "samplesheet.tiny.csv"
+  label: "nf-core/test-datasets (fastquorum) sample sheet for SRR6109255"
+  url: "https://raw.githubusercontent.com/nf-core/test-datasets/2ca9f8176f1f40ec1124c5182c58524766c95411/testdata/samplesheets/samplesheet.tiny.csv"
+  commit: 2ca9f8176f1f40ec1124c5182c58524766c95411
+  sha256: c6c8603f79cb9ee317700d0f0b055a48b0652879552dfa6dded1c31233a03a26
+- key: fastquorum
+  name: "SRR6109255_1.fastq.gz"
+  label: "nf-core/test-datasets (fastquorum) duplex reads SRR6109255, read 1"
+  url: "https://raw.githubusercontent.com/nf-core/test-datasets/2ca9f8176f1f40ec1124c5182c58524766c95411/testdata/fastqs/tiny/SRR6109255_1.fastq.gz"
+  commit: 2ca9f8176f1f40ec1124c5182c58524766c95411
+  sha256: 1506c177f3fb7d58c193604de4d9c12cf365f9fb9345e26ec9c6fd7fb9dd407f
+- key: fastquorum
+  name: "SRR6109255_2.fastq.gz"
+  label: "nf-core/test-datasets (fastquorum) duplex reads SRR6109255, read 2"
+  url: "https://raw.githubusercontent.com/nf-core/test-datasets/2ca9f8176f1f40ec1124c5182c58524766c95411/testdata/fastqs/tiny/SRR6109255_2.fastq.gz"
+  commit: 2ca9f8176f1f40ec1124c5182c58524766c95411
+  sha256: feded00ee29cb946b9a387392d8f0c2a5b63dca2d57cfc3b13365313d7d33340
+- key: fastquorum
+  name: "samplesheet.nonrandom.csv"
+  label: "nf-core/test-datasets (fastquorum) sample sheet for the fixed UMIs"
+  url: "https://raw.githubusercontent.com/nf-core/test-datasets/2ca9f8176f1f40ec1124c5182c58524766c95411/testdata/samplesheets/samplesheet.nonrandom.csv"
+  commit: 2ca9f8176f1f40ec1124c5182c58524766c95411
+  sha256: b3245e6abb9df4721a2fa21de08db92e5a2605c8c0a63a375efbbc5e83a9c87d
+- key: fastquorum
+  name: "synthetic_nonrandom_umi_1.fastq.gz"
+  label: "nf-core/test-datasets (fastquorum) reads with fixed UMIs, read 1"
+  url: "https://raw.githubusercontent.com/nf-core/test-datasets/2ca9f8176f1f40ec1124c5182c58524766c95411/testdata/fastqs/synthetic-nonrandom-umi/synthetic_nonrandom_umi_1.fastq.gz"
+  commit: 2ca9f8176f1f40ec1124c5182c58524766c95411
+  sha256: 6da282703b2eb7671800f2a34621ff2a8a0ce05b48deff6da09755466c54d855
+- key: fastquorum
+  name: "synthetic_nonrandom_umi_2.fastq.gz"
+  label: "nf-core/test-datasets (fastquorum) reads with fixed UMIs, read 2"
+  url: "https://raw.githubusercontent.com/nf-core/test-datasets/2ca9f8176f1f40ec1124c5182c58524766c95411/testdata/fastqs/synthetic-nonrandom-umi/synthetic_nonrandom_umi_2.fastq.gz"
+  commit: 2ca9f8176f1f40ec1124c5182c58524766c95411
+  sha256: 11d50af9ee3bf94882c3c9001057fad3777840f0097cbbc442f639db2d196cd3
+- key: fastquorum
+  name: "idt-xgen-cfdna-umis.txt"
+  label: "nf-core/test-datasets (fastquorum) IDT xGen cfDNA UMI list"
+  url: "https://raw.githubusercontent.com/nf-core/test-datasets/2ca9f8176f1f40ec1124c5182c58524766c95411/testdata/umis/idt-xgen-cfdna-umis.txt"
+  commit: 2ca9f8176f1f40ec1124c5182c58524766c95411
+  sha256: b1ebe64e3adf7107154b0f08143750d9d3ca03b118091ccb1dc1124ed09553e4
+- key: splitseq
+  name: "bc_8nt_v1.csv"
+  label: "split-seq-pipeline ligation barcodes (rounds 2 and 3)"
+  url: "https://raw.githubusercontent.com/yjzhang/split-seq-pipeline/c3923ea44a94a1fc0effe5ff8e2ca479c0bff934/split_seq/barcodes/bc_8nt_v1.csv"
+  commit: c3923ea44a94a1fc0effe5ff8e2ca479c0bff934
+  sha256: 76dd0395f1f450176d668619db4d7fd1a1cd502b8870c7d15411f7c53d29cff3
+- key: splitseq
+  name: "bc_8nt_v2.csv"
+  label: "split-seq-pipeline reverse-transcription barcodes (round 1)"
+  url: "https://raw.githubusercontent.com/yjzhang/split-seq-pipeline/c3923ea44a94a1fc0effe5ff8e2ca479c0bff934/split_seq/barcodes/bc_8nt_v2.csv"
+  commit: c3923ea44a94a1fc0effe5ff8e2ca479c0bff934
+  sha256: 6180689a6bf2b26d5d6578039d6f7150ee3e8165ee3b0f6ee7d2045884fda5e2
+- key: splitseq
+  name: "tools.py"
+  label: "split-seq-pipeline read layout (amp_seq, chemistry v2)"
+  url: "https://raw.githubusercontent.com/yjzhang/split-seq-pipeline/c3923ea44a94a1fc0effe5ff8e2ca479c0bff934/split_seq/tools.py"
+  commit: c3923ea44a94a1fc0effe5ff8e2ca479c0bff934
+  sha256: 87223418472ffc3e214b7b902c6c7751462a69c62e65bb4daef75cc093525ba4
+- key: dorado
+  name: "barcode_kits.cpp"
+  label: "dorado native barcodes NB01 to NB24 and their flanks"
+  url: "https://raw.githubusercontent.com/nanoporetech/dorado/651980f48c21eb93a5c46c65e1f004136f02c07a/dorado/utils/barcode_kits.cpp"
+  commit: 651980f48c21eb93a5c46c65e1f004136f02c07a
+  sha256: 6dd726dd7a3abe8eabbdfa39095269fe57393b82b411570b65cedc6d2b78fc44
+- key: dorado
+  name: "fastq_with_us_and_tags.fq"
+  label: "dorado test read written with U bases"
+  url: "https://raw.githubusercontent.com/nanoporetech/dorado/651980f48c21eb93a5c46c65e1f004136f02c07a/tests/data/bam_reader/fastq_with_us_and_tags.fq"
+  commit: 651980f48c21eb93a5c46c65e1f004136f02c07a
+  sha256: 932a2a32f845b02db19e1688bbdc129611d984998267ca8ac28b8dd4b7b68877

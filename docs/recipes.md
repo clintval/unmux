@@ -3,7 +3,7 @@
 Recipes for common unmux jobs. Each one says when to use it, the data it ran on, the exact command, and an excerpt of what unmux printed or wrote, so you can see the result before running it on your own data.
 
 > [!NOTE]
-> Every command on this page was run with unmux 0.11.0 and samtools 1.25, and every output is copied from that run. The script [`docs/recipes/generate.py`](recipes/generate.py) fetches the inputs, runs the recipes again, and rewrites this page.
+> Every command on this page was run with unmux 0.11.0 and samtools 1.25, and every output is copied from that run. The workflow in [`docs/recipes/`](recipes/) fetches the inputs, runs the recipes again, and rewrites this page.
 
 Commands are bash and run in a directory that holds their inputs. Log lines appear without their timestamps, and an excerpt that skips lines marks the gap with …. Header excerpts come from `samtools view --no-PG`, which keeps samtools' own `@PG` line out.
 
@@ -1830,12 +1830,12 @@ Every download is pinned: GitHub files by commit, SRA runs by accession and spot
 
 ## Regenerating this page
 
-One command fetches the inputs into `docs/recipes/cache/`, builds unmux, runs every recipe with its checks, and rewrites this page. It needs Python 3, samtools 1.16 or newer, fg-sra, fqtk, splitcode and, for the lima comparison, Docker.
+A Snakemake workflow in `docs/recipes/` fetches the inputs into `docs/recipes/cache/`, runs every recipe with its checks, and rewrites this page. pixi installs the tools it runs, pinned in `pixi.toml` and `pixi.lock`; the lima comparison also needs Docker.
 
 ```bash
-make -C docs/recipes            # fetch, build, run, and write docs/recipes.md
+make -C docs/recipes            # build unmux, run every recipe, and write docs/recipes.md
 make -C docs/recipes check      # fail if the page would change
-make -C docs/recipes run UNMUX=/path/to/unmux
+make -C docs/recipes check CACHE=/tmp/cookbook   # the same, from an empty cache
 ```
 
-The targets are `fetch`, `run`, `page`, `check` and `clean`, and the variables `SAMTOOLS`, `FG_SRA`, `FQTK`, `SPLITCODE` and `LIMA` give other ways to run those tools, for example `SAMTOOLS="pixi exec -c conda-forge -c bioconda -s samtools samtools"`.
+Each recipe has its own target, such as `results/uditas.json` for its checks, so `pixi run snakemake --cores 8 results/uditas.json` runs one recipe and what it depends on. Its commands are in `rules/`, its checks in `scripts/checks/`, and its prose in `templates/`; a failed check stops the run and gives the recipe.
