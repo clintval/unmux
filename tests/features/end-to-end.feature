@@ -140,5 +140,5 @@ Feature: End-to-end demux flows over the real binary
       +
       IIII
       """
-    And the file "out/summary.tsv" contains "r	2	2	0	0	0	1.000000"
+    And the file "out/summary.tsv" contains "pool	2	2	0	0	0	1.000000"
     And the directory "out" holds exactly "s1.R1.fq, s1.R2.fq, summary.tsv"
