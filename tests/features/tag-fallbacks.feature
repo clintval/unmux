@@ -161,3 +161,13 @@ Feature: Tag stream fallbacks
     When I run `unmux reads.fq --group a={a1=AAAA,a2=CCCC} --group a::loc=0:0:4 --extract ba=@a --extract r=0:8:end --tag CB=ba|missing --template r --out out.sam`
     Then the exit code is 1
     And stderr contains "tag `CB` references undefined extract stream `missing`"
+
+  Scenario: a --template stream cannot fall back
+    When I run `unmux reads.fq --group a={a1=AAAA,a2=CCCC} --group a::loc=0:0:4 --extract ba=@a --extract r=0:8:end --out out.fq --template ba|r`
+    Then the exit code is 1
+    And stderr contains "a `--template` stream cannot fall back with `|`, which works in `--tag` only; a record whose template stream is absent is unassigned, and `--unassigned` writes it as its input reads. Got: "ba|r""
+    And stderr does not contain "invalid characters"
+    And a file "out.fq" does not exist
+    When I run `unmux reads.fq --group a={a1=AAAA,a2=CCCC} --group a::loc=0:0:4 --extract ba=@a --extract r=0:8:end --out out.fq --template r ~ba|r::raw=true`
+    Then the exit code is 1
+    And stderr contains "a `--template` stream cannot fall back with `|`, which works in `--tag` only; a record whose template stream is absent is unassigned, and `--unassigned` writes it as its input reads. Got: "~ba|r::raw=true""

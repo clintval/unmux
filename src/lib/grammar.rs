@@ -3748,6 +3748,22 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_template_refuses_a_fallback() {
+        for spec in ["a|b", "a+b|c", "~a|b::raw=true", "a|"] {
+            let err = parse_templates(&[spec.to_string()])
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.starts_with(
+                    "a `--template` stream cannot fall back with `|`, which works in `--tag` only;"
+                ),
+                "{spec}: {err}"
+            );
+            assert!(err.ends_with(&format!("Got: {spec:?}")), "{spec}: {err}");
+        }
+    }
+
+    #[test]
     fn test_validate_plan_match_with_loc_is_error() {
         let mut a = args();
         a.extracts = vec!["i7=1:0:8".to_string()];
