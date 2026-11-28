@@ -91,6 +91,10 @@ unmux "R1.fastq.gz" "R2.fastq.gz" \
 - **Single-pass demultiplexing, optionally nested**: split a pool into per-sample outputs and, if you like, each sample into sub-samples (a library of samples, sub-libraries of lysates, and so on), each written as its own FASTX/SAM/BAM/CRAM with `SM`/`LB` read group identifiers.
 - **Configured on the CLI or in sheets** with the same grammar: flags repeat and accumulate, so a spec can be built up piece by piece (`--group g1::loc=... --group g1::dist=...`), or written compactly with comma lists (`--group g1::loc=...,dist=...`).
 
+## Cookbook
+
+The [cookbook](docs/recipes.md) has recipes for common jobs, each run on public data with the exact command and the output it gave: format conversions, Illumina demultiplexing, duplex UMIs, single-cell barcodes, long reads and diagnostics.
+
 ## Development and Testing
 
 See the [contributing guide](./CONTRIBUTING.md) for more information.

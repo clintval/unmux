@@ -1,0 +1,3 @@
+cache: cache
+unmux: ../../target/release/unmux
+lima: docker run --rm --platform linux/amd64 -v "$PWD":/w -w /w quay.io/biocontainers/lima:26.2.1--h9ee0642_0 lima

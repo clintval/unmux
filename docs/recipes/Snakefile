@@ -1,0 +1,30 @@
+import sys
+
+import yaml
+
+
+configfile: "config/config.yaml"
+
+
+sys.path.insert(0, f"{workflow.basedir}/scripts")
+import cookbook  # noqa: E402
+
+CACHE = config["cache"]
+RESULTS = config.get("results", "results")
+SECTIONS = yaml.safe_load(open(f"{workflow.basedir}/config/recipes.yaml"))
+RECIPES = [recipe["key"] for section in SECTIONS for recipe in section["recipes"]]
+
+
+rule all:
+    input:
+        f"{RESULTS}/recipes.md",
+
+
+include: "rules/common.smk"
+include: "rules/workflow.smk"
+include: "rules/conversions.smk"
+include: "rules/illumina.smk"
+include: "rules/umis.smk"
+include: "rules/single_cell.smk"
+include: "rules/long_reads.smk"
+include: "rules/diagnostics.smk"

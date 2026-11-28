@@ -1,0 +1,47 @@
+# The page in order: each section's file under rules/, its introduction, and its recipes.
+- section: Conversions
+  rules: conversions
+  intro: "Format conversions with nothing to demultiplex: unmux as a converter between FASTQ, SAM and BAM, compared with samtools."
+  recipes:
+    - {key: fastq_to_ubam, title: "Paired FASTQ to an unmapped BAM"}
+    - {key: ubam_to_fastq, title: "Unmapped BAM back to paired FASTQ"}
+    - {key: passthrough, title: "What plain SAM or BAM pass-through keeps and changes"}
+    - {key: split_rg, title: "Split an aligned BAM by read group"}
+    - {key: changeseq, title: "Join read pairs end to end for CHANGE-seq"}
+- section: Illumina demultiplexing
+  rules: illumina
+  intro: "Short-read runs split by index reads or inline barcodes, with reads of known origin so each result can be scored."
+  recipes:
+    - {key: uditas, title: "Dual-index demultiplexing with a sample sheet"}
+    - {key: bins, title: "Undetermined reads and a PhiX bin"}
+    - {key: inline, title: "Inline barcodes into unmapped BAMs"}
+- section: UMIs and duplex sequencing
+  rules: umis
+  intro: "Unique molecular identifiers (UMIs) into the RX tag for duplex consensus calling, on reads from the nf-core/fastquorum tests."
+  recipes:
+    - {key: duplex, title: "Random duplex UMIs into RX"}
+    - {key: duplex_fixed, title: "Fixed duplex UMIs corrected to a list"}
+- section: Single cell
+  rules: single_cell
+  intro: "Cell barcodes and UMIs into SAM tags, from 10x Chromium, split-pool and antibody-tag libraries."
+  recipes:
+    - {key: tenx, title: "10x Chromium cell barcodes and UMIs"}
+    - {key: splitseq, title: "SPLiT-seq barcodes in three rounds"}
+    - {key: match, title: "Keep the reads of called cells with a joined match"}
+    - {key: cite, title: "CITE-seq antibody barcodes"}
+- section: Long reads
+  rules: long_reads
+  intro: "Nanopore and PacBio reads: barcodes at both ends, U bases, and tags carried in FASTQ comments."
+  recipes:
+    - {key: nanopore, title: "Nanopore native barcodes at both ends"}
+    - {key: pacbio, title: "PacBio barcode pairs, compared with lima"}
+    - {key: direct_rna, title: "Direct RNA reads with U bases to BAM"}
+    - {key: comment_tags, title: "Lift SAM tags from FASTQ comments back onto records"}
+- section: Diagnostics
+  rules: diagnostics
+  intro: "Ways to see what a run did and why."
+  recipes:
+    - {key: qc_tag, title: "Explain one read's assignment with --qc-tag"}
+    - {key: metrics, title: "Read the metrics files"}
+    - {key: collision, title: "The tag-collision check"}
+    - {key: wide, title: "Search windows wider than their tags"}

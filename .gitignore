@@ -17,8 +17,16 @@
 # claude code
 .claude/*
 
-# local planning docs (kept out of the remote)
-/docs/
+# local planning docs (kept out of the remote), except the cookbook and its workflow
+/docs/*
+!/docs/recipes.md
+!/docs/recipes/
+
+# inputs, results and records the cookbook workflow writes, and its pixi environment
+/docs/recipes/cache/
+/docs/recipes/results/
+/docs/recipes/.snakemake/
+/docs/recipes/.pixi/
 
 # editor settings
 /.vscode/
