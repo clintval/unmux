@@ -1345,6 +1345,13 @@ fn parse_template(spec: &str) -> Result<Template> {
              use `--template r1 r2` or repeat `--template`. Got: {spec:?}"
         );
     }
+    if stream_part.contains('|') {
+        bail!(
+            "a `--template` stream cannot fall back with `|`, which works in `--tag` only; a record \
+             whose template stream is absent is unassigned, and `--unassigned` writes it as its \
+             input reads. Got: {spec:?}"
+        );
+    }
     let streams: Vec<StreamRef> = stream_part
         .split('+')
         .map(str::trim)
@@ -3795,6 +3802,22 @@ mod tests {
         assert!(multi[0].raw);
         let err = parse_templates(&["cdna::nope=1".to_string()]).unwrap_err();
         assert!(err.to_string().contains("unknown attribute"), "{err}");
+    }
+
+    #[test]
+    fn test_parse_template_refuses_a_fallback() {
+        for spec in ["a|b", "a+b|c", "~a|b::raw=true", "a|"] {
+            let err = parse_templates(&[spec.to_string()])
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.starts_with(
+                    "a `--template` stream cannot fall back with `|`, which works in `--tag` only;"
+                ),
+                "{spec}: {err}"
+            );
+            assert!(err.ends_with(&format!("Got: {spec:?}")), "{spec}: {err}");
+        }
     }
 
     #[test]
